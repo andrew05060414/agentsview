@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,10 +99,7 @@ func TestWindowsParentSecurityAllowsInheritOnlyWrites(t *testing.T) {
 func TestWindowsCaptureDirectoryAllowsSplitTrustedEntries(t *testing.T) {
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
-	sddl := "D:P"
-	for _, sid := range allowed {
-		sddl += "(A;OICI;GA;;;" + sid.String() + ")"
-	}
+	sddl := allowedSDDL("D:P", "A;OICI;GA", allowed)
 	sddl += "(A;CI;GA;;;" + allowed[0].String() + ")"
 	descriptor, err := windows.SecurityDescriptorFromString(sddl)
 	require.NoError(t, err)
@@ -114,10 +112,7 @@ func TestWindowsCaptureDirectoryAllowsSplitTrustedEntries(t *testing.T) {
 func TestWindowsCaptureDirectoryAllowsMappedFullAccess(t *testing.T) {
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
-	sddl := "D:P"
-	for _, sid := range allowed {
-		sddl += "(A;OICI;FA;;;" + sid.String() + ")"
-	}
+	sddl := allowedSDDL("D:P", "A;OICI;FA", allowed)
 	descriptor, err := windows.SecurityDescriptorFromString(sddl)
 	require.NoError(t, err)
 
@@ -191,10 +186,7 @@ func TestClaudeProviderRootAllowsExistingSafeUnprotectedDACL(t *testing.T) {
 func TestWindowsCaptureDirectoryRequiresInheritableTrustedAccess(t *testing.T) {
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
-	sddl := "D:P"
-	for _, sid := range allowed {
-		sddl += "(A;;GA;;;" + sid.String() + ")"
-	}
+	sddl := allowedSDDL("D:P", "A;;GA", allowed)
 	descriptor, err := windows.SecurityDescriptorFromString(sddl)
 	require.NoError(t, err)
 
@@ -206,10 +198,7 @@ func TestWindowsCaptureDirectoryRequiresInheritableTrustedAccess(t *testing.T) {
 func TestWindowsClaudeProviderRootAllowsInheritedTrustedAccess(t *testing.T) {
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
-	sddl := "D:AI"
-	for _, sid := range allowed {
-		sddl += "(A;OICIID;GA;;;" + sid.String() + ")"
-	}
+	sddl := allowedSDDL("D:AI", "A;OICIID;GA", allowed)
 	descriptor, err := windows.SecurityDescriptorFromString(sddl)
 	require.NoError(t, err)
 
@@ -281,4 +270,14 @@ func assertProtectedCaptureDACL(t *testing.T, path string) {
 	allowed, err := captureDirectorySIDs()
 	require.NoError(t, err)
 	require.NoError(t, verifyCaptureDirectoryDACL(path, allowed))
+}
+
+// allowedSDDL builds a DACL string that grants ace to every allowed SID.
+func allowedSDDL(header, ace string, allowed []*windows.SID) string {
+	var sddl strings.Builder
+	sddl.WriteString(header)
+	for _, sid := range allowed {
+		sddl.WriteString("(" + ace + ";;;" + sid.String() + ")")
+	}
+	return sddl.String()
 }
