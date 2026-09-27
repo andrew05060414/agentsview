@@ -142,6 +142,12 @@ func (h *HostedStore) GetRecallEntry(ctx context.Context, id string) (*db.Recall
 	return h.physical.GetRecallEntry(ctx, id)
 }
 
+func (h *HostedStore) ReviewRecallEntry(
+	ctx context.Context, id string, action db.RecallReviewAction,
+) (db.RecallEntry, error) {
+	return h.physical.ReviewRecallEntry(ctx, id, action)
+}
+
 func (h *HostedStore) QueryRecallEntries(ctx context.Context, q db.RecallQuery) (db.RecallPage, error) {
 	return h.physical.QueryRecallEntries(ctx, q)
 }

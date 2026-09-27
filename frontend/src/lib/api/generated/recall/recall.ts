@@ -7,11 +7,13 @@ import type {
   GetApiV1RecallEntriesByIdPathParameters,
   GetApiV1RecallEntriesParams,
   GetApiV1RecallExtractionProgressParams,
+  PostApiV1RecallEntriesByIdReviewPathParameters,
   PostApiV1RecallExtractionGenerationsByFingerprintRetirePathParameters,
   PostApiV1RecallImportParams,
   RecallEntriesResponse,
   RecallExtractProgressResponse,
   RecallExtractionStatusResponse,
+  ReviewRecallEntryRequest,
   ServiceRecallQuery,
   ServiceRecallQueryResult,
 } from "../models";
@@ -63,6 +65,47 @@ export const getApiV1RecallEntriesById = async (
   return orvalFetch<DbRecallEntry>(getGetApiV1RecallEntriesByIdUrl({ id }), {
     ...options,
     method: "GET",
+  });
+};
+
+export const getPostApiV1RecallEntriesByIdReviewUrl = ({
+  id,
+}: PostApiV1RecallEntriesByIdReviewPathParameters) => {
+  return `/api/v1/recall/entries/${encodeURIComponent(String(id))}/review`;
+};
+
+/**
+ * @summary Review recall entry
+ */
+export const postApiV1RecallEntriesByIdReview = async (
+  { id }: PostApiV1RecallEntriesByIdReviewPathParameters,
+  reviewRecallEntryRequest: ReviewRecallEntryRequest,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<DbRecallEntry> => {
+  const getHeaders = (
+    h?: NonNullable<RequestInit["headers"]>,
+  ): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<DbRecallEntry>(getPostApiV1RecallEntriesByIdReviewUrl({ id }), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(reviewRecallEntryRequest),
   });
 };
 

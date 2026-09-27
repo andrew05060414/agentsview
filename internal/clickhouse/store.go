@@ -195,6 +195,12 @@ func (s *Store) GetRecallEntry(_ context.Context, _ string) (*db.RecallEntry, er
 	return nil, db.ErrReadOnly
 }
 
+func (s *Store) ReviewRecallEntry(
+	_ context.Context, _ string, _ db.RecallReviewAction,
+) (db.RecallEntry, error) {
+	return db.RecallEntry{}, db.ErrReadOnly
+}
+
 func (s *Store) QueryRecallEntries(_ context.Context, _ db.RecallQuery) (db.RecallPage, error) {
 	return db.RecallPage{}, db.ErrReadOnly
 }

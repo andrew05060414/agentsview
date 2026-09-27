@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/json/v2"
+	"errors"
 	"net/http"
 	"reflect"
 	"strings"
@@ -32,6 +34,7 @@ func (s *Server) registerRecallRoutes() {
 	}{
 		{http.MethodGet, "/entries", "List recall entries", s.handleListRecallEntries, reflect.TypeFor[recallEntriesResponse](), "q project cwd git_branch agent type scope status review_state extractor_method source_session_id source_episode_id source_run_id supersedes_entry_id superseded_by_entry_id cursor", "limit", "trusted_only", nil, ""},
 		{http.MethodGet, "/entries/{id}", "Get recall entry", s.handleGetRecallEntry, reflect.TypeFor[db.RecallEntry](), "", "", "", nil, ""},
+		{http.MethodPost, "/entries/{id}/review", "Review recall entry", s.handleReviewRecallEntry, reflect.TypeFor[db.RecallEntry](), "", "", "", reflect.TypeFor[reviewRecallEntryRequest](), "application/json"},
 		{http.MethodGet, "/extraction/status", "Get recall extraction status", s.handleRecallExtractionStatus, reflect.TypeFor[recallExtractionStatusResponse](), "", "", "", nil, ""},
 		{http.MethodGet, "/extraction/progress", "Get recall extraction progress", s.handleRecallExtractionProgress, reflect.TypeFor[recallExtractProgressResponse](), "generation state cursor", "limit", "", nil, ""},
 		{http.MethodPost, "/extraction/activate", "Activate recall extraction", s.handleRecallExtractionActivate, nil, "", "", "", nil, ""},
@@ -76,5 +79,56 @@ func (s *Server) registerRecallRoutes() {
 			r, w := humago.Unwrap(ctx)
 			handler.ServeHTTP(w, r)
 		})
+	}
+}
+
+type reviewRecallEntryRequest struct {
+	Action db.RecallReviewAction `json:"action" enum:"approve,archive"`
+}
+
+func (s *Server) handleReviewRecallEntry(
+	w http.ResponseWriter, r *http.Request,
+) {
+	if s.db.ReadOnly() {
+		handleReadOnly(w, db.ErrReadOnly)
+		return
+	}
+	var req reviewRecallEntryRequest
+	if err := json.UnmarshalRead(r.Body, &req, json.RejectUnknownMembers(true)); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := req.Action.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	entry, err := s.db.ReviewRecallEntry(
+		r.Context(), strings.TrimSpace(r.PathValue("id")), req.Action,
+	)
+	if err != nil {
+		s.handleRecallReviewError(w, err)
+		return
+	}
+	s.notifyRecallCorpusMutation()
+	writeJSON(w, http.StatusOK, entry)
+}
+
+func (s *Server) handleRecallReviewError(w http.ResponseWriter, err error) {
+	if handleContextError(w, err) || handleReadOnly(w, err) {
+		return
+	}
+	switch {
+	case errors.Is(err, db.ErrArchiveContentExcluded):
+		writeError(w, http.StatusNotImplemented, err.Error())
+	case errors.Is(err, db.ErrInvalidRecallReviewAction):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, db.ErrRecallEntryNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, db.ErrRecallReviewConflict),
+		errors.Is(err, db.ErrRecallReviewProvenance):
+		writeError(w, http.StatusConflict, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, err.Error())
 	}
 }

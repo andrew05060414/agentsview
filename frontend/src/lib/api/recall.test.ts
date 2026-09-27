@@ -24,6 +24,7 @@ describe("generated recall entries", () => {
       project: "project-a",
       type: "decision",
       source_run_id: "generation-a",
+      status: "archived",
       review_state: "human_reviewed",
       limit: 75,
     });
@@ -37,6 +38,7 @@ describe("generated recall entries", () => {
       project: "project-a",
       type: "decision",
       source_run_id: "generation-a",
+      status: "archived",
       review_state: "human_reviewed",
     });
     expect(page).toEqual({
@@ -45,6 +47,34 @@ describe("generated recall entries", () => {
       next_cursor: "cursor-2",
       result_cap: 500,
     });
+  });
+});
+
+describe("generated recall entry review", () => {
+  it("posts one encoded review action and returns the updated entry", async () => {
+    const updated = {
+      id: "entry one",
+      status: "archived",
+      review_state: "human_rejected",
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(updated), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      RecallService.postApiV1RecallEntriesByIdReview({ id: "entry one" }, { action: "archive" }),
+    ).resolves.toEqual(updated);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/recall/entries/entry%20one/review",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ action: "archive" }),
+      }),
+    );
   });
 });
 

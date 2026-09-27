@@ -5629,6 +5629,17 @@ components:
         - launched
         - command
       type: object
+    ReviewRecallEntryRequest:
+      additionalProperties: false
+      properties:
+        action:
+          enum:
+            - approve
+            - archive
+          type: string
+      required:
+        - action
+      type: object
     SearchResponse:
       additionalProperties: false
       properties:
@@ -14755,6 +14766,85 @@ paths:
                 $ref: "#/components/schemas/ApiErrorResponse"
           description: API error
       summary: Get recall entry
+      tags:
+        - Recall
+  /api/v1/recall/entries/{id}/review:
+    post:
+      operationId: post-api-v1-recall-entries-id-review
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewRecallEntryRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DbRecallEntry"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+      summary: Review recall entry
       tags:
         - Recall
   /api/v1/recall/extraction/activate:
