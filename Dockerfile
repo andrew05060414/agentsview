@@ -15,6 +15,8 @@ RUN npm run build
 
 FROM golang:1.27.0-bookworm AS build
 
+ENV GOPROXY="https://proxy.golang.org|direct"
+
 # The Go Bookworm image already includes the C/C++ toolchain and CA bundle.
 
 WORKDIR /src

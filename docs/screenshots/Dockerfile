@@ -1,6 +1,8 @@
 # Stage 1: Build agentsview binary
 FROM golang:1.27.0-bookworm AS builder
 
+ENV GOPROXY="https://proxy.golang.org|direct"
+
 ARG AV_VERSION=dev
 ARG AV_COMMIT=unknown
 

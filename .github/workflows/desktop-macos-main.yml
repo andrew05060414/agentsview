@@ -1,5 +1,9 @@
 name: Desktop Artifacts (macOS)
 
+env:
+  # "|" falls back to direct on any proxy error (e.g. HTTP/2 INTERNAL_ERROR), not just 404/410.
+  GOPROXY: "https://proxy.golang.org|direct"
+
 on:
   # macOS self-hosted workflows are push-only for main. The organization
   # runner-group policy must pin access to their exact workflow paths on main.

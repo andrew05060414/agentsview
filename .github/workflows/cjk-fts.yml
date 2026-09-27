@@ -1,5 +1,9 @@
 name: CJK FTS
 
+env:
+  # "|" falls back to direct on any proxy error (e.g. HTTP/2 INTERNAL_ERROR), not just 404/410.
+  GOPROXY: "https://proxy.golang.org|direct"
+
 on:
   pull_request:
     paths:

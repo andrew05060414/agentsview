@@ -1,5 +1,9 @@
 name: CI (macOS)
 
+env:
+  # "|" falls back to direct on any proxy error (e.g. HTTP/2 INTERNAL_ERROR), not just 404/410.
+  GOPROXY: "https://proxy.golang.org|direct"
+
 on:
   # Persistent self-hosted runners must never be selectable from a workflow
   # definition controlled by a pull request. The ci-runners group must allow
