@@ -60,12 +60,18 @@ type ManagerConfig struct {
 	// Off by default: every recorded finding blocks. NewManager applies the
 	// same policy to the archive so the SQL boundaries agree with it.
 	AllowCandidateFindings bool
+	// Concurrency bounds how many sessions one pass distills in parallel.
+	// Units within a session stay sequential, so every cursor advance and
+	// failure mark still comes from the session's single worker. Defaults
+	// to 1.
+	Concurrency int
 }
 
 // Manager drives extraction for one generation: it scans for eligible
 // sessions, distills their units, records resumable progress, and activates
 // the generation once everything eligible is done. At most one pass runs at
 // a time; TryPass drops instead of queueing so schedulers cannot pile up.
+// Within a pass, up to Concurrency sessions distill in parallel.
 type Manager struct {
 	cfg         ManagerConfig
 	fingerprint string
@@ -168,6 +174,9 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	cfg.DB.SetExtractCandidateFindingsAllowed(cfg.AllowCandidateFindings)
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = defaultMaxAttempts
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 1
 	}
 	fingerprint, err := Fingerprint(
 		cfg.Identity, cfg.Segmenter, cfg.Prompts, cfg.Client.Request,
@@ -272,33 +281,10 @@ func (m *Manager) runPassLocked(
 	// archived so an unfinished corpus never serves; activation promotes
 	// them atomically.
 	staged := generation.State != db.ExtractGenerationActive
-	for _, sessionID := range sessionIDs {
-		if err := ctx.Err(); err != nil {
-			return result, err
-		}
-		outcome, err := m.extractSession(
-			ctx, sessionID, staged, opts.SessionID != "")
-		result.Units += outcome.units
-		result.Entries += outcome.entries
-		if outcome.failed {
-			result.Failed++
-		}
-		if err != nil {
-			// Ineligibility at the first snapshot is drift: selection
-			// only returned eligible sessions, so this one was excluded
-			// concurrently and the reconciliation below (and the next
-			// pass) own it. Aborting would drop the pass's remaining
-			// candidates. An explicit run keeps the error — the caller
-			// named the session and must hear why it was refused.
-			_, hasIneligible := errors.AsType[*ineligibleSessionError](err)
-			if opts.SessionID == "" && hasIneligible {
-				continue
-			}
-			return result, err
-		}
-		if outcome.done {
-			result.Sessions++
-		}
+	if err := m.extractSessions(
+		ctx, sessionIDs, staged, opts.SessionID != "", &result,
+	); err != nil {
+		return result, err
 	}
 	// A second reconciliation after the loop catches eligibility lost
 	// while units were at the model — the mid-extraction discard reopens
@@ -338,6 +324,90 @@ func (m *Manager) runPassLocked(
 		}
 	}
 	return result, nil
+}
+
+// extractSessions distills the pass's sessions with up to Concurrency
+// workers, handing sessions out in selection order. Each session is owned by
+// exactly one worker for the whole pass, so its units still distill and
+// commit strictly in order and the progress row's optimistic guards see the
+// same single writer they do in a sequential pass. Model calls run outside
+// any transaction; the archive serializes the per-unit commits.
+//
+// The first error that would abort a sequential pass aborts this one too: no
+// further sessions start, and sessions still in flight are cancelled, which
+// leaves their rows resumable exactly as daemon shutdown does. That keeps an
+// endpoint outage from burning every in-flight session's retry ladder.
+// Results from every started session are still counted. When ctx itself is
+// cancelled the pass returns ctx.Err(), not the cancelled calls' errors.
+func (m *Manager) extractSessions(
+	ctx context.Context, sessionIDs []string, staged, explicit bool,
+	result *PassResult,
+) error {
+	passCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		abortErr error
+		wg       sync.WaitGroup
+	)
+	record := func(outcome sessionOutcome, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		result.Units += outcome.units
+		result.Entries += outcome.entries
+		if outcome.failed {
+			result.Failed++
+		}
+		if err == nil {
+			if outcome.done {
+				result.Sessions++
+			}
+			return
+		}
+		// Ineligibility at the first snapshot is drift: selection only
+		// returned eligible sessions, so this one was excluded concurrently
+		// and the reconciliation after the loop (and the next pass) own it.
+		// Aborting would drop the pass's remaining candidates. An explicit
+		// run keeps the error — the caller named the session and must hear
+		// why it was refused.
+		if _, ineligible := errors.AsType[*ineligibleSessionError](err); ineligible && !explicit {
+			return
+		}
+		// Once the pass context is done, a worker's error is a consequence
+		// of that cancellation, not a new cause: either an earlier abort
+		// already recorded its error, or ctx was cancelled by the caller.
+		if abortErr == nil && passCtx.Err() == nil {
+			abortErr = err
+			cancel()
+		}
+	}
+	queue := make(chan string)
+	for range min(m.cfg.Concurrency, len(sessionIDs)) {
+		wg.Go(func() {
+			for sessionID := range queue {
+				if passCtx.Err() != nil {
+					continue
+				}
+				record(m.extractSession(passCtx, sessionID, staged, explicit))
+			}
+		})
+	}
+	for _, sessionID := range sessionIDs {
+		if passCtx.Err() != nil {
+			break
+		}
+		select {
+		case queue <- sessionID:
+		case <-passCtx.Done():
+		}
+	}
+	close(queue)
+	wg.Wait()
+	if abortErr != nil {
+		return abortErr
+	}
+	return ctx.Err()
 }
 
 func (m *Manager) ensureGeneration(ctx context.Context) error {
