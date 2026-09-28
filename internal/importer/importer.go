@@ -446,7 +446,9 @@ func upsertChatGPTConversation(
 	// write so the signal backfill recomputes them from the new rows.
 	if err := writeChatGPTSessionWithSignals(
 		ctx, store, chatGPTSession(s), msgs, false,
-	); err != nil {
+	); errors.Is(err, db.ErrSessionExcluded) {
+		return importSkipped, nil
+	} else if err != nil {
 		return importNew, fmt.Errorf("appending messages: %w", err)
 	}
 	return importUpdated, nil
