@@ -132,7 +132,9 @@ messages, and analytics.
 You can safely re-import the same export file:
 
 - **Claude.ai** — existing sessions are updated with any
-  new messages. User-edited display names are preserved.
+  new messages. User-edited display names are preserved. An export
+  with fewer messages than the archived session (for example an older
+  export) is reported as an error and leaves the stored session unchanged.
 - **ChatGPT** — existing sessions are skipped (not
   re-imported), so your data stays unchanged.
 - **Gemini Apps** — existing sessions are matched by the canonical UTC

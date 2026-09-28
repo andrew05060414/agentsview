@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"slices"
 	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/assets"
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 )
@@ -198,6 +200,15 @@ func upsertConversation(
 		return importNew, fmt.Errorf("checking session: %w", err)
 	}
 	isNew := existing == nil
+	// A shorter export (for example an older archive or one with deleted
+	// turns) would make the replacement below drop stored messages.
+	// Refuse it before touching the session row.
+	if !isNew && len(msgs) < existing.MessageCount {
+		return importNew, fmt.Errorf(
+			"export has %d messages, archive has %d",
+			len(msgs), existing.MessageCount,
+		)
+	}
 
 	sess := db.Session{
 		ID:               s.ID,
@@ -240,7 +251,10 @@ func upsertConversation(
 				return importNew,
 					fmt.Errorf("loading existing messages: %w", err)
 			}
-			if sameMessages(existingMsgs, msgs) {
+			// Compare in stored form: the write path sanitizes and
+			// projects rows, so raw parser output can differ from an
+			// unchanged archived copy.
+			if sameMessages(existingMsgs, storedFormMessages(store, msgs)) {
 				return importSkipped, nil
 			}
 		}
@@ -437,6 +451,21 @@ func ptrEqual(a, b *string) bool {
 		return false
 	}
 	return *a == *b
+}
+
+// storedFormMessages applies the validation and archive-content
+// projection the message write applies, without writing anything.
+func storedFormMessages(store db.Store, msgs []db.Message) []db.Message {
+	out := slices.Clone(msgs)
+	db.ValidateAndSanitize(nil, out, nil)
+	policy := config.ArchiveContentFull
+	if s, ok := store.(interface {
+		ArchiveContent() config.ArchiveContent
+	}); ok {
+		policy = s.ArchiveContent()
+	}
+	_, out = db.ProjectSessionForStoragePolicy(db.Session{}, out, policy)
+	return out
 }
 
 func sameMessages(existing, incoming []db.Message) bool {
