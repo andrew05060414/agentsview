@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"slices"
 	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/assets"
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 )
@@ -391,17 +393,29 @@ func upsertChatGPTConversation(
 			"existing session belongs to agent %q", existing.Agent,
 		)
 	}
+	policy := storeArchiveContent(store)
+	if policy.UsageOnly() {
+		// A usage archive keeps no transcript text and drops rows without
+		// token usage, so the archived history cannot be verified as a
+		// prefix of the export. Leave the stored session untouched.
+		return importSkipped, nil
+	}
 	archived, err := store.GetAllMessages(ctx, s.ID)
 	if err != nil {
 		return importNew, fmt.Errorf("loading existing messages: %w", err)
 	}
-	if len(msgs) < len(archived) {
+	// Compare against the export as it would be stored, not as parsed:
+	// the write path sanitizes and projects rows, so raw parser output
+	// can differ from an unchanged archived copy.
+	canonical := canonicalChatGPTMessages(store, chatGPTSession(s), msgs, policy)
+	if len(canonical) < len(archived) {
 		return importNew, fmt.Errorf(
 			"export has %d messages, archive has %d",
-			len(msgs), len(archived),
+			len(canonical), len(archived),
 		)
 	}
-	if !sameMessages(archived, msgs[:len(archived)]) {
+	if len(canonical) != len(msgs) ||
+		!sameMessages(archived, canonical[:len(archived)]) {
 		return importNew, errors.New(
 			"export history diverges from the archived messages",
 		)
@@ -427,8 +441,11 @@ func upsertChatGPTConversation(
 	// fields the export does not carry survive the append.
 	copy(msgs, archived)
 	fts.suspend(ctx)
-	if err := writeChatGPTSession(
-		ctx, store, chatGPTSession(s), msgs,
+	// The transcript grew, so stored quality signals and secret findings
+	// describe the shorter history. Clear them to version zero in the same
+	// write so the signal backfill recomputes them from the new rows.
+	if err := writeChatGPTSessionWithSignals(
+		ctx, store, chatGPTSession(s), msgs, false,
 	); err != nil {
 		return importNew, fmt.Errorf("appending messages: %w", err)
 	}
@@ -475,13 +492,52 @@ func chatGPTMessages(
 	return msgs
 }
 
+// storeArchiveContent reports the content policy the store enforces.
+// Stores that do not expose one keep full content.
+func storeArchiveContent(store db.Store) config.ArchiveContent {
+	if s, ok := store.(interface {
+		ArchiveContent() config.ArchiveContent
+	}); ok {
+		return s.ArchiveContent()
+	}
+	return config.ArchiveContentFull
+}
+
+// canonicalChatGPTMessages applies the same validation and storage
+// projection the batch write applies, without writing anything.
+func canonicalChatGPTMessages(
+	store db.Store, sess db.Session, msgs []db.Message,
+	policy config.ArchiveContent,
+) []db.Message {
+	out := make([]db.Message, len(msgs))
+	copy(out, msgs)
+	for i := range out {
+		out[i].ToolCalls = slices.Clone(out[i].ToolCalls)
+	}
+	db.ValidateAndSanitize(&sess, out, nil)
+	if localDB, ok := store.(*db.DB); ok {
+		out, _ = localDB.ProjectToolResultImagesWithPolicy(
+			out, localDB.ToolResultImages(),
+		)
+	}
+	_, out = db.ProjectSessionForStoragePolicy(sess, out, policy)
+	return out
+}
+
 func writeChatGPTSession(
 	ctx context.Context, store db.Store, sess db.Session, msgs []db.Message,
+) error {
+	return writeChatGPTSessionWithSignals(ctx, store, sess, msgs, true)
+}
+
+func writeChatGPTSessionWithSignals(
+	ctx context.Context, store db.Store, sess db.Session, msgs []db.Message,
+	skipSignals bool,
 ) error {
 	result, err := store.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{
 		Session:                    sess,
 		Messages:                   msgs,
-		SkipSignalUpdates:          true,
+		SkipSignalUpdates:          skipSignals,
 		ReplaceMessages:            true,
 		RejectMessageCountDecrease: true,
 	}})

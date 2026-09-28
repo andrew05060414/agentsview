@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
@@ -733,4 +734,74 @@ func testChatGPTConvWithAppend() string {
 		panic(err)
 	}
 	return string(encoded)
+}
+
+func TestImportChatGPTReimportComparesStoredForm(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "conversations-000.json")
+	assetsDir := filepath.Join(t.TempDir(), "assets")
+	// The control rune is stripped at the storage boundary, so the raw
+	// parsed message differs from the archived row.
+	data := strings.Replace(testChatGPTConv, `"Hello"`, `"Hel\u0001lo"`, 1)
+	require.NoError(t, os.WriteFile(path, []byte(data), 0o644))
+	_, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+
+	stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Errors)
+	assert.Equal(t, 1, stats.Skipped)
+}
+
+func TestImportChatGPTAppendInvalidatesSignals(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "conversations-000.json")
+	assetsDir := filepath.Join(t.TempDir(), "assets")
+	require.NoError(t, os.WriteFile(path, []byte(testChatGPTConv), 0o644))
+	_, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	score := 42
+	require.NoError(t, d.UpdateSessionSignals(ctx, "chatgpt:cg-1", db.SessionSignalUpdate{
+		HealthScore:    &score,
+		QualitySignals: db.QualitySignals{Version: db.CurrentQualitySignalVersion},
+	}))
+
+	require.NoError(t, os.WriteFile(path, []byte(testChatGPTConvWithAppend()), 0o644))
+	stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Updated)
+
+	session, err := d.GetSession(ctx, "chatgpt:cg-1")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assert.Zero(t, session.QualitySignalVersion)
+	assert.Nil(t, session.HealthScore)
+}
+
+func TestImportChatGPTUsageArchiveSkipsAppend(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "conversations-000.json")
+	assetsDir := filepath.Join(t.TempDir(), "assets")
+	require.NoError(t, os.WriteFile(path, []byte(testChatGPTConv), 0o644))
+	_, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	d.SetArchiveContent(config.ArchiveContentUsage)
+	before, err := d.GetAllMessages(ctx, "chatgpt:cg-1")
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(path, []byte(testChatGPTConvWithAppend()), 0o644))
+	stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Errors)
+	assert.Zero(t, stats.Updated)
+	assert.Equal(t, 1, stats.Skipped)
+	after, err := d.GetAllMessages(ctx, "chatgpt:cg-1")
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
 }
