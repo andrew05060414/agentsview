@@ -903,3 +903,66 @@ func TestImportClaudeAIReimportComparesStoredForm(t *testing.T) {
 	assert.Zero(t, stats.Updated)
 	assert.Equal(t, 1, stats.Skipped)
 }
+
+func TestImportChatGPTRejectsInPlaceToolResultUpdate(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "conversations-000.json")
+	assetsDir := filepath.Join(t.TempDir(), "assets")
+	node := func(id, parent, child, role, contentType, text string, ts float64) string {
+		children := "[]"
+		if child != "" {
+			children = `["` + child + `"]`
+		}
+		content := `{"content_type":"text","parts":["` + text + `"]}`
+		if contentType != "text" {
+			content = `{"content_type":"` + contentType + `","text":"` + text + `"}`
+		}
+		return `"` + id + `":{"id":"` + id + `","parent":"` + parent +
+			`","children":` + children + `,"message":{"id":"m-` + id +
+			`","create_time":` + fmt.Sprint(ts) + `,"author":{"role":"` + role +
+			`"},"content":` + content +
+			`,"status":"finished_successfully","metadata":{}}}`
+	}
+	conv := func(current string, nodes ...string) string {
+		return `[{"id":"cg-tool","conversation_id":"cg-tool","title":"Tool",` +
+			`"create_time":1706745600.0,"update_time":1706745660.0,` +
+			`"current_node":"` + current + `","mapping":{` +
+			`"r":{"id":"r","parent":null,"children":["n1"],"message":null},` +
+			strings.Join(nodes, ",") + `}}]`
+	}
+	user := node("n1", "r", "n2", "user", "text", "Run print(42)", 1706745600)
+	asst := node("n2", "n1", "n3", "assistant", "text", "Running it.", 1706745610)
+	withoutOutput := conv("n3", user, asst,
+		node("n3", "n2", "", "tool", "code", "print(42)", 1706745620))
+	withOutput := conv("n4", user, asst,
+		node("n3", "n2", "n4", "tool", "code", "print(42)", 1706745620),
+		node("n4", "n3", "", "tool", "execution_output", "42", 1706745630))
+
+	require.NoError(t, os.WriteFile(path, []byte(withoutOutput), 0o644))
+	stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Imported)
+	before, err := d.GetAllMessages(ctx, "chatgpt:cg-tool")
+	require.NoError(t, err)
+	require.Len(t, before, 2)
+	require.Len(t, before[1].ToolCalls, 1)
+	require.Empty(t, before[1].ToolCalls[0].ResultContent)
+
+	require.NoError(t, os.WriteFile(path, []byte(withOutput), 0o644))
+	stats, err = ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Errors, "changed tool output must not be skipped as unchanged")
+	assert.Zero(t, stats.Skipped)
+	after, err := d.GetAllMessages(ctx, "chatgpt:cg-tool")
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+
+	// The unchanged export is still recognized and skipped.
+	require.NoError(t, os.WriteFile(path, []byte(withoutOutput), 0o644))
+	stats, err = ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Errors)
+	assert.Equal(t, 1, stats.Skipped)
+}

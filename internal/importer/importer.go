@@ -427,7 +427,7 @@ func upsertChatGPTConversation(
 		)
 	}
 	if len(canonical) != len(msgs) ||
-		!sameMessages(archived, canonical[:len(archived)]) {
+		!sameChatGPTMessages(archived, canonical[:len(archived)]) {
 		return importNew, errors.New(
 			"export history diverges from the archived messages",
 		)
@@ -606,6 +606,32 @@ func storedFormMessages(store db.Store, msgs []db.Message) []db.Message {
 		db.Session{}, out, storeArchiveContent(store),
 	)
 	return out
+}
+
+// sameChatGPTMessages extends sameMessages with the persisted model,
+// flags, and tool-call state ChatGPT rows carry, so an export that fills
+// in tool output for an archived message is not mistaken for unchanged.
+func sameChatGPTMessages(existing, incoming []db.Message) bool {
+	if !sameMessages(existing, incoming) {
+		return false
+	}
+	for i := range existing {
+		a, b := existing[i], incoming[i]
+		if a.Model != b.Model || a.HasToolUse != b.HasToolUse ||
+			a.HasThinking != b.HasThinking || a.IsSystem != b.IsSystem ||
+			len(a.ToolCalls) != len(b.ToolCalls) {
+			return false
+		}
+		for j := range a.ToolCalls {
+			x, y := a.ToolCalls[j], b.ToolCalls[j]
+			if x.ToolName != y.ToolName || x.Category != y.Category ||
+				x.ToolUseID != y.ToolUseID || x.InputJSON != y.InputJSON ||
+				x.ResultContent != y.ResultContent {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func sameMessages(existing, incoming []db.Message) bool {
