@@ -203,7 +203,7 @@ func upsertConversation(
 	// A shorter export (for example an older archive or one with deleted
 	// turns) would make the replacement below drop stored messages.
 	// Refuse it before touching the session row.
-	if !isNew && len(msgs) < existing.MessageCount {
+	if existing != nil && len(msgs) < existing.MessageCount {
 		return importNew, fmt.Errorf(
 			"export has %d messages, archive has %d",
 			len(msgs), existing.MessageCount,
