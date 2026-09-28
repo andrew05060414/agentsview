@@ -437,15 +437,15 @@ func upsertChatGPTConversation(
 		return importSkipped, nil
 	}
 
-	// Keep the archived prefix rows as stored so message IDs, pins, and
-	// fields the export does not carry survive the append.
-	copy(msgs, archived)
+	// Insert only the rows past the verified prefix. A full replacement
+	// would delete and reinsert archived rows, changing message IDs and
+	// risking pins that cannot be re-matched without source UUIDs.
 	fts.suspend(ctx)
 	// The transcript grew, so stored quality signals and secret findings
 	// describe the shorter history. Clear them to version zero in the same
 	// write so the signal backfill recomputes them from the new rows.
-	if err := writeChatGPTSessionWithSignals(
-		ctx, store, chatGPTSession(s), msgs, false,
+	if err := appendChatGPTMessages(
+		ctx, store, chatGPTSession(s), msgs[len(archived):],
 	); errors.Is(err, db.ErrSessionExcluded) {
 		return importSkipped, nil
 	} else if err != nil {
@@ -529,20 +529,33 @@ func canonicalChatGPTMessages(
 func writeChatGPTSession(
 	ctx context.Context, store db.Store, sess db.Session, msgs []db.Message,
 ) error {
-	return writeChatGPTSessionWithSignals(ctx, store, sess, msgs, true)
-}
-
-func writeChatGPTSessionWithSignals(
-	ctx context.Context, store db.Store, sess db.Session, msgs []db.Message,
-	skipSignals bool,
-) error {
-	result, err := store.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{
+	return writeChatGPTBatch(ctx, store, db.SessionBatchWrite{
 		Session:                    sess,
 		Messages:                   msgs,
-		SkipSignalUpdates:          skipSignals,
+		SkipSignalUpdates:          true,
 		ReplaceMessages:            true,
 		RejectMessageCountDecrease: true,
-	}})
+	})
+}
+
+// appendChatGPTMessages inserts rows after the archived transcript without
+// touching existing rows. Signals are written as zero values so the
+// backfill recomputes them for the longer transcript.
+func appendChatGPTMessages(
+	ctx context.Context, store db.Store, sess db.Session, tail []db.Message,
+) error {
+	return writeChatGPTBatch(ctx, store, db.SessionBatchWrite{
+		Session:  sess,
+		Messages: tail,
+	})
+}
+
+func writeChatGPTBatch(
+	ctx context.Context, store db.Store, write db.SessionBatchWrite,
+) error {
+	result, err := store.WriteSessionBatchAtomic(
+		ctx, []db.SessionBatchWrite{write},
+	)
 	if err != nil {
 		return err
 	}
