@@ -1044,3 +1044,64 @@ func TestImportChatGPTTranscriptArchiveDetectsChangedToolResult(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, before, after)
 }
+
+// chatGPTConvWithImage appends an assistant turn that embeds an exported
+// image; firstText replaces the archived first message.
+func chatGPTConvWithImage(t *testing.T, firstText string) string {
+	t.Helper()
+	var conversations []map[string]any
+	require.NoError(t, json.Unmarshal([]byte(testChatGPTConvWithAppend()), &conversations))
+	mapping := conversations[0]["mapping"].(map[string]any)
+	first := mapping["n1"].(map[string]any)["message"].(map[string]any)
+	first["content"] = map[string]any{"content_type": "text", "parts": []any{firstText}}
+	second := mapping["n2"].(map[string]any)["message"].(map[string]any)
+	second["content"] = map[string]any{
+		"content_type": "multimodal_text",
+		"parts": []any{"See this:", map[string]any{
+			"content_type":  "image_asset_pointer",
+			"asset_pointer": "file-service://file-img1",
+		}},
+	}
+	encoded, err := json.Marshal(conversations)
+	require.NoError(t, err)
+	return string(encoded)
+}
+
+func TestImportChatGPTPublishesImagesOnlyForAcceptedImports(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "conversations-000.json")
+	assetsDir := filepath.Join(t.TempDir(), "assets")
+	png := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+	require.NoError(t, os.WriteFile(filepath.Join(dir,
+		"file-img1-aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee.png"), png, 0o644))
+
+	require.NoError(t, os.WriteFile(path, []byte(testChatGPTConv), 0o644))
+	_, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(path,
+		[]byte(chatGPTConvWithImage(t, "Changed archived message")), 0o644))
+	stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Errors)
+	entries, err := os.ReadDir(assetsDir)
+	if !os.IsNotExist(err) {
+		require.NoError(t, err)
+	}
+	assert.Empty(t, entries, "refused imports must not publish images")
+
+	require.NoError(t, os.WriteFile(path,
+		[]byte(chatGPTConvWithImage(t, "Hello")), 0o644))
+	stats, err = ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Updated)
+	entries, err = os.ReadDir(assetsDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	msgs, err := d.GetAllMessages(ctx, "chatgpt:cg-1")
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Contains(t, msgs[1].Content, "asset://"+entries[0].Name())
+}

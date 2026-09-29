@@ -133,6 +133,31 @@ func writeObject(assetsDir, destPath string, fill func(*os.File) error) error {
 	return nil
 }
 
+// AssetRef returns the asset:// reference CopyAsset would produce for
+// srcPath without writing anything. Callers that must decide whether to
+// keep a file can compute its reference first and copy it later.
+func AssetRef(srcPath string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(srcPath))
+	if !allowedImageExts[ext] {
+		return "", fmt.Errorf(
+			"unsupported asset type: %s", ext,
+		)
+	}
+	if ext == ".jpeg" {
+		ext = ".jpg"
+	}
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("reading asset: %w", err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("hashing asset: %w", err)
+	}
+	return "asset://" + hex.EncodeToString(h.Sum(nil)) + ext, nil
+}
+
 // CopyAsset copies a file to the assets directory using its SHA-256 hash as
 // the filename. Returns the asset:// reference. Only passive image types are
 // accepted; active content is rejected.

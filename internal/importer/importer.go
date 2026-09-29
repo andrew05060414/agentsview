@@ -275,23 +275,37 @@ func upsertConversation(
 	return importUpdated, nil
 }
 
-// assetResolverAdapter bridges the importer's AssetIndex / CopyAsset
-// pair to the parser.AssetResolver interface.
-type assetResolverAdapter struct {
+// stagingAssetResolver resolves export images to their content-addressed
+// references while parsing but defers the copy, so a conversation the
+// importer later refuses does not publish its images.
+type stagingAssetResolver struct {
 	index     AssetIndex
 	assetsDir string
+	pending   []string
 }
 
-func (a *assetResolverAdapter) Resolve(
-	pointer string,
-) (string, bool) {
+func (a *stagingAssetResolver) Resolve(pointer string) (string, bool) {
 	return a.index.Resolve(pointer)
 }
 
-func (a *assetResolverAdapter) Copy(
-	srcPath string,
-) (string, error) {
-	return assets.CopyAsset(srcPath, a.assetsDir)
+func (a *stagingAssetResolver) Copy(srcPath string) (string, error) {
+	ref, err := assets.AssetRef(srcPath)
+	if err != nil {
+		return "", err
+	}
+	a.pending = append(a.pending, srcPath)
+	return ref, nil
+}
+
+// publish copies the images staged for the current conversation.
+func (a *stagingAssetResolver) publish() error {
+	for _, src := range a.pending {
+		if _, err := assets.CopyAsset(src, a.assetsDir); err != nil {
+			return fmt.Errorf("publishing asset: %w", err)
+		}
+	}
+	a.pending = a.pending[:0]
+	return nil
 }
 
 // ImportChatGPT reads a ChatGPT export directory (containing
@@ -315,7 +329,7 @@ func ImportChatGPT(
 	}()
 
 	index := BuildAssetIndex(dir)
-	resolver := &assetResolverAdapter{
+	resolver := &stagingAssetResolver{
 		index:     index,
 		assetsDir: assetsDir,
 	}
@@ -341,8 +355,10 @@ func ImportChatGPT(
 				result.Session.Machine, machine,
 			)
 			status, err := upsertChatGPTConversation(
-				ctx, store, result, fts,
+				ctx, store, result, fts, resolver.publish,
 			)
+			// Images staged for a refused conversation are dropped.
+			resolver.pending = resolver.pending[:0]
 			if err != nil {
 				stats.Errors++
 				log.Printf(
@@ -381,6 +397,7 @@ func upsertChatGPTConversation(
 	store db.Store,
 	result parser.ParseResult,
 	fts *lazyFTS,
+	publishAssets func() error,
 ) (importStatus, error) {
 	s := result.Session
 	msgs := chatGPTMessages(s.ID, result.Messages)
@@ -390,6 +407,9 @@ func upsertChatGPTConversation(
 		return importNew, fmt.Errorf("checking session: %w", err)
 	}
 	if existing == nil {
+		if err := publishAssets(); err != nil {
+			return importNew, err
+		}
 		fts.suspend(ctx)
 		err := writeChatGPTSession(ctx, store, chatGPTSession(s), msgs)
 		if errors.Is(err, db.ErrSessionExcluded) {
@@ -432,6 +452,12 @@ func upsertChatGPTConversation(
 		return importNew, errors.New(
 			"export history diverges from the archived messages",
 		)
+	}
+
+	// The export is accepted from here on; publish its images before the
+	// rows that reference them are written.
+	if err := publishAssets(); err != nil {
+		return importNew, err
 	}
 
 	if len(msgs) == len(archived) {
