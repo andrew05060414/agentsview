@@ -530,7 +530,7 @@ func canonicalChatGPTMessages(
 	}
 	db.ValidateAndSanitize(&sess, out, nil)
 	if localDB, ok := store.(*db.DB); ok {
-		out, _ = localDB.ProjectToolResultImagesWithPolicy(
+		out, _ = localDB.ProjectToolResultImagesForComparison(
 			out, localDB.ToolResultImages(),
 		)
 	}
