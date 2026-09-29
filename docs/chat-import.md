@@ -142,12 +142,6 @@ You can safely re-import the same export file:
   Shorter exports and exports that change archived history are reported as
   errors and leave the archive unchanged. Existing message metadata and user
   display names are preserved during an append.
-  The comparison includes the model, thinking/tool/system flags, and tool-call
-  details. Filling in a previously missing tool result counts as changed
-  history: that export keeps reporting an error, even if it also adds messages.
-  This strict policy preserves archived history. A future parser change that
-  changes these stored values can also prevent re-imports and appends. Imported
-  ChatGPT sessions are not automatically reparsed to resolve such differences.
 - **Gemini Apps** — existing sessions are matched by the canonical UTC
   timestamp and its zero-based occurrence among records sharing that
   timestamp. Inserting or reordering records with other timestamps doesn't

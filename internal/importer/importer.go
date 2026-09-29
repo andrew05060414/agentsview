@@ -275,37 +275,23 @@ func upsertConversation(
 	return importUpdated, nil
 }
 
-// stagingAssetResolver resolves export images to their content-addressed
-// references while parsing but defers the copy, so a conversation the
-// importer later refuses does not publish its images.
-type stagingAssetResolver struct {
+// assetResolverAdapter bridges the importer's AssetIndex / CopyAsset
+// pair to the parser.AssetResolver interface.
+type assetResolverAdapter struct {
 	index     AssetIndex
 	assetsDir string
-	pending   []string
 }
 
-func (a *stagingAssetResolver) Resolve(pointer string) (string, bool) {
+func (a *assetResolverAdapter) Resolve(
+	pointer string,
+) (string, bool) {
 	return a.index.Resolve(pointer)
 }
 
-func (a *stagingAssetResolver) Copy(srcPath string) (string, error) {
-	ref, err := assets.AssetRef(srcPath)
-	if err != nil {
-		return "", err
-	}
-	a.pending = append(a.pending, srcPath)
-	return ref, nil
-}
-
-// publish copies the images staged for the current conversation.
-func (a *stagingAssetResolver) publish() error {
-	for _, src := range a.pending {
-		if _, err := assets.CopyAsset(src, a.assetsDir); err != nil {
-			return fmt.Errorf("publishing asset: %w", err)
-		}
-	}
-	a.pending = a.pending[:0]
-	return nil
+func (a *assetResolverAdapter) Copy(
+	srcPath string,
+) (string, error) {
+	return assets.CopyAsset(srcPath, a.assetsDir)
 }
 
 // ImportChatGPT reads a ChatGPT export directory (containing
@@ -329,7 +315,7 @@ func ImportChatGPT(
 	}()
 
 	index := BuildAssetIndex(dir)
-	resolver := &stagingAssetResolver{
+	resolver := &assetResolverAdapter{
 		index:     index,
 		assetsDir: assetsDir,
 	}
@@ -355,10 +341,8 @@ func ImportChatGPT(
 				result.Session.Machine, machine,
 			)
 			status, err := upsertChatGPTConversation(
-				ctx, store, result, fts, resolver.publish,
+				ctx, store, result, fts,
 			)
-			// Images staged for a refused conversation are dropped.
-			resolver.pending = resolver.pending[:0]
 			if err != nil {
 				stats.Errors++
 				log.Printf(
@@ -397,7 +381,6 @@ func upsertChatGPTConversation(
 	store db.Store,
 	result parser.ParseResult,
 	fts *lazyFTS,
-	publishAssets func() error,
 ) (importStatus, error) {
 	s := result.Session
 	msgs := chatGPTMessages(s.ID, result.Messages)
@@ -407,18 +390,8 @@ func upsertChatGPTConversation(
 		return importNew, fmt.Errorf("checking session: %w", err)
 	}
 	if existing == nil {
-		// The batch write projects tool-result images (and may publish
-		// them) before it discovers an excluded or trashed session, so
-		// refuse those sessions before any image leaves the export.
-		if localDB, ok := store.(*db.DB); ok &&
-			(localDB.IsSessionExcluded(ctx, s.ID) ||
-				localDB.IsSessionTrashed(ctx, s.ID)) {
-			return importSkipped, nil
-		}
 		fts.suspend(ctx)
-		err := writeChatGPTSession(
-			ctx, store, chatGPTSession(s), msgs, publishAssets,
-		)
+		err := writeChatGPTSession(ctx, store, chatGPTSession(s), msgs)
 		if errors.Is(err, db.ErrSessionExcluded) {
 			return importSkipped, nil
 		}
@@ -455,24 +428,13 @@ func upsertChatGPTConversation(
 		)
 	}
 	if len(canonical) != len(msgs) ||
-		!sameChatGPTMessages(archived, canonical[:len(archived)]) {
+		!sameMessages(archived, canonical[:len(archived)]) {
 		return importNew, errors.New(
 			"export history diverges from the archived messages",
 		)
 	}
 
 	if len(msgs) == len(archived) {
-		// Unchanged history: nothing is written, but restore any images
-		// the archived rows reference that are missing from the store,
-		// both exported files and offloaded tool-result images.
-		if err := publishAssets(); err != nil {
-			return importNew, err
-		}
-		if localDB, ok := store.(*db.DB); ok {
-			_, _ = localDB.ProjectToolResultImagesWithPolicy(
-				msgs, localDB.ToolResultImages(),
-			)
-		}
 		// Refresh session_name without touching any other fields —
 		// a partial UpsertSession would overwrite first_message,
 		// timestamps, and counts with zero values.
@@ -496,7 +458,7 @@ func upsertChatGPTConversation(
 	// describe the shorter history. Clear them to version zero in the same
 	// write so the signal backfill recomputes them from the new rows.
 	if err := appendChatGPTMessages(
-		ctx, store, chatGPTSession(s), msgs[len(archived):], publishAssets,
+		ctx, store, chatGPTSession(s), msgs[len(archived):],
 	); errors.Is(err, db.ErrSessionExcluded) {
 		return importSkipped, nil
 	} else if err != nil {
@@ -569,7 +531,7 @@ func canonicalChatGPTMessages(
 	}
 	db.ValidateAndSanitize(&sess, out, nil)
 	if localDB, ok := store.(*db.DB); ok {
-		out, _ = localDB.ProjectToolResultImagesForComparison(
+		out, _ = localDB.ProjectToolResultImagesWithPolicy(
 			out, localDB.ToolResultImages(),
 		)
 	}
@@ -579,9 +541,8 @@ func canonicalChatGPTMessages(
 
 func writeChatGPTSession(
 	ctx context.Context, store db.Store, sess db.Session, msgs []db.Message,
-	beforeCommit func() error,
 ) error {
-	return writeChatGPTBatch(ctx, store, beforeCommit, db.SessionBatchWrite{
+	return writeChatGPTBatch(ctx, store, db.SessionBatchWrite{
 		Session:                    sess,
 		Messages:                   msgs,
 		SkipSignalUpdates:          true,
@@ -595,23 +556,18 @@ func writeChatGPTSession(
 // backfill recomputes them for the longer transcript.
 func appendChatGPTMessages(
 	ctx context.Context, store db.Store, sess db.Session, tail []db.Message,
-	beforeCommit func() error,
 ) error {
-	return writeChatGPTBatch(ctx, store, beforeCommit, db.SessionBatchWrite{
+	return writeChatGPTBatch(ctx, store, db.SessionBatchWrite{
 		Session:  sess,
 		Messages: tail,
 	})
 }
 
-// writeChatGPTBatch runs beforeCommit only after the session write has
-// been accepted, so staged images are published only for rows that are
-// about to commit; a publish failure rolls the write back.
 func writeChatGPTBatch(
-	ctx context.Context, store db.Store, beforeCommit func() error,
-	write db.SessionBatchWrite,
+	ctx context.Context, store db.Store, write db.SessionBatchWrite,
 ) error {
 	result, err := store.WriteSessionBatchAtomic(
-		ctx, []db.SessionBatchWrite{write}, beforeCommit,
+		ctx, []db.SessionBatchWrite{write},
 	)
 	if err != nil {
 		return err
@@ -651,43 +607,6 @@ func storedFormMessages(store db.Store, msgs []db.Message) []db.Message {
 		db.Session{}, out, storeArchiveContent(store),
 	)
 	return out
-}
-
-// sameChatGPTMessages extends sameMessages with the persisted model,
-// flags, and tool-call state ChatGPT rows carry, so an export that fills
-// in tool output for an archived message is not mistaken for unchanged.
-func sameChatGPTMessages(existing, incoming []db.Message) bool {
-	if !sameMessages(existing, incoming) {
-		return false
-	}
-	for i := range existing {
-		a, b := existing[i], incoming[i]
-		if a.Model != b.Model || a.HasToolUse != b.HasToolUse ||
-			a.HasThinking != b.HasThinking || a.IsSystem != b.IsSystem ||
-			len(a.ToolCalls) != len(b.ToolCalls) {
-			return false
-		}
-		for j := range a.ToolCalls {
-			x, y := a.ToolCalls[j], b.ToolCalls[j]
-			if x.ToolName != y.ToolName || x.Category != y.Category ||
-				x.ToolUseID != y.ToolUseID || x.InputJSON != y.InputJSON ||
-				x.ResultContent != y.ResultContent ||
-				x.ResultContentLength != y.ResultContentLength ||
-				len(x.ResultEvents) != len(y.ResultEvents) {
-				return false
-			}
-			// Transcript archives clear result text but keep lengths, so
-			// lengths are what reveal a changed result there.
-			for k := range x.ResultEvents {
-				if x.ResultEvents[k].Content != y.ResultEvents[k].Content ||
-					x.ResultEvents[k].ContentLength !=
-						y.ResultEvents[k].ContentLength {
-					return false
-				}
-			}
-		}
-	}
-	return true
 }
 
 func sameMessages(existing, incoming []db.Message) bool {

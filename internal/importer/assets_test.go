@@ -47,7 +47,7 @@ func TestBuildAssetIndex(t *testing.T) {
 // assetResolverAdapter, is what chatgpt.resolveImageAsset calls to turn an
 // export pointer into an asset:// reference. Boundary: 1 file on disk, the
 // source bytes unchanged, and a repeat copy that adds no second file.
-func TestStagingAssetResolverCopiesThroughParserBoundary(t *testing.T) {
+func TestAssetResolverAdapterCopiesThroughParserBoundary(t *testing.T) {
 	exportDir := t.TempDir()
 	userDir := filepath.Join(exportDir, "user-xyz")
 	require.NoError(t, os.MkdirAll(userDir, 0o755))
@@ -58,11 +58,10 @@ func TestStagingAssetResolverCopiesThroughParserBoundary(t *testing.T) {
 	))
 
 	assetsDir := filepath.Join(t.TempDir(), "assets")
-	staging := &stagingAssetResolver{
+	var resolver parser.AssetResolver = &assetResolverAdapter{
 		index:     BuildAssetIndex(exportDir),
 		assetsDir: assetsDir,
 	}
-	var resolver parser.AssetResolver = staging
 
 	srcPath, ok := resolver.Resolve("sediment://file_deadbeef")
 	require.True(t, ok)
@@ -71,9 +70,6 @@ func TestStagingAssetResolverCopiesThroughParserBoundary(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, ref, "asset://")
 	assert.Contains(t, ref, ".png")
-	_, err = os.Stat(assetsDir)
-	assert.True(t, os.IsNotExist(err), "Copy only stages the image")
-	require.NoError(t, staging.publish())
 
 	// The reference names a file holding exactly the export's bytes.
 	stored, err := os.ReadFile(filepath.Join(assetsDir, strings.TrimPrefix(ref, "asset://")))
@@ -88,7 +84,6 @@ func TestStagingAssetResolverCopiesThroughParserBoundary(t *testing.T) {
 	ref2, err := resolver.Copy(srcPath)
 	require.NoError(t, err)
 	assert.Equal(t, ref, ref2)
-	require.NoError(t, staging.publish())
 	entries, err = os.ReadDir(assetsDir)
 	require.NoError(t, err)
 	assert.Len(t, entries, 1)
