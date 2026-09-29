@@ -407,11 +407,10 @@ func upsertChatGPTConversation(
 		return importNew, fmt.Errorf("checking session: %w", err)
 	}
 	if existing == nil {
-		if err := publishAssets(); err != nil {
-			return importNew, err
-		}
 		fts.suspend(ctx)
-		err := writeChatGPTSession(ctx, store, chatGPTSession(s), msgs)
+		err := writeChatGPTSession(
+			ctx, store, chatGPTSession(s), msgs, publishAssets,
+		)
 		if errors.Is(err, db.ErrSessionExcluded) {
 			return importSkipped, nil
 		}
@@ -454,13 +453,12 @@ func upsertChatGPTConversation(
 		)
 	}
 
-	// The export is accepted from here on; publish its images before the
-	// rows that reference them are written.
-	if err := publishAssets(); err != nil {
-		return importNew, err
-	}
-
 	if len(msgs) == len(archived) {
+		// Unchanged history: nothing is written, but restore any images
+		// the archived rows reference that are missing from the store.
+		if err := publishAssets(); err != nil {
+			return importNew, err
+		}
 		// Refresh session_name without touching any other fields —
 		// a partial UpsertSession would overwrite first_message,
 		// timestamps, and counts with zero values.
@@ -484,7 +482,7 @@ func upsertChatGPTConversation(
 	// describe the shorter history. Clear them to version zero in the same
 	// write so the signal backfill recomputes them from the new rows.
 	if err := appendChatGPTMessages(
-		ctx, store, chatGPTSession(s), msgs[len(archived):],
+		ctx, store, chatGPTSession(s), msgs[len(archived):], publishAssets,
 	); errors.Is(err, db.ErrSessionExcluded) {
 		return importSkipped, nil
 	} else if err != nil {
@@ -567,8 +565,9 @@ func canonicalChatGPTMessages(
 
 func writeChatGPTSession(
 	ctx context.Context, store db.Store, sess db.Session, msgs []db.Message,
+	beforeCommit func() error,
 ) error {
-	return writeChatGPTBatch(ctx, store, db.SessionBatchWrite{
+	return writeChatGPTBatch(ctx, store, beforeCommit, db.SessionBatchWrite{
 		Session:                    sess,
 		Messages:                   msgs,
 		SkipSignalUpdates:          true,
@@ -582,18 +581,23 @@ func writeChatGPTSession(
 // backfill recomputes them for the longer transcript.
 func appendChatGPTMessages(
 	ctx context.Context, store db.Store, sess db.Session, tail []db.Message,
+	beforeCommit func() error,
 ) error {
-	return writeChatGPTBatch(ctx, store, db.SessionBatchWrite{
+	return writeChatGPTBatch(ctx, store, beforeCommit, db.SessionBatchWrite{
 		Session:  sess,
 		Messages: tail,
 	})
 }
 
+// writeChatGPTBatch runs beforeCommit only after the session write has
+// been accepted, so staged images are published only for rows that are
+// about to commit; a publish failure rolls the write back.
 func writeChatGPTBatch(
-	ctx context.Context, store db.Store, write db.SessionBatchWrite,
+	ctx context.Context, store db.Store, beforeCommit func() error,
+	write db.SessionBatchWrite,
 ) error {
 	result, err := store.WriteSessionBatchAtomic(
-		ctx, []db.SessionBatchWrite{write},
+		ctx, []db.SessionBatchWrite{write}, beforeCommit,
 	)
 	if err != nil {
 		return err

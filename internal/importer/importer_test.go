@@ -1105,3 +1105,29 @@ func TestImportChatGPTPublishesImagesOnlyForAcceptedImports(t *testing.T) {
 	require.Len(t, msgs, 2)
 	assert.Contains(t, msgs[1].Content, "asset://"+entries[0].Name())
 }
+
+func TestImportChatGPTExcludedSessionPublishesNoImages(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "conversations-000.json")
+	assetsDir := filepath.Join(t.TempDir(), "assets")
+	png := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+	require.NoError(t, os.WriteFile(filepath.Join(dir,
+		"file-img1-aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee.png"), png, 0o644))
+
+	require.NoError(t, os.WriteFile(path, []byte(testChatGPTConv), 0o644))
+	_, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	require.NoError(t, d.DeleteSession(ctx, "chatgpt:cg-1"))
+
+	require.NoError(t, os.WriteFile(path, []byte(chatGPTConvWithImage(t, "Hello")), 0o644))
+	stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Skipped)
+	entries, err := os.ReadDir(assetsDir)
+	if !os.IsNotExist(err) {
+		require.NoError(t, err)
+	}
+	assert.Empty(t, entries, "excluded sessions must not publish images")
+}
