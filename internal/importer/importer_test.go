@@ -1145,6 +1145,7 @@ func chatGPTToolImageConv(t *testing.T) string {
 
 func TestImportChatGPTToolResultImageAssets(t *testing.T) {
 	setup := func(t *testing.T) (*db.DB, string, string) {
+		t.Helper()
 		d := testDB(t)
 		assetsDir := t.TempDir()
 		d.SetAssetsDir(assetsDir)
@@ -1155,6 +1156,7 @@ func TestImportChatGPTToolResultImageAssets(t *testing.T) {
 		return d, dir, assetsDir
 	}
 	listAssets := func(t *testing.T, dir string) []os.DirEntry {
+		t.Helper()
 		entries, err := os.ReadDir(dir)
 		require.NoError(t, err)
 		return entries
