@@ -627,8 +627,19 @@ func sameChatGPTMessages(existing, incoming []db.Message) bool {
 			x, y := a.ToolCalls[j], b.ToolCalls[j]
 			if x.ToolName != y.ToolName || x.Category != y.Category ||
 				x.ToolUseID != y.ToolUseID || x.InputJSON != y.InputJSON ||
-				x.ResultContent != y.ResultContent {
+				x.ResultContent != y.ResultContent ||
+				x.ResultContentLength != y.ResultContentLength ||
+				len(x.ResultEvents) != len(y.ResultEvents) {
 				return false
+			}
+			// Transcript archives clear result text but keep lengths, so
+			// lengths are what reveal a changed result there.
+			for k := range x.ResultEvents {
+				if x.ResultEvents[k].Content != y.ResultEvents[k].Content ||
+					x.ResultEvents[k].ContentLength !=
+						y.ResultEvents[k].ContentLength {
+					return false
+				}
 			}
 		}
 	}

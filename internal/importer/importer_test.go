@@ -985,3 +985,62 @@ func TestImportChatGPTRejectsInPlaceToolResultUpdate(t *testing.T) {
 	assert.Zero(t, stats.Errors)
 	assert.Equal(t, 1, stats.Skipped)
 }
+
+// chatGPTToolOutputConv is a user turn plus an assistant turn whose
+// code_interpreter call produced output.
+func chatGPTToolOutputConv(output string) string {
+	return `[{"id":"cg-len","conversation_id":"cg-len","title":"Tool",` +
+		`"create_time":1706745600.0,"update_time":1706745660.0,` +
+		`"current_node":"n4","mapping":{` +
+		`"r":{"id":"r","parent":null,"children":["n1"],"message":null},` +
+		`"n1":{"id":"n1","parent":"r","children":["n2"],"message":{"id":"m1",` +
+		`"create_time":1706745600.0,"author":{"role":"user"},` +
+		`"content":{"content_type":"text","parts":["Run it"]},` +
+		`"status":"finished_successfully","metadata":{}}},` +
+		`"n2":{"id":"n2","parent":"n1","children":["n3"],"message":{"id":"m2",` +
+		`"create_time":1706745610.0,"author":{"role":"assistant"},` +
+		`"content":{"content_type":"text","parts":["Running it."]},` +
+		`"status":"finished_successfully","metadata":{}}},` +
+		`"n3":{"id":"n3","parent":"n2","children":["n4"],"message":{"id":"m3",` +
+		`"create_time":1706745620.0,"author":{"role":"tool","name":"python"},` +
+		`"content":{"content_type":"code","text":"print(42)"},` +
+		`"status":"finished_successfully","metadata":{}}},` +
+		`"n4":{"id":"n4","parent":"n3","children":[],"message":{"id":"m4",` +
+		`"create_time":1706745630.0,"author":{"role":"tool","name":"python"},` +
+		`"content":{"content_type":"execution_output","text":"` + output + `"},` +
+		`"status":"finished_successfully","metadata":{}}}}}]`
+}
+
+func TestImportChatGPTTranscriptArchiveDetectsChangedToolResult(t *testing.T) {
+	d := testDB(t)
+	d.SetArchiveContent(config.ArchiveContentTranscripts)
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "conversations-000.json")
+	assetsDir := filepath.Join(t.TempDir(), "assets")
+
+	require.NoError(t, os.WriteFile(path, []byte(chatGPTToolOutputConv("42")), 0o644))
+	stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.Imported)
+	before, err := d.GetAllMessages(ctx, "chatgpt:cg-len")
+	require.NoError(t, err)
+	require.Len(t, before, 2)
+	require.Len(t, before[1].ToolCalls, 1)
+	require.Empty(t, before[1].ToolCalls[0].ResultContent)
+
+	// Unchanged export is still skipped under the transcript policy.
+	stats, err = ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Zero(t, stats.Errors)
+	assert.Equal(t, 1, stats.Skipped)
+
+	require.NoError(t, os.WriteFile(path, []byte(chatGPTToolOutputConv("4242")), 0o644))
+	stats, err = ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Errors, "changed tool result length must not compare equal")
+	assert.Zero(t, stats.Skipped)
+	after, err := d.GetAllMessages(ctx, "chatgpt:cg-len")
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
