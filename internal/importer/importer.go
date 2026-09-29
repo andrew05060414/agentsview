@@ -99,9 +99,10 @@ func (f *lazyFTS) restore(ctx context.Context) error {
 
 // ImportClaudeAI reads a Claude.ai conversations.json export
 // and upserts each conversation into the store. Existing
-// sessions are updated (messages replaced); user-renamed
-// display names are preserved. Excluded (deleted) sessions
-// are counted as skipped.
+// sessions are updated (messages replaced) unless the export
+// has fewer messages than the archive, which is refused.
+// User-renamed display names are preserved. Excluded (deleted)
+// sessions are counted as skipped.
 func ImportClaudeAI(
 	ctx context.Context,
 	store db.Store,

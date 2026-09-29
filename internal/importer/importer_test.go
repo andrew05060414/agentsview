@@ -909,7 +909,9 @@ func TestImportChatGPTRejectsInPlaceToolResultUpdate(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "conversations-000.json")
-	assetsDir := filepath.Join(t.TempDir(), "assets")
+	assetsDir := t.TempDir()
+	d.SetAssetsDir(assetsDir)
+	d.SetToolResultImages(config.ToolResultImagesOffload)
 	node := func(id, parent, child, role, contentType, text string, ts float64) string {
 		children := "[]"
 		if child != "" {
@@ -950,14 +952,31 @@ func TestImportChatGPTRejectsInPlaceToolResultUpdate(t *testing.T) {
 	require.Len(t, before[1].ToolCalls, 1)
 	require.Empty(t, before[1].ToolCalls[0].ResultContent)
 
-	require.NoError(t, os.WriteFile(path, []byte(withOutput), 0o644))
-	stats, err = ImportChatGPT(ctx, d, dir, assetsDir, nil)
+	// Blank lines delimit the JSON image section inside the execution-output
+	// code fence added by the ChatGPT parser.
+	imageOutput, err := json.Marshal("\n\n" + `[{"type":"input_image","image_url":"data:image/png;base64,AAEC"}]` + "\n\n")
 	require.NoError(t, err)
-	assert.Equal(t, 1, stats.Errors, "changed tool output must not be skipped as unchanged")
-	assert.Zero(t, stats.Skipped)
-	after, err := d.GetAllMessages(ctx, "chatgpt:cg-tool")
-	require.NoError(t, err)
-	assert.Equal(t, before, after)
+	for _, tt := range []struct {
+		name string
+		data string
+	}{
+		{name: "text", data: withOutput},
+		{name: "image", data: strings.Replace(withOutput, `"text":"42"`, `"text":`+string(imageOutput), 1)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require.NoError(t, os.WriteFile(path, []byte(tt.data), 0o644))
+			stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+			require.NoError(t, err)
+			assert.Equal(t, 1, stats.Errors, "changed tool output must not be skipped as unchanged")
+			assert.Zero(t, stats.Skipped)
+			after, err := d.GetAllMessages(ctx, "chatgpt:cg-tool")
+			require.NoError(t, err)
+			assert.Equal(t, before, after)
+			entries, err := os.ReadDir(assetsDir)
+			require.NoError(t, err)
+			assert.Empty(t, entries, "refused imports must not publish tool-result images")
+		})
+	}
 
 	// The unchanged export is still recognized and skipped.
 	require.NoError(t, os.WriteFile(path, []byte(withoutOutput), 0o644))
