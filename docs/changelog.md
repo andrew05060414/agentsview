@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-09-21
+last_edited: 2026-09-29
 title: Changelog
 description: Release history for AgentsView
 ---
@@ -109,6 +109,15 @@ The latest published release is
   used about 99% less memory in AgentsView. Local dates and hours now come
   from the PostgreSQL server's time zone data, which matches AgentsView's for
   current time zones.
+
+**Bug fixes**
+
+- Antigravity IDE and Antigravity CLI sessions stop re-syncing in a loop.
+  Reading a session database rewrote its shared-memory (`-shm`) file, and
+  AgentsView counted that as a change, so every pass re-read and re-uploaded
+  every Antigravity session. Only changes to the database or its write-ahead
+  log now trigger a re-sync. The first sync after upgrading re-reads each
+  Antigravity session once.
 
 ## 0.44.0
 

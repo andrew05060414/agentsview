@@ -33,12 +33,13 @@ var antigravityUUIDLikeRE = regexp.MustCompile(
 )
 
 // AntigravityFileInfo returns the effective file info for an IDE
-// session .db, combining the main file with its -wal/-shm sidecars,
+// session .db, combining the main file with its -wal sidecar,
 // the annotations/<id>.pbtxt sidecar, and the brain/<id> artifacts
 // the parse renders as messages. WAL-only commits and annotation or
 // brain updates do not touch the main file, so skip checks and
 // persisted file metadata must use this composite or live sessions
-// never reparse.
+// never reparse. The -shm index is left out; see
+// sqliteDBJournalSuffixes.
 func AntigravityFileInfo(path string) (os.FileInfo, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -54,8 +55,10 @@ func antigravityIDECompanionPaths(path string) []string {
 	id := strings.TrimSuffix(filepath.Base(path), ".db")
 	root := filepath.Dir(filepath.Dir(path))
 	companions := []string{
+		// No "-shm": the parse's own read-only open rewrites that index,
+		// so including it made every parse schedule the next one.
+		// Committed writes land in the main file or the -wal.
 		path + "-wal",
-		path + "-shm",
 		filepath.Join(root, "annotations", id+".pbtxt"),
 		// The agy-reader trajectory sidecar is a transcript source for
 		// IDE sessions too (see parseSession), so a sidecar write must

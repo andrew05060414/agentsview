@@ -252,7 +252,7 @@ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 			WatchRoot{
 				Path:         filepath.Join(root, "conversations"),
 				Recursive:    false,
-				IncludeGlobs: []string{"*.db", "*.db-*", "*.trajectory.json"},
+				IncludeGlobs: []string{"*.db", "*.db-wal", "*.trajectory.json"},
 				DebounceKey:  string(AgentAntigravity) + ":conversations:" + root,
 			},
 		)
@@ -443,8 +443,11 @@ func antigravityConversationDBForPath(root, path string) (string, string, bool) 
 	if len(parts) != 2 || parts[0] != "conversations" {
 		return "", "", false
 	}
+	// A bare "-shm" event never resolves to the session: every parse's
+	// read-only open rewrites that index, so honoring it would make each
+	// parse schedule the next one. Committed writes land in the main file
+	// or the -wal.
 	name := strings.TrimSuffix(parts[1], "-wal")
-	name = strings.TrimSuffix(name, "-shm")
 	if !strings.HasSuffix(name, ".db") {
 		return "", "", false
 	}
