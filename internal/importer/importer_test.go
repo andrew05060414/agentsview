@@ -1131,3 +1131,68 @@ func TestImportChatGPTExcludedSessionPublishesNoImages(t *testing.T) {
 	}
 	assert.Empty(t, entries, "excluded sessions must not publish images")
 }
+
+// chatGPTToolImageConv is chatGPTToolOutputConv with an inline image in
+// the execution output, which the offload policy stores as an asset.
+func chatGPTToolImageConv(t *testing.T) string {
+	t.Helper()
+	// Blank lines delimit the JSON image section inside the execution-output
+	// code fence added by the ChatGPT parser.
+	encoded, err := json.Marshal("\n\n" + `[{"type":"input_image","image_url":"data:image/png;base64,AAEC"}]` + "\n\n")
+	require.NoError(t, err)
+	return chatGPTToolOutputConv(string(encoded[1 : len(encoded)-1]))
+}
+
+func TestImportChatGPTToolResultImageAssets(t *testing.T) {
+	setup := func(t *testing.T) (*db.DB, string, string) {
+		d := testDB(t)
+		assetsDir := t.TempDir()
+		d.SetAssetsDir(assetsDir)
+		d.SetToolResultImages(config.ToolResultImagesOffload)
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "conversations-000.json"),
+			[]byte(chatGPTToolImageConv(t)), 0o644))
+		return d, dir, assetsDir
+	}
+	listAssets := func(t *testing.T, dir string) []os.DirEntry {
+		entries, err := os.ReadDir(dir)
+		require.NoError(t, err)
+		return entries
+	}
+
+	t.Run("excluded session publishes nothing", func(t *testing.T) {
+		d, dir, assetsDir := setup(t)
+		ctx := t.Context()
+		_, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+		require.NoError(t, err)
+		require.NotEmpty(t, listAssets(t, assetsDir))
+		require.NoError(t, d.DeleteSession(ctx, "chatgpt:cg-len"))
+		for _, e := range listAssets(t, assetsDir) {
+			require.NoError(t, os.Remove(filepath.Join(assetsDir, e.Name())))
+		}
+
+		stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+		require.NoError(t, err)
+		assert.Equal(t, 1, stats.Skipped)
+		assert.Empty(t, listAssets(t, assetsDir))
+	})
+
+	t.Run("unchanged import restores missing images", func(t *testing.T) {
+		d, dir, assetsDir := setup(t)
+		ctx := t.Context()
+		_, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+		require.NoError(t, err)
+		published := listAssets(t, assetsDir)
+		require.NotEmpty(t, published)
+		for _, e := range published {
+			require.NoError(t, os.Remove(filepath.Join(assetsDir, e.Name())))
+		}
+
+		stats, err := ImportChatGPT(ctx, d, dir, assetsDir, nil)
+		require.NoError(t, err)
+		assert.Equal(t, 1, stats.Skipped)
+		restored := listAssets(t, assetsDir)
+		require.Len(t, restored, len(published))
+		assert.Equal(t, published[0].Name(), restored[0].Name())
+	})
+}

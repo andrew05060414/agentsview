@@ -407,6 +407,14 @@ func upsertChatGPTConversation(
 		return importNew, fmt.Errorf("checking session: %w", err)
 	}
 	if existing == nil {
+		// The batch write projects tool-result images (and may publish
+		// them) before it discovers an excluded or trashed session, so
+		// refuse those sessions before any image leaves the export.
+		if localDB, ok := store.(*db.DB); ok &&
+			(localDB.IsSessionExcluded(ctx, s.ID) ||
+				localDB.IsSessionTrashed(ctx, s.ID)) {
+			return importSkipped, nil
+		}
 		fts.suspend(ctx)
 		err := writeChatGPTSession(
 			ctx, store, chatGPTSession(s), msgs, publishAssets,
@@ -455,9 +463,15 @@ func upsertChatGPTConversation(
 
 	if len(msgs) == len(archived) {
 		// Unchanged history: nothing is written, but restore any images
-		// the archived rows reference that are missing from the store.
+		// the archived rows reference that are missing from the store,
+		// both exported files and offloaded tool-result images.
 		if err := publishAssets(); err != nil {
 			return importNew, err
+		}
+		if localDB, ok := store.(*db.DB); ok {
+			_, _ = localDB.ProjectToolResultImagesWithPolicy(
+				msgs, localDB.ToolResultImages(),
+			)
 		}
 		// Refresh session_name without touching any other fields —
 		// a partial UpsertSession would overwrite first_message,
