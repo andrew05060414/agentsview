@@ -336,8 +336,10 @@ func (m *Manager) runPassLocked(
 // The first error that would abort a sequential pass aborts this one too: no
 // further sessions start, and sessions still in flight are cancelled, which
 // leaves their rows resumable exactly as daemon shutdown does. That keeps an
-// endpoint outage from burning every in-flight session's retry ladder.
-// Results from every started session are still counted. When ctx itself is
+// endpoint outage from burning every in-flight session's retry ladder, and
+// only the worker that claims the abort marks its session failed, so the
+// outage backs off one session instead of every one in flight. Results from
+// every started session are still counted. When ctx itself is
 // cancelled the pass returns ctx.Err(), not the cancelled calls' errors.
 func (m *Manager) extractSessions(
 	ctx context.Context, sessionIDs []string, staged, explicit bool,
@@ -345,11 +347,11 @@ func (m *Manager) extractSessions(
 ) error {
 	passCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	abort := &passAbort{ctx: passCtx, cancel: cancel}
 
 	var (
-		mu       sync.Mutex
-		abortErr error
-		wg       sync.WaitGroup
+		mu sync.Mutex
+		wg sync.WaitGroup
 	)
 	record := func(outcome sessionOutcome, err error) {
 		mu.Lock()
@@ -374,13 +376,7 @@ func (m *Manager) extractSessions(
 		if _, ineligible := errors.AsType[*ineligibleSessionError](err); ineligible && !explicit {
 			return
 		}
-		// Once the pass context is done, a worker's error is a consequence
-		// of that cancellation, not a new cause: either an earlier abort
-		// already recorded its error, or ctx was cancelled by the caller.
-		if abortErr == nil && passCtx.Err() == nil {
-			abortErr = err
-			cancel()
-		}
+		abort.claim(err)
 	}
 	queue := make(chan string)
 	for range min(m.cfg.Concurrency, len(sessionIDs)) {
@@ -389,7 +385,7 @@ func (m *Manager) extractSessions(
 				if passCtx.Err() != nil {
 					continue
 				}
-				record(m.extractSession(passCtx, sessionID, staged, explicit))
+				record(m.extractSession(passCtx, sessionID, staged, explicit, abort))
 			}
 		})
 	}
@@ -404,10 +400,40 @@ func (m *Manager) extractSessions(
 	}
 	close(queue)
 	wg.Wait()
-	if abortErr != nil {
-		return abortErr
+	if err := abort.error(); err != nil {
+		return err
 	}
 	return ctx.Err()
+}
+
+// passAbort records the one error that aborts a pass and cancels the pass
+// when it is recorded.
+type passAbort struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	err    error
+}
+
+// claim records err as the pass's abort cause and cancels the pass, and
+// reports whether this caller won. Once the pass context is done, a worker's
+// error is a consequence of that cancellation, not a new cause: either an
+// earlier abort already recorded its error, or the caller cancelled ctx.
+func (a *passAbort) claim(err error) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.err != nil || a.ctx.Err() != nil {
+		return false
+	}
+	a.err = err
+	a.cancel()
+	return true
+}
+
+func (a *passAbort) error() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.err
 }
 
 func (m *Manager) ensureGeneration(ctx context.Context) error {
@@ -625,6 +651,7 @@ func (m *Manager) sessionSnapshot(
 
 func (m *Manager) extractSession(
 	ctx context.Context, sessionID string, staged, explicit bool,
+	abort *passAbort,
 ) (sessionOutcome, error) {
 	var outcome sessionOutcome
 	// The transcript-read cutoff is captured before anything is read: a
@@ -897,7 +924,20 @@ func (m *Manager) extractSession(
 				// picks up where it stopped once the configuration works.
 				return outcome, err
 			}
-			if markErr := m.cfg.DB.MarkExtractProgressFailed(ctx, db.ExtractFailure{
+			_, transient := errors.AsType[*transientError](err)
+			markCtx := ctx
+			if transient {
+				// Parallel workers exhaust their ladders against the same
+				// outage together. Only the worker that claims the abort
+				// marks its session; the others stay resumable like any
+				// session the abort cancels.
+				if !abort.claim(err) {
+					return outcome, err
+				}
+				// The claim cancelled ctx; the mark must still land.
+				markCtx = context.WithoutCancel(ctx)
+			}
+			if markErr := m.cfg.DB.MarkExtractProgressFailed(markCtx, db.ExtractFailure{
 				SessionID:      sessionID,
 				Fingerprint:    m.fingerprint,
 				ExpectedDigest: digest,
@@ -907,7 +947,7 @@ func (m *Manager) extractSession(
 				return outcome, markErr
 			}
 			outcome.failed = true
-			if _, ok := errors.AsType[*transientError](err); ok {
+			if transient {
 				// An exhausted retry ladder means the endpoint is down or
 				// saturated, not that this unit is poisoned: every
 				// remaining session would burn its own full ladder

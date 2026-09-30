@@ -3,6 +3,7 @@ package extract
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -271,6 +272,38 @@ func TestManagerParallelAbortCancelsInFlightSessions(t *testing.T) {
 	_, found, err := d.ExtractProgress(ctx, "sess-c", m.Fingerprint())
 	require.NoError(t, err)
 	assert.False(t, found, "no session may start after the pass aborted")
+}
+
+// TestManagerOutageLoserStaysResumable pins the race between workers whose
+// retry ladders exhaust against the same outage together: a worker that
+// loses the abort claim to a sibling leaves its session resumable instead of
+// joining the sibling's session behind the failure backoff.
+func TestManagerOutageLoserStaysResumable(t *testing.T) {
+	d := newTestArchive(t)
+	ctx := t.Context()
+	server, _ := newTrackingServer(t, func(*http.Request, string) (int, string) {
+		return http.StatusInternalServerError, `{"error":"upstream down"}`
+	})
+	seedSession(t, d, "sess-a", turnMessages("ask", "answer"), nil)
+	m := newManager(t, d, server.URL, func(c *ManagerConfig) {
+		c.Concurrency = 2
+	})
+	require.NoError(t, m.ensureGeneration(ctx))
+	// A sibling already claimed the abort, and its cancellation has not
+	// reached this worker's context yet.
+	abort := &passAbort{ctx: ctx, cancel: func() {}}
+	require.True(t, abort.claim(errors.New("sibling exhausted its ladder")))
+
+	outcome, err := m.extractSession(ctx, "sess-a", false, false, abort)
+	_, transient := errors.AsType[*transientError](err)
+	require.True(t, transient, "the loser still reports the outage: %v", err)
+	assert.False(t, outcome.failed)
+
+	progress, found, err := d.ExtractProgress(ctx, "sess-a", m.Fingerprint())
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, db.ExtractProgressPending, progress.State,
+		"one outage must back off one session, not every one in flight")
 }
 
 // TestManagerParallelCancellationLeavesSessionsResumable pins the shutdown
