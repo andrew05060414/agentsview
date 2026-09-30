@@ -217,7 +217,7 @@ type watchRootPlanObserver interface {
 // work.
 type createdSubtreePathFilter interface {
 	shouldEnumerateCreatedSubtree(root, path string) bool
-	includeCreatedSubtreePath(root, path string) bool
+	includeCreatedSubtreePath(root, path string, isDir bool) bool
 }
 
 // pollingOwnershipBackend reports independently keyed polling obligations so

@@ -253,7 +253,9 @@ type darwinWatchBackend struct {
 // events forwarded by the kqueue fallback. Native FSEvents deliveries bypass
 // Watcher.loop through the direct sink, so this method never puts filesystem
 // work on the FSEvents callback queue.
-func (b *darwinWatchBackend) includeCreatedSubtreePath(root, path string) bool {
+func (b *darwinWatchBackend) includeCreatedSubtreePath(
+	root, path string, _ bool,
+) bool {
 	return !shouldExcludeForRoot(b.excludes, path, root)
 }
 

@@ -951,9 +951,16 @@ func (b *fsnotifyBackend) shouldExcludeForRoot(path string, root string) bool {
 }
 
 // includeCreatedSubtreePath filters both files and directories found under a
-// newly created directory. A file directly inside the deepest watched
-// directory sits one level below the depth limit and is still covered.
-func (b *fsnotifyBackend) includeCreatedSubtreePath(root, path string) bool {
+// newly created directory. Directories follow the same depth limit as native
+// watches, so the walk never descends into generated trees below it. A file
+// directly inside the deepest watched directory sits one level below the
+// depth limit and is still covered.
+func (b *fsnotifyBackend) includeCreatedSubtreePath(
+	root, path string, isDir bool,
+) bool {
+	if isDir {
+		return !b.shouldExcludeForRoot(path, root)
+	}
 	return !shouldExcludeForRoot(b.excludes, path, root) &&
 		!b.beyondRootDepth(path, root, 1)
 }

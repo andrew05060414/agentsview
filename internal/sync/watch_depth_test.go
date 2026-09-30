@@ -101,19 +101,43 @@ func TestFSNotifyBackendCreatedSubtreeFilterHonorsMaxDepth(t *testing.T) {
 	root := t.TempDir()
 	backend.setWatchRootPlan([]WatchRoot{{
 		Path: root, Recursive: true, MaxDepth: 1, Exists: true,
+		ExtraDirectories: []string{"*/.system_generated/logs"},
 	}})
+	id := filepath.Join(root, "id")
 
+	assert.True(t, backend.includeCreatedSubtreePath(root, id, true))
 	assert.True(t, backend.includeCreatedSubtreePath(
-		root, filepath.Join(root, "id", "plan.md"),
+		root, filepath.Join(id, "plan.md"), false,
 	), "files inside the deepest watched directory stay covered")
 	assert.False(t, backend.includeCreatedSubtreePath(
-		root, filepath.Join(root, "id", "generated", "note.md"),
+		root, filepath.Join(id, "generated"), true,
+	), "directories below the depth limit are not walked")
+	assert.False(t, backend.includeCreatedSubtreePath(
+		root, filepath.Join(id, "generated", "note.md"), false,
+	))
+
+	generated := filepath.Join(id, ".system_generated")
+	logs := filepath.Join(generated, "logs")
+	assert.True(t, backend.includeCreatedSubtreePath(root, generated, true),
+		"directories on the way to an extra directory are walked")
+	assert.False(t, backend.includeCreatedSubtreePath(
+		root, filepath.Join(generated, "noise.txt"), false,
+	), "files in an intermediate directory stay ignored")
+	assert.False(t, backend.includeCreatedSubtreePath(
+		root, filepath.Join(generated, "other"), true,
+	))
+	assert.True(t, backend.includeCreatedSubtreePath(root, logs, true))
+	assert.True(t, backend.includeCreatedSubtreePath(
+		root, filepath.Join(logs, "transcript.jsonl"), false,
 	))
 
 	unlimited := t.TempDir()
 	assert.True(t, backend.includeCreatedSubtreePath(
-		unlimited, filepath.Join(unlimited, "a", "b", "c", "note.md"),
+		unlimited, filepath.Join(unlimited, "a", "b", "c"), true,
 	), "roots without a depth limit are unaffected")
+	assert.True(t, backend.includeCreatedSubtreePath(
+		unlimited, filepath.Join(unlimited, "a", "b", "c", "note.md"), false,
+	))
 }
 
 func TestFSNotifyBackendTranslateEventKeepsFilesAtMaxDepth(t *testing.T) {

@@ -1357,7 +1357,7 @@ func (w *Watcher) accumulateBackendEvent(event backendEvent) {
 		if path == event.Path {
 			return nil
 		}
-		if !filter.includeCreatedSubtreePath(root, path) {
+		if !filter.includeCreatedSubtreePath(root, path, entry.IsDir()) {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}

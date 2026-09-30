@@ -261,7 +261,9 @@ func (b *fakeWatchBackend) Stop() {
 }
 func (b *fakeWatchBackend) Name() string { return "fake" }
 
-func (b *fakeWatchBackend) includeCreatedSubtreePath(root, path string) bool {
+func (b *fakeWatchBackend) includeCreatedSubtreePath(
+	root, path string, _ bool,
+) bool {
 	return b.includeSubtree == nil || b.includeSubtree(root, path)
 }
 
