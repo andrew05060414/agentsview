@@ -430,6 +430,14 @@ func (a *passAbort) claim(err error) bool {
 	return true
 }
 
+// replace swaps the recorded cause for a failure the claimant hit while
+// acting on its claim, so the pass reports the error that left work undone.
+func (a *passAbort) replace(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.err = err
+}
+
 func (a *passAbort) error() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -944,6 +952,9 @@ func (m *Manager) extractSession(
 				ExpectedCursor: i,
 				LastError:      boundedLastError(err),
 			}); markErr != nil && !errors.Is(markErr, db.ErrStaleExtractProgress) {
+				if transient {
+					abort.replace(markErr)
+				}
 				return outcome, markErr
 			}
 			outcome.failed = true

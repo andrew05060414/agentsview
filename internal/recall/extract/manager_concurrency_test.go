@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -304,6 +305,32 @@ func TestManagerOutageLoserStaysResumable(t *testing.T) {
 	require.True(t, found)
 	assert.Equal(t, db.ExtractProgressPending, progress.State,
 		"one outage must back off one session, not every one in flight")
+}
+
+// TestManagerOutageMarkFailureBecomesPassCause pins that when the worker
+// claiming an outage abort cannot record its session's failure, the pass
+// reports that storage error rather than the outage it was acting on.
+func TestManagerOutageMarkFailureBecomesPassCause(t *testing.T) {
+	d, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	ctx := t.Context()
+	var closeOnce sync.Once
+	server, _ := newTrackingServer(t, func(*http.Request, string) (int, string) {
+		closeOnce.Do(func() { assert.NoError(t, d.Close()) })
+		return http.StatusInternalServerError, `{"error":"upstream down"}`
+	})
+	seedSession(t, d, "sess-a", turnMessages("ask", "answer"), nil)
+	m := newManager(t, d, server.URL, nil)
+	require.NoError(t, m.ensureGeneration(ctx))
+	passCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	abort := &passAbort{ctx: passCtx, cancel: cancel}
+
+	_, err = m.extractSession(passCtx, "sess-a", false, false, abort)
+	require.Error(t, err)
+	_, transient := errors.AsType[*transientError](err)
+	assert.False(t, transient, "the mark failure must surface: %v", err)
+	assert.Equal(t, err, abort.error())
 }
 
 // TestManagerParallelCancellationLeavesSessionsResumable pins the shutdown
