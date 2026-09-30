@@ -1349,6 +1349,29 @@ func TestCollectWatchRootsWatchesHermesProfilesContainerRecursively(t *testing.T
 	assert.Equal(t, []watchScope{{agent: parser.AgentHermes, syncDir: profilesRoot}}, roots[0].scopes)
 }
 
+func TestCollectWatchRootsCarriesAntigravityBrainDepthLimit(t *testing.T) {
+	root := t.TempDir()
+	brain := filepath.Join(root, "brain")
+	require.NoError(t, os.MkdirAll(brain, 0o755))
+	cfg := config.Config{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentAntigravity: {root},
+		},
+	}
+
+	roots, _, _, _ := collectWatchRoots(cfg)
+
+	got, ok := findCollectedWatchRoot(roots, brain)
+	require.True(t, ok, "antigravity brain root not collected")
+	assert.True(t, got.recursive)
+	assert.Equal(t, 1, got.maxDepth)
+	assert.Equal(t, []string{"*/.system_generated/logs"}, got.extraDirectories)
+	registered := got.registeredRoot()
+	assert.True(t, registered.Recursive)
+	assert.Equal(t, 1, registered.MaxDepth)
+	assert.Equal(t, []string{"*/.system_generated/logs"}, registered.ExtraDirectories)
+}
+
 func TestCollectWatchRootsUsesCoworkProviderRecursiveRoot(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Config{

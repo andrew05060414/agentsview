@@ -32,6 +32,10 @@ func TestAntigravityProviderSourceMethods(t *testing.T) {
 	assert.False(t, plan.Roots[0].Recursive)
 	assert.Equal(t, filepath.Join(root, "brain"), plan.Roots[1].Path)
 	assert.True(t, plan.Roots[1].Recursive)
+	assert.Equal(t, 1, plan.Roots[1].MaxDepth,
+		"generated brain trees stay unwatched")
+	assert.Equal(t, []string{"*/.system_generated/logs"}, plan.Roots[1].ExtraDirectories,
+		"the plaintext transcript directory stays watched")
 	assert.Equal(t, filepath.Join(root, "conversations"), plan.Roots[2].Path)
 	assert.False(t, plan.Roots[2].Recursive)
 
@@ -198,6 +202,10 @@ func TestAntigravityCLIProviderSourceMethods(t *testing.T) {
 	require.Len(t, plan.Roots, 5)
 	assert.Equal(t, filepath.Join(root, "brain"), plan.Roots[0].Path)
 	assert.True(t, plan.Roots[0].Recursive)
+	assert.Equal(t, 1, plan.Roots[0].MaxDepth,
+		"only brain/<id>/*.md is parsed; deeper brain trees stay unwatched")
+	assert.Empty(t, plan.Roots[0].ExtraDirectories,
+		"the CLI brain root does not read the IDE transcript directory")
 	assert.Equal(t, filepath.Join(root, "conversations"), plan.Roots[1].Path)
 	assert.False(t, plan.Roots[1].Recursive)
 	assert.Equal(t, root, plan.Roots[2].Path)

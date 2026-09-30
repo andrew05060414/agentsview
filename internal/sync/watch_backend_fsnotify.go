@@ -45,6 +45,13 @@ type fsnotifyBackend struct {
 	pumpDone          chan struct{}
 	done              chan struct{}
 	finishOnce        sync.Once
+
+	// depthMu guards rootDepths and rootExtraDirs. It is a leaf lock: it is
+	// taken inside rootsMu and watchMu readers, so never acquire another
+	// lock under it.
+	depthMu       sync.RWMutex
+	rootDepths    map[string]int
+	rootExtraDirs map[string][]string
 }
 
 // nativeEventQueueLimit bounds events held between the native reader and the
@@ -258,6 +265,22 @@ func (b *fsnotifyBackend) setWatchRootPlan(roots []WatchRoot) {
 	b.watchMu.Lock()
 	defer b.watchMu.Unlock()
 	b.rootScopes = make(map[string][]PollingScope, len(roots))
+	depths := make(map[string]int)
+	extras := make(map[string][]string)
+	for _, root := range roots {
+		if !root.Recursive || root.MaxDepth <= 0 {
+			continue
+		}
+		path := filepath.Clean(root.Path)
+		depths[path] = root.MaxDepth
+		if len(root.ExtraDirectories) > 0 {
+			extras[path] = append([]string(nil), root.ExtraDirectories...)
+		}
+	}
+	b.depthMu.Lock()
+	b.rootDepths = depths
+	b.rootExtraDirs = extras
+	b.depthMu.Unlock()
 	for _, root := range roots {
 		path := filepath.Clean(root.Path)
 		for _, scope := range root.Scopes {
@@ -506,8 +529,9 @@ func (b *fsnotifyBackend) translateEvent(event fsnotify.Event) (backendEvent, bo
 	// when the file matched an exclusion during directory registration. Ignore
 	// those events here as well, otherwise transient lock-file renames can be
 	// mistaken for session changes while another process is replacing the
-	// lock.
-	if b.shouldExclude(event.Name) {
+	// lock. A depth limit drops directories below the plan, but a file
+	// directly inside a watched directory stays visible after it is removed.
+	if b.shouldDropEvent(event.Name) {
 		return backendEvent{}, false
 	}
 
@@ -846,7 +870,10 @@ func (b *fsnotifyBackend) addWatchOwner(path, root string) {
 }
 
 func (b *fsnotifyBackend) shouldExclude(path string) bool {
-	if len(b.excludes) == 0 {
+	b.depthMu.RLock()
+	hasDepthLimits := len(b.rootDepths) > 0
+	b.depthMu.RUnlock()
+	if len(b.excludes) == 0 && !hasDepthLimits {
 		return false
 	}
 	root, ok := b.mostSpecificContainingRoot(path)
@@ -856,12 +883,172 @@ func (b *fsnotifyBackend) shouldExclude(path string) bool {
 	return b.shouldExcludeForRoot(path, root)
 }
 
-func (b *fsnotifyBackend) shouldExcludeForRoot(path string, root string) bool {
-	return shouldExcludeForRoot(b.excludes, path, root)
+// shouldDropEvent reports whether an fsnotify path is outside this root's
+// coverage. Name excludes apply to every path. The depth limit applies to
+// directories. A file directly inside a watched directory stays visible,
+// including after that file has been removed or renamed.
+func (b *fsnotifyBackend) shouldDropEvent(path string) bool {
+	b.depthMu.RLock()
+	hasDepthLimits := len(b.rootDepths) > 0
+	b.depthMu.RUnlock()
+	if len(b.excludes) == 0 && !hasDepthLimits {
+		return false
+	}
+	root, ok := b.mostSpecificContainingRoot(path)
+	if !ok {
+		return false
+	}
+	if shouldExcludeForRoot(b.excludes, path, root) {
+		return true
+	}
+	if !b.beyondRootDepth(path, root, 0) {
+		return false
+	}
+	parent := filepath.Dir(filepath.Clean(path))
+	if !b.filesVisibleIn(parent, root) {
+		return true
+	}
+	info, err := os.Lstat(path)
+	return err == nil && info.IsDir()
 }
 
+// filesVisibleIn reports whether files directly inside dir are events this
+// root asked to see: dir is within MaxDepth, or dir is a listed extra
+// directory rather than an intermediate directory on the way to one.
+func (b *fsnotifyBackend) filesVisibleIn(dir, root string) bool {
+	root = filepath.Clean(root)
+	dir = filepath.Clean(dir)
+	b.depthMu.RLock()
+	limit := b.rootDepths[root]
+	patterns := b.rootExtraDirs[root]
+	b.depthMu.RUnlock()
+	if limit <= 0 {
+		return true
+	}
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == "." {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) <= limit {
+		return true
+	}
+	return extraCoversFiles(parts, patterns)
+}
+
+// shouldExcludeForRoot reports whether a directory under root stays unwatched,
+// either because it matches an exclude pattern or because it lies deeper than
+// the root's planned depth limit.
+func (b *fsnotifyBackend) shouldExcludeForRoot(path string, root string) bool {
+	return shouldExcludeForRoot(b.excludes, path, root) ||
+		b.beyondRootDepth(path, root, 0)
+}
+
+// includeCreatedSubtreePath filters both files and directories found under a
+// newly created directory. A file directly inside the deepest watched
+// directory sits one level below the depth limit and is still covered.
 func (b *fsnotifyBackend) includeCreatedSubtreePath(root, path string) bool {
-	return !b.shouldExcludeForRoot(path, root)
+	return !shouldExcludeForRoot(b.excludes, path, root) &&
+		!b.beyondRootDepth(path, root, 1)
+}
+
+// beyondRootDepth reports whether path is more than the root's depth limit
+// plus slack levels below root. A listed extra directory, and each directory
+// on the way to it, stays inside the limit. With slack, a file directly
+// inside a listed extra directory stays inside too. Roots without a limit
+// never exclude by depth.
+func (b *fsnotifyBackend) beyondRootDepth(path, root string, slack int) bool {
+	root = filepath.Clean(root)
+	b.depthMu.RLock()
+	limit := b.rootDepths[root]
+	patterns := b.rootExtraDirs[root]
+	b.depthMu.RUnlock()
+	if limit <= 0 {
+		return false
+	}
+	rel, err := filepath.Rel(root, filepath.Clean(path))
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) <= limit+slack {
+		return false
+	}
+	if extraCoversDirectory(parts, patterns) {
+		return false
+	}
+	return slack <= 0 || len(parts) < 2 ||
+		!extraCoversFiles(parts[:len(parts)-1], patterns)
+}
+
+// extraCoversDirectory reports whether parts is a listed extra directory or
+// an intermediate directory on the way to one.
+func extraCoversDirectory(parts, patterns []string) bool {
+	for _, pattern := range patterns {
+		want := extraPatternParts(pattern)
+		if matchExtraPrefix(parts, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// extraCoversFiles reports whether parts is a listed extra directory whose
+// files should be reported. An intermediate directory listed only because a
+// longer pattern passes through it does not qualify.
+func extraCoversFiles(parts, patterns []string) bool {
+	for _, pattern := range patterns {
+		want := extraPatternParts(pattern)
+		if len(want) != len(parts) || !matchExtraPrefix(parts, want) {
+			continue
+		}
+		if extraHasLongerPattern(want, patterns) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func extraHasLongerPattern(prefix, patterns []string) bool {
+	for _, pattern := range patterns {
+		want := extraPatternParts(pattern)
+		if len(want) > len(prefix) && matchExtraPrefix(prefix, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func extraPatternParts(pattern string) []string {
+	if pattern == "" {
+		return nil
+	}
+	parts := strings.Split(pattern, "/")
+	for _, part := range parts {
+		if part == "" {
+			return nil
+		}
+	}
+	return parts
+}
+
+// matchExtraPrefix reports whether parts equals want or a proper prefix of
+// want. "*" matches one directory name.
+func matchExtraPrefix(parts, want []string) bool {
+	if len(want) == 0 || len(parts) == 0 || len(parts) > len(want) {
+		return false
+	}
+	for i := range parts {
+		if want[i] != "*" && want[i] != parts[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *fsnotifyBackend) shouldEnumerateCreatedSubtree(root, path string) bool {

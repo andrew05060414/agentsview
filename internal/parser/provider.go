@@ -771,9 +771,11 @@ func watchRootMetadata(roots []WatchRoot) []WatchRoot {
 	out := make([]WatchRoot, 0, len(roots))
 	for _, root := range roots {
 		out = append(out, WatchRoot{
-			Path:        root.Path,
-			Recursive:   root.Recursive,
-			DebounceKey: root.DebounceKey,
+			Path:             root.Path,
+			Recursive:        root.Recursive,
+			MaxDepth:         root.MaxDepth,
+			ExtraDirectories: append([]string(nil), root.ExtraDirectories...),
+			DebounceKey:      root.DebounceKey,
 		})
 	}
 	return out
@@ -784,11 +786,23 @@ func watchRootMetadata(roots []WatchRoot) []WatchRoot {
 // changes and must not be treated as covering missing nested provider roots
 // unless caller-specific creation handling documents that equivalence.
 type WatchRoot struct {
-	Path         string
-	Recursive    bool
-	IncludeGlobs []string
-	ExcludeGlobs []string
-	DebounceKey  string
+	Path      string
+	Recursive bool
+	// MaxDepth limits a recursive root to directories at most MaxDepth
+	// levels below Path; zero means no limit. Set it when a provider reads
+	// only a fixed depth under a root whose deeper subtrees it never
+	// parses, so those subtrees do not consume the recursive-watch budget.
+	MaxDepth int
+	// ExtraDirectories lists directories relative to Path that stay watched
+	// below MaxDepth. Separate segments with "/" and use "*" for one
+	// directory name. Each directory on the way to a listed directory is
+	// watched too. Files directly inside a listed directory are reported.
+	// Files in an intermediate directory are not. An empty list leaves
+	// MaxDepth as the whole limit.
+	ExtraDirectories []string
+	IncludeGlobs     []string
+	ExcludeGlobs     []string
+	DebounceKey      string
 }
 
 // ActivityHintSource is one bounded append-only signal a provider exposes to

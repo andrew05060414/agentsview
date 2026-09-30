@@ -264,9 +264,18 @@ func (s antigravitySourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 				IncludeGlobs: []string{"*.pbtxt"},
 				DebounceKey:  string(AgentAntigravity) + ":annotations:" + root,
 			},
+			// brain/<id>/*.md and the plaintext transcript at
+			// brain/<id>/.system_generated/logs/transcript.jsonl are parsed.
+			// The other generated trees (.git, scratch, and the rest of
+			// .system_generated) stay unwatched so they cannot exhaust the
+			// recursive-watch budget.
 			WatchRoot{
 				Path:      filepath.Join(root, "brain"),
 				Recursive: true,
+				MaxDepth:  1,
+				ExtraDirectories: []string{
+					"*/" + antigravityBrainGeneratedDir + "/" + antigravityBrainLogsDir,
+				},
 				IncludeGlobs: []string{
 					"*.md",
 					"*.md.metadata.json",

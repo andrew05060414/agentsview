@@ -344,9 +344,12 @@ func (s antigravityCLISourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	roots := make([]WatchRoot, 0, len(s.roots)*5)
 	for _, root := range s.roots {
 		roots = append(roots,
+			// Only brain/<id>/*.md artifacts are parsed; see the IDE
+			// provider's brain root for why deeper subtrees stay unwatched.
 			WatchRoot{
 				Path:         filepath.Join(root, "brain"),
 				Recursive:    true,
+				MaxDepth:     1,
 				IncludeGlobs: []string{"*.md", "*.md.metadata.json"},
 				DebounceKey:  string(AgentAntigravityCLI) + ":brain:" + root,
 			},

@@ -16,8 +16,53 @@ type WatchScope struct {
 type WatchRoot struct {
 	Path      string
 	Recursive bool
-	Exists    bool
-	Scopes    []WatchScope
+	// MaxDepth limits a recursive root to directories at most MaxDepth
+	// levels below Path; zero means no limit.
+	MaxDepth int
+	// ExtraDirectories lists directories relative to Path that stay watched
+	// below MaxDepth. Segments are separated by "/". "*" matches one
+	// directory name. Ignored when MaxDepth is zero.
+	ExtraDirectories []string
+	Exists           bool
+	Scopes           []WatchScope
+}
+
+// MergeExtraDirectories unions the extra-directory lists of two plans for the
+// same path. Order follows the first plan, then any pattern only the second
+// plan requested.
+func MergeExtraDirectories(a, b []string) []string {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	out := append([]string(nil), a...)
+	for _, pattern := range b {
+		if pattern == "" || slices.Contains(out, pattern) {
+			continue
+		}
+		out = append(out, pattern)
+	}
+	return out
+}
+
+// MergeWatchDepth combines the depth limits of two plans for the same path.
+// Only recursive plans contribute: an unlimited recursive plan wins, otherwise
+// the deeper limit wins so neither plan loses coverage it asked for.
+func MergeWatchDepth(
+	recursiveA bool, depthA int, recursiveB bool, depthB int,
+) int {
+	switch {
+	case recursiveA && recursiveB:
+		if depthA == 0 || depthB == 0 {
+			return 0
+		}
+		return max(depthA, depthB)
+	case recursiveA:
+		return depthA
+	case recursiveB:
+		return depthB
+	default:
+		return 0
+	}
 }
 
 // RegisterRoots passes the complete desired root plan to the watcher before

@@ -136,6 +136,13 @@ The latest published release is
   every Antigravity session. Only changes to the database or its write-ahead
   log now trigger a re-sync. The first sync after upgrading re-reads each
   Antigravity session once.
+- Large Antigravity installs no longer push every agent's sessions to slow
+  polling. Each Antigravity `brain/<id>` folder can hold thousands of generated
+  subfolders that AgentsView never reads, and watching them used up the
+  8192-folder watch budget. AgentsView now watches each `brain/<id>` folder,
+  the markdown files inside it, and
+  `brain/<id>/.system_generated/logs`, which holds the plaintext transcript.
+  The other generated subfolders stay unwatched.
 
 ## 0.44.0
 

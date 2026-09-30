@@ -1670,6 +1670,14 @@ as of 0.27.0 AgentsView **degrades** that root to polling instead of aborting
 startup. The HTTP listener is now bound before any watches are registered, so
 the server still comes up cleanly.
 
+Providers can also cap how deep a recursive root is watched when they read only
+a fixed depth. Antigravity and Antigravity CLI `brain` folders are watched one
+level deep, so the generated trees inside each `brain/<id>` do not count
+against the budget. The Antigravity IDE watcher also watches
+`brain/<id>/.system_generated/logs`, which holds the plaintext transcript.
+This cap applies to the Linux and Windows watcher. The macOS FSEvents watcher
+has no per-directory budget.
+
 Roots that fall back to polling are picked up by:
 
 - the existing 15-minute periodic full sync, plus

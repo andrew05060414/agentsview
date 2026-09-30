@@ -412,6 +412,12 @@ func rawSyncProvidersAndRoots(
 					return nil, nil, errors.New("raw-sync watch root index is invalid")
 				}
 				root := &roots[index]
+				root.MaxDepth = syncpkg.MergeWatchDepth(
+					root.Recursive, root.MaxDepth, planned.Recursive, planned.MaxDepth,
+				)
+				root.ExtraDirectories = syncpkg.MergeExtraDirectories(
+					root.ExtraDirectories, planned.ExtraDirectories,
+				)
 				root.Recursive = root.Recursive || planned.Recursive
 				root.Exists = root.Exists || exists
 				if !slices.Contains(root.Scopes, scope) {
@@ -422,7 +428,11 @@ func rawSyncProvidersAndRoots(
 			rootIndex[path] = len(roots)
 			roots = append(roots, syncpkg.WatchRoot{
 				Path: path, Recursive: planned.Recursive, Exists: exists,
-				Scopes: []syncpkg.WatchScope{scope},
+				MaxDepth: syncpkg.MergeWatchDepth(
+					planned.Recursive, planned.MaxDepth, false, 0,
+				),
+				ExtraDirectories: syncpkg.MergeExtraDirectories(nil, planned.ExtraDirectories),
+				Scopes:           []syncpkg.WatchScope{scope},
 			})
 		}
 	}

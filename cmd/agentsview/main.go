@@ -2522,6 +2522,8 @@ type watchScope struct {
 type watchRoot struct {
 	path                  string
 	recursive             bool
+	maxDepth              int
+	extraDirectories      []string
 	exists                bool
 	scopes                []watchScope
 	pendingPollingDirs    []string
@@ -2537,10 +2539,12 @@ func (r watchRoot) registeredRoot() sync.WatchRoot {
 		})
 	}
 	return sync.WatchRoot{
-		Path:      r.path,
-		Recursive: r.recursive,
-		Exists:    r.exists,
-		Scopes:    scopes,
+		Path:             r.path,
+		Recursive:        r.recursive,
+		MaxDepth:         r.maxDepth,
+		ExtraDirectories: append([]string(nil), r.extraDirectories...),
+		Exists:           r.exists,
+		Scopes:           scopes,
 	}
 }
 
@@ -2613,10 +2617,19 @@ func collectWatchRoots(cfg config.Config) (
 			persistentDirAgents[cleanDir] = append(persistentDirAgents[cleanDir], agent)
 		}
 	}
-	addRoot := func(agent parser.AgentType, dir, path string, recursive, exists bool) {
+	addRoot := func(
+		agent parser.AgentType, dir, path string,
+		recursive bool, maxDepth int, extra []string, exists bool,
+	) {
 		path = filepath.Clean(path)
 		scope := watchScope{agent: agent, syncDir: dir}
 		if idx, ok := rootIndexes[path]; ok {
+			roots[idx].maxDepth = sync.MergeWatchDepth(
+				roots[idx].recursive, roots[idx].maxDepth, recursive, maxDepth,
+			)
+			roots[idx].extraDirectories = sync.MergeExtraDirectories(
+				roots[idx].extraDirectories, extra,
+			)
 			roots[idx].recursive = roots[idx].recursive || recursive
 			roots[idx].exists = roots[idx].exists || exists
 			if !slices.Contains(roots[idx].scopes, scope) {
@@ -2626,17 +2639,21 @@ func collectWatchRoots(cfg config.Config) (
 		}
 		rootIndexes[path] = len(roots)
 		roots = append(roots, watchRoot{
-			path:      path,
-			recursive: recursive,
-			exists:    exists,
-			scopes:    []watchScope{scope},
+			path:             path,
+			recursive:        recursive,
+			maxDepth:         sync.MergeWatchDepth(recursive, maxDepth, false, 0),
+			extraDirectories: sync.MergeExtraDirectories(nil, extra),
+			exists:           exists,
+			scopes:           []watchScope{scope},
 		})
 	}
 	for _, factory := range cfg.LocalProviderFactories() {
 		def := factory.Definition()
 		for _, d := range cfg.ResolveDirs(def.Type) {
-			addAgentRoot := func(dir, root string, recursive, exists bool) {
-				addRoot(def.Type, dir, root, recursive, exists)
+			addAgentRoot := func(
+				dir, root string, recursive bool, maxDepth int, extra []string, exists bool,
+			) {
+				addRoot(def.Type, dir, root, recursive, maxDepth, extra, exists)
 			}
 			if providerWatched, polling := collectProviderWatchRoots(factory, d, addAgentRoot); providerWatched {
 				if polling.persistent {
@@ -2664,7 +2681,11 @@ func collectWatchRoots(cfg config.Config) (
 				addPersistent(def.Type, d)
 				continue
 			}
-			fallbackUnwatched := collectLegacyWatchRoots(def, d, addAgentRoot)
+			fallbackUnwatched := collectLegacyWatchRoots(
+				def, d, func(dir, root string, recursive, exists bool) {
+					addAgentRoot(dir, root, recursive, 0, nil, exists)
+				},
+			)
 			for _, pollingDir := range fallbackUnwatched {
 				addPersistent(def.Type, pollingDir)
 			}
@@ -2696,7 +2717,7 @@ type providerPollingReasons struct {
 func collectProviderWatchRoots(
 	factory parser.ProviderFactory,
 	dir string,
-	addRoot func(dir, root string, recursive, exists bool),
+	addRoot func(dir, root string, recursive bool, maxDepth int, extra []string, exists bool),
 ) (bool, providerPollingReasons) {
 	def := factory.Definition()
 	provider := factory.NewProvider(parser.ProviderConfig{
@@ -2725,7 +2746,10 @@ func collectProviderWatchRoots(
 		}
 		_, err := os.Stat(root)
 		exists := err == nil
-		addRoot(dir, root, providerRoot.Recursive, exists)
+		addRoot(
+			dir, root, providerRoot.Recursive, providerRoot.MaxDepth,
+			providerRoot.ExtraDirectories, exists,
+		)
 		if exists {
 			continue
 		}
