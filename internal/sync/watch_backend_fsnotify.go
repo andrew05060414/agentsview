@@ -909,7 +909,10 @@ func (b *fsnotifyBackend) shouldDropEvent(path string) bool {
 		return true
 	}
 	info, err := os.Lstat(path)
-	return err == nil && info.IsDir()
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
 }
 
 // filesVisibleIn reports whether files directly inside dir are events this
