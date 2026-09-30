@@ -244,8 +244,10 @@ func TestManagerParallelAbortCancelsInFlightSessions(t *testing.T) {
 		}
 		return http.StatusUnauthorized, `{"error":"bad api key"}`
 	})
-	for _, id := range []string{"sess-a", "sess-b", "sess-c"} {
-		seedSession(t, d, id, turnMessages("ask "+id, "answer "+id), nil)
+	// The backlog runs newest ended first, so sess-c is the one left queued.
+	for i, id := range []string{"sess-a", "sess-b", "sess-c"} {
+		seedSession(t, d, id, turnMessages("ask "+id, "answer "+id),
+			endedAgo(time.Duration(i+1)*time.Hour))
 	}
 	m := newManager(t, d, server.URL, func(c *ManagerConfig) {
 		c.Concurrency = 2
@@ -285,8 +287,10 @@ func TestManagerParallelCancellationLeavesSessionsResumable(t *testing.T) {
 		<-r.Context().Done()
 		return http.StatusOK, completionBody(t, entriesJSON(t, "x"))
 	})
-	for _, id := range []string{"sess-a", "sess-b", "sess-c"} {
-		seedSession(t, d, id, turnMessages("ask "+id, "answer "+id), nil)
+	// The backlog runs newest ended first, so sess-c is the one left queued.
+	for i, id := range []string{"sess-a", "sess-b", "sess-c"} {
+		seedSession(t, d, id, turnMessages("ask "+id, "answer "+id),
+			endedAgo(time.Duration(i+1)*time.Hour))
 	}
 	m := newManager(t, d, server.URL, func(c *ManagerConfig) {
 		c.Concurrency = 2
