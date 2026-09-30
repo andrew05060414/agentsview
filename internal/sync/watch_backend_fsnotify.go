@@ -1029,10 +1029,8 @@ func extraPatternParts(pattern string) []string {
 		return nil
 	}
 	parts := strings.Split(pattern, "/")
-	for _, part := range parts {
-		if part == "" {
-			return nil
-		}
+	if slices.Contains(parts, "") {
+		return nil
 	}
 	return parts
 }
