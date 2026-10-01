@@ -1091,6 +1091,18 @@ func TestImportChatGPTFillsArchivedToolResult(t *testing.T) {
 			}
 			assert.Greater(t, chatGPTTranscriptRevision(t, d), revBefore)
 
+			// The messages API reads through this window with its revision.
+			observed := ""
+			window, err := d.GetMessagesWindow(ctx, "chatgpt:cg-tool", db.MessageWindow{
+				From: new(0), Limit: 10, Asc: true, ObservedRevision: &observed,
+			})
+			require.NoError(t, err)
+			require.Len(t, window, want)
+			require.Len(t, window[1].ToolCalls, 1)
+			assert.Equal(t, result.ResultContent, window[1].ToolCalls[0].ResultContent)
+			assert.Equal(t, result.ResultContentLength, window[1].ToolCalls[0].ResultContentLength)
+			assert.Equal(t, fmt.Sprint(chatGPTTranscriptRevision(t, d)), observed)
+
 			pins, err := d.ListPinnedMessages(ctx, "chatgpt:cg-tool", "")
 			require.NoError(t, err)
 			require.Len(t, pins, 1)
