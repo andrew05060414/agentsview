@@ -459,7 +459,10 @@ func upsertChatGPTConversation(
 	// the verified prefix. A full replacement would delete and reinsert
 	// archived rows, changing message IDs and risking pins that cannot be
 	// re-matched without source UUIDs. A fill-only import is an update too.
-	fts.suspend(ctx)
+	// Full-text search indexes message rows only, so fills alone skip it.
+	if len(msgs) > len(archived) {
+		fts.suspend(ctx)
+	}
 	// The transcript changed, so stored quality signals and secret findings
 	// describe the older history. Clear them to version zero in the same
 	// write so the signal backfill recomputes them from the new rows.
