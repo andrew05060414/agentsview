@@ -1101,7 +1101,7 @@ func TestImportChatGPTFillsArchivedToolResult(t *testing.T) {
 			require.Len(t, window[1].ToolCalls, 1)
 			assert.Equal(t, result.ResultContent, window[1].ToolCalls[0].ResultContent)
 			assert.Equal(t, result.ResultContentLength, window[1].ToolCalls[0].ResultContentLength)
-			assert.Equal(t, fmt.Sprint(chatGPTTranscriptRevision(t, d)), observed)
+			assert.Equal(t, strconv.Itoa(chatGPTTranscriptRevision(t, d)), observed)
 
 			pins, err := d.ListPinnedMessages(ctx, "chatgpt:cg-tool", "")
 			require.NoError(t, err)
