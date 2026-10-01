@@ -240,7 +240,7 @@ func TestZedProviderFingerprintIncludesWALSiblings(t *testing.T) {
 	require.NoError(t, err)
 
 	walPath := dbPath + "-wal"
-	writeSourceFile(t, walPath, "wal")
+	writeSourceFile(t, walPath, walWithFramesFixture)
 	walTime := time.Unix(0, before.MTimeNS+int64(time.Second))
 	require.NoError(t, os.Chtimes(walPath, walTime, walTime))
 	after, err := provider.Fingerprint(t.Context(), sources[0])
@@ -644,7 +644,7 @@ func TestShelleyProviderFingerprintIncludesWALSiblings(t *testing.T) {
 	require.NoError(t, err)
 
 	walPath := dbPath + "-wal"
-	writeSourceFile(t, walPath, "wal")
+	writeSourceFile(t, walPath, walWithFramesFixture)
 	walTime := time.Unix(0, before.MTimeNS+int64(time.Second))
 	require.NoError(t, os.Chtimes(walPath, walTime, walTime))
 	after, err := provider.Fingerprint(t.Context(), sources[0])

@@ -2009,7 +2009,7 @@ func sqliteWALHasFrames(path string) bool {
 	if info == nil {
 		return false
 	}
-	return info.Mode().IsRegular() && info.Size() > sqliteWALHeaderSize
+	return sqliteWALInfoHasFrames(info)
 }
 
 func (s openCodeFormatSourceSet) sourceForRawID(ctx context.Context, root, sessionID string) (SourceRef, bool) {

@@ -367,7 +367,7 @@ func TestKiroProviderFingerprintsSQLiteAndLegacySources(t *testing.T) {
 	beforePhysical, err := provider.Fingerprint(t.Context(), sqliteSource)
 	require.NoError(t, err)
 	walPath := dbPath + "-wal"
-	writeSourceFile(t, walPath, "wal")
+	writeSourceFile(t, walPath, walWithFramesFixture)
 	walTime := time.Unix(0, beforePhysical.MTimeNS+int64(time.Second))
 	require.NoError(t, os.Chtimes(walPath, walTime, walTime))
 	afterPhysical, err := provider.Fingerprint(t.Context(), sqliteSource)
