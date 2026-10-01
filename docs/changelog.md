@@ -155,6 +155,10 @@ The latest published release is
 
 **Bug fixes**
 
+- Re-importing a ChatGPT export now fills in code-run output that was still
+  missing when an earlier export was archived. The archived message keeps its
+  place and any pin. Re-importing a conversation you trashed now skips it
+  instead of reporting an error.
 - Antigravity IDE and Antigravity CLI sessions stop re-syncing in a loop.
   Reading a session database rewrote its shared-memory (`-shm`) file, and
   AgentsView counted that as a change, so every pass re-read and re-uploaded
