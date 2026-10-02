@@ -13657,7 +13657,11 @@ func (e *Engine) applyProviderFilePathPolicies(
 		if e.pathRewriter != nil {
 			lookupPath = e.pathRewriter(path)
 		}
+		originalID := result.Session.ID
 		currentID := e.sourceCollisionID(ctx, provider, lookupPath, &result.Session)
+		if currentID != originalID && res.retrySessionIDs[originalID] {
+			res.retrySessionIDs[currentID] = true
+		}
 		currentPrefixedID := e.idPrefix + currentID
 
 		agentsToQuery := []string{string(agent)}
