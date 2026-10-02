@@ -1,6 +1,7 @@
 package sync_test
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -396,6 +397,36 @@ func TestNewFileReusingDeletedSessionIDStaysVisible(t *testing.T) {
 	} {
 		sync()
 		assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, newcomer), 1)
+		base, err := env.db.GetSessionFull(t.Context(), collisionBaseID)
+		require.NoError(t, err)
+		assert.Nil(t, base)
+	}
+}
+
+// A deletion recorded before deletions kept their file covers every file
+// with that id, so nothing deleted before upgrading comes back.
+func TestDeletionWithoutRecordedFileHidesEveryFile(t *testing.T) {
+	env := setupTestEnv(t)
+	dir := filepath.Join("tmp", "collisionhash", "chats")
+	env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T09-00-owner.json"),
+		geminiCollisionSession("shared-session", 5))
+	env.engine.SyncAll(t.Context(), nil)
+	require.NoError(t, env.db.DeleteSession(t.Context(), collisionBaseID))
+	require.NoError(t, env.db.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), "UPDATE excluded_sessions SET file_path = NULL WHERE id = ?", collisionBaseID)
+		return err
+	}))
+	newcomer := env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-00-new.json"),
+		geminiCollisionSession("shared-session", 1))
+
+	for _, sync := range []func(){
+		func() { env.engine.SyncAll(t.Context(), nil) },
+		func() { env.engine.ResyncAll(t.Context(), nil) },
+	} {
+		sync()
+		alt, err := env.db.GetSessionFull(t.Context(), parser.AltSessionID(collisionBaseID, newcomer))
+		require.NoError(t, err)
+		assert.Nil(t, alt)
 		base, err := env.db.GetSessionFull(t.Context(), collisionBaseID)
 		require.NoError(t, err)
 		assert.Nil(t, base)
