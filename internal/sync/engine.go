@@ -18434,9 +18434,8 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 	}
 	writes := make([]db.SessionBatchWrite, 0, len(batch))
 	pendingIndexes := make([]int, 0, len(batch))
-	sources := make(map[string]batchSourceFile, len(batch))
+	sources := make([]batchSourceFile, 0, len(batch))
 	pendingByID := make(map[string]pendingWrite, len(batch))
-	pendingIndexByID := make(map[string]int, len(batch))
 	resolveWorktreeProject := e.loadWorktreeProjectResolverContext(ctx)
 
 	for pendingIndex, pw := range batch {
@@ -18589,14 +18588,11 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 		})
 		pendingIndexes = append(pendingIndexes, pendingIndex)
 		pendingByID[s.ID] = pw
-		pendingIndexByID[s.ID] = pendingIndex
-		if pw.sess.File.Path != "" {
-			sources[s.ID] = batchSourceFile{
-				path:        pw.sess.File.Path,
-				mtime:       pw.sess.File.Mtime,
-				fingerprint: pw.sess.File.Hash,
-			}
-		}
+		sources = append(sources, batchSourceFile{
+			path:        pw.sess.File.Path,
+			mtime:       pw.sess.File.Mtime,
+			fingerprint: pw.sess.File.Hash,
+		})
 	}
 	if len(writes) == 0 {
 		return outcome
@@ -18632,11 +18628,15 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 			e.markStaleFailedMemberWrite(ctx, pw)
 		}
 	}
-	for _, id := range result.ExcludedIDs {
-		if pendingIndex, ok := pendingIndexByID[id]; ok {
-			outcome.resolved[pendingIndex] = true
+	// Resolve skips by write index: two sources in one batch can share a
+	// session id, and each skipped source must be skip-cached.
+	for _, excludedIndex := range result.ExcludedIndexes {
+		if excludedIndex < 0 || excludedIndex >= len(pendingIndexes) {
+			continue
 		}
-		if source, ok := sources[id]; ok && source.path != "" {
+		pendingIndex := pendingIndexes[excludedIndex]
+		outcome.resolved[pendingIndex] = true
+		if source := sources[excludedIndex]; source.path != "" {
 			e.cacheSkip(
 				source.path, source.mtime, source.fingerprint,
 			)
