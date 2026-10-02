@@ -512,3 +512,41 @@ func TestCwdFilteredFileDoesNotClaimSessionID(t *testing.T) {
 		}
 	}
 }
+
+// A derived Cursor session whose workspace leaves the cwd allow-list keeps its
+// derived id, so cwd reconciliation updates its own row.
+func TestCwdFilteredDerivedSessionKeepsItsID(t *testing.T) {
+	root := t.TempDir()
+	workspaces := cursorWorkspaceTempDir(t)
+	keep, drop := filepath.Join(workspaces, "keep"), filepath.Join(workspaces, "drop")
+	const sessionID = "56565656-7878-4989-8a8a-cdcdcdcdcdcd"
+	paths := make(map[string]string)
+	database := dbtest.OpenTestDB(t)
+	for _, workspace := range []string{keep, drop} {
+		require.NoError(t, os.MkdirAll(workspace, 0o755))
+		path := filepath.Join(root, encodeCursorProjectDir(workspace), "agent-transcripts", sessionID+".jsonl")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(`{"role":"user","message":{"content":"hello"}}`+"\n"), 0o644))
+		paths[workspace] = path
+		initial := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+			AgentDirs: map[parser.AgentType][]string{parser.AgentCursor: {root}}, Machine: "local",
+		})
+		initial.SyncAll(t.Context(), nil)
+		initial.Close()
+	}
+	const baseID = "cursor:" + sessionID
+	altID := parser.AltSessionID(baseID, paths[drop])
+	require.Equal(t, drop, requireStoredSession(t, database, altID).Cwd)
+
+	require.NoError(t, os.RemoveAll(drop))
+	filtered := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs:          map[parser.AgentType][]string{parser.AgentCursor: {root}},
+		Machine:            "local",
+		IncludeCwdPrefixes: []string{keep},
+	})
+	t.Cleanup(filtered.Close)
+	filtered.SyncAll(t.Context(), nil)
+
+	assert.Empty(t, requireStoredSession(t, database, altID).Cwd, "the derived row's cwd follows its unresolved workspace")
+	assert.Equal(t, paths[keep], *requireStoredSession(t, database, baseID).FilePath)
+}

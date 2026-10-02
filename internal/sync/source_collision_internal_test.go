@@ -38,6 +38,7 @@ func TestSourceCollisionKeepsRetryFlag(t *testing.T) {
 	res := processResult{
 		results: []parser.ParseResult{{Session: parser.ParsedSession{
 			ID: id, Agent: parser.AgentGemini, File: parser.FileInfo{Path: other},
+			ParentSessionID: "gemini:spawner", RelationshipType: parser.RelSubagent,
 		}}},
 		retrySessionIDs: map[string]bool{id: true},
 	}
@@ -47,6 +48,10 @@ func TestSourceCollisionKeepsRetryFlag(t *testing.T) {
 	altID := parser.AltSessionID(id, other)
 	assert.Equal(t, altID, res.results[0].Session.ID)
 	assert.True(t, res.needsRetryForSession(altID))
+	// The derived session links to the session it shares an id with, even
+	// when its parser recorded another parent.
+	assert.Equal(t, id, res.results[0].Session.ParentSessionID)
+	assert.Equal(t, parser.RelContinuation, res.results[0].Session.RelationshipType)
 }
 
 // A failed ownership lookup skips the source this pass so it retries, rather

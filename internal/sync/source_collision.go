@@ -11,12 +11,15 @@ import (
 // session keeps its id while its file is missing, as archived transcripts are
 // never replaced because their source went away. Any other file with the same
 // id is stored under parser.AltSessionID as a continuation of it, unless the
-// provider reports the stored file moved to this one.
+// provider reports the stored file moved to this one. A session the write
+// step will filter out (admitted false) keeps any id its file already holds
+// but never claims or mints one.
 func (e *Engine) sourceCollisionID(
 	ctx context.Context,
 	provider parser.Provider,
 	lookupPath string,
 	s *parser.ParsedSession,
+	admitted bool,
 ) (string, error) {
 	if !collisionPolicyApplies(provider) {
 		return s.ID, nil
@@ -44,16 +47,17 @@ func (e *Engine) sourceCollisionID(
 		return s.ID, nil
 	}
 	altID := e.existingAltID(ctx, provider, records, fullID, s.ID, lookupPath)
+	if altID == "" && !admitted {
+		return s.ID, nil
+	}
 	if altID == "" {
 		if !hasStored && deleted == "" && e.claimSessionID(ctx, provider, fullID, lookupPath) {
 			return s.ID, nil
 		}
 		altID = parser.AltSessionID(s.ID, lookupPath)
 	}
-	if s.ParentSessionID == "" {
-		s.ParentSessionID = s.ID
-		s.RelationshipType = parser.RelContinuation
-	}
+	s.ParentSessionID = s.ID
+	s.RelationshipType = parser.RelContinuation
 	s.ID = altID
 	return altID, nil
 }

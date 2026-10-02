@@ -13657,15 +13657,12 @@ func (e *Engine) applyProviderFilePathPolicies(
 			lookupPath = e.pathRewriter(path)
 		}
 		originalID := result.Session.ID
-		currentID, err := originalID, error(nil)
-		if e.cwdFilter.allows(sourceCwdForFilter(result.Session.Cwd, sourceCwdDecision{
+		admitted := e.cwdFilter.allows(sourceCwdForFilter(result.Session.Cwd, sourceCwdDecision{
 			resolution: res.sourceCwdResolution,
 			storedCwd:  res.sourceCwdStored,
 			storedOK:   res.sourceCwdStoredOK,
-		})) {
-			// A session the write step will filter out never takes part in ownership.
-			currentID, err = e.sourceCollisionID(ctx, provider, lookupPath, &result.Session)
-		}
+		}))
+		currentID, err := e.sourceCollisionID(ctx, provider, lookupPath, &result.Session, admitted)
 		if err != nil {
 			// Ownership is unknown, so skip the source this pass and retry it.
 			res.err = err
