@@ -1782,6 +1782,7 @@ func (e *Engine) applyChangedPathSyncLocked(
 		return SyncStats{}, 0, prepared.classificationErr
 	}
 	e.resetS3CodexIndexCache()
+	e.resetSourceClaims()
 	e.anomalies.reset()
 	// Begin a container pass so an already-trusted, unchanged container
 	// still gates its fan-out, but never promote from a changed-path subset.
@@ -7783,9 +7784,7 @@ func (e *Engine) syncAllLocked(
 	}
 	e.phaseStats.Reset()
 	e.resetS3CodexIndexCache()
-	e.sourceClaimsMu.Lock()
-	e.sourceClaims = nil
-	e.sourceClaimsMu.Unlock()
+	e.resetSourceClaims()
 	e.anomalies.reset()
 	// Fold the per-run anomaly accumulator into the returned stats on
 	// every exit path so the CLI sync summary can surface them.
@@ -13658,7 +13657,14 @@ func (e *Engine) applyProviderFilePathPolicies(
 			lookupPath = e.pathRewriter(path)
 		}
 		originalID := result.Session.ID
-		currentID := e.sourceCollisionID(ctx, provider, lookupPath, &result.Session)
+		currentID, err := e.sourceCollisionID(ctx, provider, lookupPath, &result.Session)
+		if err != nil {
+			// Ownership is unknown, so skip the source this pass and retry it.
+			res.err = err
+			res.noCacheSkip = true
+			res.results = kept[:0]
+			return
+		}
 		if currentID != originalID && res.retrySessionIDs[originalID] {
 			res.retrySessionIDs[currentID] = true
 		}
@@ -20483,6 +20489,7 @@ func (e *Engine) SyncSingleSessionContext(
 	}()
 	defer e.syncMu.Unlock()
 	e.resetS3CodexIndexCache()
+	e.resetSourceClaims()
 
 	host, _ := parser.StripHostPrefix(sessionID)
 	if host != "" && !isS3SourcePath(e.db.GetSessionFilePath(ctx, sessionID)) {

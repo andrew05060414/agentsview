@@ -117,30 +117,53 @@ func TestSyncKeepsBothCollidingFilesInOnePass(t *testing.T) {
 	assert.Equal(t, 4, base.MessageCount+alt.MessageCount)
 }
 
-// When the owner's file is gone but not yet marked missing, two new files
-// in one pass still keep both transcripts.
-func TestSyncKeepsBothFilesReplacingMissingOwner(t *testing.T) {
+// A stored session keeps its id and transcript after its file goes missing.
+// Other files with the same id, including a plain rename the provider can't
+// resolve, show under their own ids, before and after the row is marked
+// source-missing.
+func TestMissingOwnerKeepsSessionID(t *testing.T) {
+	for _, tombstoned := range []bool{false, true} {
+		t.Run(map[bool]string{false: "not yet marked", true: "marked missing"}[tombstoned], func(t *testing.T) {
+			env := setupTestEnv(t)
+			dir := filepath.Join("tmp", "collisionhash", "chats")
+			owner := env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T09-00-owner.json"),
+				geminiCollisionSession("shared-session", 5))
+			env.engine.SyncAll(t.Context(), nil)
+			require.NoError(t, os.Remove(owner))
+			if tombstoned {
+				require.NoError(t, env.engine.SyncPathsContext(t.Context(), []string{owner}))
+				require.NotNil(t, requireStoredSession(t, env.db, collisionBaseID).SourceMissingAt)
+			}
+			paths := []string{
+				env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-00-a.json"), geminiCollisionSession("shared-session", 1)),
+				env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-05-b.json"), geminiCollisionSession("shared-session", 3)),
+			}
+			env.engine.SyncAll(t.Context(), nil)
+
+			base := requireStoredSession(t, env.db, collisionBaseID)
+			assert.Equal(t, owner, *base.FilePath)
+			assertSessionMessageCount(t, env.db, collisionBaseID, 5)
+			assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, paths[0]), 1)
+			assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, paths[1]), 3)
+		})
+	}
+}
+
+// A stored file that now holds a different session still owns the id it was
+// stored under; another file with that id is not treated as its move.
+func TestReusedOwnerPathKeepsSessionID(t *testing.T) {
 	env := setupTestEnv(t)
 	dir := filepath.Join("tmp", "collisionhash", "chats")
 	owner := env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T09-00-owner.json"),
 		geminiCollisionSession("shared-session", 5))
 	env.engine.SyncAll(t.Context(), nil)
-	require.NoError(t, os.Remove(owner))
-	paths := []string{
-		env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-00-a.json"), geminiCollisionSession("shared-session", 1)),
-		env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-05-b.json"), geminiCollisionSession("shared-session", 3)),
-	}
-	env.engine.SyncAll(t.Context(), nil)
+	env.writeGeminiSession(t, filepath.Join(dir, filepath.Base(owner)), geminiCollisionSession("other-session", 2))
+	other := env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-00-new.json"),
+		geminiCollisionSession("shared-session", 1))
+	require.NoError(t, env.engine.SyncPathsContext(t.Context(), []string{other}))
 
-	base := requireStoredSession(t, env.db, collisionBaseID)
-	require.NotNil(t, base.FilePath)
-	require.Contains(t, paths, *base.FilePath)
-	altPath := paths[0]
-	if *base.FilePath == paths[0] {
-		altPath = paths[1]
-	}
-	alt := requireStoredSession(t, env.db, parser.AltSessionID(collisionBaseID, altPath))
-	assert.Equal(t, 4, base.MessageCount+alt.MessageCount)
+	assertSessionMessageCount(t, env.db, collisionBaseID, 5)
+	assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, other), 1)
 }
 
 // A rebuild keeps the previous owner on the base id even when it discovers

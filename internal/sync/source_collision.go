@@ -2,27 +2,30 @@ package sync
 
 import (
 	"context"
-	"log"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
-// sourceCollisionID returns the raw session id to store s under. When another
-// source file the provider still serves owns s.ID, the owner keeps it and
-// this file is stored under parser.AltSessionID as a continuation of it, so
-// neither file's transcript replaces the other's.
+// sourceCollisionID returns the raw session id to store s under. A stored
+// session keeps its id while its file is missing, as archived transcripts are
+// never replaced because their source went away. Any other file with the same
+// id is stored under parser.AltSessionID as a continuation of it, unless the
+// provider reports the stored file moved to this one.
 func (e *Engine) sourceCollisionID(
 	ctx context.Context,
 	provider parser.Provider,
 	lookupPath string,
 	s *parser.ParsedSession,
-) string {
+) (string, error) {
 	if !collisionPolicyApplies(provider, s.Agent) {
-		return s.ID
+		return s.ID, nil
 	}
 	fullID := applyIDPrefixToID(e.idPrefix, s.ID)
-	records := e.sessionPathRecords(ctx, fullID)
+	records, err := e.sessionPathRecords(ctx, fullID)
+	if err != nil {
+		return "", err
+	}
 	var stored, deleted string
 	var deletedAnyFile bool
 	for _, r := range records {
@@ -30,23 +33,20 @@ func (e *Engine) sourceCollisionID(
 		case r.ID != fullID:
 		case r.Excluded:
 			deleted, deletedAnyFile = r.FilePath, r.FilePath == ""
-		case !r.SourceMissing:
-			// A base owner whose source is missing no longer holds the id.
+		default:
 			stored = r.FilePath
 		}
 	}
-	// A permanently deleted id stays with the file it was deleted for, even
-	// after the provider moves that file; every other file gets its own id.
-	// A deletion recorded without its file covers every file with the id.
-	if stored == lookupPath || deletedAnyFile ||
+	// A permanently deleted id stays with the file it was deleted for; a
+	// deletion recorded without its file covers every file with the id.
+	if deletedAnyFile || e.storedSourceLivesAt(ctx, provider, stored, lookupPath) ||
 		e.storedSourceLivesAt(ctx, provider, deleted, lookupPath) {
-		return s.ID
+		return s.ID, nil
 	}
 	altID := e.existingAltID(ctx, provider, records, fullID, s.ID, lookupPath)
 	if altID == "" {
-		if deleted == "" && !e.ownerElsewhere(ctx, provider, stored, lookupPath) &&
-			e.claimSessionID(ctx, provider, fullID, lookupPath) {
-			return s.ID
+		if stored == "" && deleted == "" && e.claimSessionID(ctx, provider, fullID, lookupPath) {
+			return s.ID, nil
 		}
 		altID = parser.AltSessionID(s.ID, lookupPath)
 	}
@@ -55,7 +55,7 @@ func (e *Engine) sourceCollisionID(
 		s.RelationshipType = parser.RelContinuation
 	}
 	s.ID = altID
-	return altID
+	return altID, nil
 }
 
 // collisionPolicyApplies excludes providers that rank duplicate copies
@@ -81,10 +81,10 @@ func (e *Engine) collisionPolicyAgents() []string {
 // sessionPathRecords returns the stored and deleted records for fullID and
 // its derived ids. During a rebuild it adds the original archive's records
 // for ids the new archive has not written yet.
-func (e *Engine) sessionPathRecords(ctx context.Context, fullID string) []db.SessionPathRecord {
+func (e *Engine) sessionPathRecords(ctx context.Context, fullID string) ([]db.SessionPathRecord, error) {
 	records, err := e.db.ListSessionPathRecords(ctx, fullID)
 	if err != nil {
-		log.Printf("session path records for %s: %v", fullID, err)
+		return nil, err
 	}
 	if index := e.archiveStaleClaudeForks; index != nil {
 		seen := make(map[string]bool, len(records))
@@ -97,7 +97,7 @@ func (e *Engine) sessionPathRecords(ctx context.Context, fullID string) []db.Ses
 			}
 		}
 	}
-	return records
+	return records, nil
 }
 
 // existingAltID returns the derived id already held by this file, stored or
@@ -116,15 +116,15 @@ func (e *Engine) existingAltID(
 	return ""
 }
 
-// claimSessionID records path as the owner of an id for this pass. It fails
-// when another file earlier in the pass claimed the id and its provider
-// still serves that file.
+// claimSessionID records path as the owner of an id no stored session holds,
+// for this pass. It fails when another file claimed the id earlier in the pass.
 func (e *Engine) claimSessionID(
 	ctx context.Context, provider parser.Provider, fullID, path string,
 ) bool {
 	e.sourceClaimsMu.Lock()
 	defer e.sourceClaimsMu.Unlock()
-	if e.ownerElsewhere(ctx, provider, e.sourceClaims[fullID], path) {
+	if claimed := e.sourceClaims[fullID]; claimed != "" &&
+		!e.storedSourceLivesAt(ctx, provider, claimed, path) {
 		return false
 	}
 	if e.sourceClaims == nil {
@@ -134,20 +134,11 @@ func (e *Engine) claimSessionID(
 	return true
 }
 
-// ownerElsewhere reports whether the provider still serves the stored source
-// path as a file other than the one at path.
-func (e *Engine) ownerElsewhere(
-	ctx context.Context, provider parser.Provider, stored, path string,
-) bool {
-	if stored == "" || stored == path {
-		return false
-	}
-	if e.pathRewriter != nil {
-		// Rewritten remote paths are never proven gone.
-		return true
-	}
-	at, live := e.providerSourcePath(ctx, provider, stored)
-	return live && at != path
+// resetSourceClaims forgets the previous pass's claims; their rows are written.
+func (e *Engine) resetSourceClaims() {
+	e.sourceClaimsMu.Lock()
+	e.sourceClaims = nil
+	e.sourceClaimsMu.Unlock()
 }
 
 // storedSourceLivesAt reports whether a stored source path is the file at
@@ -163,7 +154,9 @@ func (e *Engine) storedSourceLivesAt(
 }
 
 // providerSourcePath asks the provider where it serves a stored source path
-// now. live is false only when the provider proves the source gone.
+// now. live is false only when the provider proves the source gone. The
+// session id is left out on purpose: a lookup by id can find another file
+// with the same id and report a move that did not happen.
 func (e *Engine) providerSourcePath(
 	ctx context.Context, provider parser.Provider, stored string,
 ) (path string, live bool) {

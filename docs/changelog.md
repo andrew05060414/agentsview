@@ -203,7 +203,9 @@ The latest published release is
   could silently cut it short. Now the file stored first keeps the session,
   and the other file shows as its own session linked under it. Full resyncs
   keep the same file on the original session, so names, stars, and pins stay
-  put. Deleting either session hides only that file's session. For Cursor, the
+  put. A session keeps its transcript after its file disappears, so a file
+  renamed outside the agent shows as a second linked session. Deleting either
+  session hides only that file's session. For Cursor, the
   linked session repeats the turns both files share, so search and usage
   totals count those turns twice. OpenClaw, QClaw, and Kiro keep choosing
   between their duplicate copies themselves.
