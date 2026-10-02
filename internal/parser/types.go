@@ -1325,7 +1325,7 @@ const altSessionMarker = "_alt-"
 // when another file already owns id.
 func AltSessionID(id, path string) string {
 	sum := sha256.Sum256([]byte(path))
-	return id + altSessionMarker + hex.EncodeToString(sum[:4])
+	return id + altSessionMarker + hex.EncodeToString(sum[:8])
 }
 
 // BaseSessionID strips an AltSessionID suffix, returning the id the agent
@@ -1333,7 +1333,7 @@ func AltSessionID(id, path string) string {
 // derived ids; their native ids never end in the suffix.
 func BaseSessionID(id string) string {
 	i := strings.LastIndex(id, altSessionMarker)
-	if i < 0 || len(id)-i != len(altSessionMarker)+8 {
+	if i < 0 || len(id)-i != len(altSessionMarker)+16 {
 		return id
 	}
 	if _, err := hex.DecodeString(id[i+len(altSessionMarker):]); err != nil {

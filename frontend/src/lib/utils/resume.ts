@@ -94,7 +94,7 @@ export function buildResumeCommand(
 
   let rawId = stripIdPrefix(stripHostPrefix(sessionId), agent);
   // Gemini CLI and Cursor store a second file sharing a session id as <id>_alt-<hash>; the CLI resumes <id>.
-  if (agent === "gemini" || agent === "cursor") rawId = rawId.replace(/_alt-[0-9a-f]{8}$/, "");
+  if (agent === "gemini" || agent === "cursor") rawId = rawId.replace(/_alt-[0-9a-f]{16}$/, "");
   let cmd = builder(rawId);
 
   if (flags?.model) {

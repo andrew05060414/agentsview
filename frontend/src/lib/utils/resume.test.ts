@@ -82,14 +82,14 @@ describe("buildResumeCommand", () => {
   });
 
   it("resumes the original id of a colliding file's session", () => {
-    expect(buildResumeCommand("gemini", "gemini:abc_alt-0a1b2c3d")).toBe("gemini --resume abc");
-    expect(buildResumeCommand("gemini", "host~gemini:abc_alt-0a1b2c3d")).toBe(
+    expect(buildResumeCommand("gemini", "gemini:abc_alt-0a1b2c3d4e5f6a7b")).toBe("gemini --resume abc");
+    expect(buildResumeCommand("gemini", "host~gemini:abc_alt-0a1b2c3d4e5f6a7b")).toBe(
       "gemini --resume abc",
     );
     expect(buildResumeCommand("gemini", "gemini:abc_alt-notahash")).toBe(
       "gemini --resume abc_alt-notahash",
     );
-    expect(buildResumeCommand("amp", "amp:abc_alt-0a1b2c3d")).toBe("amp --resume abc_alt-0a1b2c3d");
+    expect(buildResumeCommand("amp", "amp:abc_alt-0a1b2c3d4e5f6a7b")).toBe("amp --resume abc_alt-0a1b2c3d4e5f6a7b");
   });
 
   it("pins Claude and Codex models with shell quoting", () => {
