@@ -61,6 +61,8 @@ var resumeAgents = map[string]string{
 const syntheticModel = "<synthetic>"
 
 func resumeCommand(agent, tmpl, rawID, model string) string {
+	// A second file sharing a session id is stored under a derived id; the CLI resumes the original.
+	rawID = parser.BaseSessionID(rawID)
 	cmd := fmt.Sprintf(tmpl, shellQuote(rawID))
 	if !resumeAgentNeedsModel(agent) {
 		return cmd

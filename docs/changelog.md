@@ -196,6 +196,17 @@ The latest published release is
   `history.jsonl` to say which sessions are active. AgentsView now also checks
   the files of Codex sessions active in the last 24 hours. A session you resume
   after more than 24 hours idle still waits until Codex closes its file.
+- When two session files record the same session ID, AgentsView keeps both.
+  This happens with two Gemini CLI chat files that share a session ID and with
+  a Cursor transcript that also appears under `projects/empty-window`. The file
+  synced last used to replace the stored session, so a sync or full resync
+  could silently cut it short. Now the file stored first keeps the session,
+  and the other file shows as its own session linked under it. Full resyncs
+  keep the same file on the original session, so names, stars, and pins stay
+  put. Deleting either session hides only that file's session. For Cursor, the
+  linked session repeats the turns both files share, so search and usage
+  totals count those turns twice. OpenClaw, QClaw, and Kiro keep choosing
+  between their duplicate copies themselves.
 
 ## 0.44.0
 

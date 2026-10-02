@@ -3946,6 +3946,28 @@ func (db *DB) ListSessionIDsByFilePath(ctx context.Context, path, agent string) 
 	return ids, nil
 }
 
+// ListAltSessionIDs returns every stored id that may be a parser.AltSessionID,
+// in any state. A rebuild loads it once from the original archive so files that
+// were stored under a derived id keep it.
+func (db *DB) ListAltSessionIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := db.getReader().Query(ctx,
+		"SELECT id FROM sessions WHERE instr(id, '_alt-') > 0",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing alt session ids: %w", err)
+	}
+	defer rows.Close()
+	ids := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scanning alt session id: %w", err)
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
+}
+
 // ListStaleForkSessionOwnerships returns every active fork row written by an
 // older parser data version for one agent, with its stored machine and source
 // path. A rebuild loads this once from the write-barriered original archive so

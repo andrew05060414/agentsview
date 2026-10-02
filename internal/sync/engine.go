@@ -553,7 +553,11 @@ type Engine struct {
 	// fork rows for one rebuild; nil outside a rebuild, where e.db is queried
 	// per source path instead.
 	archiveStaleClaudeForks *archiveStaleClaudeForkIndex
-	deferredSourceCwd       *sourceCwdReconciliationBatch
+	// sourceClaims maps a full session id to the file that took it before
+	// its row is written, so a second file in the same pass derives its own.
+	sourceClaimsMu    gosync.Mutex
+	sourceClaims      map[string]string
+	deferredSourceCwd *sourceCwdReconciliationBatch
 	// sourceSet holds the provider set and session roots this engine
 	// discovers from. ReconfigureSources replaces it as one snapshot.
 	sourceSet atomic.Pointer[engineSources]
@@ -7779,6 +7783,9 @@ func (e *Engine) syncAllLocked(
 	}
 	e.phaseStats.Reset()
 	e.resetS3CodexIndexCache()
+	e.sourceClaimsMu.Lock()
+	e.sourceClaims = nil
+	e.sourceClaimsMu.Unlock()
 	e.anomalies.reset()
 	// Fold the per-run anomaly accumulator into the returned stats on
 	// every exit path so the CLI sync summary can surface them.
@@ -13339,6 +13346,9 @@ func (e *Engine) claudeSourceMissingSessionOwnershipsForCompleteResult(
 // takes no writes while a rebuild reads it, so the snapshot stays exact.
 type archiveStaleClaudeForkIndex struct {
 	byPath map[string][]db.SessionSourceOwnership
+	// altIDs holds the archive's derived session ids so a rebuild keeps
+	// each colliding file on the id it had (see sourceCollisionID).
+	altIDs map[string]bool
 }
 
 func loadArchiveStaleClaudeForkIndex(ctx context.Context,
@@ -13350,8 +13360,13 @@ func loadArchiveStaleClaudeForkIndex(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	altIDs, err := archive.ListAltSessionIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
 	index := &archiveStaleClaudeForkIndex{
 		byPath: make(map[string][]db.SessionSourceOwnership),
+		altIDs: altIDs,
 	}
 	for _, ownership := range ownerships {
 		index.byPath[ownership.FilePath] = append(
@@ -13637,8 +13652,8 @@ func (e *Engine) applyProviderFilePathPolicies(
 		if e.pathRewriter != nil {
 			lookupPath = e.pathRewriter(path)
 		}
-		currentID := result.Session.ID
-		currentPrefixedID := e.idPrefix + result.Session.ID
+		currentID := e.sourceCollisionID(ctx, provider, lookupPath, &result.Session)
+		currentPrefixedID := e.idPrefix + currentID
 
 		agentsToQuery := []string{string(agent)}
 		var existingIDs []string

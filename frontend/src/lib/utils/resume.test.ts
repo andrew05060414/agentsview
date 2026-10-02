@@ -81,6 +81,16 @@ describe("buildResumeCommand", () => {
     );
   });
 
+  it("resumes the original id of a colliding file's session", () => {
+    expect(buildResumeCommand("gemini", "gemini:abc_alt-0a1b2c3d")).toBe("gemini --resume abc");
+    expect(buildResumeCommand("gemini", "host~gemini:abc_alt-0a1b2c3d")).toBe(
+      "gemini --resume abc",
+    );
+    expect(buildResumeCommand("gemini", "gemini:abc_alt-notahash")).toBe(
+      "gemini --resume abc_alt-notahash",
+    );
+  });
+
   it("pins Claude and Codex models with shell quoting", () => {
     expect(buildResumeCommand("claude", "run-1", { model: "claude sonnet" })).toBe(
       "claude --resume run-1 --model 'claude sonnet'",

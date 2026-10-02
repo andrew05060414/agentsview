@@ -92,7 +92,8 @@ export function buildResumeCommand(
   const builder = RESUME_AGENTS[agent];
   if (!builder) return null;
 
-  const rawId = stripIdPrefix(stripHostPrefix(sessionId), agent);
+  // A second file sharing a session id is stored as <id>_alt-<hash>; the CLI resumes <id>.
+  const rawId = stripIdPrefix(stripHostPrefix(sessionId), agent).replace(/_alt-[0-9a-f]{8}$/, "");
   let cmd = builder(rawId);
 
   if (flags?.model) {
