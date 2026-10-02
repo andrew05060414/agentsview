@@ -3952,9 +3952,10 @@ type SessionPathRecord struct {
 	ID            string
 	FilePath      string
 	SourceMissing bool
+	Excluded      bool
 }
 
-const sessionPathRecordQuery = "SELECT id, COALESCE(file_path, ''), source_missing_at IS NOT NULL FROM sessions WHERE "
+const sessionPathRecordQuery = "SELECT id, COALESCE(file_path, ''), source_missing_at IS NOT NULL, 0 FROM sessions WHERE "
 
 // ListSessionPathRecords returns the records for baseID and every id
 // parser.AltSessionID derives from it, stored rows first, then deletions.
@@ -3963,7 +3964,7 @@ func (db *DB) ListSessionPathRecords(ctx context.Context, baseID string) ([]Sess
 	low, high := baseID+"_alt-", baseID+"_alt."
 	return db.querySessionPathRecords(ctx,
 		sessionPathRecordQuery+match+
-			" UNION ALL SELECT id, COALESCE(file_path, ''), 0 FROM excluded_sessions WHERE "+match,
+			" UNION ALL SELECT id, COALESCE(file_path, ''), 0, 1 FROM excluded_sessions WHERE "+match,
 		baseID, low, high, baseID, low, high,
 	)
 }
@@ -3992,7 +3993,7 @@ func (db *DB) querySessionPathRecords(ctx context.Context, query string, args ..
 	var records []SessionPathRecord
 	for rows.Next() {
 		var r SessionPathRecord
-		if err := rows.Scan(&r.ID, &r.FilePath, &r.SourceMissing); err != nil {
+		if err := rows.Scan(&r.ID, &r.FilePath, &r.SourceMissing, &r.Excluded); err != nil {
 			return nil, fmt.Errorf("scanning session path record: %w", err)
 		}
 		records = append(records, r)

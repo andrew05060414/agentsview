@@ -376,3 +376,28 @@ func TestResyncFollowsMoveOfMissingDerivedSession(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, ids, altID)
 }
+
+// A file that reuses a permanently deleted session's id shows up under its
+// own id once the deleted session's file is gone; the deleted one stays hidden.
+func TestNewFileReusingDeletedSessionIDStaysVisible(t *testing.T) {
+	env := setupTestEnv(t)
+	dir := filepath.Join("tmp", "collisionhash", "chats")
+	owner := env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T09-00-owner.json"),
+		geminiCollisionSession("shared-session", 5))
+	env.engine.SyncAll(t.Context(), nil)
+	require.NoError(t, env.db.DeleteSession(t.Context(), collisionBaseID))
+	require.NoError(t, os.Remove(owner))
+	newcomer := env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-00-new.json"),
+		geminiCollisionSession("shared-session", 1))
+
+	for _, sync := range []func(){
+		func() { env.engine.SyncAll(t.Context(), nil) },
+		func() { env.engine.ResyncAll(t.Context(), nil) },
+	} {
+		sync()
+		assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, newcomer), 1)
+		base, err := env.db.GetSessionFull(t.Context(), collisionBaseID)
+		require.NoError(t, err)
+		assert.Nil(t, base)
+	}
+}

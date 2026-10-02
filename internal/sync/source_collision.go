@@ -23,19 +23,25 @@ func (e *Engine) sourceCollisionID(
 	}
 	fullID := applyIDPrefixToID(e.idPrefix, s.ID)
 	records := e.sessionPathRecords(ctx, fullID)
-	stored := ""
+	var stored, deleted string
 	for _, r := range records {
-		// A base owner whose source is missing no longer holds the id.
-		if r.ID == fullID && !r.SourceMissing {
+		switch {
+		case r.ID != fullID:
+		case r.Excluded:
+			deleted = r.FilePath
+		case !r.SourceMissing:
+			// A base owner whose source is missing no longer holds the id.
 			stored = r.FilePath
 		}
 	}
-	if stored == lookupPath {
+	// A permanently deleted id stays with the file it was deleted for, even
+	// after the provider moves that file; every other file gets its own id.
+	if stored == lookupPath || e.storedSourceLivesAt(ctx, provider, deleted, lookupPath) {
 		return s.ID
 	}
 	altID := e.existingAltID(ctx, provider, records, fullID, s.ID, lookupPath)
 	if altID == "" {
-		if !e.ownerElsewhere(ctx, provider, stored, lookupPath) &&
+		if deleted == "" && !e.ownerElsewhere(ctx, provider, stored, lookupPath) &&
 			e.claimSessionID(ctx, provider, fullID, lookupPath) {
 			return s.ID
 		}
