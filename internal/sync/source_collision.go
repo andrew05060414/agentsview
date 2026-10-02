@@ -27,13 +27,16 @@ func (e *Engine) sourceCollisionID(
 	}
 	fullID := applyIDPrefixToID(e.idPrefix, s.ID)
 	stored := e.db.GetSessionFilePathNotSourceMissing(ctx, fullID)
+	if index := e.archiveStaleClaudeForks; stored == "" && index != nil {
+		stored = index.altPaths[fullID]
+	}
 	if stored == lookupPath {
 		return s.ID
 	}
 	altID := parser.AltSessionID(s.ID, lookupPath)
 	if !e.altSessionKnown(ctx, applyIDPrefixToID(e.idPrefix, altID)) &&
 		!e.sourceFileElsewhere(stored, lookupPath) &&
-		(stored != "" || e.claimSessionID(fullID, lookupPath)) {
+		e.claimSessionID(fullID, lookupPath) {
 		return s.ID
 	}
 	if s.ParentSessionID == "" {
@@ -48,16 +51,18 @@ func (e *Engine) sourceCollisionID(
 // derived id, or the user deleted that session. Either way it keeps the id,
 // so a base owner that is later deleted or goes missing is never overwritten.
 func (e *Engine) altSessionKnown(ctx context.Context, fullAltID string) bool {
-	if index := e.archiveStaleClaudeForks; index != nil && index.altIDs[fullAltID] {
-		return true
+	if index := e.archiveStaleClaudeForks; index != nil {
+		if _, ok := index.altPaths[fullAltID]; ok {
+			return true
+		}
 	}
 	return e.db.GetSessionFilePath(ctx, fullAltID) != "" ||
 		e.db.IsSessionExcluded(ctx, fullAltID)
 }
 
-// claimSessionID records path as the owner of an id no stored row holds yet.
-// It fails when another file earlier in this pass claimed the id and is
-// still on disk.
+// claimSessionID records path as the owner of an id that no other existing
+// file owns in storage. It fails when another file earlier in this pass
+// claimed the id and is still on disk.
 func (e *Engine) claimSessionID(fullID, path string) bool {
 	e.sourceClaimsMu.Lock()
 	defer e.sourceClaimsMu.Unlock()

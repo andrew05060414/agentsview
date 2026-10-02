@@ -3946,26 +3946,29 @@ func (db *DB) ListSessionIDsByFilePath(ctx context.Context, path, agent string) 
 	return ids, nil
 }
 
-// ListAltSessionIDs returns every stored id that may be a parser.AltSessionID,
-// in any state. A rebuild loads it once from the original archive so files that
-// were stored under a derived id keep it.
-func (db *DB) ListAltSessionIDs(ctx context.Context) (map[string]bool, error) {
+// ListAltSessionPaths maps every stored id that may be a parser.AltSessionID,
+// and the base id it derives from, to its stored file path, in any state. A
+// rebuild loads it once from the original archive so each file sharing a
+// session id keeps the id it had.
+func (db *DB) ListAltSessionPaths(ctx context.Context) (map[string]string, error) {
+	const alt = `id LIKE '%\_alt-________' ESCAPE '\'`
 	rows, err := db.getReader().Query(ctx,
-		"SELECT id FROM sessions WHERE instr(id, '_alt-') > 0",
+		"SELECT id, COALESCE(file_path, '') FROM sessions WHERE "+alt+
+			" OR id IN (SELECT substr(id, 1, length(id) - 13) FROM sessions WHERE "+alt+")",
 	)
 	if err != nil {
-		return nil, fmt.Errorf("listing alt session ids: %w", err)
+		return nil, fmt.Errorf("listing alt session paths: %w", err)
 	}
 	defer rows.Close()
-	ids := make(map[string]bool)
+	paths := make(map[string]string)
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scanning alt session id: %w", err)
+		var id, path string
+		if err := rows.Scan(&id, &path); err != nil {
+			return nil, fmt.Errorf("scanning alt session path: %w", err)
 		}
-		ids[id] = true
+		paths[id] = path
 	}
-	return ids, rows.Err()
+	return paths, rows.Err()
 }
 
 // ListStaleForkSessionOwnerships returns every active fork row written by an

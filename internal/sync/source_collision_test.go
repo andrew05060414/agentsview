@@ -116,6 +116,32 @@ func TestSyncKeepsBothCollidingFilesInOnePass(t *testing.T) {
 	assert.Equal(t, 4, base.MessageCount+alt.MessageCount)
 }
 
+// When the owner's file is gone but not yet marked missing, two new files
+// in one pass still keep both transcripts.
+func TestSyncKeepsBothFilesReplacingMissingOwner(t *testing.T) {
+	env := setupTestEnv(t)
+	dir := filepath.Join("tmp", "collisionhash", "chats")
+	owner := env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T09-00-owner.json"),
+		geminiCollisionSession("shared-session", 5))
+	env.engine.SyncAll(t.Context(), nil)
+	require.NoError(t, os.Remove(owner))
+	paths := []string{
+		env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-00-a.json"), geminiCollisionSession("shared-session", 1)),
+		env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-05-b.json"), geminiCollisionSession("shared-session", 3)),
+	}
+	env.engine.SyncAll(t.Context(), nil)
+
+	base := requireStoredSession(t, env.db, collisionBaseID)
+	require.NotNil(t, base.FilePath)
+	require.Contains(t, paths, *base.FilePath)
+	altPath := paths[0]
+	if *base.FilePath == paths[0] {
+		altPath = paths[1]
+	}
+	alt := requireStoredSession(t, env.db, parser.AltSessionID(collisionBaseID, altPath))
+	assert.Equal(t, 4, base.MessageCount+alt.MessageCount)
+}
+
 // A rebuild keeps the previous owner on the base id even when it discovers
 // the other file first, so curation on the base stays with its transcript.
 func TestResyncKeepsCollisionOwner(t *testing.T) {
@@ -123,11 +149,15 @@ func TestResyncKeepsCollisionOwner(t *testing.T) {
 	starred, err := env.db.StarSession(t.Context(), collisionBaseID)
 	require.NoError(t, err)
 	require.True(t, starred)
+	// A third file the rebuild sees first must not take the base id either.
+	third := env.writeGeminiSession(t, filepath.Join("tmp", "collisionhash", "chats", "session-2026-01-01T09-00-third.json"),
+		geminiCollisionSession("shared-session", 3))
 
 	stats := env.engine.ResyncAll(t.Context(), nil)
 	require.False(t, stats.Aborted, "ResyncAll aborted: %v", stats.Warnings)
 
 	assertCollisionPair(t, env.db, first, 1, second, 5)
+	assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, third), 3)
 	ids, err := env.db.ListStarredSessionIDs(t.Context())
 	require.NoError(t, err)
 	assert.Contains(t, ids, collisionBaseID)
