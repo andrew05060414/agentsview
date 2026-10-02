@@ -3262,7 +3262,7 @@ func (e *Engine) resyncBuildLocked(
 	// its stale Claude fork rows serves every parsed file. Querying the archive
 	// per file would open cold reader connections while workers are busy,
 	// which SQLite's busy handler turns into sleeps on every open.
-	archiveStaleForks, err := loadArchiveStaleClaudeForkIndex(ctx, origDB)
+	archiveStaleForks, err := loadArchiveStaleClaudeForkIndex(ctx, origDB, e.collisionPolicyAgents())
 	if err != nil {
 		log.Printf("resync: snapshot stale claude forks: %v", err)
 		newDB.Close()
@@ -13346,14 +13346,14 @@ func (e *Engine) claudeSourceMissingSessionOwnershipsForCompleteResult(
 // takes no writes while a rebuild reads it, so the snapshot stays exact.
 type archiveStaleClaudeForkIndex struct {
 	byPath map[string][]db.SessionSourceOwnership
-	// altPaths maps the archive's derived session ids and their base ids to
-	// stored paths so a rebuild keeps each file on the id it had (see
-	// sourceCollisionID).
-	altPaths map[string]string
+	// sessionPaths maps the archive's session ids for the agents
+	// sourceCollisionID covers to their stored paths, so a rebuild keeps each
+	// file on the id it had.
+	sessionPaths map[string]string
 }
 
 func loadArchiveStaleClaudeForkIndex(ctx context.Context,
-	archive *db.DB,
+	archive *db.DB, collisionAgents []string,
 ) (*archiveStaleClaudeForkIndex, error) {
 	ownerships, err := archive.ListStaleForkSessionOwnerships(ctx,
 		string(parser.AgentClaude),
@@ -13361,13 +13361,13 @@ func loadArchiveStaleClaudeForkIndex(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	altPaths, err := archive.ListAltSessionPaths(ctx)
+	sessionPaths, err := archive.ListSessionPathsForAgents(ctx, collisionAgents)
 	if err != nil {
 		return nil, err
 	}
 	index := &archiveStaleClaudeForkIndex{
-		byPath:   make(map[string][]db.SessionSourceOwnership),
-		altPaths: altPaths,
+		byPath:       make(map[string][]db.SessionSourceOwnership),
+		sessionPaths: sessionPaths,
 	}
 	for _, ownership := range ownerships {
 		index.byPath[ownership.FilePath] = append(

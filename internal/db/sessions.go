@@ -3946,29 +3946,46 @@ func (db *DB) ListSessionIDsByFilePath(ctx context.Context, path, agent string) 
 	return ids, nil
 }
 
-// ListAltSessionPaths maps every stored id that may be a parser.AltSessionID,
-// and the base id it derives from, to its stored file path, in any state. A
-// rebuild loads it once from the original archive so each file sharing a
-// session id keeps the id it had.
-func (db *DB) ListAltSessionPaths(ctx context.Context) (map[string]string, error) {
-	const alt = `id LIKE '%\_alt-________' ESCAPE '\'`
+// ListSessionPathsForAgents maps every stored session id of the given agents
+// to its file path, or to "" when its source is missing. A rebuild loads it
+// once from the original archive so each file sharing a session id keeps the
+// id it had.
+func (db *DB) ListSessionPathsForAgents(ctx context.Context, agents []string) (map[string]string, error) {
+	paths := make(map[string]string)
+	if len(agents) == 0 {
+		return paths, nil
+	}
+	args := make([]any, len(agents))
+	for i, agent := range agents {
+		args[i] = agent
+	}
 	rows, err := db.getReader().Query(ctx,
-		"SELECT id, COALESCE(file_path, '') FROM sessions WHERE "+alt+
-			" OR id IN (SELECT substr(id, 1, length(id) - 13) FROM sessions WHERE "+alt+")",
+		"SELECT id, CASE WHEN source_missing_at IS NULL THEN COALESCE(file_path, '') ELSE '' END"+
+			" FROM sessions WHERE agent IN (?"+strings.Repeat(",?", len(agents)-1)+")",
+		args...,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("listing alt session paths: %w", err)
+		return nil, fmt.Errorf("listing session paths: %w", err)
 	}
 	defer rows.Close()
-	paths := make(map[string]string)
 	for rows.Next() {
 		var id, path string
 		if err := rows.Scan(&id, &path); err != nil {
-			return nil, fmt.Errorf("scanning alt session path: %w", err)
+			return nil, fmt.Errorf("scanning session path: %w", err)
 		}
 		paths[id] = path
 	}
 	return paths, rows.Err()
+}
+
+// ExcludedSessionFilePath returns the source file a permanently deleted
+// session came from, or "" when it is not excluded or predates that record.
+func (db *DB) ExcludedSessionFilePath(ctx context.Context, id string) string {
+	var fp sql.NullString
+	_ = db.getReader().QueryRow(ctx,
+		"SELECT file_path FROM excluded_sessions WHERE id = ?", id,
+	).Scan(&fp)
+	return fp.String
 }
 
 // ListStaleForkSessionOwnerships returns every active fork row written by an
@@ -5384,6 +5401,10 @@ func (db *DB) DeleteSession(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	filePath, err := sessionFilePathTx(ctx, tx, id)
+	if err != nil {
+		return err
+	}
 	if err := deleteSessionMessagesTx(tx, id); err != nil {
 		return fmt.Errorf(
 			"pre-deleting session %s messages: %w",
@@ -5399,11 +5420,11 @@ func (db *DB) DeleteSession(ctx context.Context, id string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		if err := excludeSessionIDTx(ctx, tx, id); err != nil {
+		if err := excludeSessionIDTx(ctx, tx, id, filePath); err != nil {
 			return fmt.Errorf("excluding session %s: %w", id, err)
 		}
 		for _, aliasID := range aliasIDs {
-			if err := excludeSessionIDTx(ctx, tx, aliasID); err != nil {
+			if err := excludeSessionIDTx(ctx, tx, aliasID, sql.NullString{}); err != nil {
 				return fmt.Errorf(
 					"excluding session alias %s: %w", aliasID, err,
 				)
@@ -5413,12 +5434,21 @@ func (db *DB) DeleteSession(ctx context.Context, id string) error {
 	return tx.Commit()
 }
 
-func excludeSessionIDTx(ctx context.Context, tx *sql.Tx, id string) error {
+func excludeSessionIDTx(ctx context.Context, tx *sql.Tx, id string, filePath sql.NullString) error {
 	_, err := tx.ExecContext(ctx,
-		"INSERT OR IGNORE INTO excluded_sessions (id) VALUES (?)",
-		id,
+		"INSERT OR IGNORE INTO excluded_sessions (id, file_path) VALUES (?, ?)",
+		id, filePath,
 	)
 	return err
+}
+
+func sessionFilePathTx(ctx context.Context, tx *sql.Tx, id string) (sql.NullString, error) {
+	var filePath sql.NullString
+	err := tx.QueryRowContext(ctx, "SELECT file_path FROM sessions WHERE id = ?", id).Scan(&filePath)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return filePath, fmt.Errorf("reading file path of session %s: %w", id, err)
+	}
+	return filePath, nil
 }
 
 func sessionAliasIDsTx(ctx context.Context, tx *sql.Tx, where string, args ...any) ([]string, error) {
@@ -5526,6 +5556,10 @@ func (db *DB) DeleteSessionIfTrashed(ctx context.Context, id string) (int64, err
 	if err != nil {
 		return 0, err
 	}
+	filePath, err := sessionFilePathTx(ctx, tx, id)
+	if err != nil {
+		return 0, err
+	}
 	if err := deleteSessionMessagesTx(tx, id); err != nil {
 		return 0, fmt.Errorf(
 			"pre-deleting trashed session %s messages: %w",
@@ -5543,11 +5577,11 @@ func (db *DB) DeleteSessionIfTrashed(ctx context.Context, id string) (int64, err
 	n, _ := res.RowsAffected()
 
 	// Record in exclusion list so sync doesn't re-import.
-	if err := excludeSessionIDTx(ctx, tx, id); err != nil {
+	if err := excludeSessionIDTx(ctx, tx, id, filePath); err != nil {
 		return 0, fmt.Errorf("excluding session %s: %w", id, err)
 	}
 	for _, aliasID := range aliasIDs {
-		if err := excludeSessionIDTx(ctx, tx, aliasID); err != nil {
+		if err := excludeSessionIDTx(ctx, tx, aliasID, sql.NullString{}); err != nil {
 			return 0, fmt.Errorf(
 				"excluding session alias %s: %w", aliasID, err,
 			)
@@ -6093,14 +6127,14 @@ func (db *DB) EmptyTrash(ctx context.Context) (int, error) {
 
 	// Record all trashed session IDs before deleting.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT OR IGNORE INTO excluded_sessions (id)
-		 SELECT id FROM sessions
+		`INSERT OR IGNORE INTO excluded_sessions (id, file_path)
+		 SELECT id, file_path FROM sessions
 		 WHERE deleted_at IS NOT NULL`,
 	); err != nil {
 		return 0, fmt.Errorf("excluding trashed sessions: %w", err)
 	}
 	for _, aliasID := range aliasIDs {
-		if err := excludeSessionIDTx(ctx, tx, aliasID); err != nil {
+		if err := excludeSessionIDTx(ctx, tx, aliasID, sql.NullString{}); err != nil {
 			return 0, fmt.Errorf(
 				"excluding trashed session alias %s: %w", aliasID, err,
 			)
@@ -6170,14 +6204,14 @@ func (db *DB) DeleteSessions(ctx context.Context, ids []string) (int, error) {
 
 		// Exclude only IDs that exist before we delete them.
 		if _, err := tx.ExecContext(ctx,
-			"INSERT OR IGNORE INTO excluded_sessions (id) "+
-				"SELECT id FROM sessions WHERE id IN ("+placeholders+")",
+			"INSERT OR IGNORE INTO excluded_sessions (id, file_path) "+
+				"SELECT id, file_path FROM sessions WHERE id IN ("+placeholders+")",
 			args...,
 		); err != nil {
 			return 0, fmt.Errorf("excluding batch: %w", err)
 		}
 		for _, aliasID := range aliasIDs {
-			if err := excludeSessionIDTx(ctx, tx, aliasID); err != nil {
+			if err := excludeSessionIDTx(ctx, tx, aliasID, sql.NullString{}); err != nil {
 				return 0, fmt.Errorf(
 					"excluding batch session alias %s: %w", aliasID, err,
 				)

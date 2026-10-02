@@ -163,6 +163,48 @@ func TestResyncKeepsCollisionOwner(t *testing.T) {
 	assert.Contains(t, ids, collisionBaseID)
 }
 
+// A collision first seen during a rebuild keeps the stored file on the base
+// id, with its curation, even when the rebuild discovers the new file first.
+func TestResyncMeetingNewFileKeepsStoredOwner(t *testing.T) {
+	for _, deleted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stored", true: "deleted"}[deleted], func(t *testing.T) {
+			env := setupTestEnv(t)
+			dir := filepath.Join("tmp", "collisionhash", "chats")
+			owner := env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T10-05-owner.json"),
+				geminiCollisionSession("shared-session", 5))
+			env.engine.SyncAll(t.Context(), nil)
+			if deleted {
+				require.NoError(t, env.db.DeleteSession(t.Context(), collisionBaseID))
+			} else {
+				starred, err := env.db.StarSession(t.Context(), collisionBaseID)
+				require.NoError(t, err)
+				require.True(t, starred)
+			}
+			newcomer := env.writeGeminiSession(t, filepath.Join(dir, "session-2026-01-01T09-00-new.json"),
+				geminiCollisionSession("shared-session", 1))
+
+			stats := env.engine.ResyncAll(t.Context(), nil)
+			require.False(t, stats.Aborted, "ResyncAll aborted: %v", stats.Warnings)
+
+			assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, newcomer), 1)
+			base, err := env.db.GetSessionFull(t.Context(), collisionBaseID)
+			require.NoError(t, err)
+			alt, err := env.db.GetSessionFull(t.Context(), parser.AltSessionID(collisionBaseID, owner))
+			require.NoError(t, err)
+			assert.Nil(t, alt, "the stored file never moves to a derived id")
+			if deleted {
+				assert.Nil(t, base, "the deleted transcript stays deleted")
+				return
+			}
+			require.NotNil(t, base)
+			assert.Equal(t, owner, *base.FilePath)
+			ids, err := env.db.ListStarredSessionIDs(t.Context())
+			require.NoError(t, err)
+			assert.Contains(t, ids, collisionBaseID)
+		})
+	}
+}
+
 // Each file's row follows its own file: deleting one marks only that row
 // source-missing, and the survivor keeps its id.
 func TestCollidingFileDeletionMarksOnlyItsRow(t *testing.T) {
