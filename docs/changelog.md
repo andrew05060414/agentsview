@@ -11,6 +11,9 @@ The latest published release is
 
 **New features**
 
+- The web UI reports an anonymous `app_opened` event through the server when it
+  loads and on the first focus of each later UTC day.
+  `AGENTSVIEW_TELEMETRY_ENABLED=0` turns it off with the daemon ping.
 - Sessions show the title their agent keeps for them, and a name you chose with
   `/rename` or the agent's equivalent wins over a generated title. Current
   Claude Code `/rename` names now appear, and Qwen Code, Gemini CLI, Kimi CLI,
@@ -86,8 +89,22 @@ The latest published release is
   archived messages. Antigravity sources re-parse once on upgrade to pick the
   transcripts up.
 
+- StepCode sessions are collected. StepCode ships the same session format as
+  Pi but keeps its own directory, so its transcripts were previously invisible
+  even though the format was already supported. Sessions from
+  `~/.stepcode/agent/sessions` now appear alongside Pi's, under their own agent
+  name. `STEPCODE_DIR`, `STEP_CODING_AGENT_DIR`, and
+  `STEP_CODING_AGENT_SESSION_DIR` point discovery elsewhere when you keep
+  sessions somewhere else. Subagent and workflow runs StepCode spawns are
+  tagged as subagents, so they stay out of the session list the way they stay
+  out of StepCode's own resume picker.
+
 **Improvements**
 
+- The Usage page shows a **Total Input** card that adds uncached input, cache
+  writes, and cache reads, so heavy prompt caching no longer looks like missing
+  input. The input count that leaves out cached tokens is now labeled
+  **Uncached Input** on the Usage and Activity pages.
 - On Windows, each watched folder reserves 16 KiB for change notifications
   instead of 64 KiB. At the 8192-folder budget, that reduces buffer capacity
   from 512 MiB to 128 MiB.
@@ -168,6 +185,11 @@ The latest published release is
 
 **Bug fixes**
 
+- Price Codex auto-review turns, recorded as `codex-auto-review`, at GPT-5.6
+  Luna catalog rates instead of $0. Usage reports still list
+  `codex-auto-review` as the reported model, and a custom pricing row for it
+  still wins. Existing SQLite usage caches rebuild and the next ClickHouse push
+  reprices the mirror. (#2078)
 - Sync continues importing local sessions and reachable remotes when another
   remote's hostname cannot resolve, such as while disconnected from a private
   network. This also applies during archive upgrades and full rebuilds, which
@@ -176,6 +198,14 @@ The latest published release is
   missing when an earlier export was archived. The archived message keeps its
   place and any pin. Re-importing a conversation you trashed now skips it
   instead of reporting an error.
+- Cursor IDE chats stop re-syncing in a loop while Cursor is closed. Opening
+  Cursor's `state.vscdb` to read it makes SQLite create an empty `-wal` file
+  and delete it again on close, and AgentsView counted that file's appearance
+  and timestamp as a change, so each pass re-read every Cursor chat and
+  scheduled the next pass. On a large Cursor history this kept one or more CPU
+  cores busy indefinitely. An empty write-ahead log no longer counts as a
+  change for Cursor IDE or for other agents whose sessions live in SQLite
+  databases; real writes still sync as before.
 - Antigravity IDE and Antigravity CLI sessions stop re-syncing in a loop.
   Reading a session database rewrote its shared-memory (`-shm`) file, and
   AgentsView counted that as a change, so every pass re-read and re-uploaded
@@ -196,19 +226,24 @@ The latest published release is
   `history.jsonl` to say which sessions are active. AgentsView now also checks
   the files of Codex sessions active in the last 24 hours. A session you resume
   after more than 24 hours idle still waits until Codex closes its file.
-- When two session files record the same session ID, AgentsView keeps both.
-  This happens with two Gemini CLI chat files that share a session ID and with
-  a Cursor transcript that also appears under `projects/empty-window`. The file
-  synced last used to replace the stored session, so a sync or full resync
-  could silently cut it short. Now the file stored first keeps the session,
-  and the other file shows as its own session linked under it. Full resyncs
-  keep the same file on the original session, so names, stars, and pins stay
-  put. A session keeps its transcript after its file disappears, so a file
-  renamed outside the agent shows as a second linked session. Deleting either
-  session hides only that file's session. For Cursor, the
-  linked session repeats the turns both files share, so search and usage
-  totals count those turns twice. Only Gemini CLI and Cursor sessions work this
-  way; other agents sync as before.
+- Keep both transcripts when two Gemini CLI or Cursor files record the same
+  session ID. The stored file keeps its ID; the other becomes a linked session.
+  Moving the data folder or renaming a file keeps one session when the old file
+  is gone and the new transcript has at least as many messages. A shorter file
+  stays separate so it cannot shorten the archive. Full resyncs preserve this
+  ownership and existing names, stars, and pins. On a first sync, parallel parse
+  order decides which file gets the original ID; it need not be the earliest
+  segment. Trashing the base also hides its linked sessions from the sidebar;
+  permanently deleting it promotes them. Cursor copies retain shared turns,
+  which search and usage count twice. A copied subagent links to the session
+  with the same ID, replacing its original parent link. Other agents sync as
+  before.
+- Recall no longer records work an agent only proposed as work it completed.
+  When a stretch of a session ran no tools, extraction cannot produce a
+  procedure entry for it and tells the model nothing there was executed.
+  Other entry types still rely on the model's wording. A tool call counts as
+  evidence even if it was denied or failed. Upgrading re-extracts recall
+  entries for every session, which costs one round of model calls per session.
 
 ## 0.44.0
 

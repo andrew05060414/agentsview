@@ -549,10 +549,9 @@ type Engine struct {
 	// During a resync/rebuild it points at the original DB while
 	// e.db points at the fresh one; nil means e.db is the archive.
 	archiveStore db.Store
-	// archiveStaleClaudeForks snapshots the original archive's stale Claude
-	// fork rows for one rebuild; nil outside a rebuild, where e.db is queried
-	// per source path instead.
-	archiveStaleClaudeForks *archiveStaleClaudeForkIndex
+	// archiveRebuildIndex snapshots source ownership in the original archive
+	// for one rebuild; nil outside a rebuild, where e.db is queried instead.
+	archiveRebuildIndex *archiveRebuildIndex
 	// sourceClaims maps a full session id to the file that took it before
 	// its row is written, so a second file in the same pass derives its own.
 	sourceClaimsMu    gosync.Mutex
@@ -3260,19 +3259,19 @@ func (e *Engine) resyncBuildLocked(
 	// minutes. Without this marker the progress printer credits that
 	// silent time to the preceding (instant) "Disabling ..." phase.
 	// The archive is write-barriered for the whole rebuild, so one snapshot of
-	// its stale Claude fork rows serves every parsed file. Querying the archive
+	// its source ownership serves every parsed file. Querying the archive
 	// per file would open cold reader connections while workers are busy,
 	// which SQLite's busy handler turns into sleeps on every open.
-	archiveStaleForks, err := loadArchiveStaleClaudeForkIndex(ctx, origDB, e.collisionPolicyAgents())
+	archiveIndex, err := loadArchiveRebuildIndex(ctx, origDB, e.collisionPolicyAgents())
 	if err != nil {
-		log.Printf("resync: snapshot stale claude forks: %v", err)
+		log.Printf("resync: snapshot archive source ownership: %v", err)
 		newDB.Close()
 		removeTempDB(tempPath)
 		restoreSkipCache()
 		stats = SyncStats{
 			Aborted: true,
 			Warnings: []string{
-				"resync failed: snapshot stale claude forks: " + err.Error(),
+				"resync failed: snapshot archive source ownership: " + err.Error(),
 			},
 		}
 		e.mu.Lock()
@@ -3281,7 +3280,7 @@ func (e *Engine) resyncBuildLocked(
 		return stats, err
 	}
 	e.archiveStore = origDB
-	e.archiveStaleClaudeForks = archiveStaleForks
+	e.archiveRebuildIndex = archiveIndex
 	deferredSourceCwd := newSourceCwdReconciliationBatch()
 	e.deferredSourceCwd = deferredSourceCwd
 	defer func() { e.deferredSourceCwd = nil }()
@@ -3296,7 +3295,7 @@ func (e *Engine) resyncBuildLocked(
 	)
 	e.db = origDB // restore immediately
 	e.archiveStore = nil
-	e.archiveStaleClaudeForks = nil
+	e.archiveRebuildIndex = nil
 	pendingTombstoned += stats.Tombstoned
 	stats.Tombstoned = 0
 	e.phaseStats.Log("resync")
@@ -3329,7 +3328,7 @@ func (e *Engine) resyncBuildLocked(
 		}
 		contributorEngine := NewEngine(ctx, newDB, contributor.Config)
 		contributorEngine.archiveStore = origDB
-		contributorEngine.archiveStaleClaudeForks = archiveStaleForks
+		contributorEngine.archiveRebuildIndex = archiveIndex
 		contributorEngine.deferredSourceCwd = deferredSourceCwd
 		contributorEngine.forceFullParse = contributor.ForceParse ||
 			contributor.ForceFullParseAfterCache
@@ -13299,7 +13298,7 @@ func (e *Engine) claudeSourceMissingSessionOwnershipsForCompleteResult(
 	for _, id := range e.applyIDPrefixToSessionIDs(excludedSessionIDs) {
 		present[id] = struct{}{}
 	}
-	if index := e.archiveStaleClaudeForks; index != nil {
+	if index := e.archiveRebuildIndex; index != nil {
 		return index.missingMembers(paths, present), nil
 	}
 	var members []sourceMissingMember
@@ -13340,10 +13339,10 @@ func (e *Engine) claudeSourceMissingSessionOwnershipsForCompleteResult(
 	return members, nil
 }
 
-// archiveStaleClaudeForkIndex is a rebuild-scoped snapshot of the original
-// archive's stale Claude fork rows keyed by stored source path. The archive
-// takes no writes while a rebuild reads it, so the snapshot stays exact.
-type archiveStaleClaudeForkIndex struct {
+// archiveRebuildIndex snapshots stale Claude forks and shared-session source
+// ownership from the original archive. The archive takes no writes during a
+// rebuild, so the snapshot stays exact.
+type archiveRebuildIndex struct {
 	byPath map[string][]db.SessionSourceOwnership
 	// pathRecords holds the archive's session path records for the agents
 	// sourceCollisionID covers, keyed by base id, so a rebuild sees the same
@@ -13351,9 +13350,9 @@ type archiveStaleClaudeForkIndex struct {
 	pathRecords map[string][]db.SessionPathRecord
 }
 
-func loadArchiveStaleClaudeForkIndex(ctx context.Context,
+func loadArchiveRebuildIndex(ctx context.Context,
 	archive *db.DB, collisionAgents []string,
-) (*archiveStaleClaudeForkIndex, error) {
+) (*archiveRebuildIndex, error) {
 	ownerships, err := archive.ListStaleForkSessionOwnerships(ctx,
 		string(parser.AgentClaude),
 	)
@@ -13364,7 +13363,7 @@ func loadArchiveStaleClaudeForkIndex(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	index := &archiveStaleClaudeForkIndex{
+	index := &archiveRebuildIndex{
 		byPath:      make(map[string][]db.SessionSourceOwnership),
 		pathRecords: make(map[string][]db.SessionPathRecord),
 	}
@@ -13382,7 +13381,7 @@ func loadArchiveStaleClaudeForkIndex(ctx context.Context,
 
 // missingMembers returns the snapshotted stale forks under paths that a
 // complete parse did not re-emit, in a stable path-then-ID order.
-func (index *archiveStaleClaudeForkIndex) missingMembers(
+func (index *archiveRebuildIndex) missingMembers(
 	paths map[string]struct{},
 	present map[string]struct{},
 ) []sourceMissingMember {

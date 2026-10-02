@@ -46,6 +46,7 @@ const (
 	AgentPrimeAgent     AgentType = "prime-agent"
 	AgentOMP            AgentType = "omp"
 	AgentOMO            AgentType = "omo"
+	AgentStepCode       AgentType = "stepcode"
 	AgentQwen           AgentType = "qwen"
 	AgentCommandCode    AgentType = "commandcode"
 	AgentDeepSeekTUI    AgentType = "deepseek-tui"
@@ -585,6 +586,22 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".omo/agent/sessions"},
 		IDPrefix:    "omo:",
 		FileBased:   true,
+	},
+	{
+		// StepCode packages the Pi harness as a product, so its transcripts
+		// use Pi's JSONL format and layout verbatim and go through the Pi
+		// provider. It keeps its own agent root, so a Pi default root would
+		// otherwise never see StepCode sessions.
+		Type:              AgentStepCode,
+		DisplayName:       "StepCode",
+		EnvVar:            "STEPCODE_DIR",
+		NativeEnvVar:      "STEP_CODING_AGENT_SESSION_DIR",
+		DefaultRootEnvVar: "STEP_CODING_AGENT_DIR",
+		DefaultRootDir:    ".stepcode/agent",
+		ConfigKey:         "stepcode_dirs",
+		DefaultDirs:       []string{".stepcode/agent/sessions"},
+		IDPrefix:          "stepcode:",
+		FileBased:         true,
 	},
 	{
 		Type:        AgentQwen,

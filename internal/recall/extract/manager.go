@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/parser"
 	recall "go.kenn.io/agentsview/internal/recall"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/stringutil"
@@ -629,6 +630,10 @@ func (m *Manager) extractSession(
 			Role:     row.Role,
 			Content:  row.Content,
 			IsSystem: row.IsSystem,
+			// Providers record execution as a flag, call rows, or tool output.
+			ToolUse: row.HasToolUse || len(row.ToolCalls) > 0 ||
+				row.Role == string(parser.RoleTool) ||
+				row.SourceSubtype == parser.SourceSubtypeToolResult,
 		})
 	}
 	// Per-message scanning misses a secret whose structure spans messages:
@@ -813,7 +818,8 @@ func (m *Manager) extractSession(
 			return outcome, nil
 		}
 		unit := units[i]
-		entries, err := m.distillSplit(ctx, m.cfg.Prompts[unit.Role], unit.Text)
+		prompt, types := m.unitRequest(unit)
+		entries, err := m.distillSplit(ctx, prompt, unit.Text, types)
 		if err != nil {
 			if ctx.Err() != nil {
 				// Shutdown, not a poisoned session: leave the row
@@ -1043,10 +1049,21 @@ func transcriptSecretMatches(rows []db.Message, allowCandidates bool) int {
 // below it the text is small enough that splitting further would only
 // destroy context, so the error surfaces instead.
 func (m *Manager) distillSplit(
-	ctx context.Context, prompt, text string,
+	ctx context.Context, prompt, text string, types []string,
 ) ([]Entry, error) {
 	calls := 0
-	return m.distillSplitBounded(ctx, prompt, text, &calls)
+	return m.distillSplitBounded(ctx, prompt, text, types, &calls)
+}
+
+// unitRequest returns the system prompt and allowed entry types for unit.
+// An action unit whose messages ran no tool cannot report executed steps,
+// so it drops 'procedure' and opens with a preamble saying nothing ran.
+func (m *Manager) unitRequest(unit Unit) (string, []string) {
+	prompt := m.cfg.Prompts[unit.Role]
+	if unit.Role != RoleAction || unit.ToolUse {
+		return prompt, entryTypes
+	}
+	return unexecutedActionPreamble + "\n\n" + prompt, unexecutedEntryTypes
 }
 
 // distillSplitBounded is distillSplit with a shared call counter so one
@@ -1055,7 +1072,7 @@ func (m *Manager) distillSplit(
 // budget the unit fails closed with ErrSplitBudgetExceeded rather than
 // splitting an unbounded message into ever more leaves.
 func (m *Manager) distillSplitBounded(
-	ctx context.Context, prompt, text string, calls *int,
+	ctx context.Context, prompt, text string, types []string, calls *int,
 ) ([]Entry, error) {
 	if *calls >= maxUnitDistillCalls {
 		return nil, fmt.Errorf(
@@ -1063,8 +1080,8 @@ func (m *Manager) distillSplitBounded(
 			maxUnitDistillCalls, ErrSplitBudgetExceeded)
 	}
 	*calls++
-	entries, _, err := m.cfg.Client.DistillWithRecovery(
-		ctx, prompt, text, m.cfg.MaxAttempts,
+	entries, _, err := m.cfg.Client.distillWithRecovery(
+		ctx, prompt, text, types, m.cfg.MaxAttempts,
 	)
 	if err == nil {
 		return entries, nil
@@ -1078,11 +1095,11 @@ func (m *Manager) distillSplitBounded(
 		return nil, err
 	}
 	mid := len(runes) / 2
-	left, err := m.distillSplitBounded(ctx, prompt, string(runes[:mid]), calls)
+	left, err := m.distillSplitBounded(ctx, prompt, string(runes[:mid]), types, calls)
 	if err != nil {
 		return nil, err
 	}
-	right, err := m.distillSplitBounded(ctx, prompt, string(runes[mid:]), calls)
+	right, err := m.distillSplitBounded(ctx, prompt, string(runes[mid:]), types, calls)
 	if err != nil {
 		return nil, err
 	}
@@ -1287,8 +1304,8 @@ func (m *Manager) generation(
 func unitsDigest(units []Unit) string {
 	h := sha256.New()
 	for _, unit := range units {
-		fmt.Fprintf(h, "%s\x1f%d\x1f%d\x1f%d\x1f",
-			unit.Role, unit.OrdinalStart, unit.OrdinalEnd,
+		fmt.Fprintf(h, "%s\x1f%d\x1f%d\x1f%t\x1f%d\x1f",
+			unit.Role, unit.OrdinalStart, unit.OrdinalEnd, unit.ToolUse,
 			utf8.RuneCountInString(unit.Text),
 		)
 		h.Write([]byte(unit.Text))

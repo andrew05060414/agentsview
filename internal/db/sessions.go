@@ -166,7 +166,7 @@ func scanSessionRow(rs rowScanner) (Session, error) {
 }
 
 // scanSessionRowWithSource scans sessionBaseCols and an optional trailing
-// file_path into a Session.
+// source metadata into a Session.
 func scanSessionRowWithSource(rs rowScanner, includeSource bool) (Session, error) {
 	var s Session
 	targets := []any{
@@ -202,7 +202,7 @@ func scanSessionRowWithSource(rs rowScanner, includeSource bool) (Session, error
 		&s.TranscriptRevision, &s.CreatedAt, &s.ProjectAssigned,
 	}
 	if includeSource {
-		targets = append(targets, &s.FilePath)
+		targets = append(targets, &s.FilePath, &s.FileSize, &s.LocalModifiedAt)
 	}
 	err := rs.Scan(targets...)
 	return s, err
@@ -527,6 +527,11 @@ func (db *DB) DecodeCursor(s string) (SessionCursor, error) {
 
 // SessionFilter specifies how to query sessions.
 type SessionFilter struct {
+	// IDs selects rows directly. Nil preserves discovery defaults; an empty
+	// non-nil slice matches nothing. Raw IDs expand over literal tilde suffixes.
+	IDs []string
+	// IDsExact selects only physical IDs resolved by the hosted public-ID layer.
+	IDsExact  bool
 	SessionID string
 	Project   string
 	// ProjectLabels carries exact internal project labels resolved from an
@@ -755,7 +760,7 @@ func (db *DB) ListSessions(
 
 	columns := sessionBaseCols
 	if f.IncludeSource {
-		columns += ", file_path"
+		columns += ", file_path, file_size, local_modified_at"
 	}
 	query := "SELECT " + columns +
 		" FROM sessions WHERE " + cursorWhere + " " +
@@ -3953,9 +3958,11 @@ type SessionPathRecord struct {
 	FilePath      string
 	SourceMissing bool
 	Excluded      bool
+	MessageCount  int
+	Trashed       bool
 }
 
-const sessionPathRecordQuery = "SELECT id, COALESCE(file_path, ''), source_missing_at IS NOT NULL, 0 FROM sessions WHERE "
+const sessionPathRecordQuery = "SELECT id, COALESCE(file_path, ''), source_missing_at IS NOT NULL, 0, message_count, deleted_at IS NOT NULL FROM sessions WHERE "
 
 // ListSessionPathRecords returns the records for baseID and every id
 // parser.AltSessionID derives from it, stored rows first, then deletions.
@@ -3964,7 +3971,7 @@ func (db *DB) ListSessionPathRecords(ctx context.Context, baseID string) ([]Sess
 	low, high := baseID+"_alt-", baseID+"_alt."
 	return db.querySessionPathRecords(ctx,
 		sessionPathRecordQuery+match+
-			" UNION ALL SELECT id, COALESCE(file_path, ''), 0, 1 FROM excluded_sessions WHERE "+match,
+			" UNION ALL SELECT id, COALESCE(file_path, ''), 0, 1, 0, 0 FROM excluded_sessions WHERE "+match,
 		baseID, low, high, baseID, low, high,
 	)
 }
@@ -3993,7 +4000,7 @@ func (db *DB) querySessionPathRecords(ctx context.Context, query string, args ..
 	var records []SessionPathRecord
 	for rows.Next() {
 		var r SessionPathRecord
-		if err := rows.Scan(&r.ID, &r.FilePath, &r.SourceMissing, &r.Excluded); err != nil {
+		if err := rows.Scan(&r.ID, &r.FilePath, &r.SourceMissing, &r.Excluded, &r.MessageCount, &r.Trashed); err != nil {
 			return nil, fmt.Errorf("scanning session path record: %w", err)
 		}
 		records = append(records, r)

@@ -119,10 +119,8 @@ func TestSyncKeepsBothCollidingFilesInOnePass(t *testing.T) {
 	assert.Equal(t, 4, base.MessageCount+alt.MessageCount)
 }
 
-// A stored session keeps its id and transcript after its file goes missing.
-// Other files with the same id, including a plain rename the provider can't
-// resolve, show under their own ids, before and after the row is marked
-// source-missing.
+// A shorter file cannot take over a missing owner's archived transcript,
+// before or after the row is marked source-missing.
 func TestMissingOwnerKeepsSessionID(t *testing.T) {
 	for _, tombstoned := range []bool{false, true} {
 		t.Run(map[bool]string{false: "not yet marked", true: "marked missing"}[tombstoned], func(t *testing.T) {
@@ -148,6 +146,89 @@ func TestMissingOwnerKeepsSessionID(t *testing.T) {
 			assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, paths[0]), 1)
 			assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, paths[1]), 3)
 		})
+	}
+}
+
+// Changing the configured root after moving the agent's data keeps one session
+// when the new transcript is at least as long as the archive. A shorter source
+// stays separate, including when a rebuild reads ownership from the old DB.
+func TestMovedSourceRootKeepsSessionID(t *testing.T) {
+	for _, agent := range []parser.AgentType{parser.AgentGemini, parser.AgentCursor} {
+		for _, mode := range []string{"sync", "resync", "watcher"} {
+			for _, length := range []string{"equal", "longer", "shorter", "copy"} {
+				t.Run(string(agent)+"/"+mode+"/"+length, func(t *testing.T) {
+					root := t.TempDir()
+					oldRoot, newRoot := filepath.Join(root, "old"), filepath.Join(root, "new")
+					count := 2
+					switch length {
+					case "longer":
+						count = 3
+					case "shorter":
+						count = 1
+					}
+					rel := filepath.Join("tmp", "collisionhash", "chats", "session-2026-01-01T10-00-shared.json")
+					original, replacement := geminiCollisionSession("shared", 2), geminiCollisionSession("shared", count)
+					if agent == parser.AgentCursor {
+						rel = filepath.Join("project-a", "agent-transcripts", "shared.txt")
+						original = "user:\nHello\nassistant:\nHi\n"
+						replacement = original
+						switch length {
+						case "longer":
+							replacement += "user:\nMore\n"
+						case "shorter":
+							replacement = "user:\nHello\n"
+						}
+					}
+					oldPath, newPath := filepath.Join(oldRoot, rel), filepath.Join(newRoot, rel)
+					require.NoError(t, os.MkdirAll(filepath.Dir(oldPath), 0o755))
+					require.NoError(t, os.WriteFile(oldPath, []byte(original), 0o644))
+					database := dbtest.OpenTestDB(t)
+					initial := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+						AgentDirs: map[parser.AgentType][]string{agent: {oldRoot}}, Machine: "local",
+					})
+					initial.SyncAll(t.Context(), nil)
+					initial.Close()
+					baseID := string(agent) + ":shared"
+					assertSessionMessageCount(t, database, baseID, 2)
+					_, err := database.StarSession(t.Context(), baseID)
+					require.NoError(t, err)
+					if length == "copy" {
+						require.NoError(t, os.MkdirAll(filepath.Dir(newPath), 0o755))
+					} else {
+						require.NoError(t, os.Rename(oldRoot, newRoot))
+					}
+					require.NoError(t, os.WriteFile(newPath, []byte(replacement), 0o644))
+					moved := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+						AgentDirs: map[parser.AgentType][]string{agent: {newRoot}}, Machine: "local",
+					})
+					t.Cleanup(moved.Close)
+					switch mode {
+					case "resync":
+						stats := moved.ResyncAll(t.Context(), nil)
+						require.False(t, stats.Aborted, "%v", stats.Warnings)
+					case "watcher":
+						require.NoError(t, moved.SyncPathsContext(t.Context(), []string{newPath}))
+					default:
+						moved.SyncAll(t.Context(), nil)
+					}
+					base := requireStoredSession(t, database, baseID)
+					if length == "shorter" || length == "copy" {
+						assert.Equal(t, oldPath, *base.FilePath)
+						assertSessionMessageCount(t, database, baseID, 2)
+						assertSessionMessageCount(t, database, parser.AltSessionID(baseID, newPath), count)
+					} else {
+						assert.Equal(t, newPath, *base.FilePath)
+						assertSessionMessageCount(t, database, baseID, count)
+						records, err := database.ListSessionPathRecords(t.Context(), baseID)
+						require.NoError(t, err)
+						assert.Len(t, records, 1, "moving the root must not duplicate the session")
+					}
+					starred, err := database.ListStarredSessionIDs(t.Context())
+					require.NoError(t, err)
+					assert.Contains(t, starred, baseID)
+				})
+			}
+		}
 	}
 }
 
@@ -246,22 +327,22 @@ func TestCollidingFileDeletionMarksOnlyItsRow(t *testing.T) {
 		assert.Equal(t, first, *base.FilePath)
 	})
 	t.Run("base file deleted", func(t *testing.T) {
-		env, first, second := collisionEnv(t, 5, 1)
+		env, first, second := collisionEnv(t, 3, 5)
 		require.NoError(t, os.Remove(first))
 		require.NoError(t, env.engine.SyncPathsContext(t.Context(), []string{first}))
 		env.writeGeminiSession(t, filepath.Join("tmp", "collisionhash", "chats", filepath.Base(second)),
-			geminiCollisionSession("shared-session", 3))
+			geminiCollisionSession("shared-session", 7))
 		env.engine.SyncAll(t.Context(), nil)
 
 		base := requireStoredSession(t, env.db, collisionBaseID)
 		assert.NotNil(t, base.SourceMissingAt)
-		assertCollisionPair(t, env.db, first, 5, second, 3)
+		assertCollisionPair(t, env.db, first, 3, second, 7)
 	})
 }
 
-// Deleting or trashing the base session hides only the base. The other file
-// keeps its derived id and stays visible, and the base id is never refilled
-// from it, including across a rebuild.
+// Deleting or trashing the base never deletes the derived transcript or refills
+// the base from it. Trashing the base hides the linked session from the sidebar;
+// permanent deletion promotes it to a top-level entry.
 func TestUserDeletedBaseKeepsCollidingFileSeparate(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -283,6 +364,14 @@ func TestUserDeletedBaseKeepsCollidingFileSeparate(t *testing.T) {
 				alt := requireStoredSession(t, env.db, altID)
 				assert.Nil(t, alt.DeletedAt)
 				assertSessionMessageCount(t, env.db, altID, 1)
+				index, err := env.db.GetSidebarSessionIndex(t.Context(), db.SessionFilter{})
+				require.NoError(t, err)
+				if tt.name == "trashed" {
+					assert.Empty(t, index.Sessions)
+				} else {
+					require.Len(t, index.Sessions, 1)
+					assert.Equal(t, altID, index.Sessions[0].ID)
+				}
 				base, err := env.db.GetSessionFull(t.Context(), collisionBaseID)
 				require.NoError(t, err)
 				if base != nil {

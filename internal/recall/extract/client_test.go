@@ -1306,6 +1306,71 @@ func TestClientRequestSchemaKeepsLargeBodyLimitLocal(t *testing.T) {
 	entityItems, ok := entities["items"].(map[string]any)
 	require.True(t, ok, "entities schema has no items object")
 	assert.InDelta(t, float64(maxEntityChars), entityItems["maxLength"], 1e-9)
+	// The exported path serves the doctor probe and must stay unrestricted.
+	typeField, ok := fields["type"].(map[string]any)
+	require.True(t, ok, "entry schema has no type property")
+	assert.Equal(t, []any{
+		"fact", "decision", "procedure", "warning", "preference", "open_question",
+	}, typeField["enum"])
+	messages, ok := requests[0]["messages"].([]any)
+	require.True(t, ok, "request has no messages array")
+	require.NotEmpty(t, messages)
+	system, ok := messages[0].(map[string]any)
+	require.True(t, ok, "request message is not an object")
+	assert.Equal(t, "system", system["role"])
+	assert.Equal(t, "p", system["content"])
+}
+
+// Restricted requests validate the response against the enum sent to the
+// server. A type outside the narrowed enum indicts this unit's output, while
+// a type outside every enum means the server ignores the schema.
+func TestClientRejectsDisallowedEntryType(t *testing.T) {
+	entry := func(kind string) string {
+		return `{"entries":[{"type":"` + kind + `","title":"Added deploy.yml",` +
+			`"body":"Added the workflow.","entities":[]}]}`
+	}
+	cases := []struct {
+		name          string
+		content       string
+		types         []string
+		wantErr       error
+		endpointScope bool
+	}{
+		{
+			name: "restricted", content: entry("procedure"),
+			types: unexecutedEntryTypes, wantErr: errDisallowedEntryType,
+		},
+		{name: "unrestricted", content: entry("procedure"), types: entryTypes},
+		{
+			name: "unknown type", content: entry("changelog"),
+			types: unexecutedEntryTypes, wantErr: errProtocolViolation, endpointScope: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests []map[string]any
+			server := newScriptedServer(t, []scriptedResponse{
+				{finishReason: "stop", content: tc.content},
+			}, &requests)
+			defer server.Close()
+
+			entries, _, err := testClient(server.URL).distillWithRecovery(
+				t.Context(), "p", "text", tc.types, 3,
+			)
+			assert.Len(t, requests, 1)
+			if tc.wantErr != nil {
+				require.ErrorIs(t, err, tc.wantErr)
+				assert.Equal(t, tc.endpointScope, endpointScopedRejection(err))
+				_, transient := errors.AsType[*transientError](err)
+				assert.False(t, transient)
+				assert.Empty(t, entries)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			assert.Equal(t, "procedure", entries[0].Type)
+		})
+	}
 }
 
 func TestSplitFloorChars(t *testing.T) {

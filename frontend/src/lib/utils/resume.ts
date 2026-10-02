@@ -92,9 +92,10 @@ export function buildResumeCommand(
   const builder = RESUME_AGENTS[agent];
   if (!builder) return null;
 
-  let rawId = stripIdPrefix(stripHostPrefix(sessionId), agent);
-  // Gemini CLI and Cursor store a second file sharing a session id as <id>_alt-<hash>; the CLI resumes <id>.
-  if (agent === "gemini" || agent === "cursor") rawId = rawId.replace(/_alt-[0-9a-f]{16}$/, "");
+  const rawId = stripIdPrefix(stripHostPrefix(sessionId), agent);
+  // The server owns collision IDs and provider capabilities. Callers ask it
+  // first; don't guess a fallback for any ID that might need its resolution.
+  if (rawId.includes("_alt-")) return null;
   let cmd = builder(rawId);
 
   if (flags?.model) {

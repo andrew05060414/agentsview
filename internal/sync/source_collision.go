@@ -2,18 +2,18 @@ package sync
 
 import (
 	"context"
+	"os"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
 // sourceCollisionID returns the raw session id to store s under. A stored
-// session keeps its id while its file is missing, as archived transcripts are
-// never replaced because their source went away. Any other file with the same
-// id is stored under parser.AltSessionID as a continuation of it, unless the
-// provider reports the stored file moved to this one. A session the write
-// step will filter out (admitted false) keeps any id its file already holds
-// but never claims or mints one.
+// session keeps its id unless its file is gone and an unclaimed replacement
+// has at least as many messages. Other files with the same id are stored under
+// parser.AltSessionID as continuations, unless the provider recognizes a move.
+// A session the write step will filter out (admitted false) keeps any id its
+// file already holds but never claims or mints one.
 func (e *Engine) sourceCollisionID(
 	ctx context.Context,
 	provider parser.Provider,
@@ -31,6 +31,7 @@ func (e *Engine) sourceCollisionID(
 	}
 	var stored, deleted string
 	var hasStored, deletedAnyFile bool
+	var owner db.SessionPathRecord
 	for _, r := range records {
 		switch {
 		case r.ID != fullID:
@@ -38,6 +39,7 @@ func (e *Engine) sourceCollisionID(
 			deleted, deletedAnyFile = r.FilePath, r.FilePath == ""
 		default:
 			stored, hasStored = r.FilePath, true
+			owner = r
 		}
 	}
 	// A permanently deleted id stays with the file it was deleted for; a
@@ -51,7 +53,18 @@ func (e *Engine) sourceCollisionID(
 		return s.ID, nil
 	}
 	if altID == "" {
-		if !hasStored && deleted == "" && e.claimSessionID(ctx, provider, fullID, lookupPath) {
+		available := !hasStored
+		if hasStored && !owner.Trashed && stored != "" && e.pathRewriter == nil &&
+			s.MessageCount >= owner.MessageCount {
+			// FindSource may decline a path outside the new configured roots.
+			// Check that the old file is actually gone, not merely unscanned or
+			// unreadable, before treating a root change as a move.
+			if _, err := os.Stat(stored); os.IsNotExist(err) {
+				_, live := e.providerSourcePath(ctx, provider, stored)
+				available = !live
+			}
+		}
+		if available && deleted == "" && e.claimSessionID(ctx, provider, fullID, lookupPath) {
 			return s.ID, nil
 		}
 		altID = parser.AltSessionID(s.ID, lookupPath)
@@ -88,7 +101,7 @@ func (e *Engine) sessionPathRecords(ctx context.Context, fullID string) ([]db.Se
 	if err != nil {
 		return nil, err
 	}
-	if index := e.archiveStaleClaudeForks; index != nil {
+	if index := e.archiveRebuildIndex; index != nil {
 		seen := make(map[string]bool, len(records))
 		for _, r := range records {
 			seen[r.ID] = true
