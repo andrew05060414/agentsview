@@ -2,7 +2,9 @@ package sync
 
 import (
 	"context"
+	"log"
 
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -20,18 +22,18 @@ func (e *Engine) sourceCollisionID(
 		return s.ID
 	}
 	fullID := applyIDPrefixToID(e.idPrefix, s.ID)
-	stored := e.db.GetSessionFilePathNotSourceMissing(ctx, fullID)
-	if stored == "" {
-		// A permanently deleted session still belongs to its file.
-		stored = e.db.ExcludedSessionFilePath(ctx, fullID)
-	}
-	if index := e.archiveStaleClaudeForks; stored == "" && index != nil {
-		stored = index.sessionPaths[fullID]
+	records := e.sessionPathRecords(ctx, fullID)
+	stored := ""
+	for _, r := range records {
+		// A base owner whose source is missing no longer holds the id.
+		if r.ID == fullID && !r.SourceMissing {
+			stored = r.FilePath
+		}
 	}
 	if stored == lookupPath {
 		return s.ID
 	}
-	altID := e.existingAltID(ctx, provider, fullID, s.ID, lookupPath)
+	altID := e.existingAltID(ctx, provider, records, fullID, s.ID, lookupPath)
 	if altID == "" {
 		if !e.ownerElsewhere(ctx, provider, stored, lookupPath) &&
 			e.claimSessionID(ctx, provider, fullID, lookupPath) {
@@ -67,22 +69,39 @@ func (e *Engine) collisionPolicyAgents() []string {
 	return agents
 }
 
+// sessionPathRecords returns the stored and deleted records for fullID and
+// its derived ids. During a rebuild it adds the original archive's records
+// for ids the new archive has not written yet.
+func (e *Engine) sessionPathRecords(ctx context.Context, fullID string) []db.SessionPathRecord {
+	records, err := e.db.ListSessionPathRecords(ctx, fullID)
+	if err != nil {
+		log.Printf("session path records for %s: %v", fullID, err)
+	}
+	if index := e.archiveStaleClaudeForks; index != nil {
+		seen := make(map[string]bool, len(records))
+		for _, r := range records {
+			seen[r.ID] = true
+		}
+		for _, r := range index.pathRecords[fullID] {
+			if !seen[r.ID] {
+				records = append(records, r)
+			}
+		}
+	}
+	return records
+}
+
 // existingAltID returns the derived id already held by this file, stored or
 // deleted, including one the provider has since moved to lookupPath, so its
 // curation and any deletion carry over. It returns "" when there is none.
 func (e *Engine) existingAltID(
-	ctx context.Context, provider parser.Provider, fullID, rawID, lookupPath string,
+	ctx context.Context, provider parser.Provider, records []db.SessionPathRecord,
+	fullID, rawID, lookupPath string,
 ) string {
-	alts := e.db.ListAltSessionPaths(ctx, fullID)
-	if index := e.archiveStaleClaudeForks; index != nil {
-		for _, id := range index.altsByBase[fullID] {
-			alts[id] = index.sessionPaths[id]
-		}
-	}
 	minted := applyIDPrefixToID(e.idPrefix, parser.AltSessionID(rawID, lookupPath))
-	for id, stored := range alts {
-		if id == minted || e.storedSourceLivesAt(ctx, provider, stored, lookupPath) {
-			return rawID + id[len(fullID):]
+	for _, r := range records {
+		if r.ID != fullID && (r.ID == minted || e.storedSourceLivesAt(ctx, provider, r.FilePath, lookupPath)) {
+			return rawID + r.ID[len(fullID):]
 		}
 	}
 	return ""

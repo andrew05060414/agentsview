@@ -13346,11 +13346,10 @@ func (e *Engine) claudeSourceMissingSessionOwnershipsForCompleteResult(
 // takes no writes while a rebuild reads it, so the snapshot stays exact.
 type archiveStaleClaudeForkIndex struct {
 	byPath map[string][]db.SessionSourceOwnership
-	// sessionPaths maps the archive's session ids for the agents
-	// sourceCollisionID covers to their stored paths, so a rebuild keeps each
-	// file on the id it had.
-	sessionPaths map[string]string
-	altsByBase   map[string][]string
+	// pathRecords holds the archive's session path records for the agents
+	// sourceCollisionID covers, keyed by base id, so a rebuild sees the same
+	// ownership an ordinary sync reads from the live archive.
+	pathRecords map[string][]db.SessionPathRecord
 }
 
 func loadArchiveStaleClaudeForkIndex(ctx context.Context,
@@ -13362,19 +13361,17 @@ func loadArchiveStaleClaudeForkIndex(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	sessionPaths, err := archive.ListSessionPathsForAgents(ctx, collisionAgents)
+	records, err := archive.ListSessionPathRecordsForAgents(ctx, collisionAgents)
 	if err != nil {
 		return nil, err
 	}
 	index := &archiveStaleClaudeForkIndex{
-		byPath:       make(map[string][]db.SessionSourceOwnership),
-		sessionPaths: sessionPaths,
-		altsByBase:   make(map[string][]string),
+		byPath:      make(map[string][]db.SessionSourceOwnership),
+		pathRecords: make(map[string][]db.SessionPathRecord),
 	}
-	for id := range sessionPaths {
-		if base := parser.BaseSessionID(id); base != id {
-			index.altsByBase[base] = append(index.altsByBase[base], id)
-		}
+	for _, record := range records {
+		base := parser.BaseSessionID(record.ID)
+		index.pathRecords[base] = append(index.pathRecords[base], record)
 	}
 	for _, ownership := range ownerships {
 		index.byPath[ownership.FilePath] = append(

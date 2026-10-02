@@ -3946,70 +3946,58 @@ func (db *DB) ListSessionIDsByFilePath(ctx context.Context, path, agent string) 
 	return ids, nil
 }
 
-// ListSessionPathsForAgents maps every stored session id of the given agents
-// to its file path, or to "" when its source is missing. A rebuild loads it
-// once from the original archive so each file sharing a session id keeps the
-// id it had.
-func (db *DB) ListSessionPathsForAgents(ctx context.Context, agents []string) (map[string]string, error) {
-	paths := make(map[string]string)
+// SessionPathRecord is a session id with the source file recorded for it,
+// from a stored row or from a permanent deletion.
+type SessionPathRecord struct {
+	ID            string
+	FilePath      string
+	SourceMissing bool
+}
+
+const sessionPathRecordQuery = "SELECT id, COALESCE(file_path, ''), source_missing_at IS NOT NULL FROM sessions WHERE "
+
+// ListSessionPathRecords returns the records for baseID and every id
+// parser.AltSessionID derives from it, stored rows first, then deletions.
+func (db *DB) ListSessionPathRecords(ctx context.Context, baseID string) ([]SessionPathRecord, error) {
+	const match = "(id = ? OR (id >= ? AND id < ?))"
+	low, high := baseID+"_alt-", baseID+"_alt."
+	return db.querySessionPathRecords(ctx,
+		sessionPathRecordQuery+match+
+			" UNION ALL SELECT id, COALESCE(file_path, ''), 0 FROM excluded_sessions WHERE "+match,
+		baseID, low, high, baseID, low, high,
+	)
+}
+
+// ListSessionPathRecordsForAgents returns the stored rows of the given agents.
+// A rebuild loads it once from the original archive.
+func (db *DB) ListSessionPathRecordsForAgents(ctx context.Context, agents []string) ([]SessionPathRecord, error) {
 	if len(agents) == 0 {
-		return paths, nil
+		return nil, nil
 	}
 	args := make([]any, len(agents))
 	for i, agent := range agents {
 		args[i] = agent
 	}
-	rows, err := db.getReader().Query(ctx,
-		"SELECT id, CASE WHEN source_missing_at IS NULL THEN COALESCE(file_path, '') ELSE '' END"+
-			" FROM sessions WHERE agent IN (?"+strings.Repeat(",?", len(agents)-1)+")",
-		args...,
+	return db.querySessionPathRecords(ctx,
+		sessionPathRecordQuery+"agent IN (?"+strings.Repeat(",?", len(agents)-1)+")", args...,
 	)
-	if err != nil {
-		return nil, fmt.Errorf("listing session paths: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id, path string
-		if err := rows.Scan(&id, &path); err != nil {
-			return nil, fmt.Errorf("scanning session path: %w", err)
-		}
-		paths[id] = path
-	}
-	return paths, rows.Err()
 }
 
-// ListAltSessionPaths maps each stored or permanently deleted session id
-// derived from baseID by parser.AltSessionID to its recorded file path ("" when
-// none was recorded).
-func (db *DB) ListAltSessionPaths(ctx context.Context, baseID string) map[string]string {
-	paths := make(map[string]string)
-	low, high := baseID+"_alt-", baseID+"_alt."
-	rows, err := db.getReader().Query(ctx,
-		"SELECT id, COALESCE(file_path, '') FROM sessions WHERE id >= ? AND id < ?"+
-			" UNION ALL SELECT id, COALESCE(file_path, '') FROM excluded_sessions WHERE id >= ? AND id < ?",
-		low, high, low, high,
-	)
+func (db *DB) querySessionPathRecords(ctx context.Context, query string, args ...any) ([]SessionPathRecord, error) {
+	rows, err := db.getReader().Query(ctx, query, args...)
 	if err != nil {
-		return paths
+		return nil, fmt.Errorf("listing session path records: %w", err)
 	}
 	defer rows.Close()
+	var records []SessionPathRecord
 	for rows.Next() {
-		var id, path string
-		if rows.Scan(&id, &path) == nil && (paths[id] == "" || path != "") {
-			paths[id] = path
+		var r SessionPathRecord
+		if err := rows.Scan(&r.ID, &r.FilePath, &r.SourceMissing); err != nil {
+			return nil, fmt.Errorf("scanning session path record: %w", err)
 		}
+		records = append(records, r)
 	}
-	return paths
-}
-
-// ExcludedSessionFilePath returns the source file a permanently deleted
-// session came from, or "" when it is not excluded or predates that record.
-func (db *DB) ExcludedSessionFilePath(ctx context.Context, id string) string {
-	var fp sql.NullString
-	_ = db.getReader().QueryRow(ctx,
-		"SELECT file_path FROM excluded_sessions WHERE id = ?", id,
-	).Scan(&fp)
-	return fp.String
+	return records, rows.Err()
 }
 
 // ListStaleForkSessionOwnerships returns every active fork row written by an

@@ -339,3 +339,40 @@ func TestDerivedSessionFollowsProviderMove(t *testing.T) {
 		})
 	}
 }
+
+// A rebuild resolves a derived session's move the same way an ordinary sync
+// does, even after its old file was marked missing.
+func TestResyncFollowsMoveOfMissingDerivedSession(t *testing.T) {
+	const baseID = "cursor:shared"
+	cursorDir := t.TempDir()
+	env := setupTestEnv(t, WithCursorDirs([]string{cursorDir}))
+	txt := "user:\nHello\nassistant:\nHi\n"
+	env.writeCursorSession(t, cursorDir, "Users-alice-code-one", "shared.txt", txt)
+	env.engine.SyncAll(t.Context(), nil)
+	second := env.writeCursorSession(t, cursorDir, "Users-alice-code-two", "shared.txt", txt)
+	env.engine.SyncAll(t.Context(), nil)
+	altID := parser.AltSessionID(baseID, second)
+	starred, err := env.db.StarSession(t.Context(), altID)
+	require.NoError(t, err)
+	require.True(t, starred)
+	require.NoError(t, os.Remove(second))
+	require.NoError(t, env.engine.SyncPathsContext(t.Context(), []string{second}))
+	require.NotNil(t, requireStoredSession(t, env.db, altID).SourceMissingAt)
+
+	jsonl := env.writeCursorSession(t, cursorDir, "Users-alice-code-two", "shared.jsonl",
+		`{"role":"user","message":{"content":"Hello"}}`+"\n"+
+			`{"role":"assistant","message":{"content":"Hi"}}`+"\n"+
+			`{"role":"user","message":{"content":"More"}}`+"\n")
+	stats := env.engine.ResyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "ResyncAll aborted: %v", stats.Warnings)
+
+	moved, err := env.db.GetSessionFull(t.Context(), parser.AltSessionID(baseID, jsonl))
+	require.NoError(t, err)
+	assert.Nil(t, moved, "no second derived id for the moved file")
+	alt := requireStoredSession(t, env.db, altID)
+	assert.Equal(t, jsonl, *alt.FilePath)
+	assert.Equal(t, 3, alt.MessageCount)
+	ids, err := env.db.ListStarredSessionIDs(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, ids, altID)
+}
