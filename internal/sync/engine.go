@@ -13350,6 +13350,7 @@ type archiveStaleClaudeForkIndex struct {
 	// sourceCollisionID covers to their stored paths, so a rebuild keeps each
 	// file on the id it had.
 	sessionPaths map[string]string
+	altsByBase   map[string][]string
 }
 
 func loadArchiveStaleClaudeForkIndex(ctx context.Context,
@@ -13368,6 +13369,12 @@ func loadArchiveStaleClaudeForkIndex(ctx context.Context,
 	index := &archiveStaleClaudeForkIndex{
 		byPath:       make(map[string][]db.SessionSourceOwnership),
 		sessionPaths: sessionPaths,
+		altsByBase:   make(map[string][]string),
+	}
+	for id := range sessionPaths {
+		if base := parser.BaseSessionID(id); base != id {
+			index.altsByBase[base] = append(index.altsByBase[base], id)
+		}
 	}
 	for _, ownership := range ownerships {
 		index.byPath[ownership.FilePath] = append(

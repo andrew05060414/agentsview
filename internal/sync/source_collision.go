@@ -31,11 +31,13 @@ func (e *Engine) sourceCollisionID(
 	if stored == lookupPath {
 		return s.ID
 	}
-	altID := parser.AltSessionID(s.ID, lookupPath)
-	if !e.altSessionKnown(ctx, applyIDPrefixToID(e.idPrefix, altID)) &&
-		!e.ownerElsewhere(ctx, provider, stored, lookupPath) &&
-		e.claimSessionID(ctx, provider, fullID, lookupPath) {
-		return s.ID
+	altID := e.existingAltID(ctx, provider, fullID, s.ID, lookupPath)
+	if altID == "" {
+		if !e.ownerElsewhere(ctx, provider, stored, lookupPath) &&
+			e.claimSessionID(ctx, provider, fullID, lookupPath) {
+			return s.ID
+		}
+		altID = parser.AltSessionID(s.ID, lookupPath)
 	}
 	if s.ParentSessionID == "" {
 		s.ParentSessionID = s.ID
@@ -65,17 +67,25 @@ func (e *Engine) collisionPolicyAgents() []string {
 	return agents
 }
 
-// altSessionKnown reports whether this file was already stored under its
-// derived id, or the user deleted that session. Either way it keeps the id,
-// so a base owner that is later deleted or goes missing is never overwritten.
-func (e *Engine) altSessionKnown(ctx context.Context, fullAltID string) bool {
+// existingAltID returns the derived id already held by this file, stored or
+// deleted, including one the provider has since moved to lookupPath, so its
+// curation and any deletion carry over. It returns "" when there is none.
+func (e *Engine) existingAltID(
+	ctx context.Context, provider parser.Provider, fullID, rawID, lookupPath string,
+) string {
+	alts := e.db.ListAltSessionPaths(ctx, fullID)
 	if index := e.archiveStaleClaudeForks; index != nil {
-		if _, ok := index.sessionPaths[fullAltID]; ok {
-			return true
+		for _, id := range index.altsByBase[fullID] {
+			alts[id] = index.sessionPaths[id]
 		}
 	}
-	return e.db.GetSessionFilePath(ctx, fullAltID) != "" ||
-		e.db.IsSessionExcluded(ctx, fullAltID)
+	minted := applyIDPrefixToID(e.idPrefix, parser.AltSessionID(rawID, lookupPath))
+	for id, stored := range alts {
+		if id == minted || e.storedSourceLivesAt(ctx, provider, stored, lookupPath) {
+			return rawID + id[len(fullID):]
+		}
+	}
+	return ""
 }
 
 // claimSessionID records path as the owner of an id for this pass. It fails
@@ -97,8 +107,7 @@ func (e *Engine) claimSessionID(
 }
 
 // ownerElsewhere reports whether the provider still serves the stored source
-// path as a file other than the one at path. A source it resolves to path is
-// the same session moved there. Rewritten remote paths are never proven gone.
+// path as a file other than the one at path.
 func (e *Engine) ownerElsewhere(
 	ctx context.Context, provider parser.Provider, stored, path string,
 ) bool {
@@ -106,13 +115,35 @@ func (e *Engine) ownerElsewhere(
 		return false
 	}
 	if e.pathRewriter != nil {
+		// Rewritten remote paths are never proven gone.
 		return true
 	}
+	at, live := e.providerSourcePath(ctx, provider, stored)
+	return live && at != path
+}
+
+// storedSourceLivesAt reports whether a stored source path is the file at
+// path, or the provider has moved that source there.
+func (e *Engine) storedSourceLivesAt(
+	ctx context.Context, provider parser.Provider, stored, path string,
+) bool {
+	if stored == "" || stored == path || e.pathRewriter != nil {
+		return stored != "" && stored == path
+	}
+	at, live := e.providerSourcePath(ctx, provider, stored)
+	return live && at == path
+}
+
+// providerSourcePath asks the provider where it serves a stored source path
+// now. live is false only when the provider proves the source gone.
+func (e *Engine) providerSourcePath(
+	ctx context.Context, provider parser.Provider, stored string,
+) (path string, live bool) {
 	source, found, err := provider.FindSource(ctx, parser.FindSourceRequest{
 		StoredFilePath: stored, RequireFreshSource: true,
 	})
 	if err != nil {
-		return true
+		return stored, true
 	}
-	return found && providerDiscoveredPath(source) != path
+	return providerDiscoveredPath(source), found
 }

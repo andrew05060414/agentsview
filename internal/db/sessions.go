@@ -3978,6 +3978,30 @@ func (db *DB) ListSessionPathsForAgents(ctx context.Context, agents []string) (m
 	return paths, rows.Err()
 }
 
+// ListAltSessionPaths maps each stored or permanently deleted session id
+// derived from baseID by parser.AltSessionID to its recorded file path ("" when
+// none was recorded).
+func (db *DB) ListAltSessionPaths(ctx context.Context, baseID string) map[string]string {
+	paths := make(map[string]string)
+	low, high := baseID+"_alt-", baseID+"_alt."
+	rows, err := db.getReader().Query(ctx,
+		"SELECT id, COALESCE(file_path, '') FROM sessions WHERE id >= ? AND id < ?"+
+			" UNION ALL SELECT id, COALESCE(file_path, '') FROM excluded_sessions WHERE id >= ? AND id < ?",
+		low, high, low, high,
+	)
+	if err != nil {
+		return paths
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, path string
+		if rows.Scan(&id, &path) == nil && (paths[id] == "" || path != "") {
+			paths[id] = path
+		}
+	}
+	return paths
+}
+
 // ExcludedSessionFilePath returns the source file a permanently deleted
 // session came from, or "" when it is not excluded or predates that record.
 func (db *DB) ExcludedSessionFilePath(ctx context.Context, id string) string {

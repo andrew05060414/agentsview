@@ -297,3 +297,45 @@ func TestSyncAcceptsSameSourceShrinking(t *testing.T) {
 	env.engine.SyncAll(t.Context(), nil)
 	assertSessionMessageCount(t, env.db, "gemini:shrinking-session", 1)
 }
+
+// A derived session follows its file when the provider moves it: a second
+// project's Cursor .txt transcript replaced by a .jsonl beside it keeps one
+// row under the same id, and a deleted one stays deleted.
+func TestDerivedSessionFollowsProviderMove(t *testing.T) {
+	const baseID = "cursor:shared"
+	for _, deleted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "kept", true: "deleted"}[deleted], func(t *testing.T) {
+			cursorDir := t.TempDir()
+			env := setupTestEnv(t, WithCursorDirs([]string{cursorDir}))
+			txt := "user:\nHello\nassistant:\nHi\n"
+			env.writeCursorSession(t, cursorDir, "Users-alice-code-one", "shared.txt", txt)
+			env.engine.SyncAll(t.Context(), nil)
+			second := env.writeCursorSession(t, cursorDir, "Users-alice-code-two", "shared.txt", txt)
+			env.engine.SyncAll(t.Context(), nil)
+			altID := parser.AltSessionID(baseID, second)
+			requireStoredSession(t, env.db, altID)
+			if deleted {
+				require.NoError(t, env.db.DeleteSession(t.Context(), altID))
+			}
+
+			jsonl := env.writeCursorSession(t, cursorDir, "Users-alice-code-two", "shared.jsonl",
+				`{"role":"user","message":{"content":"Hello"}}`+"\n"+
+					`{"role":"assistant","message":{"content":"Hi"}}`+"\n"+
+					`{"role":"user","message":{"content":"More"}}`+"\n")
+			env.engine.SyncAll(t.Context(), nil)
+
+			moved, err := env.db.GetSessionFull(t.Context(), parser.AltSessionID(baseID, jsonl))
+			require.NoError(t, err)
+			assert.Nil(t, moved, "no second derived id for the moved file")
+			alt, err := env.db.GetSessionFull(t.Context(), altID)
+			require.NoError(t, err)
+			if deleted {
+				assert.Nil(t, alt, "the deleted session stays deleted")
+				return
+			}
+			require.NotNil(t, alt)
+			assert.Equal(t, jsonl, *alt.FilePath)
+			assert.Equal(t, 3, alt.MessageCount)
+		})
+	}
+}
