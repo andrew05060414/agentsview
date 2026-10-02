@@ -70,20 +70,21 @@ type (
 )
 
 // passEpilogueDeferred reports whether a grouped caller owns the pass
-// epilogue — global subagent linking and skip-cache persistence — so a
-// scoped reconciliation must not repeat that archive-sized work itself.
+// epilogue — queued parent repairs, global linking, and skip-cache persistence —
+// so a scoped reconciliation must not repeat that work itself.
 func passEpilogueDeferred(ctx context.Context) bool {
 	deferred, _ := ctx.Value(deferPassEpilogueContextKey{}).(bool)
 	return deferred
 }
 
 // passEpilogueEligibility records, at the per-pass gate sites, whether a
-// pass would have run global subagent linking and skip-cache persistence.
+// pass would have run queued repairs, global linking, and skip-cache persistence.
 // Grouped callers consume it instead of inferring eligibility from the
 // pass's final error: that error also reflects later tombstoning and spool
 // cleanup failures, which never suppressed the per-pass epilogue and must
 // not suppress the shared one.
 type passEpilogueEligibility struct {
+	repair  bool
 	link    bool
 	persist bool
 }
@@ -576,15 +577,16 @@ type Engine struct {
 	// TCC-protected locations. homeDir is empty when the home directory
 	// cannot be resolved, which disables the gate rather than guessing.
 	// goos mirrors runtime.GOOS so the gate is testable off-darwin.
-	scanProtectedPaths bool
-	homeDir            string
-	goos               string
-	syncMu             gosync.Mutex // serializes all sync operations
-	mu                 gosync.RWMutex
-	lastSync           time.Time
-	lastSyncStats      SyncStats
-	currentProgress    *Progress
-	progressStallAfter time.Duration
+	scanProtectedPaths  bool
+	homeDir             string
+	goos                string
+	subagentLinkPending bool         // protected by syncMu; retains failed global linking
+	syncMu              gosync.Mutex // serializes all sync operations
+	mu                  gosync.RWMutex
+	lastSync            time.Time
+	lastSyncStats       SyncStats
+	currentProgress     *Progress
+	progressStallAfter  time.Duration
 	// skipCache tracks paths that should be skipped on
 	// subsequent syncs, keyed by path with the file mtime
 	// at time of caching. Covers parse errors and
@@ -1791,11 +1793,21 @@ func (e *Engine) applyChangedPathSyncLocked(
 		Detail:        "Syncing changed session paths",
 		SessionsTotal: len(prepared.files),
 	})
-	results := e.startWorkers(ctx, prepared.files)
-	stats := e.collectAndBatch(
-		ctx, results, len(prepared.files), len(prepared.files), nil,
-		syncWriteDefault,
+	processingCtx := context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
+	results := e.startWorkers(processingCtx, prepared.files)
+	affectedSessionIDs := make(changedSessionLinks)
+	stats := e.collectAndBatchWithOptions(
+		processingCtx, results, len(prepared.files), len(prepared.files), nil,
+		syncWriteDefault, collectAndBatchOptions{
+			observeResult: func(job syncJob) {
+				affectedSessionIDs.observe(job, e.idPrefix)
+			},
+		},
 	)
+	linkErr := affectedSessionIDs.link(ctx, e, &stats)
+	if linkErr != nil {
+		stats.RecordFailed()
+	}
 	e.anomalies.applyTo(&stats)
 	complete := prepared.classificationErr == nil && ctx.Err() == nil &&
 		stats.ProcessingComplete()
@@ -1829,7 +1841,7 @@ func (e *Engine) applyChangedPathSyncLocked(
 	if stats.Synced > 0 {
 		log.Printf("sync: %d file(s) updated", stats.Synced)
 	}
-	if err := errors.Join(prepared.classificationErr, ctx.Err()); err != nil {
+	if err := errors.Join(prepared.classificationErr, linkErr, ctx.Err()); err != nil {
 		if stats.Deferred > 0 {
 			return stats, tombstoned, &incompleteReconciliationError{
 				deferred: stats.Deferred,
@@ -2401,6 +2413,11 @@ func providerChangedPathForceParse(
 	if mode != parser.ProviderMigrationProviderAuthoritative {
 		return true
 	}
+	// Grok requires a matching content fingerprint for all companion files.
+	// Ordinary watcher events must not clear its failed-source retry cache.
+	if agent == parser.AgentGrok {
+		return false
+	}
 	// Codebuff changed-path events must always force a fingerprint
 	// comparison. The composite stat-only freshness gate may skip
 	// same-size, same-mtime rewrites, so a concrete changed-path
@@ -2946,18 +2963,29 @@ func (e *Engine) resyncAllWithOptionsLocked(
 	preBuildSkipHashKeys := e.skipHashKeys
 	e.skipMu.Unlock()
 
+	preBuildLinkPending := e.subagentLinkPending
+	installed := false
+	defer func() {
+		// Linking in the replacement does not repair the live archive until
+		// the swap installs it. Keep the live retry on every discarded build.
+		if !installed {
+			e.subagentLinkPending = preBuildLinkPending
+		}
+	}()
+
 	stats, err := e.resyncBuildLocked(ctx, onProgress, opts, ops, ownedBarrier)
 	if err != nil || stats.Aborted {
 		return stats, err
 	}
 	swapStageReached = true
-	installed, swapErr := e.swapResyncDatabaseLocked(
+	var swapErr error
+	installed, swapErr = e.swapResyncDatabaseLocked(
 		ctx, onProgress, e.ResyncTempPath(), ops, &stats,
 	)
 	if swapErr != nil {
 		if !installed {
 			// The original archive is still in place; drop the discarded
-			// replacement's skip entries and its tombstone count. A
+			// replacement's skip entries and its change counts. A
 			// post-install failure keeps both: the replacement is the live
 			// archive there.
 			e.skipMu.Lock()
@@ -2966,6 +2994,7 @@ func (e *Engine) resyncAllWithOptionsLocked(
 			e.skipHashKeys = preBuildSkipHashKeys
 			e.skipMu.Unlock()
 			stats.Tombstoned = 0
+			stats.LinksUpdated = 0
 		}
 		e.setLastSyncStats(stats)
 		return stats, swapErr
@@ -2989,11 +3018,11 @@ func (e *Engine) resyncBuildLocked(
 ) (stats SyncStats, retErr error) {
 	e.clearPiebaldFailureMemo()
 	defer e.clearPiebaldFailureMemo()
-	// Rebuild tombstones are committed only inside the replacement, and every
+	// Rebuild tombstones and links commit only inside the replacement, and every
 	// aborted or failed build discards it. Hold them here and publish the
 	// count only on the successful return, so no failure branch stores or
 	// returns removals that never reached the archive.
-	pendingTombstoned := 0
+	var pendingTombstoned, pendingLinksUpdated int
 	reportResyncProgress := func(p Progress) {
 		p.Resync = true
 		if p.Phase == PhaseSyncing && p.Detail == "" {
@@ -3298,6 +3327,8 @@ func (e *Engine) resyncBuildLocked(
 	e.archiveRebuildIndex = nil
 	pendingTombstoned += stats.Tombstoned
 	stats.Tombstoned = 0
+	pendingLinksUpdated += stats.LinksUpdated
+	stats.LinksUpdated = 0
 	e.phaseStats.Log("resync")
 	if opts.includePhaseDiagnostics {
 		stats.RebuildPhases = append(stats.RebuildPhases,
@@ -3363,6 +3394,8 @@ func (e *Engine) resyncBuildLocked(
 		mergeSyncStats(&stats, contributorStats)
 		pendingTombstoned += stats.Tombstoned
 		stats.Tombstoned = 0
+		pendingLinksUpdated += stats.LinksUpdated
+		stats.LinksUpdated = 0
 		if opts.includePhaseDiagnostics {
 			stats.RebuildPhases = append(stats.RebuildPhases, phase)
 		}
@@ -3614,15 +3647,15 @@ func (e *Engine) resyncBuildLocked(
 
 	// Re-link subagent sessions after orphan copy so copied
 	// tool_calls.subagent_session_id references are resolved.
+	var repaired int
 	if len(orphaned) > 0 {
 		reportResyncPhase(
 			PhaseCopyingOrphans,
 			"Relinking archived subagent sessions",
 			"",
 		)
-		if err := newDB.LinkSubagentSessions(); err != nil {
-			log.Printf("resync: relink subagent sessions: %v", err)
-		}
+		repaired, err = newDB.LinkSubagentSessionsContext(ctx)
+		pendingLinksUpdated += repaired
 	}
 
 	// CopySyncStateFrom runs after the fresh archive's normal linking pass so
@@ -3630,9 +3663,13 @@ func (e *Engine) resyncBuildLocked(
 	// Wait until orphan restoration is complete so every queued session and
 	// copied spawn edge is present. A failed repair leaves hierarchy state
 	// uncertain and must abort before the replacement can be installed.
-	if err := newDB.RepairQueuedSubagentParentsContext(ctx, func(done, total int) {
-		e.reportSubagentRepairProgress(reportResyncProgress, done, total)
-	}); err != nil {
+	if err == nil {
+		repaired, err = newDB.RepairQueuedSubagentParentsContext(ctx, func(done, total int) {
+			e.reportSubagentRepairProgress(reportResyncProgress, done, total)
+		})
+		pendingLinksUpdated += repaired
+	}
+	if err != nil {
 		log.Printf("resync: repair copied subagent parents: %v", err)
 		stats.Aborted = true
 		stats.Warnings = append(stats.Warnings,
@@ -3923,6 +3960,7 @@ func (e *Engine) resyncBuildLocked(
 		return stats, err
 	}
 	stats.Tombstoned = pendingTombstoned
+	stats.LinksUpdated = pendingLinksUpdated
 	return stats, nil
 }
 
@@ -4589,7 +4627,9 @@ func startupReconciliationSucceeded(
 // acknowledged startup is a no-op rather than a double-release; the last-sync
 // bookkeeping and emit re-run per pass by design.
 func (e *Engine) RecordStartupReconciled(stats SyncStats, err error) {
+	e.syncMu.Lock()
 	e.RecordStartupReconciledExclusive(stats, err)
+	e.syncMu.Unlock()
 	e.FinishStartupReconciled(stats)
 }
 
@@ -4600,6 +4640,7 @@ func (e *Engine) RecordStartupReconciled(stats SyncStats, err error) {
 // archive-scale worker. FinishStartupReconciled completes the tail that must
 // run outside the lock.
 func (e *Engine) RecordStartupReconciledExclusive(stats SyncStats, err error) {
+	e.RetainSubagentLinkRetryExclusive(stats.LinksPending)
 	e.mu.Lock()
 	if err == nil && !stats.Aborted {
 		e.lastSync = time.Now()
@@ -4969,9 +5010,9 @@ type ProviderRootsGroup struct {
 }
 
 // ReconcileProviderRootsGrouped runs the bounded scheduled pass for every
-// group and shares one pass epilogue — global subagent linking and skip-cache
-// persistence — across the whole batch, so a multi-provider poll performs
-// that archive-sized work once instead of once per provider. Every group is
+// group and shares one pass epilogue — queued repairs, global linking, and
+// skip-cache persistence — across the whole batch. A multi-provider poll performs
+// global linking once instead of once per provider. Every group is
 // attempted even when an earlier one fails; per-group failures are wrapped
 // with the provider and joined.
 //
@@ -4996,6 +5037,7 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 		e.syncMu.Lock()
 		defer e.syncMu.Unlock()
 		defer e.clearCurrentProgress()
+		repairEligible := false
 		linkEligible := false
 		persistEligible := false
 		for _, group := range groups {
@@ -5006,6 +5048,7 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 				deferredCtx, group.Agent, group.Roots, false, false, nil,
 			)
 			changed = changed || stats.hasSessionChanges() || tombstoned > 0
+			repairEligible = repairEligible || eligibility.repair
 			linkEligible = linkEligible || eligibility.link
 			persistEligible = persistEligible || eligibility.persist
 			if err == nil {
@@ -5029,10 +5072,25 @@ func (e *Engine) ReconcileProviderRootsGrouped(
 			return
 		}
 		if linkEligible {
-			if err := e.linkSubagentSessions(ctx); err != nil {
+			linked, err := e.linkSubagentSessions(ctx)
+			if err != nil {
 				errs = append(errs, fmt.Errorf(
 					"link subagent sessions after grouped reconciliation: %w", err,
 				))
+			} else if linked > 0 {
+				// The repair runs after per-group stats are folded into
+				// changed. A parent-only update still has to refresh clients.
+				changed = true
+			}
+		}
+		if repairEligible {
+			repaired, err := e.db.RepairQueuedSubagentParentsContext(ctx, nil)
+			if err != nil {
+				errs = append(errs, fmt.Errorf(
+					"repair queued subagent parents after grouped reconciliation: %w", err,
+				))
+			} else if repaired > 0 {
+				changed = true
 			}
 		}
 		if persistEligible {
@@ -5498,31 +5556,45 @@ func (e *Engine) reconcileWatchRootsStreamedLocked(
 		e.promoteSkipCacheWrites(eligibleCacheWrites)
 		cursor = page[len(page)-1].Cursor()
 	}
-	// Page writes committed cleanly when the paging loop finished without an
-	// error or a failed write; provider discovery failures are layered on
-	// below and must not suppress work that only depends on committed writes.
-	// A grouped caller (passEpilogueDeferred) runs linking once after every
-	// group instead, consuming the eligibility recorded here; tombstoning
-	// below then proceeds without the linking gate, which is safe because
-	// linking is idempotent and retried on the caller's next pass.
-	if retErr == nil && stats.Failed == 0 && !stats.Aborted {
-		eligibility.link = true
+	// Pending linking depends only on committed archive rows. Unrelated source
+	// failures must not suppress it; full reconciliation without pending work
+	// still requires a completed pass. Grouped callers consume this eligibility
+	// once after all groups, and tombstoning keeps its separate success gate.
+	e.subagentLinkPending = e.subagentLinkPending || stats.Synced > 0
+	if ctx.Err() == nil {
+		eligibility.repair = true
+		eligibility.link = e.subagentLinkPending ||
+			(fullCoverage && retErr == nil && stats.Failed == 0 && !stats.Aborted)
 	}
 	if eligibility.link && !passEpilogueDeferred(ctx) {
-		// Batch-level linking was deferred to this global pass, so run it
-		// whenever the committed page writes succeeded — including partial
-		// provider failures. Sessions from healthy providers are already in
-		// the archive, and a permanently failing unrelated provider must not
-		// leave their subagent relationships missing indefinitely. Linking
-		// runs before the incomplete-reconciliation error is built: a
-		// linking failure blocks the completed scopes' tombstoning below, so
-		// those scopes must join the retry roots rather than staying stale.
-		if err := e.linkSubagentSessions(ctx); err != nil {
+		// Keep earlier processing errors so failed work still blocks tombstoning
+		// and retains its retry roots even when the pending links are repaired.
+		linked, err := e.linkSubagentSessions(ctx)
+		if err != nil {
 			stats.RecordFailed()
 			stats.Aborted = true
-			retErr = fmt.Errorf(
+			retErr = errors.Join(retErr, fmt.Errorf(
 				"link subagent sessions after reconciliation: %w", err,
-			)
+			))
+		} else {
+			// Record after subagentLinkPending is sampled above. Folding
+			// the repair into that sample would keep the next unchanged
+			// poll on the global link path.
+			stats.RecordLinksUpdated(linked)
+		}
+	}
+	// An empty spool never enters collectAndBatch, so its pending durable
+	// repairs must run here too. This touches queued IDs, not the full archive.
+	if eligibility.repair && !passEpilogueDeferred(ctx) {
+		repaired, err := e.db.RepairQueuedSubagentParentsContext(ctx, nil)
+		if err != nil {
+			stats.RecordFailed()
+			stats.Aborted = true
+			retErr = errors.Join(retErr, fmt.Errorf(
+				"repair queued subagent parents after reconciliation: %w", err,
+			))
+		} else {
+			stats.RecordLinksUpdated(repaired)
 		}
 	}
 	canTombstoneCompletedScopes :=
@@ -6832,6 +6904,7 @@ func mergeReconciliationSyncStats(dst *SyncStats, src SyncStats) {
 	dst.cwdFilteredSessions += src.cwdFilteredSessions
 	dst.cwdFilteredFiles += src.cwdFilteredFiles
 	dst.CwdUpdated += src.CwdUpdated
+	dst.LinksUpdated += src.LinksUpdated
 	dst.Aborted = dst.Aborted || src.Aborted
 	if !dst.deferredRetryOverflow {
 		deferred := dst.Deferred
@@ -8055,8 +8128,12 @@ func (e *Engine) syncAllLocked(
 	e.reportFinalizingProgress(
 		onProgress, writeMode, finalizingAllLinksDetail,
 	)
-	if err := e.db.LinkSubagentSessions(); err != nil {
+	linked, err := e.linkSubagentSessions(ctx)
+	if err != nil {
 		log.Printf("link subagent sessions: %v", err)
+		stats.RecordFailed()
+	} else {
+		stats.RecordLinksUpdated(linked)
 	}
 
 	e.reportFinalizingProgress(
@@ -9812,6 +9889,8 @@ func (e *Engine) syncProviderDBBackedAgent(
 	if pendingCount > 0 {
 		stats.TotalSessions += pendingCount
 		stats.RecordSynced(written)
+		// Retain linking if cancellation skips the final full-sync pass.
+		e.subagentLinkPending = e.subagentLinkPending || written > 0
 		if verbose {
 			log.Printf(
 				"%s write: %d sessions in %s",
@@ -10836,9 +10915,12 @@ flush:
 		e.reportFinalizingProgress(
 			onProgress, writeMode, finalizingFileLinksDetail,
 		)
-		if err := e.linkSubagentSessions(postWriteCtx); err != nil {
+		linked, err := e.linkSubagentSessions(postWriteCtx)
+		if err != nil {
 			log.Printf("link subagent sessions: %v", err)
 			stats.RecordFailed()
+		} else {
+			stats.RecordLinksUpdated(linked)
 		}
 	}
 	e.reportFinalizingProgress(
@@ -10850,9 +10932,12 @@ flush:
 			e.reportSubagentRepairProgress(onProgress, done, total)
 		}
 	}
-	if err := e.db.RepairQueuedSubagentParentsContext(postWriteCtx, repairProgress); err != nil {
+	repaired, err := e.db.RepairQueuedSubagentParentsContext(postWriteCtx, repairProgress)
+	if err != nil {
 		log.Printf("repair queued subagent parents: %v", err)
 		stats.RecordFailed()
+	} else {
+		stats.RecordLinksUpdated(repaired)
 	}
 
 	// PhaseDone is emitted by syncAllLocked after the DB-backed
@@ -11041,11 +11126,16 @@ func (e *Engine) reconcileSkippedSingleSessionSourceBaselines(
 	return nil
 }
 
-func (e *Engine) linkSubagentSessions(ctx context.Context) error {
+func (e *Engine) linkSubagentSessions(ctx context.Context) (int, error) {
 	if runtimeMetrics := reconciliationRuntimeMetricsFor(ctx); runtimeMetrics != nil {
 		runtimeMetrics.globalLinkPass()
 	}
-	return e.db.LinkSubagentSessionsContext(ctx)
+	updated, err := e.db.LinkSubagentSessionsContext(ctx)
+	e.subagentLinkPending = err != nil
+	if err != nil {
+		return 0, err
+	}
+	return updated, nil
 }
 
 // drainResults consumes remaining items from the results
@@ -20735,22 +20825,26 @@ func (e *Engine) processAndWriteSessionFile(
 				"reconcile fresh source baselines: %w", err,
 			)
 		}
-		if err := e.db.RepairQueuedSubagentParents(); err != nil {
+		repaired, err := e.db.RepairQueuedSubagentParentsContext(context.Background(), nil)
+		if err != nil {
 			return false, sessionsChanged, fmt.Errorf(
 				"repair queued subagent parents: %w", err,
 			)
 		}
+		sessionsChanged = sessionsChanged || repaired > 0
 		// A previous write may have stored a new spawn edge but failed
 		// before its child could be durably queued. The requested session is
 		// still a bounded repair seed on the freshness path because its
 		// surviving edges identify those children directly.
-		if err := e.db.LinkSubagentSessionsForSessions(ctx,
+		linked, err := e.db.LinkSubagentSessionsForSessions(ctx,
 			[]string{requestedSessionID},
-		); err != nil {
+		)
+		if err != nil {
 			return false, sessionsChanged, fmt.Errorf(
 				"link fresh subagent sessions: %w", err,
 			)
 		}
+		sessionsChanged = sessionsChanged || linked > 0
 		return false, sessionsChanged, nil
 	}
 	if res.cacheSkip {
@@ -20782,11 +20876,13 @@ func (e *Engine) processAndWriteSessionFile(
 	// A prior sync may have removed an edge and then failed before repairing
 	// its child. Retry that durable work after this sync's read-only capture
 	// but before making any new mutations.
-	if err := e.db.RepairQueuedSubagentParents(); err != nil {
+	repaired, err := e.db.RepairQueuedSubagentParentsContext(context.Background(), nil)
+	if err != nil {
 		return false, sessionsChanged, fmt.Errorf(
 			"repair queued subagent parents: %w", err,
 		)
 	}
+	sessionsChanged = sessionsChanged || repaired > 0
 	if err := e.db.QueueSubagentParentCleanupRepairs(ctx, priorChildren); err != nil {
 		return false, sessionsChanged, fmt.Errorf(
 			"queue subagent parent repairs: %w", err,
@@ -20817,11 +20913,13 @@ func (e *Engine) processAndWriteSessionFile(
 		if !repairQueued {
 			return
 		}
-		if repairErr := e.db.RepairQueuedSubagentParents(); repairErr != nil {
+		repaired, repairErr := e.db.RepairQueuedSubagentParentsContext(context.Background(), nil)
+		if repairErr != nil {
 			err = errors.Join(err, fmt.Errorf(
 				"repair queued subagent parents: %w", repairErr,
 			))
 		}
+		sessionsChanged = sessionsChanged || repaired > 0
 	}()
 	queueWrittenChildren := func(spawnerIDs []string) error {
 		children, childErr := e.db.SubagentChildSessionIDs(ctx, spawnerIDs)
@@ -20907,12 +21005,14 @@ func (e *Engine) processAndWriteSessionFile(
 		); err != nil {
 			return false, sessionsChanged, err
 		}
-		if err := e.db.LinkSubagentSessionsForSessions(ctx,
+		linked, err := e.db.LinkSubagentSessionsForSessions(ctx,
 			[]string{res.incremental.sessionID},
-		); err != nil {
+		)
+		if err != nil {
 			return false, sessionsChanged, fmt.Errorf(
 				"link incremental subagent sessions: %w", err)
 		}
+		sessionsChanged = sessionsChanged || linked > 0
 		return false, sessionsChanged, nil
 	}
 
@@ -21006,12 +21106,14 @@ func (e *Engine) processAndWriteSessionFile(
 	if !sourceComplete {
 		markSourceIncomplete()
 	}
-	if err := e.db.LinkSubagentSessionsForSessions(ctx, resultIDs); err != nil {
+	linked, err := e.db.LinkSubagentSessionsForSessions(ctx, resultIDs)
+	if err != nil {
 		markSourceIncomplete()
 		return false, sessionsChanged, fmt.Errorf(
 			"link changed subagent sessions: %w", err,
 		)
 	}
+	sessionsChanged = sessionsChanged || linked > 0
 	if sourceComplete && atomicDAG {
 		if err := e.db.SetSessionDataVersions(
 			writtenIDs, db.CurrentDataVersion(),

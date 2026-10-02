@@ -1,16 +1,19 @@
 package sync_test
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 )
@@ -494,7 +497,9 @@ func TestSyncForgeSubagentLinking(t *testing.T) {
 		"",
 	)
 
-	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 2, Synced: 2, Skipped: 0})
+	runSyncAndAssert(t, env.engine, sync.SyncStats{
+		TotalSessions: 2, Synced: 2, LinksUpdated: 1,
+	})
 
 	// After SyncAll the tool_call row must already carry subagent_session_id.
 	// This is set by the parser before LinkSubagentSessions runs.
@@ -521,6 +526,135 @@ func TestSyncForgeSubagentLinking(t *testing.T) {
 	assert.Equal(t, "forge:"+parentID, parentSessID.String)
 	require.True(t, relType.Valid, "child relationship_type not valid")
 	assert.Equal(t, "subagent", relType.String)
+}
+
+func TestSyncForgeSubagentLinkFailureRetriesOnUnchangedPoll(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentForge)
+	forge := createForgeDB(t, env.forgeDir)
+	forge.addConversation(t, "parent-conv", "Parent",
+		forgeParentContext("child-conv"),
+		"2026-05-02 09:00:00", "2026-05-02 09:01:00", "")
+	forge.addConversation(t, "child-conv", "Child",
+		forgeTestContext("Child work.", "Child done."),
+		"2026-05-02 09:00:30", "2026-05-02 09:01:30", "")
+	require.NoError(t, env.db.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `
+			CREATE TRIGGER fail_subagent_link
+			BEFORE UPDATE OF relationship_type ON sessions
+			WHEN NEW.id = 'forge:child-conv' AND NEW.relationship_type = 'subagent'
+			BEGIN
+				SELECT RAISE(FAIL, 'injected linking failure');
+			END;
+		`)
+		return err
+	}))
+
+	stats := env.engine.SyncAll(t.Context(), nil)
+	assert.Equal(t, 2, stats.Synced)
+	assert.Equal(t, 1, stats.Failed)
+	child, err := env.db.GetSession(t.Context(), "forge:child-conv")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	require.Nil(t, child.ParentSessionID)
+
+	require.NoError(t, env.db.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), "DROP TRIGGER fail_subagent_link")
+		return err
+	}))
+	require.NoError(t, env.engine.ReconcileProviderRootsGrouped(
+		t.Context(), []sync.ProviderRootsGroup{{
+			Agent: parser.AgentForge, Roots: []string{env.forgeDir},
+		}},
+	))
+	child, err = env.db.GetSession(t.Context(), "forge:child-conv")
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	require.NotNil(t, child.ParentSessionID)
+	assert.Equal(t, "forge:parent-conv", *child.ParentSessionID)
+}
+
+func TestSyncForgeCanceledImportRetriesLinksOnUnchangedPoll(t *testing.T) {
+	for _, rebuild := range []string{"none", "canceled", "failed swap", "installed"} {
+		t.Run(rebuild, func(t *testing.T) {
+			env := setupSingleAgentTestEnv(t, parser.AgentForge)
+			defer env.engine.Close()
+			forge := createForgeDB(t, env.forgeDir)
+			forge.addConversation(t, "parent-conv", "Parent",
+				forgeParentContext("child-conv"),
+				"2026-05-02 09:00:00", "2026-05-02 09:01:00", "")
+			forge.addConversation(t, "child-conv", "Child",
+				forgeTestContext("Child work.", "Child done."),
+				"2026-05-02 09:00:30", "2026-05-02 09:01:30", "")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			stats := env.engine.SyncAll(ctx, func(progress sync.Progress) {
+				if progress.SessionsDone == 2 {
+					cancel()
+				}
+			})
+			require.True(t, stats.Aborted)
+			require.Equal(t, 2, stats.Synced)
+			child, err := env.db.GetSession(t.Context(), "forge:child-conv")
+			require.NoError(t, err)
+			require.NotNil(t, child)
+			require.Nil(t, child.ParentSessionID)
+
+			switch rebuild {
+			case "canceled":
+				buildCtx, cancelBuild := context.WithCancel(t.Context())
+				defer cancelBuild()
+				reached := false
+				stats = env.engine.ResyncAll(buildCtx, func(p sync.Progress) {
+					if p.Detail == "Copying sync metadata" {
+						reached = true
+						cancelBuild()
+					}
+				})
+				require.True(t, reached)
+				require.True(t, stats.Aborted)
+				require.False(t, stats.ArchiveRebuilt)
+			case "failed swap":
+				restore := db.SetCloseDrainTimeoutForTest(100 * time.Millisecond)
+				defer restore()
+				// A reader held across the build prevents the live archive
+				// from closing, so the replacement cannot be installed.
+				pinned, err := env.db.Reader().Query(t.Context(), "SELECT 1")
+				require.NoError(t, err)
+				defer pinned.Close()
+				stats = env.engine.ResyncAll(t.Context(), nil)
+				require.NoError(t, pinned.Err())
+				require.NoError(t, pinned.Close())
+				require.True(t, stats.Aborted)
+				require.False(t, stats.ArchiveRebuilt)
+			case "installed":
+				stats = env.engine.ResyncAll(t.Context(), nil)
+				require.False(t, stats.Aborted)
+				require.True(t, stats.ArchiveRebuilt)
+				assert.False(t, env.engine.PendingSubagentLinks(),
+					"an installed replacement must not inherit the old retry")
+			}
+			if rebuild != "installed" {
+				child, err = env.db.GetSession(t.Context(), "forge:child-conv")
+				require.NoError(t, err)
+				require.NotNil(t, child)
+				require.Nil(t, child.ParentSessionID,
+					"a discarded rebuild must leave the live archive unchanged")
+			}
+
+			require.NoError(t, env.engine.ReconcileProviderRootsGrouped(
+				t.Context(), []sync.ProviderRootsGroup{{
+					Agent: parser.AgentForge, Roots: []string{env.forgeDir},
+				}},
+			))
+			child, err = env.db.GetSession(t.Context(), "forge:child-conv")
+			require.NoError(t, err)
+			require.NotNil(t, child)
+			require.NotNil(t, child.ParentSessionID,
+				"unchanged polling must repair links after a discarded rebuild")
+			assert.Equal(t, "forge:parent-conv", *child.ParentSessionID)
+			assert.False(t, env.engine.PendingSubagentLinks())
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

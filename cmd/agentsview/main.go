@@ -382,6 +382,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 						ctx,
 						reconcileRootPaths(ingestion.Config()),
 						statsFromWorkerResult(workerStartupResult),
+						engine.RetainSubagentLinkRetry,
 						engine.ReconcileWatchRoots,
 						ingestion.QueueWatchRetry,
 						engine.RecordStartupReconciled,
@@ -790,7 +791,7 @@ func runStartupSyncViaWorker(
 		}
 		progress.SetSyncProgress(p)
 	}
-	result, err := launchSyncWorker(ctx, cfg, "startup", onLine)
+	result, err := launchSyncWorker(ctx, cfg, syncWorkerRequest{Mode: "startup"}, onLine)
 	if err == nil && result.Stats != nil {
 		printSyncSummary(*result.Stats, t)
 	} else if progressShown {
@@ -823,6 +824,12 @@ func startupWorkerOutcome(result workerResult, err error) (workerResult, bool) {
 			result.Status = "aborted"
 		}
 		result.DiscoveryComplete = false
+		if result.Stats == nil {
+			// The worker may have committed sessions before losing its result.
+			// Keep linking pending for recovery even when sources are unchanged.
+			result.Stats = new(statsFromWorkerResult(result))
+			result.Stats.LinksPending = true
+		}
 		return result, true
 	}
 }
@@ -1168,7 +1175,7 @@ func runWorkerResyncBuild(
 	var result workerResult
 	var launchErr error
 	var doneStats sync.SyncStats
-	barrierErr := engine.RunExclusive(func() error {
+	barrierErr := engine.RunExclusive(func() (err error) {
 		engine.UpdateProgress(sync.Progress{
 			Phase:  sync.PhasePreparingResync,
 			Detail: "Starting resync worker",
@@ -1187,8 +1194,11 @@ func runWorkerResyncBuild(
 		); cerr != nil {
 			return cerr
 		}
-		result, launchErr = launchSyncWorker(ctx, cfg, "resync-build", relay)
+		result, launchErr = launchSyncWorker(ctx, cfg, syncWorkerRequest{Mode: "resync-build"}, relay)
 		if launchErr != nil {
+			if result.Stats != nil {
+				result.Stats.LinksUpdated = 0
+			}
 			// The worker never swapped; restore the writer the barrier closed.
 			// Restoration is mandatory — abandoning it would leave every write
 			// endpoint failing until restart.
@@ -1202,14 +1212,28 @@ func runWorkerResyncBuild(
 			return launchErr
 		}
 		installed, serr := engine.SwapResyncDatabase(engine.ResyncTempPath())
+		if installed {
+			doneStats = statsFromWorkerResult(result)
+			doneStats.ArchiveRebuilt = true
+			if result.Stats != nil {
+				engine.SetSubagentLinkRetryExclusive(doneStats.LinksPending)
+			}
+			// Record installed changes even when later recovery fails. The
+			// completion notification runs after releasing the exclusive lock.
+			defer func() {
+				doneStats.Aborted = doneStats.Aborted || err != nil
+				engine.RecordStartupReconciledExclusive(doneStats, err)
+			}()
+		}
 		if serr != nil {
 			if !installed {
-				// The replacement was discarded, so its tombstones never
+				// The replacement was discarded, so its changes never
 				// reached the archive. A post-install failure keeps them:
 				// the replacement is the live archive there.
 				result.Tombstoned = 0
 				if result.Stats != nil {
 					result.Stats.Tombstoned = 0
+					result.Stats.LinksUpdated = 0
 				}
 			}
 			// Swap failures happen at or after CloseConnections closed the
@@ -1234,23 +1258,17 @@ func runWorkerResyncBuild(
 		if cerr := engine.ResetCachesAfterSwap(ctx); cerr != nil {
 			return cerr
 		}
-		// Record the completed resync with ResyncAll parity before the
-		// exclusive lock is released: last-sync state feeds /sync/status
-		// hydration, and the closed startup gate keeps the deferred startup
-		// fallback from launching another archive-scale pass. The emit and
-		// startup callback fire after the lock below.
-		doneStats = statsFromWorkerResult(result)
-		doneStats.ArchiveRebuilt = true
-		engine.RecordStartupReconciledExclusive(doneStats, nil)
 		return nil
 	})
+	if doneStats.ArchiveRebuilt {
+		engine.FinishStartupReconciled(doneStats)
+	}
 	if barrierErr != nil {
 		if errors.Is(barrierErr, errWorkerSpawn) {
 			return workerResult{}, barrierErr, true
 		}
 		return result, barrierErr, false
 	}
-	engine.FinishStartupReconciled(doneStats)
 	return result, nil, false
 }
 
@@ -3012,14 +3030,14 @@ func runArchiveAudit(
 }
 
 // workerResultHasSessionChanges reports whether a worker pass changed rows
-// clients must refetch. Cwd-only reconciliations ride the serialized
-// SyncStats payload rather than the summary counters, so the audit emit
-// must consult it or a cwd-only pass would leave the UI stale.
+// clients must refetch. Cwd-only changes and parent-link repairs ride the
+// serialized SyncStats payload rather than the summary counters, so the audit
+// emit must consult it or a metadata-only pass would leave the UI stale.
 func workerResultHasSessionChanges(result workerResult) bool {
 	if result.Synced > 0 || result.Tombstoned > 0 {
 		return true
 	}
-	return result.Stats != nil && result.Stats.CwdUpdated > 0
+	return result.Stats != nil && (result.Stats.CwdUpdated > 0 || result.Stats.LinksUpdated > 0)
 }
 
 // scheduledSyncEngine is the reconciliation surface the scheduled pass needs.

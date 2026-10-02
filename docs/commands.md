@@ -231,6 +231,32 @@ On startup, the server:
 The server shuts down cleanly on `Ctrl+C`, flushing the database and stopping
 file watchers.
 
+On current `main`, watcher batches link subagent relationships only for affected
+sessions. Unchanged polls skip archive-wide linking unless a failed or canceled
+batch left unfinished links. Poll logs identify the provider roots being checked
+and report how long the pass took.
+
+During polling, changes to working-directory metadata refresh clients without
+triggering global parent linking. Worker processes return link repairs and
+unfinished linking to the daemon, so clients see repaired links and later polls
+retry failed linking even when an unrelated source cannot be processed.
+Workers confirm their link state separately from source errors, so completed
+repairs clear obsolete retries even when another source fails. Installed
+rebuilds also clear completed retries. Audit workers receive pending links from
+the daemon even when sources are unchanged. Missing or invalid worker results
+keep the retry pending. Startup transfers pending links before
+reconciling the worker-to-watcher gap. Repairs queued in the archive run even
+when discovery finds no source files. Repairs committed to the live archive
+refresh clients even if sync is canceled. Full resync aborts before replacing
+the archive if relinking copied sessions fails; discarded replacements do not
+report their repairs and preserve pending retries for the live archive.
+
+Unchanged broken or missing source files are skipped through the failure cache
+described in [Sync Behavior](configuration.md#sync-behavior). Grok
+companion-file events use normal content-fingerprint checks, so repeated
+companion removal events do not clear a cached missing-summary failure. Actual
+companion edits still trigger sync.
+
 #### Background Mode
 
 The existing `serve` background and lifecycle forms remain available:

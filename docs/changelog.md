@@ -228,9 +228,11 @@ The latest published release is
   after more than 24 hours idle still waits until Codex closes its file.
 - Keep both transcripts when two Gemini CLI or Cursor files record the same
   session ID. The stored file keeps its ID; the other becomes a linked session.
-  Moving the data folder or renaming a file keeps one session when the old file
-  is gone and the new transcript has at least as many messages. A shorter file
-  stays separate so it cannot shorten the archive. Full resyncs preserve this
+  A new file can take over the original ID when the old file is gone and the
+  new transcript has at least as many messages. This covers folder moves and
+  renames of the original session. Already linked files need a move the provider
+  recognizes to keep their IDs. A shorter file stays separate so it cannot
+  shorten the archive. Full resyncs preserve this
   ownership and existing names, stars, and pins. On a first sync, parallel parse
   order decides which file gets the original ID; it need not be the earliest
   segment. Trashing the base also hides its linked sessions from the sidebar;
@@ -381,6 +383,10 @@ The latest published release is
 - Sync avoids repeatedly parsing unchanged malformed or missing source files
   where failure caching applies. Unrelated file events no longer bypass retry
   delays, and temporary lock-file changes no longer trigger session syncing.
+- The session list refreshes when sync repairs a subagent parent link, including
+  older self-parent links, even when no transcript changed.
+- Canceled syncs that saved session data retry unfinished parent links on the
+  next poll.
 - Configuration loading rejects unknown keys under `[vector]`, including
   misspelled or misplaced settings. Previously accepted configurations may now
   fail; correct or remove the named keys, even if vector search is disabled.

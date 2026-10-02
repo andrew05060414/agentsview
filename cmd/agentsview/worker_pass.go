@@ -277,7 +277,19 @@ func workerWritePassLocked(
 		)
 	}
 
-	result, workerErr := launchSyncWorker(ctx, cfg, mode, onLine)
+	request := syncWorkerRequest{Mode: mode, LinksPending: engine.PendingSubagentLinksExclusive()}
+	result, workerErr := launchSyncWorker(ctx, cfg, request, onLine)
+	if result.Stats != nil {
+		if (mode == "sync" || mode == "audit") && result.LinkStateKnown {
+			engine.SetSubagentLinkRetryExclusive(result.Stats.LinksPending)
+		} else {
+			engine.RetainSubagentLinkRetryExclusive(result.Stats.LinksPending)
+		}
+	} else if !workerNeverRan(workerErr) {
+		// A started worker may commit before losing its terminal result.
+		// Keep one linking pass pending when its completion is unknown.
+		engine.RetainSubagentLinkRetryExclusive(true)
+	}
 
 	// Lock recovery must not die with the caller's context: foreground
 	// syncs pass the HTTP request context, and a client disconnect
@@ -372,9 +384,10 @@ func reacquireWriteOwnerLock(
 func launchSyncWorkerProcess(
 	ctx context.Context,
 	cfg config.Config,
-	mode string,
+	request syncWorkerRequest,
 	onLine func(workerLine),
 ) (workerResult, error) {
+	mode := request.Mode
 	exe, err := os.Executable()
 	if err != nil {
 		return workerResult{}, fmt.Errorf(
@@ -382,7 +395,7 @@ func launchSyncWorkerProcess(
 		)
 	}
 
-	cmd := exec.CommandContext(ctx, exe, syncWorkerChildArgs(os.Args[1:], mode)...)
+	cmd := exec.CommandContext(ctx, exe, syncWorkerChildArgs(os.Args[1:], request)...)
 	// Config forwarding mirrors startServeBackgroundProcess: the child inherits
 	// the parent environment (per-agent dir overrides, AGENTSVIEW_* vars), plus
 	// the worker marker and the resolved data dir. syncWorkerChildArgs forwards
@@ -447,11 +460,17 @@ func collectWorkerResult(
 // malformed line, or a result count other than one, is a protocol error.
 func readWorkerResult(
 	r io.Reader, onLine func(workerLine),
-) (workerResult, error) {
+) (result workerResult, err error) {
+	defer func() {
+		if err != nil {
+			// Partial counters can still report committed writes, but an invalid
+			// result must not acknowledge completion of the daemon's pending links.
+			result.LinkStateKnown = false
+		}
+	}()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), workerLineMaxBytes)
 
-	var result workerResult
 	resultCount, malformed := 0, 0
 	for sc.Scan() {
 		raw := sc.Bytes()
@@ -494,8 +513,11 @@ func readWorkerResult(
 // --background child. Re-emitting the parsed flags (rather than copying raw
 // tokens) drops serve-only lifecycle flags the worker does not accept and
 // normalizes every value to an unambiguous --name=value form.
-func syncWorkerChildArgs(parentArgs []string, mode string) []string {
-	args := []string{"sync-worker", "--mode", mode}
+func syncWorkerChildArgs(parentArgs []string, request syncWorkerRequest) []string {
+	args := []string{"sync-worker", "--mode", request.Mode}
+	if request.LinksPending {
+		args = append(args, "--links-pending")
+	}
 	fs := pflag.NewFlagSet("sync-worker-forward", pflag.ContinueOnError)
 	fs.ParseErrorsAllowlist.UnknownFlags = true
 	config.RegisterServePFlags(fs)
