@@ -455,3 +455,20 @@ func TestDeletionWithoutRecordedFileHidesEveryFile(t *testing.T) {
 		assert.Nil(t, base)
 	}
 }
+
+// A stored session with no recorded file still owns its id; a file that
+// arrives with the same id gets its own id.
+func TestPathlessOwnerKeepsSessionID(t *testing.T) {
+	env := setupTestEnv(t)
+	require.NoError(t, env.db.UpsertSession(t.Context(), db.Session{
+		ID: collisionBaseID, Project: "p", Machine: "local", Agent: string(parser.AgentGemini), MessageCount: 7,
+	}))
+	other := env.writeGeminiSession(t, filepath.Join("tmp", "collisionhash", "chats", "session-2026-01-01T10-00-new.json"),
+		geminiCollisionSession("shared-session", 1))
+	env.engine.SyncAll(t.Context(), nil)
+
+	base := requireStoredSession(t, env.db, collisionBaseID)
+	assert.Nil(t, base.FilePath)
+	assert.Equal(t, 7, base.MessageCount)
+	assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, other), 1)
+}

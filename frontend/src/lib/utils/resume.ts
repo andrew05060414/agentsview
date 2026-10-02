@@ -92,8 +92,9 @@ export function buildResumeCommand(
   const builder = RESUME_AGENTS[agent];
   if (!builder) return null;
 
-  // A second file sharing a session id is stored as <id>_alt-<hash>; the CLI resumes <id>.
-  const rawId = stripIdPrefix(stripHostPrefix(sessionId), agent).replace(/_alt-[0-9a-f]{8}$/, "");
+  let rawId = stripIdPrefix(stripHostPrefix(sessionId), agent);
+  // Gemini CLI and Cursor store a second file sharing a session id as <id>_alt-<hash>; the CLI resumes <id>.
+  if (agent === "gemini" || agent === "cursor") rawId = rawId.replace(/_alt-[0-9a-f]{8}$/, "");
   let cmd = builder(rawId);
 
   if (flags?.model) {

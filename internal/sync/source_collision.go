@@ -27,14 +27,14 @@ func (e *Engine) sourceCollisionID(
 		return "", err
 	}
 	var stored, deleted string
-	var deletedAnyFile bool
+	var hasStored, deletedAnyFile bool
 	for _, r := range records {
 		switch {
 		case r.ID != fullID:
 		case r.Excluded:
 			deleted, deletedAnyFile = r.FilePath, r.FilePath == ""
 		default:
-			stored = r.FilePath
+			stored, hasStored = r.FilePath, true
 		}
 	}
 	// A permanently deleted id stays with the file it was deleted for; a
@@ -45,7 +45,7 @@ func (e *Engine) sourceCollisionID(
 	}
 	altID := e.existingAltID(ctx, provider, records, fullID, s.ID, lookupPath)
 	if altID == "" {
-		if stored == "" && deleted == "" && e.claimSessionID(ctx, provider, fullID, lookupPath) {
+		if !hasStored && deleted == "" && e.claimSessionID(ctx, provider, fullID, lookupPath) {
 			return s.ID, nil
 		}
 		altID = parser.AltSessionID(s.ID, lookupPath)

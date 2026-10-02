@@ -89,6 +89,7 @@ describe("buildResumeCommand", () => {
     expect(buildResumeCommand("gemini", "gemini:abc_alt-notahash")).toBe(
       "gemini --resume abc_alt-notahash",
     );
+    expect(buildResumeCommand("amp", "amp:abc_alt-0a1b2c3d")).toBe("amp --resume abc_alt-0a1b2c3d");
   });
 
   it("pins Claude and Codex models with shell quoting", () => {

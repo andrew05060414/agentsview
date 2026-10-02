@@ -1329,7 +1329,8 @@ func AltSessionID(id, path string) string {
 }
 
 // BaseSessionID strips an AltSessionID suffix, returning the id the agent
-// itself recorded.
+// itself recorded. Only agents whose provider declares SharedSessionIDs have
+// derived ids; their native ids never end in the suffix.
 func BaseSessionID(id string) string {
 	i := strings.LastIndex(id, altSessionMarker)
 	if i < 0 || len(id)-i != len(altSessionMarker)+8 {
