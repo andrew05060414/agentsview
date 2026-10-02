@@ -9,7 +9,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
@@ -471,4 +473,42 @@ func TestPathlessOwnerKeepsSessionID(t *testing.T) {
 	assert.Nil(t, base.FilePath)
 	assert.Equal(t, 7, base.MessageCount)
 	assertSessionMessageCount(t, env.db, parser.AltSessionID(collisionBaseID, other), 1)
+}
+
+// A Cursor file outside the cwd allow-list never takes part in ownership: an
+// allowed file with the same id gets the base id, with no dangling parent, on
+// every pass.
+func TestCwdFilteredFileDoesNotClaimSessionID(t *testing.T) {
+	root := t.TempDir()
+	workspaces := cursorWorkspaceTempDir(t)
+	keep, drop := filepath.Join(workspaces, "keep"), filepath.Join(workspaces, "drop")
+	const sessionID = "12121212-3434-4565-8787-abababababab"
+	paths := make(map[string]string)
+	for _, workspace := range []string{keep, drop} {
+		require.NoError(t, os.MkdirAll(workspace, 0o755))
+		path := filepath.Join(root, encodeCursorProjectDir(workspace), "agent-transcripts", sessionID+".jsonl")
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(`{"role":"user","message":{"content":"hello"}}`+"\n"), 0o644))
+		paths[workspace] = path
+	}
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs:          map[parser.AgentType][]string{parser.AgentCursor: {root}},
+		Machine:            "local",
+		IncludeCwdPrefixes: []string{keep},
+	})
+	t.Cleanup(engine.Close)
+
+	const baseID = "cursor:" + sessionID
+	for range 2 {
+		engine.SyncAll(t.Context(), nil)
+		base := requireStoredSession(t, database, baseID)
+		assert.Equal(t, paths[keep], *base.FilePath)
+		assert.Nil(t, base.ParentSessionID)
+		for _, path := range paths {
+			alt, err := database.GetSessionFull(t.Context(), parser.AltSessionID(baseID, path))
+			require.NoError(t, err)
+			assert.Nil(t, alt)
+		}
+	}
 }
