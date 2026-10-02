@@ -18,7 +18,7 @@ func (e *Engine) sourceCollisionID(
 	lookupPath string,
 	s *parser.ParsedSession,
 ) (string, error) {
-	if !collisionPolicyApplies(provider, s.Agent) {
+	if !collisionPolicyApplies(provider) {
 		return s.ID, nil
 	}
 	fullID := applyIDPrefixToID(e.idPrefix, s.ID)
@@ -58,20 +58,18 @@ func (e *Engine) sourceCollisionID(
 	return altID, nil
 }
 
-// collisionPolicyApplies excludes providers that rank duplicate copies
-// themselves, Claude- and Codex-format agents, which keep their own rules,
-// and multi-session containers, whose members never reach the policy.
-func collisionPolicyApplies(provider parser.Provider, agent parser.AgentType) bool {
-	_, ranks := provider.(parser.ReconciliationSourceRanker)
-	return !ranks && !isClaudeFormatAgent(agent) && !isCodexFormatAgent(agent) &&
-		provider.Capabilities().Source.MultiSessionSource != parser.CapabilitySupported
+// collisionPolicyApplies reports whether the provider declares that two of
+// its files can carry the same session id. Every other provider keeps its own
+// rules, including planned moves between its files.
+func collisionPolicyApplies(provider parser.Provider) bool {
+	return provider.Capabilities().Source.SharedSessionIDs == parser.CapabilitySupported
 }
 
 // collisionPolicyAgents lists the configured agents sourceCollisionID covers.
 func (e *Engine) collisionPolicyAgents() []string {
 	var agents []string
 	for agent, factory := range e.sources().providerFactories {
-		if factory != nil && collisionPolicyApplies(factory.NewProvider(parser.ProviderConfig{}), agent) {
+		if factory != nil && factory.Capabilities().Source.SharedSessionIDs == parser.CapabilitySupported {
 			agents = append(agents, string(agent))
 		}
 	}

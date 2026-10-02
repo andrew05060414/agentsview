@@ -207,8 +207,8 @@ The latest published release is
   renamed outside the agent shows as a second linked session. Deleting either
   session hides only that file's session. For Cursor, the
   linked session repeats the turns both files share, so search and usage
-  totals count those turns twice. OpenClaw, QClaw, and Kiro keep choosing
-  between their duplicate copies themselves.
+  totals count those turns twice. Only Gemini CLI and Cursor sessions work this
+  way; other agents sync as before.
 
 ## 0.44.0
 
