@@ -4,6 +4,7 @@ package parser
 
 import (
 	"encoding/binary"
+	"errors"
 	"os"
 )
 
@@ -131,11 +132,15 @@ func sqliteWALInfoHasFrames(info os.FileInfo) bool {
 	return info.Mode().IsRegular() && info.Size() > sqliteWALHeaderSize
 }
 
-// sqliteWALPathHasFrames is sqliteWALInfoHasFrames for a path; a WAL that
-// cannot be stat'ed (typically already deleted) holds no frames.
-func sqliteWALPathHasFrames(path string) bool {
+// sqliteWALHasFrames is sqliteWALInfoHasFrames for a path. Only a WAL that
+// is confirmed missing (typically already deleted) holds no frames; any other
+// stat error fails open so a real update still syncs, at worst once more.
+func sqliteWALHasFrames(path string) bool {
 	info, err := os.Stat(path)
-	return err == nil && sqliteWALInfoHasFrames(info)
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist)
+	}
+	return sqliteWALInfoHasFrames(info)
 }
 
 // StatSQLiteContainerState captures the current change-detection state of a

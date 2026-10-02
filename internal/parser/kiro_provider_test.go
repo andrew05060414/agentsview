@@ -73,6 +73,7 @@ func TestKiroProviderSourceMethods(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, legacyPath, foundLegacy.DisplayPath)
 
+	writeSourceFile(t, dbPath+"-wal", walWithFramesFixture)
 	changed, err := provider.SourcesForChangedPath(
 		t.Context(),
 		ChangedPathRequest{Path: dbPath + "-wal", EventKind: "write", WatchRoot: root},

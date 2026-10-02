@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 )
 
 // Cursor IDE stores every chat session in one shared SQLite database
@@ -70,18 +69,9 @@ func cursorIDEWatchRoots(roots []string) []WatchRoot {
 // cursorIDEClassifyPath maps a stored or changed path to its database
 // container and composer. allowMissing relaxes the regular-file check so a
 // database delete (or its WAL/SHM sibling) still classifies for tombstones.
-// A "-wal" event whose WAL is absent or holds no frames is ignored, like a
-// bare "-shm" event: every read connection, this process's own included,
-// creates an empty WAL on open and deletes it on close, so resolving those
-// events made each scan schedule the next one. A real commit writes frames
-// past the header (a later event sees them) and a checkpoint rewrites the
-// database file itself, so no content change is lost.
 func cursorIDEClassifyPath(
 	root, path string, allowMissing bool,
 ) (multiSessionMatch, bool) {
-	if strings.HasSuffix(path, "-wal") && !sqliteWALPathHasFrames(path) {
-		return multiSessionMatch{}, false
-	}
 	return classifySQLiteContainerPath(
 		root, path, CursorIDEDBRelPath, allowMissing, true,
 		parseCursorIDEVirtualPath,
