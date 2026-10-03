@@ -54,15 +54,9 @@ func (e *Engine) sourceCollisionID(
 	}
 	if altID == "" {
 		available := !hasStored
-		if hasStored && !owner.Trashed && stored != "" && e.pathRewriter == nil &&
+		if hasStored && !owner.Trashed && stored != "" &&
 			s.MessageCount >= owner.MessageCount {
-			// FindSource may decline a path outside the new configured roots.
-			// Check that the old file is actually gone, not merely unscanned or
-			// unreadable, before treating a root change as a move.
-			if _, err := os.Stat(stored); os.IsNotExist(err) {
-				_, live := e.providerSourcePath(ctx, provider, stored)
-				available = !live
-			}
+			available = e.storedSourceGone(ctx, provider, stored)
 		}
 		if available && deleted == "" && e.claimSessionID(ctx, provider, fullID, lookupPath) {
 			return s.ID, nil
@@ -73,6 +67,29 @@ func (e *Engine) sourceCollisionID(
 	s.RelationshipType = parser.RelContinuation
 	s.ID = altID
 	return altID, nil
+}
+
+// storedSourceGone requires absence on disk and at the provider. Remote paths
+// must resolve inside a complete mirror; absence from a partial import is not
+// evidence that the remote file is gone.
+func (e *Engine) storedSourceGone(ctx context.Context, provider parser.Provider, stored string) bool {
+	if e.pathRewriter != nil {
+		if !e.completeSourceMirror || e.storedPathResolver == nil {
+			return false
+		}
+		resolved, ok := e.storedPathResolver(stored)
+		if !ok {
+			return false
+		}
+		stored = resolved
+	}
+	// FindSource may decline a path outside the configured roots. Check the
+	// file itself so an unscanned or unreadable source keeps its identity.
+	if _, err := os.Stat(stored); !os.IsNotExist(err) {
+		return false
+	}
+	_, live := e.providerSourcePath(ctx, provider, stored)
+	return !live
 }
 
 // collisionPolicyApplies reports whether the provider declares that two of

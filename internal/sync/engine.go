@@ -488,6 +488,10 @@ type EngineConfig struct {
 	// physical path under the current mirror. Remote changed-path planning uses
 	// it to make persisted source hints usable by mirror-local providers.
 	StoredPathResolver func(storedPath string) (physicalPath string, ok bool)
+	// CompleteSourceMirror means resolved source paths cover the remote's
+	// complete export. A missing resolved file can prove a source is gone.
+	// Leave false for partial extracts; a full parse alone proves no coverage.
+	CompleteSourceMirror bool
 	// InitialSkipCache seeds an ephemeral engine with caller-owned translated
 	// skip state. Rebuild contributors use it because their engine is created
 	// inside the atomic replacement workflow.
@@ -632,6 +636,7 @@ type Engine struct {
 	idPrefix                string
 	pathRewriter            func(string) string
 	storedPathResolver      func(string) (string, bool)
+	completeSourceMirror    bool
 	emitter                 Emitter
 	providerMigrationModes  map[parser.AgentType]parser.ProviderMigrationMode
 
@@ -984,6 +989,7 @@ func NewEngine(ctx context.Context,
 		idPrefix:                cfg.IDPrefix,
 		pathRewriter:            cfg.PathRewriter,
 		storedPathResolver:      cfg.StoredPathResolver,
+		completeSourceMirror:    cfg.CompleteSourceMirror,
 		emitter:                 cfg.Emitter,
 		providerMigrationModes:  providerModes,
 		digestVerifiedAt:        make(map[string]time.Time),

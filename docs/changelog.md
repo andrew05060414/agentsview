@@ -230,7 +230,9 @@ The latest published release is
   session ID. The stored file keeps its ID; the other becomes a linked session.
   A new file can take over the original ID when the old file is gone and the
   new transcript has at least as many messages. This covers folder moves and
-  renames of the original session. Already linked files need a move the provider
+  renames of the original session. Remote imports also preserve the ID when
+  a complete mirror covers the old path; partial imports and paths outside
+  the exported roots stay separate. Already linked files need a move the provider
   recognizes to keep their IDs. A shorter file stays separate so it cannot
   shorten the archive. Full resyncs preserve this
   ownership and existing names, stars, and pins. On a first sync, parallel parse
