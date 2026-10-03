@@ -125,7 +125,7 @@ func TestHTTPSourceCollisionOwnership(t *testing.T) {
 			require.NoError(t, err)
 			if tc.wantMove {
 				assert.Len(t, records, 1, "moving a complete remote source must retain its session identity")
-				assert.Equal(t, "devbox:"+filepath.ToSlash(newPath), *stored.FilePath)
+				assert.Equal(t, "devbox:"+newPath, *stored.FilePath)
 				assert.Equal(t, tc.count, stored.MessageCount)
 				assert.Nil(t, stored.SourceMissingAt)
 				messages, err := database.GetAllMessages(t.Context(), id)
@@ -138,7 +138,7 @@ func TestHTTPSourceCollisionOwnership(t *testing.T) {
 				assert.Equal(t, 2, stored.MessageCount)
 				for _, record := range records {
 					if record.ID != id {
-						assert.Equal(t, "devbox:"+filepath.ToSlash(newPath), record.FilePath)
+						assert.Equal(t, "devbox:"+newPath, record.FilePath)
 						assert.Equal(t, tc.count, record.MessageCount)
 					}
 				}
