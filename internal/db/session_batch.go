@@ -846,7 +846,7 @@ func extendTruncatedTextTx(
 				sessionID, m.Ordinal, err,
 			)
 		}
-		if !IsTextExtension(stored, m.Content) {
+		if !IsTextExtension(stored, m.Content) && !IsImagePlaceholderUpgrade(stored, m.Content) {
 			continue
 		}
 		if _, err := tx.Exec(
