@@ -387,7 +387,7 @@ func (s *Server) importClaudeAIFromFileWithCallbacks(
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrWriterClosed) {
-			return importer.ImportStats{}, writerClosedError()
+			return importer.ImportStats{}, writerClosedError(s.archiveStale())
 		}
 		return importer.ImportStats{}, apiError(http.StatusInternalServerError,
 			"import failed: "+err.Error())
@@ -527,7 +527,7 @@ func (s *Server) importChatGPTFromFile(
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrWriterClosed) {
-			return importer.ImportStats{}, writerClosedError()
+			return importer.ImportStats{}, writerClosedError(s.archiveStale())
 		}
 		return importer.ImportStats{}, apiError(http.StatusInternalServerError,
 			"import failed: "+err.Error())

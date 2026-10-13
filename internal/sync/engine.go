@@ -3915,6 +3915,26 @@ func (e *Engine) resyncBuildLocked(
 		}
 	}
 
+	if !e.disableSignalRecompute {
+		reportResyncPhase(PhaseReclassifying, "Recomputing archived session signals", "")
+		e.db = newDB
+		err := newDB.BackfillSignals(ctx, e.BackfillSignalComputer())
+		e.db = origDB
+		if err != nil {
+			stats.Aborted = true
+			stats.Warnings = append(stats.Warnings,
+				"archived session signal recompute failed, aborting swap: "+err.Error(),
+			)
+			newDB.Close()
+			removeTempDB(tempPath)
+			restoreSkipCache()
+			e.mu.Lock()
+			e.lastSyncStats = stats
+			e.mu.Unlock()
+			return stats, err
+		}
+	}
+
 	if ftsDropped {
 		tFTS := time.Now()
 		reportResyncPhase(
@@ -16739,6 +16759,11 @@ func (e *Engine) codexIndexSessionNameState(
 		// rewrite preserves the title, so the loop could never converge.
 		return false, true
 	}
+	if e.db.ArchiveContent().UsageOnly() {
+		// Usage-only archives store no titles, so a rename has nothing to
+		// refresh and the empty stored title must not read as stale.
+		return false, true
+	}
 	storedName, found, err := e.db.GetSessionName(
 		context.Background(), e.idPrefix+"codex:"+uuid,
 	)
@@ -16964,6 +16989,9 @@ func (e *Engine) codexStoredNameDiffersBySessionID(
 	sessionID, indexTitle string,
 	missingDiffers bool,
 ) bool {
+	if e.db.ArchiveContent().UsageOnly() {
+		return false
+	}
 	storedName, found, err := e.db.GetSessionName(
 		context.Background(), sessionID,
 	)
@@ -18625,7 +18653,7 @@ func (e *Engine) writeStagedFullParse(
 	positions := stagedToolCallPositions(msgs)
 	var closure db.StagedSignalsFunc
 	if !e.disableSignalRecompute {
-		closure = func(verdicts map[string]bool) (
+		closure = func(verdicts map[string]db.StagedToolVerdict) (
 			db.SessionSignalUpdate, []db.SecretFinding, error,
 		) {
 			update, findings, err := e.computeFullSignalsAndSecretsForStorage(s, msgs, verdicts)

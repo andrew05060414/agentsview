@@ -11,6 +11,9 @@ The latest release is
 
 **New features**
 
+- Browse and search the retained archive during full parser and archive-only
+  preservation rebuilds with a stale warning; archive writes fail with a retryable
+  503. Scoped upgrades and schema repairs finish before serving.
 - Sync Claude.ai chats from the desktop or Chrome Import dialog without
   downloading an export. Later runs fetch new or changed chats, including branch
   switches. Run `agentsview chrome setup` once and load the printed folder in
@@ -40,11 +43,24 @@ The latest release is
   and selection. The Projects picker hides projects.
   Project and model selections reset on reload; an agent selection is the header
   Agent filter.
+- Tool Usage shows empty, repeat and recovery rates for each tool. Click a rate
+  to list the sessions behind it and open the message with the matching call.
+  Rates follow the same filters as the rest of the Analytics page. After you
+  upgrade, AgentsView recomputes older sessions in the background, so their
+  rates appear without a resync. Archives that store no tool results show no
+  rates. Hosted deployments must grant the runtime role `UPDATE` on three new
+  `tool_calls` columns before upgrading, or hosted startup fails; see
+  [Hosted Raw Sync](/docs/hosted-raw-sync/#http-control-plane).
 
 **Bug fixes**
 
 - DeepSeek Harness v4 sessions now appear after sync, with tool results and
   recorded token usage.
+- ClickHouse usage reports read prepared usage again for a machine whose
+  mirror held a session with no archive id that the machine's archive no
+  longer has. No push removed such a session, and it kept every session of
+  that machine on the slower raw usage reads. The first push from each
+  machine after upgrading removes them.
 - Fill MCP content-search pages with older matches by excluding recent sessions
   before the limit. Cutoffs preserve their UTC instant across time zones. Older
   daemons keep the previous guard after pagination and can return short pages.
@@ -57,6 +73,10 @@ The latest release is
   daemon keeps serving the existing archive, retries after an hour, and backs
   off to once a day. Before, the rebuild waited for a restart or a manual
   resync.
+- Re-importing an unchanged archive with usage-only storage no longer re-reads
+  every titled Codex thread. Usage-only storage discards session titles, so the
+  empty stored title always differed from the thread's title in
+  `session_index.jsonl`, and each import parsed those threads again.
 
 - Codex threads rewound with undo keep every message and every day's usage.
   Each extra rollout file Codex writes for the undo now shows as its own linked

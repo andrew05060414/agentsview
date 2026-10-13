@@ -118,6 +118,13 @@ jobs:
         run: npm ci
         working-directory: frontend
 
+      - name: Format, lint, and type-check (fix formatting with npm run fmt)
+        # Runs before the slower checks so formatting mistakes show up
+        # first. Lint warnings do not fail this step yet; errors and
+        # unformatted files do.
+        run: npm run check:vp
+        working-directory: frontend
+
       - name: Type-check (svelte-check)
         run: npm run check
         working-directory: frontend
@@ -171,7 +178,7 @@ jobs:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
 
       - name: Install docs check tools
         run: |
@@ -230,7 +237,7 @@ jobs:
         if: runner.os == 'Windows'
         id: setup_mingw
         continue-on-error: true
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
         with:
           msystem: MINGW64
           update: false
@@ -239,7 +246,7 @@ jobs:
 
       - name: Setup MinGW (Windows, retry on transient failure)
         if: runner.os == 'Windows' && steps.setup_mingw.outcome == 'failure'
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
         with:
           msystem: MINGW64
           update: false
@@ -335,10 +342,10 @@ jobs:
           # Complementary filters keep every sync test in exactly one job.
           - name: Sync A-R
             package: ./internal/sync
-            run: '^Test[A-R]'
+            run: &sync-test-prefix '^Test[A-R]'
           - name: Sync remaining
             package: ./internal/sync
-            skip: '^Test[A-R]'
+            skip: *sync-test-prefix
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -358,7 +365,7 @@ jobs:
       - name: Setup MinGW
         id: setup_mingw
         continue-on-error: true
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
         with:
           msystem: MINGW64
           update: false
@@ -367,7 +374,7 @@ jobs:
 
       - name: Setup MinGW (retry on transient failure)
         if: steps.setup_mingw.outcome == 'failure'
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
         with:
           msystem: MINGW64
           update: false
@@ -528,7 +535,7 @@ jobs:
       - name: Setup MinGW
         id: setup_mingw
         continue-on-error: true
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
         with:
           msystem: MINGW64
           update: false
@@ -537,7 +544,7 @@ jobs:
 
       - name: Setup MinGW (retry on transient failure)
         if: steps.setup_mingw.outcome == 'failure'
-        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
         with:
           msystem: MINGW64
           update: false
@@ -553,8 +560,23 @@ jobs:
           CGO_ENABLED: "1"
 
   test-race:
-    name: Go Test (race detector)
-    runs-on: namespace-profile-linux-8cpu
+    name: Go Test (race detector, ${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Sync A-R
+            runner: namespace-profile-linux-4cpu
+            testSet: sync
+            run: *sync-test-prefix
+          - name: Sync remaining
+            runner: namespace-profile-linux-4cpu
+            testSet: sync
+            skip: *sync-test-prefix
+          - name: Other packages
+            runner: namespace-profile-linux-8cpu
+            testSet: other
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -585,7 +607,14 @@ jobs:
       # main test job's ./... run. Limit package fan-out because the race
       # detector makes highly parallel runs slow enough to exhaust deadlines.
       - name: Run Go tests (race detector)
-        run: go list ./... | grep -v '/internal/duckdb$' | xargs go test -p 4 -tags "fts5" -race -count=1 -timeout=20m
+        if: matrix.testSet == 'other'
+        run: go list ./... | grep -vE '/internal/(duckdb|sync)$' | xargs go test -p 4 -tags "fts5" -race -count=1 -timeout=20m
+        env:
+          CGO_ENABLED: "1"
+
+      - name: Run sync tests (race detector)
+        if: matrix.testSet == 'sync'
+        run: go test -tags "fts5" -race ./internal/sync -run '${{ matrix.run || '.' }}' -skip '${{ matrix.skip || '^$' }}' -count=1 -timeout=20m
         env:
           CGO_ENABLED: "1"
 
@@ -631,7 +660,17 @@ jobs:
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib
 
   integration:
+    name: Integration (${{ matrix.name }})
     runs-on: namespace-profile-linux-4cpu
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: PostgreSQL core
+            postgres-target: test-postgres-core-fast-ci
+          - name: PostgreSQL raw-sync and ClickHouse
+            postgres-target: test-postgres-raw-sync-ci test-postgres-core-heavy-ci
+            clickhouse: true
     services:
       postgres:
         image: pgvector/pgvector:pg18
@@ -650,7 +689,8 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       clickhouse:
-        image: clickhouse/clickhouse-server:26.8
+        # An empty image omits this service for the PostgreSQL-only lane.
+        image: ${{ matrix.clickhouse && 'clickhouse/clickhouse-server:26.8' || '' }}
         env:
           CLICKHOUSE_SKIP_USER_SETUP: "1"
         ports:
@@ -682,12 +722,13 @@ jobs:
         run: go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       - name: Run PostgreSQL integration tests
-        run: make test-postgres-ci
+        run: make ${{ matrix.postgres-target }}
         env:
           CGO_ENABLED: "1"
           TEST_PG_URL: postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable
 
       - name: Run ClickHouse integration tests
+        if: matrix.clickhouse
         run: make test-clickhouse-ci
         env:
           CGO_ENABLED: "1"

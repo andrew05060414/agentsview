@@ -130,6 +130,9 @@ func (s *Sync) PushWithOptions(
 			return result, err
 		}
 	}
+	if err := s.pruneUnownedSessionsMissingLocally(ctx, &result); err != nil {
+		return result, err
+	}
 
 	since := storedCutoff
 	if full {
@@ -517,6 +520,59 @@ func (s *Sync) deleteSessionsMissingLocally(ctx context.Context, keep []string, 
 	return nil
 }
 
+// pruneUnownedSessionsMissingLocally removes this machine's mirror sessions
+// that carry no archive id and that the local archive no longer holds. Pushes
+// always record their archive, but a mirror can still hold older rows without
+// one. deleteSessionsMissingLocally only sees rows that carry this archive's
+// id, so such a row would otherwise stay forever. It never gets a usage
+// snapshot either, and one session without a snapshot sends every session of
+// its machine to the slower raw usage reads.
+//
+// A row for a session the archive still holds is left alone; the next push
+// of that session records the archive. Rows mirrored under another machine
+// name are left alone too, since nothing shows which archive owns them.
+func (s *Sync) pruneUnownedSessionsMissingLocally(ctx context.Context, result *storage.PushResult) error {
+	if s.unownedPruned {
+		return nil
+	}
+	rows, err := s.conn.QueryContext(ctx,
+		"SELECT id FROM sessions WHERE source_archive_id = '' AND machine = ?", s.machine)
+	if err != nil {
+		return fmt.Errorf("listing clickhouse sessions without an archive id: %w", err)
+	}
+	defer rows.Close()
+	var unowned []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scanning clickhouse session without an archive id: %w", err)
+		}
+		unowned = append(unowned, id)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("listing clickhouse sessions without an archive id: %w", err)
+	}
+	rows.Close()
+	local, err := s.local.SessionProjectsByIDs(ctx, unowned)
+	if err != nil {
+		return fmt.Errorf("checking which mirror sessions without an archive id the archive holds: %w", err)
+	}
+	remove := slices.DeleteFunc(unowned, func(id string) bool {
+		_, held := local[id]
+		return held
+	})
+	if err := s.deleteMirrorSessions(ctx, remove); err != nil {
+		return err
+	}
+	if len(remove) > 0 {
+		log.Printf("clickhouse push: removed %d mirror sessions without an archive id that the local archive no longer has",
+			len(remove))
+	}
+	result.DeletedStale += len(remove)
+	s.unownedPruned = true
+	return nil
+}
+
 // pushBatchWithRetry writes one batch; when the batch fails for a reason
 // other than cancellation it retries each session alone and counts the
 // ones that still fail.
@@ -860,7 +916,7 @@ func toolCallRow(m db.Message, tc db.ToolCall, callIndex int, version uint64) []
 		}
 	}
 	return []any{
-		m.ID, int64(m.Ordinal), m.SessionID, tc.ToolName, tc.Category, int64(callIndex),
+		m.ID, int64(m.Ordinal), m.SessionID, tc.ToolName, tc.ObservedOutcome, tc.ObservedRepeat, tc.SequenceEnding, tc.Category, int64(callIndex),
 		tc.ToolUseID, tc.InputJSON, tc.SkillName, int64(length),
 		stored,
 		tc.SubagentSessionID, tc.FilePath,

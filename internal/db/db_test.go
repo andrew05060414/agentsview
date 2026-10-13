@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 func reflectedFieldValue(v any, name string) reflect.Value {
@@ -484,27 +485,11 @@ func TestCloseWriterKeepsReadersServing(t *testing.T) {
 	require.Error(t, err, "writes must fail cleanly while the writer is closed")
 	require.ErrorIs(t, err, ErrWriterClosed)
 
-	require.NoError(t, database.ReopenWriter())
-	assert.NoError(t, writeOneSession(t.Context(), database),
-		"writer must accept writes again after ReopenWriter")
-}
-
-// TestCloseWriterFailsEveryWritePathCleanly proves the write barrier covers
-// every writer access, not just the writerHandle facade: the Update transaction
-// path and the real star/delete session mutations must all return
-// ErrWriterClosed without panicking while the writer is closed.
-func TestCloseWriterFailsEveryWritePathCleanly(t *testing.T) {
-	database := testDB(t)
-	insertSession(t, database, "barrier-session", "handoff")
-
-	require.NoError(t, database.CloseWriter())
-	t.Cleanup(func() { require.NoError(t, database.ReopenWriter()) })
-
 	t.Run("Update", func(t *testing.T) {
 		err := database.Update(t.Context(), func(tx *sql.Tx) error {
 			_, execErr := tx.ExecContext(t.Context(),
 				"UPDATE sessions SET first_message = ? WHERE id = ?",
-				"x", "barrier-session",
+				"x", "writer-handoff-seed",
 			)
 			return execErr
 		})
@@ -512,19 +497,23 @@ func TestCloseWriterFailsEveryWritePathCleanly(t *testing.T) {
 	})
 
 	t.Run("StarSession", func(t *testing.T) {
-		_, err := database.StarSession(t.Context(), "barrier-session")
+		_, err := database.StarSession(t.Context(), "writer-handoff-seed")
 		require.ErrorIs(t, err, ErrWriterClosed)
 	})
 
 	t.Run("DeleteSession", func(t *testing.T) {
-		err := database.DeleteSession(t.Context(), "barrier-session")
+		err := database.DeleteSession(t.Context(), "writer-handoff-seed")
 		require.ErrorIs(t, err, ErrWriterClosed)
 	})
 
 	t.Run("RestoreSession", func(t *testing.T) {
-		_, err := database.RestoreSession(t.Context(), "barrier-session")
+		_, err := database.RestoreSession(t.Context(), "writer-handoff-seed")
 		require.ErrorIs(t, err, ErrWriterClosed)
 	})
+
+	require.NoError(t, database.ReopenWriter())
+	assert.NoError(t, writeOneSession(t.Context(), database),
+		"writer must accept writes again after ReopenWriter")
 }
 
 func insertSession(
@@ -1254,6 +1243,48 @@ func TestOpenAcceptsArchiveUserVersion111(t *testing.T) {
 	page, err := d2.ListSessions(t.Context(), SessionFilter{Limit: 100})
 	requireNoError(t, err, "list sessions")
 	require.Len(t, page.Sessions, 1)
+}
+
+func TestArchiveResyncState(t *testing.T) {
+	for _, tc := range []struct {
+		name                                      string
+		version                                   int
+		pending, repair, archiveOnly, needs, full bool
+	}{
+		{name: "current", version: dataVersion},
+		{name: "data stale", version: 129, needs: true, full: true},
+		{name: "scoped version", version: dataVersion - 1, needs: true},
+		{name: "scoped pending", version: dataVersion, pending: true, needs: true},
+		{name: "schema repair", version: dataVersion, repair: true, needs: true},
+		{name: "archive only", version: dataVersion - 1, archiveOnly: true, needs: true, full: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(InstallDataVersionScopesForTest(map[int][]parser.AgentType{dataVersion: {parser.AgentClaude}}))
+			d := testDB(t)
+			require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(t.Context(), fmt.Sprintf("PRAGMA user_version=%d", tc.version))
+				if err != nil {
+					return err
+				}
+				if tc.pending {
+					_, err = tx.ExecContext(t.Context(), "INSERT INTO stats(key,value) VALUES ('scoped_upgrade_pending',1)")
+				}
+				if tc.repair {
+					_, err = tx.ExecContext(t.Context(), "ALTER TABLE tool_calls DROP COLUMN result_content_length")
+				}
+				return err
+			}))
+			if tc.archiveOnly {
+				require.NoError(t, d.EnableArchiveOnly(t.Context()))
+			}
+			path := d.Path()
+			require.NoError(t, d.Close())
+			needs, full, err := ArchiveResyncState(t.Context(), path)
+			require.NoError(t, err)
+			assert.Equal(t, tc.needs, needs)
+			assert.Equal(t, tc.full, full)
+		})
+	}
 }
 
 func TestOpenProbeErrorPropagates(t *testing.T) {
@@ -4667,6 +4698,15 @@ func TestBackfillToolCallAgentStateTracksFirstAndLatest(t *testing.T) {
 		  AND agent_id = 'agent-a'`,
 		"s1", 0, 0,
 	).Scan(&first, &latest))
+	_, err = d.getWriter().Exec(t.Context(), "UPDATE tool_call_occurrence_agent_state SET latest_evidence_event_index=-1 WHERE session_id='s1'")
+	require.NoError(t, err)
+	tx, err = d.getWriter().Begin(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, ensureToolCallAgentStateTx(t.Context(), tx, "s1", ToolCallPosition{}))
+	require.NoError(t, tx.Commit())
+	var evidence int
+	require.NoError(t, d.Reader().QueryRow(t.Context(), "SELECT latest_evidence_event_index FROM tool_call_occurrence_agent_state WHERE session_id='s1'").Scan(&evidence))
+	assert.Equal(t, 2, evidence)
 	assert.Equal(t, 0, first)
 	assert.Equal(t, 2, latest,
 		"backfill keeps the newest event index per agent")
@@ -7874,6 +7914,12 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     result_content_length INTEGER,
     subagent_session_id TEXT
 );
+CREATE TABLE tool_call_occurrence_agent_state (
+ session_id TEXT NOT NULL, message_ordinal INTEGER NOT NULL, call_index INTEGER NOT NULL,
+ agent_id TEXT NOT NULL, first_event_index INTEGER NOT NULL, latest_event_index INTEGER NOT NULL,
+ PRIMARY KEY(session_id,message_ordinal,call_index,agent_id)
+);
+INSERT INTO tool_call_occurrence_agent_state VALUES ('keep-me',0,0,'',0,0);
 CREATE TABLE IF NOT EXISTS insights (
     id          INTEGER PRIMARY KEY,
     type        TEXT NOT NULL,
@@ -7911,6 +7957,9 @@ CREATE TABLE IF NOT EXISTS insights (
 	requireNoError(t, err, "Open with legacy schema")
 	defer d.Close()
 
+	var coordinate int
+	require.NoError(t, d.getReader().QueryRow(t.Context(), "SELECT latest_evidence_event_index FROM tool_call_occurrence_agent_state WHERE session_id='keep-me'").Scan(&coordinate))
+	assert.Equal(t, -1, coordinate)
 	// Session data must survive.
 	ctx := t.Context()
 	s, err := d.GetSession(ctx, "keep-me")

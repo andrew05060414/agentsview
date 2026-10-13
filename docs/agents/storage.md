@@ -10,12 +10,27 @@ to handle a data-version change.
 
 Use non-destructive schema migrations such as `ALTER TABLE` and `UPDATE`.
 
+Dashboard analytics, report, and search scans, and other multi-second scans over
+message or usage rows, take the lane; the list and sidebar reads every page loads
+(session list, stats, project list) and reads scoped to one session stay outside.
+The lane uses `acquireBulkRead`, using at most `readerMaxOpenConns - 1` reader
+connections so quick reads always get one.
+Each holder uses one reader connection at a time. Validate input before
+acquiring a permit. Release it before waiting for another bulk reader or doing
+host git/GitHub lookups.
+
 A parser upgrade normally requires a full resync. A parser change that needs a
 full resync must build a fresh database, sync source files, copy orphaned
 sessions from the old database, and swap the files atomically. Preserve sessions
 even when their source files no longer exist. Schema repairs also require a full
 resync. Archive-only archives use the preservation rebuild, which does not read
 source files on the receiving host.
+
+Full parser and archive-only preservation rebuilds serve the old archive while
+writes receive a retryable HTTP 503. Scoped upgrades and schema repairs still
+block startup. A failed or unlaunchable startup rebuild keeps serving with
+writes allowed and retries on the archive audit cadence. Startup uses no
+in-process fallback.
 
 A parser upgrade can instead reparse only the affected providers in place.
 Declare it in `dataVersionScopes` in `internal/db/data_version_scope.go`:
@@ -564,9 +579,10 @@ read-only opens require the indexes.
 
 SQLite's summary and tool analytics can read model names and message timestamps
 through `idx_messages_analytics_metadata` on
-`messages(session_id, id, timestamp, model)` without loading message body pages.
-The next writable open builds this index once and logs that startup is waiting
-for the message scan. Existing rows are preserved; no parser resync is required.
+`messages(session_id, id, timestamp, model, ordinal)` without loading message
+body pages. The next writable open builds or upgrades this index and logs that
+startup is waiting for the message scan. Existing rows are preserved; no parser
+resync is required.
 
 Writable opens and completed bulk index builds run `PRAGMA optimize = 0x10012`.
 This considers all archive tables and limits the statistics samples. Statistics

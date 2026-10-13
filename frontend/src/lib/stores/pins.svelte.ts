@@ -111,7 +111,7 @@ class PinsStore {
   /** Re-fetch session pins after the last in-flight mutation settles. */
   #refetchAfterMutation() {
     if (this.#inflight.size === 0 && this.#currentSessionId) {
-      this.loadForSession(this.#currentSessionId);
+      void this.loadForSession(this.#currentSessionId);
     }
   }
 
@@ -126,16 +126,14 @@ class PinsStore {
       this.pins = this.pins.filter(
         (p) => !(p.session_id === pin.session_id && p.message_key === pin.message_key),
       );
-    } catch {
-      // Reload below reconciles failed removal without losing the retained card.
     } finally {
-      this.loadAll(this.#loadedProject);
-      if (this.#currentSessionId) this.loadForSession(this.#currentSessionId);
+      void this.loadAll(this.#loadedProject);
+      if (this.#currentSessionId) void this.loadForSession(this.#currentSessionId);
     }
   }
 
   async unpin(sessionId: string, messageId: number) {
-    if (this.#inflight.has(messageId)) return;
+    if (this.#inflight.has(messageId)) return false;
     this.#inflight.add(messageId);
     this.#mutationVersion++;
     try {
@@ -152,8 +150,7 @@ class PinsStore {
       this.pins = this.pins.filter(
         (p) => !(p.session_id === sessionId && p.message_id === messageId),
       );
-    } catch {
-      // Silently ignore — refetch will reconcile state.
+      return true;
     } finally {
       this.#inflight.delete(messageId);
       this.#refetchAfterMutation();
@@ -161,9 +158,9 @@ class PinsStore {
   }
 
   async togglePin(sessionId: string, messageId: number, ordinal: number) {
-    if (this.#inflight.has(messageId)) return;
+    if (this.#inflight.has(messageId)) return false;
     if (this.sessionPinIds.has(messageId)) {
-      await this.unpin(sessionId, messageId);
+      return this.unpin(sessionId, messageId);
     } else {
       this.#inflight.add(messageId);
       this.#mutationVersion++;
@@ -188,8 +185,7 @@ class PinsStore {
           },
           ...this.pins.filter((p) => !(p.session_id === sessionId && p.message_id === messageId)),
         ];
-      } catch {
-        // Silently ignore — refetch will reconcile state.
+        return true;
       } finally {
         this.#inflight.delete(messageId);
         this.#refetchAfterMutation();
