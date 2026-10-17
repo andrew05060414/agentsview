@@ -60,10 +60,10 @@ func (e *Engine) reconcileAntigravityTitlesLocked(ctx context.Context, stats *Sy
 		}
 		delete(e.appliedAntigravityTitles, store)
 		parser.InvalidateAntigravityTitles(store)
-		titles, state, err := parser.AntigravityStoreTitles(ctx, store)
+		summaries, state, err := parser.AntigravityStoreSummaries(ctx, store)
 		if err == nil {
 			var n int
-			n, err = e.applyAntigravityStoreTitles(ctx, root, titles)
+			n, err = e.applyAntigravityStoreSummaries(ctx, root, summaries)
 			stats.TitlesUpdated += n
 		}
 		if err != nil {
@@ -118,12 +118,20 @@ func (e *Engine) recordAntigravityTitleUpdates(stats SyncStats) {
 }
 
 func (e *Engine) applyAntigravityStoreTitles(ctx context.Context, root string, titles map[string]string) (updated int, err error) {
-	if len(titles) == 0 {
+	summaries := make(map[string]parser.AntigravitySummary, len(titles))
+	for id, title := range titles {
+		summaries[id] = parser.AntigravitySummary{Title: title, TitlePresent: true}
+	}
+	return e.applyAntigravityStoreSummaries(ctx, root, summaries)
+}
+
+func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string, summaries map[string]parser.AntigravitySummary) (updated int, err error) {
+	if len(summaries) == 0 {
 		return 0, nil
 	}
 	prefix := e.idPrefix + string(parser.AgentAntigravity) + ":"
-	ids := make([]string, 0, len(titles))
-	for id := range maps.Keys(titles) {
+	ids := make([]string, 0, len(summaries))
+	for id := range maps.Keys(summaries) {
 		ids = append(ids, prefix+id)
 	}
 	slices.Sort(ids)
@@ -147,24 +155,41 @@ func (e *Engine) applyAntigravityStoreTitles(ctx context.Context, root string, t
 		if !ok && !deferred {
 			continue
 		}
-		title := db.SanitizeUTF8(titles[strings.TrimPrefix(id, prefix)])
-		if session.SessionName != nil && *session.SessionName == title ||
-			session.SessionName == nil && title == "" {
+		rawID := strings.TrimPrefix(id, prefix)
+		summary := summaries[rawID]
+		title := db.SanitizeUTF8(summary.Title)
+
+		titleChanged := summary.TitlePresent && ((session.SessionName != nil && *session.SessionName != title) ||
+			(session.SessionName == nil && title != ""))
+		cwdChanged := summary.Cwd != "" && session.Cwd != summary.Cwd
+		parentID := ""
+		if summary.ParentConversationID != "" {
+			parentID = prefix + summary.ParentConversationID
+		}
+		parentChanged := parentID != "" && session.ParentSessionID == ""
+
+		if !titleChanged && !cwdChanged && !parentChanged {
 			continue
 		}
-		if !e.antigravityRootOwns(root, session.FilePath) || !e.cwdFilter.allows(session.Cwd) {
+		targetCwd := summary.Cwd
+		if targetCwd == "" {
+			targetCwd = session.Cwd
+		}
+		if !e.antigravityRootOwns(root, session.FilePath) || !e.cwdFilter.allows(targetCwd) {
 			continue
 		}
 		var name *string
-		if title != "" {
+		if summary.TitlePresent && title != "" {
 			name = &title
 		}
 		if deferred {
-			e.deferredAntigravityTitles[id] = name
+			if summary.TitlePresent {
+				e.deferredAntigravityTitles[id] = name
+			}
 			continue
 		}
 		// Trashed sessions take the title too, so restoring one needs no store change.
-		if err := e.db.RefreshNativeSessionName(ctx, id, name); err != nil {
+		if err := e.db.RefreshNativeSessionSummary(ctx, id, name, summary.TitlePresent, summary.Cwd, summary.Project, parentID); err != nil {
 			return updated, err
 		}
 		updated++

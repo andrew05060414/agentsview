@@ -115,6 +115,10 @@ For CI runner selection and caching, read the
   state that in the handoff.
 - After changing Go code, run `go fmt ./...` and `go vet ./...` before
   committing.
+- On Andrew's Windows machine, run `internal/server` tests with
+  `go test -skip Wildcard ./internal/server/`. The `Wildcard` tests bind
+  `0.0.0.0` and `::`, and each run compiles a new `server.test.exe` path, so
+  Windows Firewall prompts every time. CI still runs them.
 - Preserve observable behavior and update documentation when behavior changes.
 
 ## Provider Format Provenance
