@@ -10,11 +10,12 @@ import (
 	"path/filepath"
 	"time"
 
+	"go.kenn.io/agentsview/internal/ctxio"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
 func WriteArchive(ctx context.Context, w io.Writer, targets TargetSet) error {
-	tw := tar.NewWriter(w)
+	tw := tar.NewWriter(ctxio.Writer{Context: ctx, Writer: w})
 	forbidden := newForbiddenRootMatcher(targets.ForbiddenRoots)
 	snapshotSQLite := make(map[string]string)
 	for stateDB := range sqliteSnapshotTargets(targets) {
@@ -23,10 +24,7 @@ func WriteArchive(ctx context.Context, w io.Writer, targets TargetSet) error {
 		}
 	}
 	writtenSnapshots := make(map[string]struct{})
-	writePath := func(path string, optional bool) error {
-		if forbidden.within(path) {
-			return nil
-		}
+	writeFile := func(path string, info os.FileInfo) error {
 		clean := filepath.Clean(path)
 		if stateDB, ok := snapshotSQLite[clean]; ok {
 			if _, written := writtenSnapshots[stateDB]; written {
@@ -35,10 +33,19 @@ func WriteArchive(ctx context.Context, w io.Writer, targets TargetSet) error {
 			writtenSnapshots[stateDB] = struct{}{}
 			return writeSQLiteStateDBSnapshot(ctx, tw, stateDB)
 		}
+		return writeArchiveFile(tw, path, info)
+	}
+	writePath := func(path string, optional bool) error {
+		if forbidden.within(path) {
+			return nil
+		}
+		if _, snapshot := snapshotSQLite[filepath.Clean(path)]; snapshot {
+			return writeFile(path, nil)
+		}
 		if optional {
 			return writeOptionalArchiveFile(tw, path)
 		}
-		return writeArchivePath(tw, path, forbidden)
+		return writeArchivePath(tw, path, forbidden, writeFile)
 	}
 	for agent, dirs := range targets.Dirs {
 		if parser.RemoteSyncExcludedAgent(agent) {
@@ -95,7 +102,10 @@ func writeSQLiteStateDBSnapshot(ctx context.Context, tw *tar.Writer, stateDB str
 	}
 	defer os.RemoveAll(tmpDir)
 	snapshotPath := filepath.Join(tmpDir, "state.db")
-	if err := writeSQLiteSnapshotFile(snapshotPath, stateDB); err != nil {
+	if err := writeSQLiteSnapshotFile(ctx, snapshotPath, stateDB); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		// The source can vanish or turn unreadable between the identity
 		// probe above and the online backup. Re-probe it: an unusable
 		// source is an omitted archive entry, exactly as if the probe
@@ -213,7 +223,7 @@ func writeOptionalArchiveFile(tw *tar.Writer, path string) error {
 }
 
 func writeArchivePath(
-	tw *tar.Writer, root string, forbidden forbiddenRootMatcher,
+	tw *tar.Writer, root string, forbidden forbiddenRootMatcher, writeFile func(string, os.FileInfo) error,
 ) error {
 	if forbidden.within(root) {
 		return nil
@@ -226,7 +236,7 @@ func writeArchivePath(
 		return nil
 	}
 	if !info.IsDir() {
-		return writeArchiveFile(tw, root, info)
+		return writeFile(root, info)
 	}
 	return filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -254,7 +264,7 @@ func writeArchivePath(
 		if info.IsDir() {
 			return writeArchiveHeader(tw, path, info, nil)
 		}
-		return writeArchiveFile(tw, path, info)
+		return writeFile(path, info)
 	})
 }
 
@@ -372,7 +382,7 @@ func writeArchiveHeader(
 // escape the resolved targets, even if a future caller forgets to
 // validate.
 func WriteArchiveFiles(ctx context.Context, w io.Writer, allowed TargetSet, files []string) error {
-	tw := tar.NewWriter(w)
+	tw := tar.NewWriter(ctxio.Writer{Context: ctx, Writer: w})
 	forbidden := newForbiddenRootMatcher(allowed.ForbiddenRoots)
 	allowedRoots := allowed.DeltaAllowedRoots()
 	snapshotDBs := sqliteSnapshotTargets(allowed)

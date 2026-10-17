@@ -571,7 +571,20 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // codex:<thread>. Re-parse unchanged Codex sources so every file gets its own
 // session; the resync's orphan copy drops a stale codex:<thread> row whose
 // file now belongs to a page session.)
-const dataVersion = 131
+// (132: Claude pr-link records populate sessions.pr_links. Re-parse unchanged
+// Claude sources in place so existing session IDs gain their pull request links.)
+// (133: Codex-format sessions store git_branch from session_meta git.branch.
+// Re-parse unchanged Codex-format sources in place so existing sessions gain
+// the branch they started on.)
+// (134: a Codex revert page written by Codex Desktop 0.148.0-alpha.15 through
+// 0.154.0-alpha.6.2 keeps its own rollout id in session_meta.id and the thread
+// id in session_meta.session_id. It is now stored as codex:<thread>_<rollout>,
+// linked to its thread, instead of codex:<rollout>. This changes session ids,
+// so it is a full rebuild; the resync's curation copy moves the old row's
+// state to the new id.)
+// (135: reparse Vibe sessions in place so existing search_replace tool calls
+// gain the corrected Edit category without changing session identities.)
+const dataVersion = 135
 
 const archiveOnlyVersionBase = 1 << 20
 
@@ -787,6 +800,7 @@ type DB struct {
 	writer               atomic.Pointer[sql.DB]
 	reader               atomic.Pointer[sql.DB]
 	usageCache           *usageCacheManager
+	activityMemo         activityCandidateMemo
 	usageBackfillMu      sync.Mutex
 	usageBackfillCancel  context.CancelFunc
 	usageBackfillDone    chan struct{}
@@ -797,6 +811,7 @@ type DB struct {
 	// background backfill (the daemon lifecycle). Reopen restarts a pass
 	// only then, so CLI resyncs never trigger an unrequested archive scan.
 	usageBackfillEnabled bool
+	usageNotifyWork      func() (func(), bool)
 	mu                   sync.Mutex // serializes writes
 	compactMu            sync.Mutex // serializes staged archive compactions
 	connMu               sync.RWMutex
@@ -1880,6 +1895,8 @@ var readOnlyRequiredTables = []string{
 	"excluded_sessions",
 	"worktree_project_mappings",
 	"session_project_assignments",
+	"session_labels",
+	"session_external_parents",
 	"archive_metadata",
 	"background_migrations",
 	"project_identity_observations",
@@ -2266,6 +2283,10 @@ func legacySchemaColumnMigrations() []schemaColumnMigration {
 
 func schemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
+		{
+			"sessions", "pr_links",
+			"ALTER TABLE sessions ADD COLUMN pr_links TEXT NOT NULL DEFAULT ''",
+		},
 		{"excluded_sessions", "file_path", "ALTER TABLE excluded_sessions ADD COLUMN file_path TEXT"},
 		{
 			"sessions", "trash_includes_codex_pages",
@@ -2338,6 +2359,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"sessions", "parser_parent_session_id",
 			"ALTER TABLE sessions ADD COLUMN parser_parent_session_id TEXT;" +
 				" UPDATE sessions SET parser_parent_session_id = parent_session_id",
+		},
+		{
+			"sessions", "parser_relationship_type",
+			"ALTER TABLE sessions ADD COLUMN parser_relationship_type TEXT",
 		},
 		{
 			"sessions", "session_name",
@@ -2653,6 +2678,18 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{
 			"sessions", "secrets_rules_version",
 			"ALTER TABLE sessions ADD COLUMN secrets_rules_version TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"sessions", "friction_count",
+			"ALTER TABLE sessions ADD COLUMN friction_count INTEGER NOT NULL DEFAULT 0",
+		},
+		{
+			"sessions", "friction_rules_version",
+			"ALTER TABLE sessions ADD COLUMN friction_rules_version TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			"sessions", "friction_hash",
+			"ALTER TABLE sessions ADD COLUMN friction_hash TEXT NOT NULL DEFAULT ''",
 		},
 		{
 			"recall_extract_progress", "content_stamped_at",
@@ -2993,6 +3030,7 @@ WHEN (
     OLD.data_version IS NOT NEW.data_version OR
     OLD.cwd IS NOT NEW.cwd OR
     OLD.git_branch IS NOT NEW.git_branch OR
+    OLD.pr_links IS NOT NEW.pr_links OR
     OLD.source_session_id IS NOT NEW.source_session_id OR
     OLD.source_version IS NOT NEW.source_version OR
     OLD.group_key IS NOT NEW.group_key OR
@@ -3547,6 +3585,7 @@ func (db *DB) RequeueAllArtifactExports(ctx context.Context) error {
 // semantics; a full rebuild still covers it.
 // AFTER UPDATE OF only fires on the five source columns, and the trigger
 // body writes only sync_marker, so it cannot recurse.
+// Annotation writes advance sync_marker directly and leave these signals alone.
 //
 // This lives here rather than in schema.sql because schema.sql runs
 // unconditionally on every Open() (via db.init) before
@@ -3754,6 +3793,8 @@ func (db *DB) createPartialIndexesLocked(ctx context.Context, w *writerHandle) e
 		   AND claude_request_id != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_friction_rules_version
+		 ON sessions(friction_rules_version)`,
 	}
 	for _, ddl := range indexes {
 		if _, err := w.Exec(ctx, ddl); err != nil {
@@ -3761,6 +3802,15 @@ func (db *DB) createPartialIndexesLocked(ctx context.Context, w *writerHandle) e
 		}
 	}
 	if err := ensureUsageIndexesLocked(ctx, w); err != nil {
+		return err
+	}
+	// Widened here, after column migrations, since legacy archives lack is_automated.
+	if err := ensureIndexColumnsLocked(ctx,
+		w, "idx_sessions_parent", []string{"parent_session_id", "is_automated"},
+		`CREATE INDEX IF NOT EXISTS idx_sessions_parent
+		 ON sessions(parent_session_id, is_automated)
+		 WHERE parent_session_id IS NOT NULL`,
+	); err != nil {
 		return err
 	}
 	if err := ensureAnalyticsIndexLocked(ctx, w); err != nil {
@@ -3850,7 +3900,7 @@ func ensureUsageIndexesLocked(ctx context.Context, w *writerHandle) error {
 	if _, err := w.Exec(ctx, `DROP INDEX IF EXISTS idx_messages_usage_covering`); err != nil {
 		return fmt.Errorf("dropping superseded usage covering index: %w", err)
 	}
-	if err := ensureUsageIndexColumnsLocked(ctx,
+	if err := ensureIndexColumnsLocked(ctx,
 		w, "idx_messages_usage_timestamp", []string{"timestamp", "session_id"},
 		`CREATE INDEX IF NOT EXISTS idx_messages_usage_timestamp
 		 ON messages(timestamp, session_id)
@@ -3858,7 +3908,7 @@ func ensureUsageIndexesLocked(ctx context.Context, w *writerHandle) error {
 	); err != nil {
 		return err
 	}
-	if err := ensureUsageIndexColumnsLocked(ctx,
+	if err := ensureIndexColumnsLocked(ctx,
 		w, "idx_messages_usage_session_covering", usageSessionCoveringIndexColumns,
 		`CREATE INDEX IF NOT EXISTS idx_messages_usage_session_covering
 		 ON messages(session_id, ordinal, timestamp, role, model, provider_id,
@@ -3867,7 +3917,7 @@ func ensureUsageIndexesLocked(ctx context.Context, w *writerHandle) error {
 	); err != nil {
 		return err
 	}
-	if err := ensureUsageIndexColumnsLocked(ctx,
+	if err := ensureIndexColumnsLocked(ctx,
 		w, "idx_messages_activity_timestamp",
 		[]string{"timestamp", "session_id", "ordinal", "model"},
 		`CREATE INDEX IF NOT EXISTS idx_messages_activity_timestamp
@@ -3879,36 +3929,59 @@ func ensureUsageIndexesLocked(ctx context.Context, w *writerHandle) error {
 	return nil
 }
 
-func ensureUsageIndexColumnsLocked(ctx context.Context,
+func ensureIndexColumnsLocked(ctx context.Context,
 	w *writerHandle, name string, want []string, ddl string,
 ) error {
-	var columns sql.NullString
+	// Read the columns and table together so a concurrent rebuild cannot
+	// drop the index between the two reads.
+	var columns, table sql.NullString
 	if err := w.QueryRow(ctx, fmt.Sprintf(`
-		SELECT group_concat(name, ',')
-		FROM (
-			SELECT name
-			FROM pragma_index_info('%s')
-			ORDER BY seqno
-		)`, name)).Scan(&columns); err != nil {
-		return fmt.Errorf("probing usage index %s: %w", name, err)
+		SELECT
+			(SELECT group_concat(name, ',')
+			 FROM (
+				SELECT name
+				FROM pragma_index_info('%s')
+				ORDER BY seqno
+			 )),
+			(SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?)`,
+		name), name).Scan(&columns, &table); err != nil {
+		return fmt.Errorf("probing index %s: %w", name, err)
 	}
 	if columns.String != strings.Join(want, ",") {
-		if columns.Valid && columns.String != "" {
+		populated := false
+		if columns.Valid && columns.String != "" && table.Valid {
+			var err error
+			if populated, err = tableHasRowsLocked(ctx, w, table.String); err != nil {
+				return fmt.Errorf("checking rows for index %s: %w", name, err)
+			}
+		}
+		// Fresh archives rebuild schema.sql's older form instantly; only populated ones wait.
+		if populated {
 			log.Printf(
-				"rebuilding stale SQLite usage index %s; startup continues after the archive index migration completes",
+				"rebuilding stale SQLite index %s; startup continues after the archive index migration completes",
 				name,
 			)
 		}
 		if _, err := w.Exec(ctx,
 			`DROP INDEX IF EXISTS `+name,
 		); err != nil {
-			return fmt.Errorf("dropping stale usage index %s: %w", name, err)
+			return fmt.Errorf("dropping stale index %s: %w", name, err)
 		}
 		if _, err := w.Exec(ctx, ddl); err != nil {
-			return fmt.Errorf("creating usage index %s: %w", name, err)
+			return fmt.Errorf("creating index %s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+func tableHasRowsLocked(ctx context.Context, w *writerHandle, table string) (bool, error) {
+	var populated bool
+	if err := w.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM "`+table+`")`,
+	).Scan(&populated); err != nil {
+		return false, err
+	}
+	return populated, nil
 }
 
 // backfillIsAutomatedLocked verifies is_automated for all
@@ -5333,7 +5406,8 @@ func (db *DB) reopenLockedWithBarrier(keepWriterBarrier bool) error {
 	db.connMu.Lock()
 	retired := append([]*sql.DB(nil), db.retired...)
 	oldWriter := db.writer.Swap(writer)
-	oldReader := db.reader.Swap(reader)
+	var oldReader *sql.DB
+	db.activityMemo.swap(func() { oldReader = db.reader.Swap(reader) })
 	// Reopen fully restores the writer pool, so clear any writer-closed barrier
 	// a prior CloseWriter set unless the caller keeps it. Without the clear a
 	// resync swap that ran behind the worker write barrier would reopen the

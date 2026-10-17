@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     transcript_revision TEXT NOT NULL DEFAULT '0',
     parent_session_id TEXT,
     parser_parent_session_id TEXT,
+    parser_relationship_type TEXT,
     relationship_type TEXT NOT NULL DEFAULT '',
     total_output_tokens INTEGER NOT NULL DEFAULT 0,
     peak_context_tokens INTEGER NOT NULL DEFAULT 0,
@@ -68,6 +69,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     data_version INTEGER NOT NULL DEFAULT 0,
     cwd TEXT NOT NULL DEFAULT '',
     git_branch TEXT NOT NULL DEFAULT '',
+    -- JSON array of parser-derived pull request links; '' when none.
+    pr_links TEXT NOT NULL DEFAULT '',
     source_session_id TEXT NOT NULL DEFAULT '',
     source_version TEXT NOT NULL DEFAULT '',
     group_key TEXT NOT NULL DEFAULT '',
@@ -95,6 +98,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     termination_status TEXT,
     secret_leak_count INTEGER NOT NULL DEFAULT 0,
     secrets_rules_version TEXT NOT NULL DEFAULT '',
+    friction_count INTEGER NOT NULL DEFAULT 0,
+    friction_rules_version TEXT NOT NULL DEFAULT '',
+    friction_hash TEXT NOT NULL DEFAULT '',
     sync_marker TEXT
 );
 
@@ -739,6 +745,30 @@ CREATE TABLE IF NOT EXISTS starred_sessions (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Session labels: user- or tool-supplied tags. Like project assignments,
+-- rows are keyed by session id without a foreign key so a launcher can
+-- label a session before sync imports it, and parser writes never touch
+-- them.
+CREATE TABLE IF NOT EXISTS session_labels (
+    session_id TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (session_id, label)
+);
+
+-- Launcher-supplied parent links. Linking passes recompute them from current
+-- evidence: a link is the session's parent only while the transcript gives
+-- none, no tool-call spawn edge claims the session, and the link's chain
+-- does not lead back to the session.
+CREATE TABLE IF NOT EXISTS session_external_parents (
+    session_id        TEXT PRIMARY KEY,
+    parent_session_id TEXT NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_session_external_parents_parent
+    ON session_external_parents(parent_session_id);
+
 -- Excluded sessions: tracks session IDs that were permanently
 -- deleted by the user so the sync engine does not re-import them.
 CREATE TABLE IF NOT EXISTS excluded_sessions (
@@ -1307,6 +1337,33 @@ CREATE INDEX IF NOT EXISTS idx_secret_findings_session
     ON secret_findings(session_id);
 CREATE INDEX IF NOT EXISTS idx_secret_findings_rule
     ON secret_findings(rule_name);
+
+-- Friction findings: per-occurrence detections from internal/friction.
+-- Derived from stored messages at sync time and replaced per session.
+-- Natural coordinates let findings survive the full-resync orphan copy.
+CREATE TABLE IF NOT EXISTS friction_findings (
+    id              INTEGER PRIMARY KEY,
+    session_id      TEXT NOT NULL
+        REFERENCES sessions(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    detector        TEXT NOT NULL,
+    message_ordinal INTEGER,
+    call_index      INTEGER,
+    tool_name       TEXT NOT NULL DEFAULT '',
+    label           TEXT NOT NULL DEFAULT '',
+    text            TEXT NOT NULL DEFAULT '',
+    evidence        TEXT NOT NULL DEFAULT '',
+    title           TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL,
+    occurred_at     TEXT,
+    seq             INTEGER NOT NULL,
+    rules_version   TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+        DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_findings_session
+    ON friction_findings(session_id);
 
 -- Durable normalized-artifact import claims. Artifact kinds evolve
 -- independently, so each claim retains a separate version gate.

@@ -4,6 +4,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -233,12 +234,11 @@ func testBulkReadEntryPoints(t *testing.T, blocked bool) {
 		}
 		t.Run(tc.name, func(t *testing.T) {
 			budget := 30 * time.Second
-			if blocked {
+			if blocked && tc.wantError == nil {
 				budget = 100 * time.Millisecond
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), budget)
 			defer cancel()
-			require.NoError(t, ctx.Err())
 			err := tc.read(ctx)
 			if tc.wantError != nil {
 				if statsError, ok := errors.AsType[*StatsInputError](tc.wantError); ok {
@@ -396,6 +396,91 @@ func TestUsageCacheFillExtractionUsesNarrowIndexes(t *testing.T) {
 		"idx_messages_session_role")
 	assert.Contains(t, plan(usageFillEventFactsSQL),
 		"idx_usage_events_session")
+}
+
+type countingUsageCacheStatementRunner struct {
+	usageCacheStatementRunner
+	queryArgCounts []int
+}
+
+func (r *countingUsageCacheStatementRunner) QueryContext(
+	ctx context.Context, query string, args ...any,
+) (*sql.Rows, error) {
+	r.queryArgCounts = append(r.queryArgCounts, len(args))
+	return r.usageCacheStatementRunner.QueryContext(ctx, query, args...)
+}
+
+func TestReadUsageCachedSessionsCrossesChunkBoundary(t *testing.T) {
+	database := testDB(t)
+	snapshot, err := database.captureUsageQuery(t.Context(), UsageFilter{}, usageQueryKindToken)
+	require.NoError(t, err)
+	cache, err := database.usageCache.Generation(t.Context(), snapshot.DatabaseID)
+	require.NoError(t, err)
+	tx, err := cache.db.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+	want := make(map[string]usageFillResult)
+	ids := make([]string, 0, maxSQLVars+5)
+	for i := range maxSQLVars + 2 {
+		id := fmt.Sprintf("session-%d", i)
+		result := usageFillResult{
+			InstallRevision: int64(i + 1),
+			source: usageSourceVersion{
+				SessionID: id, SyncMarker: fmt.Sprintf("sync-%d", i),
+				TranscriptRevision:    fmt.Sprintf("revision-%d", i),
+				UsageEventFingerprint: fmt.Sprintf("events-%d", i),
+			},
+		}
+		_, err := tx.ExecContext(t.Context(), `INSERT INTO usage_cached_sessions(
+			session_id, source_sync_marker, source_transcript_rev,
+			usage_event_fingerprint, install_revision) VALUES (?, ?, ?, ?, ?)`,
+			id, result.source.SyncMarker, result.source.TranscriptRevision,
+			result.source.UsageEventFingerprint, result.InstallRevision)
+		require.NoError(t, err)
+		ids = append(ids, id)
+		want[id] = result
+	}
+	require.NoError(t, tx.Commit())
+	ids = append(ids, "absent-1", "absent-2", "absent-3")
+	runner := &countingUsageCacheStatementRunner{usageCacheStatementRunner: cache.db}
+	empty, err := readUsageCachedSessions(t.Context(), runner, nil)
+	require.NoError(t, err)
+	assert.Empty(t, empty)
+	assert.Empty(t, runner.queryArgCounts)
+	got, err := readUsageCachedSessions(t.Context(), runner, ids)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	assert.Equal(t, []int{maxSQLVars, 5}, runner.queryArgCounts)
+}
+
+func TestUsageFillEnsureRefillsOnlyChangedSessions(t *testing.T) {
+	database := testDB(t)
+	database.SetUsageCacheNotificationWork(func() (func(), bool) {
+		return nil, false
+	})
+	for _, id := range []string{"changed", "unchanged"} {
+		insertSession(t, database, id, "project")
+		insertMessages(t, database, asstMsgAt(id, 0, "answer", "2026-08-10T10:00:00Z"))
+	}
+	snapshot, err := database.captureUsageQuery(t.Context(), UsageFilter{}, usageQueryKindToken)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Versions, 2)
+	cache, err := database.usageCache.Generation(t.Context(), snapshot.DatabaseID)
+	require.NoError(t, err)
+	first, err := cache.fill.Ensure(t.Context(), snapshot.Versions, 0)
+	require.NoError(t, err)
+	insertMessages(t, database, asstMsgAt("changed", 1, "more", "2026-08-10T10:01:00Z"))
+	snapshot, err = database.captureUsageQuery(t.Context(), UsageFilter{}, usageQueryKindToken)
+	require.NoError(t, err)
+	var extracted []string
+	cache.fill.observer.beforeExtract = func(versions []usageSourceVersion) {
+		extracted = append(extracted, usageSourceVersionIDs(versions)...)
+	}
+	second, err := cache.fill.Ensure(t.Context(), snapshot.Versions, 0)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"changed"}, extracted)
+	assert.Equal(t, first["unchanged"], second["unchanged"])
+	assert.Greater(t, second["changed"].InstallRevision, first["changed"].InstallRevision)
 }
 
 func TestUsageFillCoordinatorSharesDetachedSessionWork(t *testing.T) {
@@ -819,8 +904,8 @@ func TestUsageCursorFactsResumeAtRequestedHighWater(t *testing.T) {
 	assert.Equal(t, 2, usageCacheCount(t, cache, "cursor_usage_facts"))
 }
 
-func TestUsageCursorFactsRetainBoundedBatchProgress(t *testing.T) {
-	database := testDB(t)
+func usageCursorBatchFailureFixture(t *testing.T, database *DB) (usageQuerySnapshot, *usageCache) {
+	t.Helper()
 	const batchSize = usageCursorCopyBatchSize
 	events := make([]CursorUsageEvent, 0, batchSize+1)
 	for index := range batchSize + 1 {
@@ -844,7 +929,15 @@ func TestUsageCursorFactsRetainBoundedBatchProgress(t *testing.T) {
 		END`, batchSize))
 	require.NoError(t, err)
 
-	_, err = cache.fill.Ensure(t.Context(), nil, snapshot.CursorHighWater)
+	return snapshot, cache
+}
+
+func TestUsageCursorFactsRetainBoundedBatchProgress(t *testing.T) {
+	database := testDB(t)
+	snapshot, cache := usageCursorBatchFailureFixture(t, database)
+	const batchSize = usageCursorCopyBatchSize
+
+	_, err := cache.fill.Ensure(t.Context(), nil, snapshot.CursorHighWater)
 	require.Error(t, err)
 	assert.Equal(t, batchSize, usageCacheCount(t, cache, "cursor_usage_facts"))
 	assert.Equal(t, strconv.Itoa(batchSize), readUsageCacheMetadata(

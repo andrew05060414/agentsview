@@ -3,6 +3,7 @@ package remotesync
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -145,10 +147,11 @@ func TestWriteArchiveSkipsDirectoryValuedExtraFile(t *testing.T) {
 	assert.ErrorIs(t, err, io.EOF)
 }
 
-func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
+func TestArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 	tests := []struct {
-		name  string
-		write func(io.Writer, string) error
+		name        string
+		antigravity bool
+		write       func(io.Writer, string) error
 	}{
 		{
 			name: "full archive",
@@ -174,12 +177,30 @@ func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 				return WriteArchiveFiles(t.Context(), w, allowed, []string{stateDB, wal})
 			},
 		},
+		{
+			name: "Antigravity full archive", antigravity: true,
+			write: func(w io.Writer, stateDB string) error {
+				return WriteArchive(t.Context(), w, TargetSet{Dirs: map[parser.AgentType][]string{parser.AgentAntigravity: {filepath.Dir(stateDB)}}})
+			},
+		},
+		{
+			name: "Antigravity WAL-only delta", antigravity: true,
+			write: func(w io.Writer, stateDB string) error {
+				return WriteArchiveFiles(t.Context(), w, TargetSet{Dirs: map[parser.AgentType][]string{parser.AgentAntigravity: {filepath.Dir(stateDB)}}}, []string{stateDB + "-wal"})
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			stateDB := filepath.Join(t.TempDir(), "profile", "state.db")
 			require.NoError(t, os.MkdirAll(filepath.Dir(stateDB), 0o755))
-			writeHermesImportStateDB(t, stateDB)
+			table, idColumn, id := "sessions", "id", "database-only"
+			if tt.antigravity {
+				stateDB = dbtest.SetAntigravityTitle(t, filepath.Dir(stateDB), "First")
+				table, idColumn, id = "conversation_summaries", "conversation_id", dbtest.AntigravityTitleID
+			} else {
+				writeHermesImportStateDB(t, stateDB)
+			}
 			writer, err := sql.Open("sqlite3", stateDB)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = writer.Close() })
@@ -188,11 +209,7 @@ func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 			assert.Equal(t, "wal", journalMode)
 			_, err = writer.ExecContext(t.Context(), `PRAGMA wal_autocheckpoint = 0`)
 			require.NoError(t, err)
-			_, err = writer.ExecContext(t.Context(), `
-				UPDATE sessions
-				SET title = 'Committed in WAL'
-				WHERE id = 'database-only'
-			`)
+			_, err = writer.ExecContext(t.Context(), "UPDATE "+table+" SET title = 'Committed in WAL' WHERE "+idColumn+" = ?", id)
 			require.NoError(t, err)
 			wal := stateDB + "-wal"
 			require.FileExists(t, wal)
@@ -228,9 +245,7 @@ func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, snapshot.Close()) })
 			var title string
-			require.NoError(t, snapshot.QueryRowContext(t.Context(), `
-				SELECT title FROM sessions WHERE id = 'database-only'
-			`).Scan(&title))
+			require.NoError(t, snapshot.QueryRowContext(t.Context(), "SELECT title FROM "+table+" WHERE "+idColumn+" = ?", id).Scan(&title))
 			assert.Equal(t, "Committed in WAL", title)
 			assert.NoFileExists(t, extractedDB+"-wal")
 			assert.NoFileExists(t, extractedDB+"-shm")
@@ -340,7 +355,7 @@ func TestWriteArchivePropagatesAdvertisedHermesSnapshotFailure(t *testing.T) {
 
 	wantErr := errors.New("forced sqlite backup failure")
 	originalSnapshot := writeSQLiteSnapshotFile
-	writeSQLiteSnapshotFile = func(dstPath, srcPath string) error {
+	writeSQLiteSnapshotFile = func(_ context.Context, dstPath, srcPath string) error {
 		assert.NotEmpty(t, dstPath)
 		assert.Equal(t, stateDB, srcPath)
 		return wantErr
@@ -367,7 +382,7 @@ func TestWriteArchiveOmitsSnapshotWhenSourceVanishesMidBackup(t *testing.T) {
 	writeHermesImportStateDB(t, stateDB)
 
 	originalSnapshot := writeSQLiteSnapshotFile
-	writeSQLiteSnapshotFile = func(dstPath, srcPath string) error {
+	writeSQLiteSnapshotFile = func(_ context.Context, dstPath, srcPath string) error {
 		require.NoError(t, os.Remove(srcPath))
 		return errors.New("open sqlite snapshot source: no such file")
 	}

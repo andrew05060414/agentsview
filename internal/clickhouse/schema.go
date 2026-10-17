@@ -15,7 +15,7 @@ import (
 // added later ship as ADD COLUMN IF NOT EXISTS entries in the table specs,
 // so an older mirror upgrades in place; the version tells operators and
 // status output which shape a mirror has.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // Metadata keys shared by every archive that pushes into the mirror.
 const (
@@ -36,6 +36,8 @@ const (
 	cursorUsageMaxIDKeyBase    = "agentsview_cursor_usage_max_id"
 	usageSnapshotReadyKeyBase  = "agentsview_usage_snapshot_ready"
 	storedCountRepairKeyBase   = "agentsview_stored_message_count_repair"
+	databaseIDKeyBase          = "agentsview_source_database_id"
+	fullPushRunKeyBase         = "agentsview_full_push_run"
 )
 
 // archiveMetadataKey scopes a sync_metadata key to one source archive so
@@ -57,6 +59,7 @@ const (
 	tNullTime      = "Nullable(DateTime64(6, 'UTC'))"
 	tVersion       = "UInt64"
 	tFloatArray    = "Array(Float32)"
+	tStringArray   = "Array(String)"
 	pushVersionCol = "push_version"
 )
 
@@ -223,6 +226,11 @@ var mirrorTables = []tableSpec{
 			col("termination_status", tNullString),
 			col("secret_leak_count", tInt),
 			col("secrets_rules_version", tString),
+			// pr_links holds db.EncodePRLinks text ('' when none), the same
+			// form SQLite stores, so the shared PR filter reads one shape.
+			col("pr_links", tString),
+			// labels mirrors the SQLite session_labels rows, sorted.
+			col("labels", tStringArray),
 			col("last_message_at", tNullTime),
 			col("agentsview_push_fingerprint", tString),
 			col("source_archive_id", tString),

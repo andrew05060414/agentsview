@@ -50,6 +50,8 @@ type usageCacheBackfillRecorder struct {
 	observer func()
 }
 
+func (recorder *usageCacheBackfillRecorder) SetUsageCacheNotificationWork(func() (func(), bool)) {}
+
 func (recorder *usageCacheBackfillRecorder) SetUsageCacheBackfillStarted(
 	observer func(),
 ) {
@@ -113,6 +115,80 @@ func TestServeStartsUsageCacheBackfillWithoutIdleTracker(t *testing.T) {
 		require.FailNow(t, "usage cache backfill was not awaited without an idle tracker")
 	}
 	close(recorder.release)
+}
+
+func TestUsageNotificationHoldsIdleWorkAfterSync(t *testing.T) {
+	path := filepath.Join(dbtest.MkdirTempWithCleanup(t), "archive.db")
+	database := dbtest.OpenTestDBAt(t, path)
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{ID: "session", Agent: "claude", Project: "project"}))
+	require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+		SessionID: "session", Ordinal: 0, Role: "assistant", Model: "model-a",
+		Timestamp: "2026-08-10T09:00:00Z", TokenUsage: []byte(`{"input_tokens":10}`),
+		ClaudeMessageID: "message-a", ClaudeRequestID: "request-a",
+	}}))
+	idled := make(chan struct{})
+	shutdown := make(chan error, 1)
+	tracker := server.NewIdleTracker(20*time.Millisecond, func() {
+		close(idled)
+		shutdown <- database.Close()
+	})
+	finishSync, ok := tracker.BeginWork()
+	require.True(t, ok)
+	defer finishSync()
+	startDaemonUsageCacheBackfill(t.Context(), database, tracker)
+	require.NoError(t, database.WaitUsageCacheBackfill(t.Context()))
+	_, err := database.GetDailyUsage(t.Context(), db.UsageFilter{Timezone: "UTC"})
+	require.NoError(t, err)
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(path), "usage-cache-v*.db"))
+	require.NoError(t, err)
+	require.Len(t, paths, 1)
+	cache, err := sql.Open("sqlite3", paths[0])
+	require.NoError(t, err)
+	defer cache.Close()
+	conn, err := cache.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.ExecContext(t.Context(), "BEGIN IMMEDIATE")
+	require.NoError(t, err)
+	defer func() { _, _ = conn.ExecContext(t.Context(), "ROLLBACK") }()
+	require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+		SessionID: "session", Ordinal: 1, Role: "assistant", Model: "model-a",
+		Timestamp: "2026-08-10T10:00:00Z", TokenUsage: []byte(`{"input_tokens":7}`),
+		ClaudeMessageID: "message-b", ClaudeRequestID: "request-b",
+	}}))
+	go tracker.Run(t.Context())
+	idleFired := func() bool {
+		select {
+		case <-idled:
+			return true
+		default:
+			return false
+		}
+	}
+	assert.Never(t, idleFired, 50*time.Millisecond, time.Millisecond)
+	finishSync()
+	assert.Never(t, idleFired, 200*time.Millisecond, time.Millisecond, "idle shutdown cancelled the blocked notification rebuild")
+	_, err = conn.ExecContext(t.Context(), "ROLLBACK")
+	require.NoError(t, err)
+	select {
+	case <-idled:
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "notification work did not release its idle lease")
+	}
+	select {
+	case err := <-shutdown:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "idle shutdown did not finish")
+	}
+	reopened := dbtest.OpenTestDBAt(t, path)
+	var revisionBefore, revisionAfter int64
+	require.NoError(t, cache.QueryRowContext(t.Context(), "SELECT SUM(install_revision) FROM usage_rollup_installs").Scan(&revisionBefore))
+	daily, err := reopened.GetDailyUsage(t.Context(), db.UsageFilter{Timezone: "UTC"})
+	require.NoError(t, err)
+	assert.Equal(t, 17, daily.Totals.InputTokens)
+	require.NoError(t, cache.QueryRowContext(t.Context(), "SELECT SUM(install_revision) FROM usage_rollup_installs").Scan(&revisionAfter))
+	assert.Equal(t, revisionBefore, revisionAfter, "request rebuilt totals after idle work drained")
 }
 
 func (recorder *cursorSecretRecorder) SetCursorSecret(secret []byte) {
@@ -1019,15 +1095,15 @@ func TestRemoteHostSyncFuncAcquiresHTTPCleanupBeforeEngine(t *testing.T) {
 		},
 	)
 	require.Error(t, seedErr)
-	originalHTTP := runHTTPRemoteSync
+	originalHTTP := runRemoteHostSync
 	httpCalls := 0
-	runHTTPRemoteSync = func(
+	runRemoteHostSync = func(
 		context.Context, config.Config, *db.DB, config.RemoteHost, bool,
 	) (remotesync.SyncStats, error) {
 		httpCalls++
 		return remotesync.SyncStats{SessionsSynced: 1}, nil
 	}
-	t.Cleanup(func() { runHTTPRemoteSync = originalHTTP })
+	t.Cleanup(func() { runRemoteHostSync = originalHTTP })
 	database := dbtest.OpenTestDB(t)
 	syncFn := remoteHostSyncFunc(
 		t.Context(), config.Config{}, database, runner,
@@ -1085,7 +1161,7 @@ func TestRemoteHostSyncFuncDispatchesHTTPTransport(t *testing.T) {
 		Machine:   "local",
 	})
 	var called config.RemoteHost
-	restore := stubHTTPRemoteSyncForTest(t, func(
+	restore := stubRemoteHostSyncForTest(t, func(
 		_ context.Context,
 		rh config.RemoteHost,
 		full bool,
@@ -3766,7 +3842,7 @@ func TestOpenCodeSQLiteOnlyRootKeepsItsPollingFallback(t *testing.T) {
 	for _, obligation := range obligations {
 		local = append(local, syncObligationToPoller(obligation))
 	}
-	scopes := availableUnwatchedPollScopes(local)
+	scopes, _ := availableUnwatchedPollScopes(local)
 	assert.Equal(t, []string{root}, scopes[parser.AgentOpenCode],
 		"degraded coverage on a SQLite-only root must still reach polling")
 }
@@ -3797,7 +3873,7 @@ func TestOpenCodeAbsentRootPollsTheConfiguredDir(t *testing.T) {
 	for _, obligation := range obligations {
 		local = append(local, syncObligationToPoller(obligation))
 	}
-	scopes := availableUnwatchedPollScopes(local)
+	scopes, _ := availableUnwatchedPollScopes(local)
 	assert.Equal(t, []string{root}, scopes[parser.AgentOpenCode],
 		"the dir must become pollable as soon as it appears")
 }

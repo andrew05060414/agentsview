@@ -163,6 +163,17 @@ Key assumptions reviewers MUST account for:
     unmerged branch carry no such promise, so don't flag a missing
     migration for schema that only existed on that branch.
 
+22. AGENT CATALOG TESTS: TestRegistryCompleteness and the KNOWN_AGENTS
+    test are exhaustive on purpose and must list every agent, so a new
+    agent's row there is expected. Don't flag those lists as duplicating
+    production catalogs.
+
+23. WEB UI AND SERVER VERSIONS: The web UI expects a server from the
+    same build, including one reached through Remote settings. It warns
+    when the server's commit differs and never gates on api_version.
+    Don't flag a frontend path for failing against an older server API;
+    version gates belong to the Go CLI and MCP clients.
+
 For local/legacy modes, do not impose requirements that apply only to
 public-facing multi-tenant services. For opt-in hosted raw processing,
 review its actual tenant/role/catalog boundary, immutable source provenance,

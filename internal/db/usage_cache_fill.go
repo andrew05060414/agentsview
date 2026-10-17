@@ -22,6 +22,7 @@ const (
 	usageFillInstallBatchSize     = 256
 	usageCursorCopyBatchSize      = 1_000
 	usageFillNotificationDebounce = 100 * time.Millisecond
+	usageFillNotificationCapacity = 1024
 )
 
 var errUsageCacheSourceChanged = errors.New("usage cache source archive changed")
@@ -51,10 +52,11 @@ type usageCursorFillCall struct {
 // usageFillObserver exposes lifecycle boundaries to deterministic tests. Its
 // callbacks must never be used for production work.
 type usageFillObserver struct {
-	beforeExtract    func([]usageSourceVersion)
-	afterExtract     func([]usageSourceVersion)
-	beforeInstall    func([]usageSourceVersion)
-	afterMaintenance func()
+	beforeExtract          func([]usageSourceVersion)
+	afterExtract           func([]usageSourceVersion)
+	beforeInstall          func([]usageSourceVersion)
+	afterNotificationBatch func()
+	afterMaintenance       func()
 }
 
 type usageFillCoordinator struct {
@@ -69,7 +71,10 @@ type usageFillCoordinator struct {
 	cursorTarget int64
 	observer     usageFillObserver
 	notify       chan usageFillNotification
+	overflow     map[string]bool
 	done         chan struct{}
+
+	notificationDone func()
 }
 
 type usageFillNotification struct {
@@ -84,7 +89,7 @@ func newUsageFillCoordinator(
 	c := &usageFillCoordinator{
 		archive: archive, cache: cache, ctx: ctx, cancel: cancel,
 		calls:  make(map[string]*usageFillCall),
-		notify: make(chan usageFillNotification, 1024),
+		notify: make(chan usageFillNotification, usageFillNotificationCapacity),
 		done:   make(chan struct{}),
 	}
 	go c.runNotifications()
@@ -108,11 +113,12 @@ func (c *usageFillCoordinator) Ensure(
 	results := make(map[string]usageFillResult, len(versions))
 	waiting := make(map[string]*usageFillCall)
 	owned := make([]usageSourceVersion, 0, len(versions))
+	cachedSessions, err := readUsageCachedSessions(ctx, c.cache.db, usageSourceVersionIDs(versions))
+	if err != nil {
+		return nil, err
+	}
 	for _, version := range versions {
-		cached, ok, err := c.cachedSession(ctx, version.SessionID)
-		if err != nil {
-			return nil, err
-		}
+		cached, ok := cachedSessions[version.SessionID]
 		if ok && cached.source.Equal(version) {
 			results[version.SessionID] = cached
 			continue
@@ -167,26 +173,43 @@ func usageFillCallKey(version usageSourceVersion) string {
 	}, "\x00")
 }
 
-func (c *usageFillCoordinator) cachedSession(ctx context.Context,
-	sessionID string,
-) (usageFillResult, bool, error) {
-	var result usageFillResult
-	err := c.cache.db.QueryRowContext(ctx, `
-		SELECT source_sync_marker, source_transcript_rev,
-		       usage_event_fingerprint, install_revision
-		FROM usage_cached_sessions WHERE session_id = ?`, sessionID).Scan(
-		&result.source.SyncMarker, &result.source.TranscriptRevision,
-		&result.source.UsageEventFingerprint, &result.InstallRevision,
-	)
-	result.source.SessionID = sessionID
-	if errors.Is(err, sql.ErrNoRows) {
-		return usageFillResult{}, false, nil
+func usageSourceVersionIDs(versions []usageSourceVersion) []string {
+	ids := make([]string, len(versions))
+	for i, version := range versions {
+		ids[i] = version.SessionID
 	}
+	return ids
+}
+
+func readUsageCachedSessions(
+	ctx context.Context, runner usageCacheStatementRunner, sessionIDs []string,
+) (map[string]usageFillResult, error) {
+	results := make(map[string]usageFillResult, len(sessionIDs))
+	err := queryChunked(sessionIDs, func(chunk []string) error {
+		placeholders, args := InPlaceholders(chunk)
+		rows, err := runner.QueryContext(ctx, `SELECT session_id,
+			source_sync_marker, source_transcript_rev,
+			usage_event_fingerprint, install_revision
+			FROM usage_cached_sessions WHERE session_id IN `+placeholders, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var result usageFillResult
+			if err := rows.Scan(&result.source.SessionID,
+				&result.source.SyncMarker, &result.source.TranscriptRevision,
+				&result.source.UsageEventFingerprint, &result.InstallRevision); err != nil {
+				return err
+			}
+			results[result.source.SessionID] = result
+		}
+		return rows.Err()
+	})
 	if err != nil {
-		return usageFillResult{}, false,
-			fmt.Errorf("reading cached usage session %s: %w", sessionID, err)
+		return nil, fmt.Errorf("reading cached usage sessions: %w", err)
 	}
-	return result, true, nil
+	return results, nil
 }
 
 func (c *usageFillCoordinator) fillSessions(versions []usageSourceVersion) {
@@ -295,11 +318,12 @@ func (c *usageFillCoordinator) captureFillInstallExpectations(ctx context.Contex
 	versions []usageSourceVersion,
 ) (map[string]usageFillInstallExpectation, error) {
 	expected := make(map[string]usageFillInstallExpectation, len(versions))
+	cachedSessions, err := readUsageCachedSessions(ctx, c.cache.db, usageSourceVersionIDs(versions))
+	if err != nil {
+		return nil, err
+	}
 	for _, version := range versions {
-		cached, ok, err := c.cachedSession(ctx, version.SessionID)
-		if err != nil {
-			return nil, err
-		}
+		cached, ok := cachedSessions[version.SessionID]
 		expected[version.SessionID] = usageFillInstallExpectation{
 			InstallRevision: cached.InstallRevision,
 			Exists:          ok,
@@ -317,11 +341,12 @@ func (c *usageFillCoordinator) FillBackground(
 ) (map[string]usageFillResult, error) {
 	results := make(map[string]usageFillResult, len(versions))
 	pending := make([]usageSourceVersion, 0, len(versions))
+	cachedSessions, err := readUsageCachedSessions(ctx, c.cache.db, usageSourceVersionIDs(versions))
+	if err != nil {
+		return nil, err
+	}
 	for _, version := range versions {
-		cached, ok, err := c.cachedSession(ctx, version.SessionID)
-		if err != nil {
-			return nil, err
-		}
+		cached, ok := cachedSessions[version.SessionID]
 		if ok && cached.source.Equal(version) {
 			results[version.SessionID] = cached
 			continue
@@ -798,28 +823,25 @@ func (c *usageFillCoordinator) installSpoolBatch(
 		}
 	}()
 
+	sessionIDs := append(usageSourceVersionIDs(stable), deleted...)
+	cachedSessions, err := readUsageCachedSessions(ctx, conn, sessionIDs)
+	if err != nil {
+		return nil, nil, err
+	}
 	eligibleStable := make([]usageSourceVersion, 0, len(stable))
 	eligibleDeleted := make([]string, 0, len(deleted))
 	var lost []string
 	for _, version := range stable {
-		matches, matchErr := fillInstallExpectationMatches(
-			ctx, conn, version.SessionID, expected[version.SessionID])
-		if matchErr != nil {
-			return nil, nil, matchErr
-		}
-		if matches {
+		cached, exists := cachedSessions[version.SessionID]
+		if fillInstallExpectationMatches(cached, exists, expected[version.SessionID]) {
 			eligibleStable = append(eligibleStable, version)
 		} else {
 			lost = append(lost, version.SessionID)
 		}
 	}
 	for _, sessionID := range deleted {
-		matches, matchErr := fillInstallExpectationMatches(
-			ctx, conn, sessionID, expected[sessionID])
-		if matchErr != nil {
-			return nil, nil, matchErr
-		}
-		if matches {
+		cached, exists := cachedSessions[sessionID]
+		if fillInstallExpectationMatches(cached, exists, expected[sessionID]) {
 			eligibleDeleted = append(eligibleDeleted, sessionID)
 		} else {
 			lost = append(lost, sessionID)
@@ -853,32 +875,28 @@ func (c *usageFillCoordinator) installSpoolBatch(
 		return nil, nil, err
 	}
 	maps.Copy(results, stableResults)
-	if err := c.invalidateChangedIdentitySharers(
+	sharers, err := c.invalidateChangedIdentitySharers(
 		ctx, conn, oldIdentities, eligibleStable, affected,
-	); err != nil {
+	)
+	if err != nil {
 		return nil, nil, err
 	}
 	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
 		return nil, nil, fmt.Errorf("committing usage cache fill: %w", err)
 	}
 	committed = true
+	c.requeueSessions(sharers)
 	return results, lost, nil
 }
 
 func fillInstallExpectationMatches(
-	ctx context.Context, conn *sql.Conn, sessionID string,
+	cached usageFillResult, exists bool,
 	expected usageFillInstallExpectation,
-) (bool, error) {
-	var revision int64
-	err := conn.QueryRowContext(ctx, `SELECT install_revision
-		FROM usage_cached_sessions WHERE session_id = ?`, sessionID).Scan(&revision)
-	if errors.Is(err, sql.ErrNoRows) {
-		return !expected.Exists, nil
+) bool {
+	if !exists {
+		return !expected.Exists
 	}
-	if err != nil {
-		return false, err
-	}
-	return expected.Exists && revision == expected.InstallRevision, nil
+	return expected.Exists && cached.InstallRevision == expected.InstallRevision
 }
 
 // invalidateChangedIdentitySharers compares the dedup identities a fill
@@ -888,9 +906,9 @@ func fillInstallExpectationMatches(
 func (c *usageFillCoordinator) invalidateChangedIdentitySharers(
 	ctx context.Context, conn *sql.Conn, oldIdentities usageDedupIdentitySet,
 	stable []usageSourceVersion, affected []string,
-) error {
+) ([]string, error) {
 	if len(affected) == 0 {
-		return nil
+		return nil, nil
 	}
 	stableIDs := make([]string, 0, len(stable))
 	for _, version := range stable {
@@ -898,7 +916,7 @@ func (c *usageFillCoordinator) invalidateChangedIdentitySharers(
 	}
 	newIdentities, err := usageSpoolIdentitiesForSessions(ctx, conn, stableIDs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	changed := newUsageDedupIdentitySet()
 	changed.mergeDifferences(oldIdentities, newIdentities)
@@ -1003,7 +1021,7 @@ func loadUsageSourceVersions(
 			foundIDs = append(foundIDs, id)
 		}
 	}
-	fingerprints, err := usageEventFingerprintsWithQuerier(ctx, tx, foundIDs)
+	fingerprints, err := usageEventFingerprintsWithQuerier(ctx, tx, foundIDs, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1315,7 +1333,8 @@ func (c *usageFillCoordinator) installCursorBatch(
 	}
 	// A session usage key equal to a newly arrived Cursor key must fall back
 	// to the exception tier, so its finalized rollups are invalidated here.
-	if err := invalidateUsageDedupSharers(ctx, tx, arrived, nil); err != nil {
+	sharers, err := invalidateUsageDedupSharers(ctx, tx, arrived, nil)
+	if err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -1325,7 +1344,11 @@ func (c *usageFillCoordinator) installCursorBatch(
 	); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	c.requeueSessions(sharers)
+	return nil
 }
 
 func (m *usageCacheManager) NotifySessions(sessionIDs []string) {
@@ -1338,13 +1361,50 @@ func (m *usageCacheManager) NotifySessions(sessionIDs []string) {
 	}
 	m.mu.Unlock()
 	for _, coordinator := range coordinators {
-		for _, id := range sessionIDs {
-			select {
-			case coordinator.notify <- usageFillNotification{sessionID: id}:
-			default:
+		coordinator.enqueueSessions(sessionIDs)
+	}
+}
+
+func (c *usageFillCoordinator) enqueueSessions(ids []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, id := range ids {
+		if id == "" || !c.beginNotificationWork() {
+			continue
+		}
+		select {
+		case c.notify <- usageFillNotification{sessionID: id}:
+		default:
+			if len(c.overflow) >= usageFillNotificationCapacity {
+				continue
 			}
+			if c.overflow == nil {
+				c.overflow = make(map[string]bool)
+			}
+			c.overflow[id] = true
 		}
 	}
+}
+
+// Called with c.mu held so enqueue and drain cannot split a work lease.
+func (c *usageFillCoordinator) beginNotificationWork() bool {
+	if c.ctx.Err() != nil {
+		return false
+	}
+	if c.notificationDone != nil {
+		return true
+	}
+	c.archive.usageBackfillMu.Lock()
+	begin := c.archive.usageNotifyWork
+	c.archive.usageBackfillMu.Unlock()
+	if begin == nil {
+		return true
+	}
+	done, ok := begin()
+	if ok {
+		c.notificationDone = done
+	}
+	return ok
 }
 
 func (m *usageCacheManager) NotifyCursorUsage() {
@@ -1357,10 +1417,16 @@ func (m *usageCacheManager) NotifyCursorUsage() {
 	}
 	m.mu.Unlock()
 	for _, coordinator := range coordinators {
+		coordinator.mu.Lock()
+		if !coordinator.beginNotificationWork() {
+			coordinator.mu.Unlock()
+			continue
+		}
 		select {
 		case coordinator.notify <- usageFillNotification{cursor: true}:
 		default:
 		}
+		coordinator.mu.Unlock()
 	}
 }
 
@@ -1378,11 +1444,39 @@ func (db *DB) notifyCursorUsage() {
 
 func (c *usageFillCoordinator) runNotifications() {
 	defer close(c.done)
+	defer func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.notificationDone != nil {
+			c.notificationDone()
+			c.notificationDone = nil
+		}
+	}()
 	pending := make(map[string]bool)
 	var cursorPending bool
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	for {
+		c.mu.Lock()
+		for id := range c.overflow {
+			if len(pending) < 2*usageFillNotificationCapacity {
+				pending[id] = true
+			}
+		}
+		clear(c.overflow)
+		if len(pending) == 0 && !cursorPending && len(c.notify) == 0 && c.notificationDone != nil {
+			c.notificationDone()
+			c.notificationDone = nil
+		}
+		c.mu.Unlock()
+		if len(pending) > 0 && timerC == nil {
+			if timer == nil {
+				timer = time.NewTimer(usageFillNotificationDebounce)
+			} else {
+				timer.Reset(usageFillNotificationDebounce)
+			}
+			timerC = timer.C
+		}
 		select {
 		case <-c.ctx.Done():
 			if timer != nil {
@@ -1392,7 +1486,7 @@ func (c *usageFillCoordinator) runNotifications() {
 		case notification := <-c.notify:
 			if notification.cursor {
 				cursorPending = true
-			} else if notification.sessionID != "" {
+			} else if notification.sessionID != "" && len(pending) < 2*usageFillNotificationCapacity {
 				pending[notification.sessionID] = true
 			}
 			if timer == nil {
@@ -1419,6 +1513,21 @@ func (c *usageFillCoordinator) runNotifications() {
 func (c *usageFillCoordinator) processNotificationBatch(
 	pending map[string]bool, cursorPending bool,
 ) {
+	if c.observer.afterNotificationBatch != nil {
+		defer c.observer.afterNotificationBatch()
+	}
+	if cursorPending {
+		var target int64
+		err := c.archive.getReader().QueryRowContext(c.ctx,
+			`SELECT COALESCE(MAX(id), 0) FROM cursor_usage_events`,
+		).Scan(&target)
+		if err == nil && target > 0 {
+			_, err = c.Ensure(c.ctx, nil, target)
+		}
+		if err != nil && c.ctx.Err() == nil {
+			log.Printf("usage cache Cursor notification fill: %v", err)
+		}
+	}
 	if len(pending) > 0 {
 		ids := make([]string, 0, len(pending))
 		for id := range pending {
@@ -1451,22 +1560,12 @@ func (c *usageFillCoordinator) processNotificationBatch(
 				}
 			}
 			if len(current) > 0 {
-				if _, err := c.Ensure(c.ctx, current, 0); err != nil && c.ctx.Err() == nil {
+				fills, err := c.Ensure(c.ctx, current, 0)
+				if err != nil && c.ctx.Err() == nil {
 					log.Printf("usage cache notification fill: %v", err)
 				}
+				c.archive.refreshUsageRollups(c.ctx, c.cache, fills)
 			}
-		}
-	}
-	if cursorPending {
-		var target int64
-		err := c.archive.getReader().QueryRowContext(c.ctx,
-			`SELECT COALESCE(MAX(id), 0) FROM cursor_usage_events`,
-		).Scan(&target)
-		if err == nil && target > 0 {
-			_, err = c.Ensure(c.ctx, nil, target)
-		}
-		if err != nil && c.ctx.Err() == nil {
-			log.Printf("usage cache Cursor notification fill: %v", err)
 		}
 	}
 }
@@ -1509,12 +1608,20 @@ func (c *usageFillCoordinator) deleteNotificationSessions(ids []string) error {
 	}
 	// Rebuild the survivors' rollups so groups the deleted sessions kept
 	// irreducible can finalize again.
-	if err := invalidateUsageDedupSharers(c.ctx, conn, removed, excluded); err != nil {
+	sharers, err := invalidateUsageDedupSharers(c.ctx, conn, removed, excluded)
+	if err != nil {
 		return err
 	}
 	if _, err := conn.ExecContext(c.ctx, `COMMIT`); err != nil {
 		return fmt.Errorf("committing usage cache session delete: %w", err)
 	}
 	committed = true
+	c.requeueSessions(sharers)
 	return nil
+}
+
+func (c *usageFillCoordinator) requeueSessions(ids []string) {
+	if c.archive.isUsageBackfillEnabled() {
+		c.enqueueSessions(ids)
+	}
 }

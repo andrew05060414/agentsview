@@ -35,6 +35,7 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 		MinUserMessages:      2,
 		ExcludeOneShot:       true,
 		ExcludeAutomated:     false,
+		AutomatedScope:       "automated",
 		Outcome:              []string{"success", "failed"},
 		HealthGrade:          []string{"A", "C"},
 		MinToolFailures:      &minToolFailures,
@@ -70,6 +71,7 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 				"user_message_count >= ?",
 				"(termination_status = 'clean' OR termination_status = 'awaiting_user')",
 				"(user_message_count > 1 OR is_automated = 1)",
+				"AND is_automated = 1",
 				"outcome IN (?,?)",
 				"health_grade IN (?,?)",
 				"tool_failure_signal_count >= ?",
@@ -97,6 +99,7 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 				"user_message_count >= $14",
 				"(termination_status = 'clean' OR termination_status = 'awaiting_user')",
 				"(user_message_count > 1 OR is_automated = TRUE)",
+				"AND is_automated = TRUE",
 				"outcome IN ($15,$16)",
 				"health_grade IN ($17,$18)",
 				"tool_failure_signal_count >= $19",
@@ -124,6 +127,7 @@ func TestBuildSessionFilterSQLRendersEquivalentDialectFilters(t *testing.T) {
 				"user_message_count >= ?",
 				"(termination_status = 'clean' OR termination_status = 'awaiting_user')",
 				"(user_message_count > 1 OR is_automated = TRUE)",
+				"AND is_automated = TRUE",
 				"outcome IN (?,?)",
 				"health_grade IN (?,?)",
 				"tool_failure_signal_count >= ?",
@@ -403,4 +407,37 @@ func normalizeSQL(s string) string {
 func TestNormalizeSQLHelperDoesNotMaskPlaceholders(t *testing.T) {
 	require.True(t, regexp.MustCompile(`\?\)|\$1`).MatchString(
 		normalizeSQL("value IN (?,?) OR value = $1")))
+}
+
+func TestBuildSessionFilterSQLPRHost(t *testing.T) {
+	for _, dialect := range []QueryDialect{SQLiteQueryDialect(), PostgresQueryDialect(), DuckDBQueryDialect(), ClickHouseQueryDialect()} {
+		t.Run(dialect.name, func(t *testing.T) {
+			where, args := BuildSessionFilterSQL(SessionFilter{PR: PRFilter{Number: 12}}, dialect)
+			assert.Equal(t, []any{12}, args)
+			numberPredicate := map[string]string{
+				"sqlite":     "EXISTS (SELECT 1 FROM json_each(NULLIF(pr_links, '')) pl WHERE 1=1 AND json_extract(pl.value, '$.number') = ?)",
+				"postgres":   "EXISTS (SELECT 1 FROM jsonb_array_elements(NULLIF(pr_links, '')::jsonb) pl WHERE TRUE AND (pl->>'number')::bigint = $1)",
+				"duckdb":     "len(list_filter(CAST(json_extract(NULLIF(pr_links, ''), '$[*]') AS JSON[]), pl -> true AND CAST(pl->>'number' AS BIGINT) = ?)) > 0",
+				"clickhouse": "arrayExists(pl -> true AND JSONExtractInt(pl, 'number') = ?, JSONExtractArrayRaw(pr_links))",
+			}
+			assert.Contains(t, where, numberPredicate[dialect.name])
+			for _, host := range []string{"", "GITHUB.COM"} {
+				_, args := BuildSessionFilterSQL(SessionFilter{PR: PRFilter{Repository: "OWNER/REPO", Number: 12, Host: host}}, dialect)
+				wantArgs := []any{"owner/repo", 12}
+				if host != "" {
+					wantArgs = append(wantArgs, "github.com")
+				}
+				assert.Equal(t, wantArgs, args)
+			}
+		})
+	}
+}
+
+func TestQueryDialectPosition(t *testing.T) {
+	assert.Equal(t, "position('needle' in content)", PostgresQueryDialect().Position("content", "'needle'"))
+	assert.Equal(t, "position('needle' in content)", DuckDBQueryDialect().Position("content", "'needle'"))
+	assert.Equal(t, "position(content, 'needle')", ClickHouseQueryDialect().Position("content", "'needle'"))
+	assert.PanicsWithValue(t, "SQL position is unsupported for dialect missing", func() {
+		QueryDialect{name: "missing"}.Position("content", "'needle'")
+	})
 }

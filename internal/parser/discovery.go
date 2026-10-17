@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json/v2"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -778,9 +779,10 @@ func claudeFindSourceFile(
 	return ""
 }
 
+// isCodexSessionFilename reports whether name is a Codex rollout, plain
+// (.jsonl) or compressed by Codex (.jsonl.zst); both forms name one session.
 func isCodexSessionFilename(name string) bool {
-	return strings.HasPrefix(name, "rollout-") &&
-		strings.HasSuffix(name, ".jsonl")
+	return strings.HasPrefix(name, "rollout-") && hasCodexRolloutSuffix(name)
 }
 
 // CodexSessionUUIDFromFilename extracts the session key from a Codex
@@ -792,6 +794,20 @@ func CodexSessionUUIDFromFilename(name string) string {
 		return ""
 	}
 	return extractUUIDFromRollout(name)
+}
+
+// CodexSessionUUIDFromPath is CodexSessionUUIDFromFilename for a stored session
+// path. A foreign raw-archive session stores "archive://<root>/<escaped key>",
+// so the file name sits inside the escaped last segment.
+func CodexSessionUUIDFromPath(path string) string {
+	if rest, ok := strings.CutPrefix(path, "archive://"); ok {
+		if _, after, found := strings.CutLast(rest, "/"); found {
+			if unescaped, err := url.PathUnescape(after); err == nil {
+				path = unescaped
+			}
+		}
+	}
+	return CodexSessionUUIDFromFilename(path[strings.LastIndexAny(path, `/\`)+1:])
 }
 
 // CodexThreadIDFromSessionKey returns the thread UUID of a revert page key
@@ -826,7 +842,7 @@ func CodexSessionPathInfo(root, path string) (CodexLayout, string, bool) {
 	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+sep) {
 		return CodexLayoutUnknown, "", false
 	}
-	if !strings.HasSuffix(path, ".jsonl") {
+	if !hasCodexRolloutSuffix(path) {
 		return CodexLayoutUnknown, "", false
 	}
 	parts := strings.Split(rel, sep)
@@ -892,10 +908,11 @@ func walkCodexDayDirs(
 }
 
 // extractUUIDFromRollout extracts the session key from a Codex filename
-// like rollout-{timestamp}-{uuid}.jsonl: the thread UUID, or
-// {thread}_{rollout} for a file Codex thread/revert wrote.
+// like rollout-{timestamp}-{uuid}.jsonl or its compressed .jsonl.zst form:
+// the thread UUID, or {thread}_{rollout} for a file Codex thread/revert
+// wrote.
 func extractUUIDFromRollout(filename string) string {
-	stem := strings.TrimSuffix(filename, ".jsonl")
+	stem := codexRolloutStem(filename)
 	match := uuidRe.FindStringSubmatch(stem)
 	if len(match) < 2 {
 		return ""

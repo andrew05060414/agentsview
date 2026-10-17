@@ -43,6 +43,7 @@ const (
 	AgentVSCopilot      AgentType = "visualstudio-copilot"
 	AgentPi             AgentType = "pi"
 	AgentTau            AgentType = "tau"
+	AgentFx             AgentType = "fx"
 	AgentPrimeAgent     AgentType = "prime-agent"
 	AgentOMP            AgentType = "omp"
 	AgentOMO            AgentType = "omo"
@@ -91,6 +92,7 @@ const (
 	AgentCodebuff       AgentType = "codebuff"
 	AgentFreebuff       AgentType = "freebuff"
 	AgentCrush          AgentType = "crush"
+	AgentMuse           AgentType = "muse"
 )
 
 const AgentDeepSeekHarness AgentType = "deepseek-harness"
@@ -550,6 +552,16 @@ var Registry = []AgentDef{
 		DefaultDirs:       []string{".pi/agent/sessions"},
 		IDPrefix:          "pi:",
 		FileBased:         true,
+	},
+	{
+		Type:        AgentFx,
+		DisplayName: "fx",
+		EnvVar:      "FX_SESSIONS_DIR",
+		ConfigKey:   "fx_dirs",
+		DefaultDirs: []string{".fx/sessions"},
+		IDPrefix:    "fx:",
+		FileBased:   true,
+		Usage:       UsageCapabilities{NoPerMessageTokenData: true},
 	},
 	{
 		Type:        AgentTau,
@@ -1179,6 +1191,18 @@ var Registry = []AgentDef{
 		// registry and schema churn.
 		PeriodicReconcile: true,
 	},
+	{
+		// Muse Code (Meta) keeps its data under
+		// ${XDG_DATA_HOME:-~/.local/share}/muse on every platform.
+		Type:              AgentMuse,
+		DisplayName:       "Muse Code",
+		EnvVar:            "MUSE_SESSIONS_DIR",
+		DefaultRootEnvVar: "XDG_DATA_HOME",
+		DefaultRootDir:    ".local/share",
+		DefaultDirs:       []string{".local/share/muse/sessions"},
+		IDPrefix:          "muse:",
+		FileBased:         true,
+	},
 }
 
 // AgentByType returns the AgentDef for the given type.
@@ -1457,15 +1481,18 @@ type ParsedSession struct {
 	FirstMessage            string
 	SessionName             string
 	// SessionNamePresent distinguishes an explicitly present provider title
-	// (including a blank title) from no title signal. Codex needs this because
-	// current releases may omit session_index.jsonl entirely, while an older
-	// index entry with a blank thread_name explicitly clears a stored title.
+	// (including a blank title) from no title signal. Codex and Antigravity
+	// keep titles outside the transcript, so a missing or unreadable title
+	// source keeps the stored title while an explicit blank clears it.
 	SessionNamePresent bool
-	StartedAt          time.Time
-	EndedAt            time.Time
-	MessageCount       int
-	UserMessageCount   int
-	File               FileInfo
+	// PRLinks lists the pull or merge requests the source associated with
+	// this session, deduplicated by URL in first-appearance order.
+	PRLinks          []PRLink
+	StartedAt        time.Time
+	EndedAt          time.Time
+	MessageCount     int
+	UserMessageCount int
+	File             FileInfo
 
 	// TerminationStatus describes how the session appears to have
 	// ended. Empty string = unknown (parser did not classify, or
@@ -1569,6 +1596,11 @@ type ParsedToolResult struct {
 	Status        string
 	ContentLength int
 	ContentRaw    string // raw JSON of the content field; decode with DecodeContent
+	// PersistedOutputUnresolved is set, transiently and parse-time only, when
+	// this block genuinely referenced a Claude or iCodeMate
+	// persistedOutputPath side file that failed to resolve. It is never
+	// derived from ContentRaw's shape, only from that resolution attempt.
+	PersistedOutputUnresolved bool
 }
 
 // ParsedToolResultEvent is a canonical chronological update attached

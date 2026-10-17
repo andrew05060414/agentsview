@@ -392,37 +392,48 @@ type SessionList struct {
 	Total      int          `json:"total"`
 }
 
+// SessionAnnotationsAPIVersion is the first daemon API that applies label
+// and pull request filters; older daemons ignore them.
+const SessionAnnotationsAPIVersion = 11
+
 // ListFilter mirrors the HTTP query parameters in handleListSessions.
 // Field names map to HTTP query param names via json tags.
 type ListFilter struct {
 	// IDs selects explicit sessions and their host copies; nil uses discovery defaults.
 	IDs []string `json:"ids,omitzero"`
 
-	Project          string `json:"project,omitempty"`
-	ExcludeProject   string `json:"exclude_project,omitempty"`
-	Machine          string `json:"machine,omitempty"`
-	GitBranch        string `json:"git_branch,omitempty"`
-	Agent            string `json:"agent,omitempty"`
-	Date             string `json:"date,omitempty"`
-	DateFrom         string `json:"date_from,omitempty"`
-	DateTo           string `json:"date_to,omitempty"`
-	Timezone         string `json:"timezone,omitempty"`
-	ActiveSince      string `json:"active_since,omitempty"`
-	MinMessages      int    `json:"min_messages,omitempty"`
-	MaxMessages      int    `json:"max_messages,omitempty"`
-	MinUserMessages  int    `json:"min_user_messages,omitempty"`
-	IncludeOneShot   bool   `json:"include_one_shot,omitempty"`
-	IncludeAutomated bool   `json:"include_automated,omitempty"`
-	IncludeChildren  bool   `json:"include_children,omitempty"`
-	IncludeSource    bool   `json:"include_source,omitempty"`
-	Outcome          string `json:"outcome,omitempty"`      // comma-separated
-	HealthGrade      string `json:"health_grade,omitempty"` // comma-separated
-	Termination      string `json:"termination,omitempty"`  // comma-separated
-	MinToolFailures  *int   `json:"min_tool_failures,omitempty"`
-	HasSecret        bool   `json:"has_secret,omitempty"`
-	Starred          bool   `json:"starred,omitempty"`
-	Cursor           string `json:"cursor,omitempty"`
-	Limit            int    `json:"limit,omitempty"`
+	Project            string `json:"project,omitempty"`
+	ExcludeProject     string `json:"exclude_project,omitempty"`
+	Machine            string `json:"machine,omitempty"`
+	GitBranch          string `json:"git_branch,omitempty"`
+	Agent              string `json:"agent,omitempty"`
+	Date               string `json:"date,omitempty"`
+	DateFrom           string `json:"date_from,omitempty"`
+	DateTo             string `json:"date_to,omitempty"`
+	Timezone           string `json:"timezone,omitempty"`
+	ActiveSince        string `json:"active_since,omitempty"`
+	MinMessages        int    `json:"min_messages,omitempty"`
+	MaxMessages        int    `json:"max_messages,omitempty"`
+	MinUserMessages    int    `json:"min_user_messages,omitempty"`
+	IncludeOneShot     bool   `json:"include_one_shot,omitempty"`
+	OneShotFilterSet   bool   `json:"-"`
+	AutomatedFilterSet bool   `json:"-"`
+	IncludeAutomated   bool   `json:"include_automated,omitempty"`
+	IncludeChildren    bool   `json:"include_children,omitempty"`
+	IncludeSource      bool   `json:"include_source,omitempty"`
+	Outcome            string `json:"outcome,omitempty"`      // comma-separated
+	HealthGrade        string `json:"health_grade,omitempty"` // comma-separated
+	Termination        string `json:"termination,omitempty"`  // comma-separated
+	MinToolFailures    *int   `json:"min_tool_failures,omitempty"`
+	HasSecret          bool   `json:"has_secret,omitempty"`
+	Starred            bool   `json:"starred,omitempty"`
+	// Labels keeps sessions carrying every listed label.
+	Labels []string `json:"label,omitempty"`
+	// PR keeps sessions linked to a pull request: owner/repo,
+	// owner/repo#123.
+	PR     string `json:"pr,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
+	Limit  int    `json:"limit,omitempty"`
 	// OrderBy selects the sort column ("" = recent activity). Descending
 	// overrides the sort key's canonical direction when non-nil.
 	OrderBy    string `json:"order_by,omitempty"`
@@ -521,9 +532,21 @@ type ToolCallList struct {
 // SyncInput carries the payload for a per-session sync.
 // Exactly one of Path or ID must be set.
 type SyncInput struct {
-	Path      string `json:"path,omitempty"`
-	ID        string `json:"id,omitempty"`
-	Subagents bool   `json:"subagents,omitempty"`
+	Path         string `json:"path,omitempty"`
+	ID           string `json:"id,omitempty"`
+	Subagents    bool   `json:"subagents,omitempty"`
+	UsageRefresh bool   `json:"usage_refresh,omitempty"`
+}
+
+// ErrInvalidUsageRefresh reports a usage refresh without both ID and Subagents.
+var ErrInvalidUsageRefresh = errors.New("sync: usage_refresh requires id and subagents")
+
+// ValidateUsageRefresh checks that a usage refresh targets one combined session.
+func ValidateUsageRefresh(in SyncInput) error {
+	if in.UsageRefresh && (in.ID == "" || !in.Subagents) {
+		return ErrInvalidUsageRefresh
+	}
+	return nil
 }
 
 // Event is the CLI-side NDJSON wrapper for SSE events from

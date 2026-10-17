@@ -110,8 +110,9 @@ type StoredFingerprintProvider interface {
 }
 
 // ParseSourceSizer reports all bytes a full parse may read, including companion
-// sources. It affects memory admission only, never stored fingerprints or offsets.
-// Providers without this capability use the discovered source's size.
+// sources. A negative size means unknown. It affects memory admission and
+// staging, never stored fingerprints or offsets. Providers without this
+// capability use the discovered source's size.
 type ParseSourceSizer interface {
 	ParseSourceSize(context.Context, SourceRef) (int64, error)
 }
@@ -1149,6 +1150,8 @@ type IncrementalRequest struct {
 	// still-empty stored name, and on an appended custom-title only when it
 	// differs from the stored name. nil keeps the append incremental.
 	StoredSessionName *string
+	// StoredPRLinks lets repeated PR URLs stay incremental; nil reparses any appended valid pr-link.
+	StoredPRLinks map[string]struct{}
 	// StoredPendingUsageOrdinal is the last assistant message without token
 	// usage in the current turn, as resolved from the committed transcript.
 	// Codex uses it to attach a token_count that follows a late tool result
@@ -1208,6 +1211,14 @@ func ProviderFactories() []ProviderFactory {
 func SharesSessionIDs(agent AgentType) bool {
 	def, ok := AgentByType(agent)
 	return ok && providerFactoryForDef(def).Capabilities().Source.SharedSessionIDs == CapabilitySupported
+}
+
+// OwnsAppStore reports whether storedPath resolves to the provider's shared
+// state.db store, either as a bare path or as a state.db#<id> member.
+func OwnsAppStore(agent AgentType, storedPath string) bool {
+	def, ok := AgentByType(agent)
+	return ok && providerFactoryForDef(def).Capabilities().Source.AppOwnedStore == CapabilitySupported &&
+		HermesStoredPathIsAggregateArchive(ResolveSourceFilePath(storedPath))
 }
 
 func providerFactoryForDef(def AgentDef) ProviderFactory {
@@ -1307,8 +1318,12 @@ func providerFactoryForDef(def AgentDef) ProviderFactory {
 		return newPoolsideProviderFactory(def)
 	case AgentPi:
 		return newPiProviderFactory(def)
+	case AgentFx:
+		return newFxProviderFactory(def)
 	case AgentTau:
 		return newTauProviderFactory(def)
+	case AgentMuse:
+		return newMuseProviderFactory(def)
 	case AgentPrimeAgent:
 		return newPiProviderFactory(def)
 	case AgentPositron:

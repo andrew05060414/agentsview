@@ -191,6 +191,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Set cache paths before setup-go restores its cache.
+      - &windows-go-paths
+        name: Prepare Windows Go paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($name in @('GOCACHE', 'GOMODCACHE', 'TMP', 'TEMP')) {
+            $path = Join-Path $env:RUNNER_TEMP $name
+            New-Item -ItemType Directory -Force -Path $path | Out-Null
+            "$name=$path" >> $env:GITHUB_ENV
+          }
+
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go.mod
@@ -253,32 +265,39 @@ jobs:
         env:
           CGO_ENABLED: "1"
 
+      - name: Install Go linter (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version: *//p' .custom-gcl.yml)
+          bash scripts/retry.sh 3 5 go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$version"
+        env:
+          CGO_ENABLED: "1"
+
       - name: Run Go linters (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           # Windows-only files never reach the Linux lint job.
-          $version = (Select-String -Path .custom-gcl.yml -Pattern '^version:\s*(\S+)').Matches[0].Groups[1].Value
-          go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$version"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$(go env GOPATH)\bin\golangci-lint.exe" custom --name custom-gcl
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./custom-gcl run ./...
         env:
           CGO_ENABLED: "1"
+          GOLANGCI_LINT_CACHE: ${{ runner.temp }}/golangci-lint
 
-      - name: Run archive, CLI, and volume identity tests (macOS)
+      - name: Run archive, CLI, signing, and volume identity tests (macOS)
         if: runner.os == 'macOS'
-        run: go test -tags "fts5" ./internal/db ./internal/rawcapture ./cmd/agentsview ./internal/volumeid -count=1 -timeout=10m
+        run: go test -tags "fts5" ./internal/db ./internal/rawcapture ./internal/requestsign ./cmd/agentsview ./internal/volumeid -count=1 -timeout=10m
         env:
           CGO_ENABLED: "1"
 
-      - name: Run file identity race tests and linters (macOS)
+      - name: Run file identity and signing race tests and linters (macOS)
         if: runner.os == 'macOS'
         run: |
-          go test -race -tags fts5 ./internal/volumeid ./internal/rawcapture -count=1 -timeout=10m
+          go test -race -tags fts5 ./internal/volumeid ./internal/rawcapture ./internal/requestsign -count=1 -timeout=10m
           make lint-tools nilaway-golangci-build
-          ./custom-gcl run ./internal/volumeid ./internal/rawcapture
+          ./custom-gcl run ./internal/volumeid ./internal/rawcapture ./internal/requestsign
         env:
           CGO_ENABLED: "1"
 
@@ -312,8 +331,10 @@ jobs:
           - name: CLI remaining
             package: ./cmd/agentsview
             skip: *cli-test-prefix
-          - name: Capture, Database, Parser
-            package: ./internal/capture ./internal/db ./internal/parser
+          - name: Capture
+            package: ./internal/capture
+          - name: Database, Parser
+            package: ./internal/db ./internal/parser
           # Complementary filters keep every sync test in exactly one job.
           - name: Sync A-R
             package: ./internal/sync
@@ -326,6 +347,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - *windows-go-paths
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
@@ -364,7 +387,8 @@ jobs:
           New-Item -ItemType Directory -Path $testTemp | Out-Null
           icacls $testTemp /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "SystemTemp=$testTemp" >> $env:GITHUB_ENV
+          "TMP=$testTemp" >> $env:GITHUB_ENV
+          "TEMP=$testTemp" >> $env:GITHUB_ENV
           "AGENTSVIEW_CI_TEMP=$testTemp" >> $env:GITHUB_ENV
 
       - name: Run ${{ matrix.name }} tests
@@ -490,6 +514,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - *windows-go-paths
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:

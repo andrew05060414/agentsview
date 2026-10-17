@@ -192,7 +192,7 @@ configuration. Seed import and restore generate fresh local authentication and l
 Previously retained raw files are preserved without redaction and may contain
 credentials. Seeded and restored databases are permanently archive-only: foreground starts,
 background starts and restarts do not scan the receiving machine. Ordinary sync,
-source transfers, ChatGPT, Claude.ai and Gemini Apps imports, artifact exchange,
+source transfers over HTTP or SSH, ChatGPT, Claude.ai and Gemini Apps imports, artifact exchange,
 mirror publication and raw-sync watch are refused. Browsing, curation, archive
 import, verification, extraction, backup and explicit reparse remain available. Use a separate data directory to collect new
 local sessions; no runtime flag or config setting disables archive-only mode.
@@ -579,7 +579,7 @@ agentsview sync [flags]
 | ---------- | ------- | --------------------------------------------------- |
 | `--full`   | `false` | Force a full resync regardless of data version       |
 | `--target` |         | Exchange normalized artifacts with a trusted folder |
-| `--host`   |         | Configured HTTP remote host name                    |
+| `--host`   |         | Configured remote host name                         |
 
 **Examples:**
 
@@ -599,8 +599,9 @@ first-use requirements, and exclusions. `--target` cannot be combined with
 When `--host` is set, AgentsView syncs only the matching configured
 `[[remote_hosts]]` entry and fails fast on error. This also applies to offline
 sync with `AGENTSVIEW_NO_DAEMON=1`: the local command contacts the configured
-remote daemon directly. Unknown host names are rejected; ad hoc remotes are not
-supported.
+remote directly. Unknown host names are rejected; ad hoc remotes are not
+supported. `--host` runs an entry with `transport = "ssh"` the same way as an
+HTTP entry; see [SSH Remote Sync](/docs/remote-access/#ssh-remote-sync).
 
 Local sync can also read configured Claude, Codex, and Cursor roots from
 S3-compatible object storage. Add `s3://` entries to `agents.claude.dirs`,
@@ -614,7 +615,9 @@ parsing. See
 #### Configured Remote Hosts
 
 Declare remote hosts in `~/.agentsview/config.toml` so a single bare
-`agentsview sync` covers a whole fleet. HTTP is the only remote sync transport:
+`agentsview sync` covers a whole fleet. An entry uses `transport = "http"` (the
+default) to reach a remote daemon, or `transport = "ssh"` to reach a machine
+over `ssh` with no AgentsView running there:
 
 ```toml
 [[remote_hosts]]
@@ -622,13 +625,19 @@ host = "devbox1"
 transport = "http" # optional; default
 url = "http://devbox1.tailnet.ts.net:8080"
 token = "remote-token"
+
+[[remote_hosts]]
+host = "devbox2"
+transport = "ssh"
+destination = "user@devbox.example.com" # optional; defaults to host
 ```
 
 With hosts configured, `agentsview sync` (no `--host`) includes local sources
-and configured HTTP hosts in one coordinated sync. During a full or automatic
-data-version rebuild, AgentsView prepares every HTTP mirror, bulk-ingests the
-local and HTTP sources into one temporary database with FTS updates suspended,
-rebuilds FTS once, and atomically swaps the completed archive into place.
+and configured hosts, HTTP and SSH, in one coordinated sync. During a full or
+automatic data-version rebuild, AgentsView prepares every remote mirror,
+bulk-ingests the local and remote sources into one temporary database with FTS
+updates suspended, rebuilds FTS once, and atomically swaps the completed
+archive into place.
 
 `--full` reparses every discovered local and remote session, but it does not
 force unchanged manifest-capable files to transfer again. Directory-scoped and
@@ -636,12 +645,14 @@ verbatim curated content still use delta transfer. Windsurf's sanitized curated
 export remains a separate full-archive transfer on every sync. HTTP collectors
 and spokes must use the same remote-sync protocol version; incompatible peers
 fail before exchanging targets or archive data. A configured HTTP host that is
-offline, cannot resolve through DNS, is unreachable, or times out is skipped;
-local sources and reachable HTTP hosts still join the combined rebuild. Archived
-sessions from skipped hosts are preserved. Other HTTP preparation or contributor
-failures abort the combined rebuild without replacing the active archive. The
-command exits non-zero for any failure other than an unavailable configured HTTP
-host. See [Incremental Sync](/docs/remote-access/#incremental-sync).
+offline, cannot resolve through DNS, is unreachable, or times out is skipped; an
+SSH host is skipped when `ssh` reports one of the network errors listed under
+[Offline Hosts](/docs/remote-access/#offline-hosts). Local sources and reachable
+hosts still join the combined rebuild. Archived sessions from skipped hosts are
+preserved. Other remote preparation or contributor failures abort the combined
+rebuild without replacing the active archive. The command exits non-zero for
+any failure other than an unavailable configured host. See
+[Incremental Sync](/docs/remote-access/#incremental-sync).
 
 HTTP remote sync requires a reachable remote daemon, preferably over a private
 network such as Tailscale, and remote archive endpoints always require bearer
@@ -703,8 +714,10 @@ agentsview prune --first-message "test" --yes
 agentsview prune --project "old-project" --max-messages 5 --before 2025-06-01
 ```
 
-The prune command displays the number of sessions deleted and disk space
-reclaimed. Use `--dry-run` first to verify the filter matches what you expect.
+Prune deletes each matching session's source file, except the shared
+`state.db` of apps such as Hermes and Augure Desktop, which stays in place. The
+summary reports sessions deleted, disk space reclaimed, and how many source
+files stay in place. Use `--dry-run` first to preview the matches.
 
 ______________________________________________________________________
 
@@ -975,8 +988,8 @@ server's normal write timeout. Press Ctrl+C to stop waiting; shared cache work
 can continue in the daemon.
 
 Restart older daemons after upgrading so they provide the usage progress
-endpoint. `session usage`, `token-use`, and `usage statusline` still wait for
-initial sync, including when they reuse a daemon started by daily usage.
+endpoint. `usage statusline` still waits for initial sync, including when it
+reuses a daemon started by daily usage.
 Statusline limits the complete wait and report request to 30 seconds.
 
 Offline reads require an archive at the current data version. If an upgrade
@@ -1148,13 +1161,12 @@ use IDs like `agent-a86574e`, and some other agents use prefixes such as
 `codex:my-session-id`. Raw session IDs emitted by the underlying agent are also
 accepted when AgentsView can resolve them back to the canonical stored session.
 
-If the AgentsView server is already running, the command reads the current
-database state. If no server is running, it performs an on-demand sync for the
-requested session first.
+The command uses a compatible local daemon, starting one if needed. It follows
+the same refresh and missing-session behavior as
+[`agentsview session usage`](/docs/session-api/#agentsview-session-usage).
 
-As of 0.40.0, the reported totals include every subagent transcript the session
-spawned, so the cost matches what the session actually spent. `token-use` has no
-opt-out; use `agentsview session usage <id> --own-only` for own-session numbers.
+Totals include archived subagent spend. `token-use` has no opt-out; use
+`agentsview session usage <id> --own-only` for own-session numbers.
 
 **Example:**
 
@@ -1200,6 +1212,7 @@ agentsview pg push [target] [flags]
 | -------------------- | ------- | -------------------------------------------------------------- |
 | `--full`             | `false` | Force full local resync and re-push                            |
 | `--no-vectors`       | `false` | Skip the semantic-search vector phase for this run             |
+| `--embed`            | `false` | Push sessions first, then build and push vectors; watch builds after syncs and pushes vectors on the next interval |
 | `--projects`         |         | Comma-separated projects to push (inclusive)                   |
 | `--exclude-projects` |         | Comma-separated projects to exclude from push                  |
 | `--all-projects`     | `false` | Ignore configured project filters for this run                 |
@@ -1210,6 +1223,15 @@ agentsview pg push [target] [flags]
 
 See [PostgreSQL Sync — Project Filtering](/docs/pg-sync/#project-filtering) for
 details on how filtering interacts with the push watermark.
+
+`--embed` pushes sessions first, then builds and pushes embeddings in the same
+push, using `[vector]` or a recipe published to PostgreSQL. `--full --embed`
+repairs vector rows too. Watch mode builds in the background after each sync
+that commits changes and pushes built vectors
+on the next interval. It never starts a daemon and refuses to run while one owns
+the archive. It cannot be combined with
+`--no-vectors`, `--all`, or a target with `push_vectors = false`. See
+[Build and push embeddings in a container](/docs/pg-sync/#build-and-push-embeddings-in-a-container).
 
 ______________________________________________________________________
 
@@ -1704,11 +1726,18 @@ agentsview session watch <id>            # NDJSON event stream
 agentsview session search <pattern>      # content search across sessions
 agentsview session usage <id>            # token usage and cost estimate
 agentsview session usage <id> --own-only # exclude subagent transcripts
+agentsview session label <id> k=v ...    # add or remove labels
+agentsview session parent <id> <parent>  # record the launching session
 ```
 
-`session usage` attributes each subagent transcript's spend to the session that
-spawned it, so a parent that delegated most of its work still reports the full
-cost. `--own-only` restores the older own-session output.
+`session list --label k=v` and `--pr owner/repo#123` filter by
+[labels](/docs/session-api/#agentsview-session-label) and
+[pull request links](/docs/session-api/#pull-request-links).
+
+`session usage` includes archived subagent spend in the parent total. See the
+[session usage contract](/docs/session-api/#agentsview-session-usage) for
+refresh behavior, missing-session exit codes, and the `refresh_incomplete`
+JSON field.
 
 `session search` supports substring (default), `--regex`, `--fts`, `--semantic`,
 and `--hybrid` modes. Repeatable `--exclude-session <id>` drops matches from
@@ -2105,6 +2134,7 @@ agentsview help
 | `GROK_DIR`                            | `~/.grok/sessions`                                   | Grok sessions directory                                                                             |
 | `HERMES_SESSIONS_DIR`                 | `~/.hermes/sessions` (macOS/Linux), `~/AppData/Local/hermes/sessions` (Windows) | Hermes Agent sessions root; sibling SQLite `state.db` is discovered even when `sessions/` is absent |
 | `IFLOW_DIR`                           | `~/.iflow/projects`                                  | iFlow projects directory                                                                            |
+| `FX_SESSIONS_DIR`                     | `~/.fx/sessions`                                     | fx sessions directory                                                                               |
 | `JUNIE_DIR`                           | `~/.junie/sessions`                                  | Junie CLI session store directory                                                                   |
 | `JUNIE_HOME`                          | `~/.junie`                                           | Junie home that re-roots the default `sessions/` discovery path                                     |
 | `KILO_DIR`                            | `~/.local/share/kilo`                                | Kilo data directory                                                                                 |
@@ -2114,6 +2144,7 @@ agentsview help
 | `KIRO_SESSIONS_DIR`                   | `~/.kiro/sessions/cli` and `~/.local/share/kiro-cli` | Kiro CLI sessions directory (JSONL and SQLite)                                                      |
 | `KIRO_IDE_DIR`                        | (platform-specific)                                  | Kiro IDE sessions directory                                                                         |
 | `MIMOCODE_DIR`                        | `~/.local/share/mimocode`                            | MiMoCode data directory                                                                             |
+| `MUSE_SESSIONS_DIR`                   | `~/.local/share/muse/sessions`                       | Muse Code sessions directory; defaults to `$XDG_DATA_HOME/muse/sessions` when set                   |
 | `VIBE_SESSIONS_DIR`                   | `~/.vibe/logs/session`                               | Mistral Vibe sessions directory                                                                     |
 | `OMP_DIR`                             | `~/.omp/agent/sessions`                              | OhMyPi sessions directory                                                                           |
 | `OPENCLAW_DIR`                        | `~/.openclaw/agents` and `~/.kimi_openclaw/agents`   | OpenClaw agents directory                                                                           |
@@ -2150,11 +2181,20 @@ agentsview help
 | `ZENCODER_DIR`                        | `~/.zencoder/sessions`                               | Zencoder sessions directory                                                                         |
 | `AGENTSVIEW_DATA_DIR`                 | `~/.agentsview`                                      | Data directory (database, config)                                                                   |
 | `AGENTSVIEW_AUTH_TOKEN`               |                                                      | Bearer token for `require_auth`; overrides `auth_token` in `config.toml`                            |
+| `AGENTSVIEW_MODE`                     |                                                      | `serve` or `pg-serve`; turns on the [container deployment](/docs/configuration/#container-deployment) variables |
+| `AGENTSVIEW_HOST`                     |                                                      | Listener address under `AGENTSVIEW_MODE`; non-loopback needs authentication                         |
+| `AGENTSVIEW_REQUIRE_AUTH`             |                                                      | Require bearer authentication under `AGENTSVIEW_MODE`                                               |
+| `AGENTSVIEW_NO_BROWSER`               |                                                      | Do not open a browser under `AGENTSVIEW_MODE`                                                       |
+| `AGENTSVIEW_AUTH_TOKEN_FILE`          |                                                      | Bearer token file under `AGENTSVIEW_MODE`; overrides `auth_token` in `config.toml`                  |
 | `AGENTSVIEW_SKILLS_SERVER`            |                                                      | Remote daemon URL baked into `skills install` examples; not a default for `session` commands        |
 | `AGENTSVIEW_SKILLS_SERVER_TOKEN_FILE` |                                                      | Token file path baked into `skills install` examples with `AGENTSVIEW_SKILLS_SERVER`                |
 | `AGENTSVIEW_PG_URL`                   |                                                      | PostgreSQL connection URL                                                                           |
 | `AGENTSVIEW_PG_MACHINE`               |                                                      | Machine name for PG push sync                                                                       |
 | `AGENTSVIEW_PG_SCHEMA`                | `agentsview`                                         | PostgreSQL schema name                                                                              |
+| `AGENTSVIEW_PG_ALLOW_INSECURE`        |                                                      | Allow a plaintext default PostgreSQL target under `AGENTSVIEW_MODE`                                 |
+| `AGENTSVIEW_EMBEDDINGS_ENDPOINT`      |                                                      | Embeddings endpoint for adopting a recipe published to PostgreSQL, under `AGENTSVIEW_MODE`          |
+| `AGENTSVIEW_EMBEDDINGS_API_KEY_FILE`  |                                                      | API key file for `AGENTSVIEW_EMBEDDINGS_ENDPOINT`                                                   |
+| `AGENTSVIEW_EMBEDDINGS_BATCH_SIZE`    | `32`                                                 | Positive number of inputs per embeddings request when adopting a published PostgreSQL recipe       |
 | `AGENTSVIEW_DUCKDB_PATH`              | `~/.agentsview/sessions.duckdb`                      | DuckDB mirror file path                                                                             |
 | `AGENTSVIEW_DUCKDB_URL`               |                                                      | Remote Quack endpoint URL for `duckdb status` and `duckdb serve` (read side only)                   |
 | `AGENTSVIEW_DUCKDB_TOKEN`             |                                                      | Quack authentication token                                                                          |

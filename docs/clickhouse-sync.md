@@ -129,8 +129,29 @@ to fan out across every configured target. `--all --watch` is rejected.
 Use `--full` to bypass fingerprints and re-push everything — for example after a
 schema reset or when message content was rewritten in place.
 
-If any sessions fail to push, the cursor is not advanced so they are retried on
-the next run. The exit code is 1 when any errors occur, 0 otherwise.
+Every push sends the most recently active sessions first, so recent activity
+reaches the mirror before older history. A full push that stops partway, for
+example because the process restarted, resumes on the next push: sessions it
+already pushed are skipped. The summary says `resuming an unfinished full push`
+and counts the skipped sessions. The push starts over instead when `--full` is
+passed or when the archive was rebuilt, the push scope changed, or the mirror
+format changed since it began. When `--full` discards an unfinished full push,
+the summary says `discarded an unfinished full push`. A full push that reaches
+the end with session errors resumes only while something else still requires a
+full push. Otherwise the next push is incremental: it picks up failed sessions
+that changed since the last clean push and skips the rest. If a `--full` push
+ends with errors, run it again.
+
+If a full push ended with session errors and began under a different push scope,
+archive, or mirror format, the next push is also full. Pushes stay full until
+one finishes without errors. This brings back sessions that a filtered push
+removed from the mirror when you restore the wider scope. The push log names
+each session that failed, and pushes return to incremental once those sessions
+push cleanly.
+
+If any sessions fail during an incremental push, the cursor is not advanced, so
+the next push retries them. The exit code is 1 when any errors occur, 0
+otherwise.
 
 #### Automatic Push Watcher
 
@@ -194,6 +215,30 @@ projects = ["alpha", "beta"]
 CLI flags override config values. Use
 [`agentsview projects`](/docs/commands/#agentsview-projects) to list available
 project names.
+
+#### Push Batch Size
+
+`clickhouse push` writes changed sessions in batches of 100. Each batch ends
+with one delete per session table, and under ClickHouse's default
+`lightweight_delete_mode` each delete rewrites every active part of its table,
+even when no rows match. Fewer batches mean fewer rewrites, which matters most
+for full pushes and for servers on slow storage.
+
+Raise the batch size per target with `push_batch_size`:
+
+```toml
+[clickhouse]
+url = "clickhouse://localhost:9000/agentsview"
+push_batch_size = 500
+```
+
+Larger batches hold more session content in memory at once. On a test archive of
+about 46,800 sessions, a full push peaked at about 2.8 GB of memory with the
+default of 100, 3.4 GB at 500, 4.5 GB at 1,000, and 7.5 GB at 2,000, while the
+batch phase took 510 s, 206 s, 135 s, and 142 s. Peak memory depends on the
+largest sessions that land in one batch, so leave headroom. The value must be at
+least 1; remove the key to use the default. A delegated push sends the target's
+value to the daemon, so the setting applies there too.
 
 #### Vector Push
 
@@ -417,6 +462,7 @@ ______________________________________________________________________
 | `projects`           | Inclusive project filter                                              |
 | `exclude_projects`   | Exclusive project filter                                              |
 | `push_vectors`       | Run the vector phase on push; default `true`                          |
+| `push_batch_size`    | Sessions per push batch; default `100`                                |
 | `default_clickhouse` | Named target used when more than one `[clickhouse.NAME]` block exists |
 
 Environment overrides for the effective default target:

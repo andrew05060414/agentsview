@@ -999,7 +999,7 @@ func (s *Sync) refreshCurationIfChanged(ctx context.Context) (bool, error) {
 // pushSession fully replaces one mirror session row and all of its
 // dependent rows (messages, tool calls/results, usage events, secret
 // findings, pins) with the current local content, then writes the
-// fingerprint used to detect future changes. rebuildMirror and
+// fingerprint used to detect future changes. buildMirror and
 // incrementalPush share this single write path: on a freshly created
 // rebuild file the pre-delete below is simply a no-op.
 func (s *Sync) pushSession(
@@ -1109,12 +1109,13 @@ func (s *Sync) upsertSession(
 			cwd, git_branch, source_session_id, source_version, group_key, transcript_fidelity,
 			parser_malformed_lines, is_truncated, deleted_at, deletion_cause, created_at,
 			termination_status, secret_leak_count, secrets_rules_version,
+			pr_links, labels,
 			agentsview_push_fingerprint, source_archive_id
 		) VALUES (?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		)`
 	query += `
 		ON CONFLICT(id) DO UPDATE SET
@@ -1186,6 +1187,8 @@ func (s *Sync) upsertSession(
 			termination_status = excluded.termination_status,
 			secret_leak_count = excluded.secret_leak_count,
 			secrets_rules_version = excluded.secrets_rules_version,
+			pr_links = excluded.pr_links,
+			labels = excluded.labels,
 			agentsview_push_fingerprint = excluded.agentsview_push_fingerprint,
 			source_archive_id = excluded.source_archive_id`
 
@@ -1238,6 +1241,7 @@ func sessionInsertArgs(
 		sess.IsTruncated, nilTime(sess.DeletedAt), nilString(sess.DeletionCause),
 		timeValue(sess.CreatedAt), nilString(sess.TerminationStatus),
 		sess.SecretLeakCount, sess.SecretsRulesVersion,
+		db.EncodePRLinks(sess.PRLinks), db.LabelsArg(sess.Labels),
 		nilEmpty(fingerprint), archiveID,
 	}
 }

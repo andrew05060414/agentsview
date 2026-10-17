@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-09
+last_edited: 2026-10-16
 title: Changelog
 description: Release history for AgentsView
 ---
@@ -9,17 +9,59 @@ The latest release is
 
 ## Unreleased
 
+**Upgrade notes**
+
+- The container image now requires a bearer token. Read `auth_token` from
+  `/data/config.toml` or set `AGENTSVIEW_AUTH_TOKEN_FILE` to a mounted token file.
+  The image keeps its defaults when you pass flags:
+  `docker run ghcr.io/kenn-io/agentsview --port 9000` still listens on every
+  interface without opening a browser. The image runs the binary directly;
+  `AGENTSVIEW_MODE=pg-serve` (or the older `PG_SERVE=1`) selects `pg serve`.
+  A PostgreSQL hub can adopt the embedding recipe a workstation pushed, given
+  `AGENTSVIEW_EMBEDDINGS_ENDPOINT`, and `pg push --embed` builds and pushes
+  embeddings in one process. See
+  [container deployment](/docs/configuration/#container-deployment).
+
 **New features**
 
+- Browse and search fx sessions, including tool results and child runs. Schema
+  4 sessions sync from `~/.fx/sessions/`, with token costs from the pricing catalog.
 - Assistants connected over MCP can see which tools a session ran, find which
   sessions edited a file, list a session's sub-agents, read the Activity report,
   see tool usage and where agents struggled, compare usage between two models or
   projects, and search the AgentsView guides. The eight new tools are read-only
   and stay out of the `memory` profile. The server now speaks MCP 2026-07-28
   over stdio, and clients on older protocol versions keep working.
+- Browse and search Muse Code sessions, Meta's terminal coding agent. Each
+  session shows its prompts, replies, reasoning summaries, tool calls, and tool
+  results. Subagent runs appear as child sessions. Usage reports include Muse
+  token counts, priced at Meta's published Muse Spark and Muse Wonder rates.
+  (#2241)
+- Mistral Vibe sessions from the unified session store sync again, including
+  running turns, tool output, subagents, and token usage. Existing Vibe
+  sessions reparse once for corrected tool categories. (#2139)
+- Include single-prompt sessions in MCP `list_sessions` results with
+  `include_one_shot`, matching `search_content`.
 - Browse and search the retained archive during full parser and archive-only
   preservation rebuilds with a stale warning; archive writes fail with a retryable
   503. Scoped upgrades and schema repairs finish before serving.
+- Sessions show the pull requests Claude Code linked them to. Find them on the
+  session page, in `session get`, and in session JSON, and filter with
+  `session list --pr owner/repo#123` or the `pr` API parameter. The first sync
+  after upgrading re-reads Claude sessions in place once to pick up existing links.
+- Label sessions by ticket, role, or run type with
+  `agentsview session label <id> ticket=example` or
+  `PATCH /api/v1/sessions/{id}/labels`, then filter with `--label`, the `label`
+  API parameter, the web UI, or the MCP `list_sessions` tool. Labels survive
+  reparses and resyncs. Label and pull request filters also find child and
+  headless sessions, such as orchestrator workers; the web UI shows the tree
+  that contains them. An explicit one-shot exclusion still applies.
+- An orchestrator can record which session launched a worker with
+  `agentsview session parent <worker-id> <manager-id>` or
+  `PUT /api/v1/sessions/{id}/parent`. The worker appears under its launcher in
+  the session tree, and its cost counts toward the launcher's usage. Transcript
+  links take precedence. Labels and parent links can be recorded before a
+  session syncs.
 - Sync Claude.ai chats from the desktop or Chrome Import dialog without
   downloading an export. Later runs fetch new or changed chats, including branch
   switches. Run `agentsview chrome setup` once and load the printed folder in
@@ -27,12 +69,16 @@ The latest release is
   `agentsview import --type claude-ai --sync` with no AgentsView tab open. See
   [Claude.ai Sync](https://agentsview.io/docs/chat-import/#sync-claudeai-chats)
   for setup, branch updates, Trash copies, and failure handling.
+- Antigravity sessions show the conversation title Antigravity saves in
+  `conversation_summaries.db`, and follow renames there, including for
+  conversations whose transcript is gone. Names set in AgentsView still win.
 - See costs for each Hermes cron job in the `hermes-cron` Usage drill-down.
   Renamed runs and continuations stay together through recorded parent links.
   Each job shows its latest recorded name in the selected range, including on
   hosted PostgreSQL archives. Usage-only archives show job IDs because their
-  titles are discarded. Archived Hermes and Augure Desktop cron runs whose
-  sources were gone before upgrading stay individual sessions unless they
+  titles are discarded. AgentsView keeps no copy of the original Hermes and
+  Augure Desktop files, so cron runs stay individual sessions in archive-only
+  databases and when their sources were gone before upgrading, unless they
   already have a stored job ID. A non-empty source in `state.db` takes precedence
   over the transcript's platform when grouping runs.
   The first sync after upgrading rebuilds the archive once to populate groups.
@@ -57,9 +103,80 @@ The latest release is
   rates. Hosted deployments must grant the runtime role `UPDATE` on three new
   `tool_calls` columns before upgrading, or hosted startup fails; see
   [Hosted Raw Sync](/docs/hosted-raw-sync/#http-control-plane).
+- Turn on the Friction Log with `enabled = true` under `[friction]` to record
+  corrections, tool errors, workarounds, deferrals, repeated patterns,
+  frustration, and interruptions for each session. Findings are stored in
+  SQLite and sent to PostgreSQL mirrors, ready for upcoming digest, API, and UI
+  work. Review is off by default and never runs during sync: the daemon reviews
+  changed sessions in the background after each sync, so sync speed is the
+  same with it on or off. Turning it on reviews existing sessions in the
+  background. The first PostgreSQL push after turning it on reviews every
+  waiting session before it starts and holds sync until it is done. It then
+  sends every session once. Sessions above 2,000 message, tool-call, and
+  result-event rows or 4 MiB of stored text are marked skipped rather than
+  reviewed. Hosted raw sync adds findings to existing sessions through a
+  `pg raw-reparse` rollout. See
+  [Friction Log](/docs/configuration/#friction-log).
+- Sync a machine you reach over SSH without installing AgentsView on it. Add a
+  `[[remote_hosts]]` entry with `transport = "ssh"` and, if it differs from
+  `host`, a `destination` such as `user@devbox.example.com`. AgentsView places a
+  matching copy of itself in the remote's `~/.cache/agentsview/bin` and runs it
+  only while a sync is in progress. Transfers are compressed with zstd and send
+  only changed files after the first sync, which uploads about 50 MB. An
+  unreachable host is skipped like an offline HTTP host. See
+  [SSH Remote Sync](https://agentsview.io/docs/remote-access/#ssh-remote-sync)
+  for setup, the files left on the remote, and limits.
+
+**Improvements**
+
+- Load Usage totals, top sessions and model comparison faster on large archives.
+- The Usage page starts its model comparison together with totals instead of
+  waiting for them. On an archive of 24,000 sessions the page finished in 4.0
+  seconds instead of 5.6. The comparison pickers stay disabled until totals and
+  the first pair arrive. If a date or filter change leaves a compared model or
+  project with no usage, the comparison switches to the two costliest models, or
+  to projects when fewer than two models have usage. API clients can omit both
+  sides of `GET /api/v1/usage/pairwise-comparison` to get the same default pair.
+- Push semantic search vectors to ClickHouse faster. Each write now covers up to
+  500 sessions instead of one. In testing, the vector part of a full push of
+  1,360 sessions took about 2 seconds instead of about 5 minutes.
+- Speed up large ClickHouse pushes by setting `push_batch_size` on a
+  `[clickhouse]` target. Each batch of sessions makes ClickHouse rewrite its
+  session tables, so larger batches mean fewer rewrites, at the cost of more
+  memory during the push. The default stays at 100 sessions.
+- A full push to ClickHouse or PostgreSQL, or a DuckDB mirror rebuild,
+  interrupted by a restart continues where it stopped on the next push instead
+  of starting over. Pushes to all three now send the most recently active
+  sessions first, so a push that stops early has already delivered your newest
+  work. `--full` still starts over from scratch. If another process has the
+  DuckDB mirror open, a manual push rebuilds the mirror. When an earlier rebuild
+  stopped with session errors, that push now continues it instead of starting
+  over.
+- Push summaries say why a ClickHouse or PostgreSQL push ran in full when you
+  did not pass `--full`, and say `discarded an unfinished full push` when
+  `--full` threw away an interrupted one. A DuckDB rebuild reports
+  `discarded an unfinished rebuild` the same way.
+  A summary that reports ownership conflicts now also shows how many sessions
+  were unchanged, already pushed by the interrupted run, or removed.
 
 **Bug fixes**
 
+- `agentsview prune` no longer deletes the shared `state.db` of Hermes or
+  Augure Desktop. Sessions synced by 0.45.0 or earlier record the bare
+  `state.db` path, and pruning one deleted the whole app database. The prune
+  summary now says how many source files stay in place.
+- A ClickHouse push that restores a wider project scope after a filtered push
+  stopped with session errors now runs a full push, and pushes stay full until
+  one finishes without errors. Sessions the filtered push removed from the
+  mirror come back. Before, the next push was incremental and left those older
+  sessions missing while reporting success.
+- Codex pages from Desktop builds 0.148.0-alpha.15 through 0.154.0-alpha.6.2
+  now join their thread with its title instead of showing as separate untitled
+  sessions. The upgrade rebuilds the archive once and keeps names, stars, pins,
+  trash, and deletions on the right page. ClickHouse mirrors now run a full push
+  whenever the archive's database id changes, so any full rebuild causes one.
+- Hidden tabs release their live connections so new tabs load, and catch up when
+  shown again.
 - DeepSeek Harness v4 sessions now appear after sync, with tool results and
   recorded token usage.
 - ClickHouse usage reports read prepared usage again for a machine whose
@@ -83,6 +200,17 @@ The latest release is
   every titled Codex thread. Usage-only storage discards session titles, so the
   empty stored title always differed from the thread's title in
   `session_index.jsonl`, and each import parsed those threads again.
+- Codex, TraeX, and Augure Code sessions show the git branch they started on,
+  so branch filters and project identity include them. Before, every such
+  session had an empty branch. Existing sessions gain their branch on the
+  first sync after upgrading. Sessions started outside a repository or on a
+  detached HEAD, and sessions whose source files are gone, keep an empty
+  branch.
+- Large Claude Code and iCodeMate CLI tool output stays in the archive after
+  the side file holding it is deleted, which happens after Claude Code's
+  cleanup period (30 days by default). Before, a later full re-parse or
+  rebuild replaced the output with the provider's short placeholder. Output
+  replaced before upgrading is not restored.
 
 - Codex threads rewound with undo keep every message and every day's usage.
   Each extra rollout file Codex writes for the undo now shows as its own linked
@@ -96,6 +224,25 @@ The latest release is
   Saved names, stars, pinned messages, project identities, and already archived
   undo files survive this upgrade, even when their source files are gone. Live
   updates follow the newest undo file even if the original file is gone.
+- A write to one Hermes or Augure Desktop session no longer makes AgentsView
+  reparse and rewrite every session in the same `state.db`. Full sync and
+  file/WAL events now resolve to that one session's source, so an archive
+  with many sessions in one database stops reprocessing all of them on
+  every unrelated write. The first sync after upgrading reparses every Hermes
+  and Augure Desktop session once to record its new per-session source, and a
+  configured PostgreSQL push updates each of them once.
+- Repeated remote imports no longer rewrite unchanged Hermes and Augure Desktop
+  sessions. An HTTP import that downloads a full archive, because the remote
+  host lacks incremental sync or no local mirror is set up, unpacks it into a
+  new temporary folder each time. That folder's location was part of each
+  session's change check, so every such import parsed and stored the same
+  sessions again. The check now uses each file's place inside the Hermes folder.
+  The first sync after upgrading reparses every Hermes and Augure Desktop
+  session once.
+
+**Acknowledgements**
+
+- [@iainlane](https://github.com/iainlane) for the Hermes per-session sync fix.
 
 ## 0.45.0
 

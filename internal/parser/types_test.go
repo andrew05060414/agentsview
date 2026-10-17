@@ -489,6 +489,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentVSCopilot,
 		AgentPi,
 		AgentTau,
+		AgentFx,
 		AgentPrimeAgent,
 		AgentOMP,
 		AgentOMO,
@@ -539,6 +540,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentOmnigent,
 		AgentCodebuff,
 		AgentCrush,
+		AgentMuse,
 	}
 
 	expected := make(map[AgentType]bool, len(allTypes))

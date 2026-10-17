@@ -19,7 +19,11 @@ import (
 // whose output changes, including each provider that shares the changed
 // parser. A provider left out keeps stale output marked as current.
 // Validate the map with validateDataVersionScopes.
-var dataVersionScopes = map[int][]parser.AgentType{}
+var dataVersionScopes = map[int][]parser.AgentType{
+	132: {parser.AgentClaude, parser.AgentCowork, parser.AgentQoder, parser.AgentIcodemate, parser.AgentGrok},
+	133: {parser.AgentCodex, parser.AgentTraeX, parser.AgentAugureCode},
+	135: {parser.AgentVibe},
+}
 
 // firstScopedDataVersion is the oldest version that may be declared. Released
 // binaries treated every earlier version as a full rebuild, and their retry

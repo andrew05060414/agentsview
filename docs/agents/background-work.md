@@ -44,6 +44,19 @@ recall extraction still own their timing; migrating them is separate work.
   macOS, record `vmmap` physical footprint and dirty memory. Use portable Go
   allocation and heap metrics on Linux and Windows.
 
+## Codex rollout compression
+
+Before changing rollout selection or accepting a compression-related review
+finding, read the pinned Codex sources in the
+[format provenance](../internal/session-format-sources.md#codex-codex).
+Compression and restoration change the representation of one rollout at the same
+path. Prefer its plain JSONL sibling when both forms exist.
+
+A test that writes different transcript contents under separate configured roots
+exercises AgentsView's import policy. It does not show that Codex creates that
+state. Establish the upstream producer path before reporting such a test as a
+Codex data-loss bug or a merge blocker.
+
 ## Usage cache backfill
 
 - Start usage-cache backfill only after the writable archive transaction that
@@ -60,11 +73,25 @@ recall extraction still own their timing; migrating them is separate work.
   process-local timezone plus up to eight retained recently requested explicit
   timezones. Installed source and aggregate fingerprints, not a progress
   cursor, are the authoritative coverage records.
+- Served usage requests own timezone recency in
+  `usage_rollup_timezones.last_requested_at`, rewriting it at most once a
+  minute per zone. Rollup installs stamp only a zone's first row, so
+  background rebuilds never reorder which eight explicit zones stay warm.
 - A pass runs once and is never restarted because the archive was written while
   it ran. Each session's facts and source version come from one archive read
   transaction, so they are always paired correctly, and a session written
   during the pass is refilled by its own mutation notification. Do not
   reintroduce a restart loop over a moving source fingerprint.
+- After each notification batch, the daemon rebuilds filled sessions' daily
+  rollups and requeues invalidated dedup peers for the same timezones, in
+  chunks of 256. A failed rebuild is retried by the next write or usage
+  request. Cursor rollups stay with the request.
+- Session notifications that exceed the channel capacity retain their IDs in a
+  deduplicated overflow map capped at 1,024 IDs, including dedup peers.
+  Pending batches hold at most 2,048 IDs; backfill or requests cover dropped
+  IDs.
+- Notifications hold a daemon work lease through queueing and rebuilding until
+  the pending set, overflow and in-flight batch are empty.
 - A scheduled pricing refresh calls `RewarmUsageCache` once it returns, when the
   stored catalog digest changed, including a partial refresh that also reports
   an error. It starts the same coverage pass, which rebuilds only rollups

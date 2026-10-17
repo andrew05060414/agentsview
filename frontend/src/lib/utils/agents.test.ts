@@ -37,6 +37,7 @@ describe("KNOWN_AGENTS", () => {
       "visualstudio-copilot",
       "pi",
       "stepcode",
+      "fx",
       "tau",
       "prime-agent",
       "qwen",
@@ -68,6 +69,7 @@ describe("KNOWN_AGENTS", () => {
       "codebuff",
       "freebuff",
       "crush",
+      "muse",
     ]);
   });
 
@@ -114,6 +116,7 @@ describe("agentColor", () => {
     expect(agentColor("omnigent")).toBe("var(--accent-teal)");
     expect(agentColor("cline")).toBe("var(--accent-violet)");
     expect(agentColor("crush")).toBe("var(--accent-coral)");
+    expect(agentColor("muse")).toBe("var(--accent-sky)");
   });
 
   it("falls back to blue for unknown agents", () => {
@@ -176,6 +179,7 @@ describe("agentLabel", () => {
     expect(agentLabel("workbuddy")).toBe("WorkBuddy");
     expect(agentLabel("codebuddy")).toBe("CodeBuddy");
     expect(agentLabel("piebald")).toBe("Piebald");
+    expect(agentLabel("fx")).toBe("fx");
     expect(agentLabel("zed")).toBe("Zed");
     expect(agentLabel("qwen")).toBe("Qwen Code");
     expect(agentLabel("qwenpaw")).toBe("QwenPaw");
@@ -191,6 +195,7 @@ describe("agentLabel", () => {
     expect(agentLabel("augure-desktop")).toBe("Augure Desktop");
     expect(agentLabel("opencodereview")).toBe("Open Code Review");
     expect(agentLabel("crush")).toBe("Charm Crush");
+    expect(agentLabel("muse")).toBe("Muse Code");
   });
 
   it("capitalizes simple agent names", () => {

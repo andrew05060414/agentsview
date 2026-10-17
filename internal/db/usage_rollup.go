@@ -203,6 +203,7 @@ type usageRollupCall struct {
 
 type usageRollupObserver struct {
 	beforeEnsure  func()
+	beforeAttempt func(map[string]usageFillResult)
 	beforeInstall func([]usageRollupBuild)
 }
 
@@ -250,9 +251,9 @@ func (c *usageRollupCoordinator) Ensure(
 			}
 			call.installs, call.metrics, call.err = c.ensureNow(
 				c.ctx, snapshot, fills, resolver)
-			close(call.done)
 			c.mu.Lock()
 			delete(c.calls, key)
+			close(call.done)
 			c.mu.Unlock()
 		}) {
 			delete(c.calls, key)
@@ -324,6 +325,9 @@ func (c *usageRollupCoordinator) ensureAttempt(
 	snapshot usageQuerySnapshot, fills map[string]usageFillResult,
 	pricing *usagePricingIdentities,
 ) (map[string]usageRollupInstall, bool, usageRollupMetrics, error) {
+	if c.observer.beforeAttempt != nil {
+		c.observer.beforeAttempt(fills)
+	}
 	installs, stale, err := readUsageRollupInstalls(
 		ctx, conn, identity, snapshot, fills, pricing)
 	if err != nil || len(stale) == 0 {
@@ -415,23 +419,14 @@ func (c *usageRollupCoordinator) ensureAttempt(
 func readCurrentUsageFillResults(
 	ctx context.Context, conn *sql.Conn, versions []usageSourceVersion,
 ) (map[string]usageFillResult, error) {
-	results := make(map[string]usageFillResult, len(versions))
+	results, err := readUsageCachedSessions(ctx, conn, usageSourceVersionIDs(versions))
+	if err != nil {
+		return nil, err
+	}
 	for _, version := range versions {
-		var result usageFillResult
-		err := conn.QueryRowContext(ctx, `SELECT source_sync_marker,
-			source_transcript_rev, usage_event_fingerprint, install_revision
-			FROM usage_cached_sessions WHERE session_id = ?`, version.SessionID).Scan(
-			&result.source.SyncMarker, &result.source.TranscriptRevision,
-			&result.source.UsageEventFingerprint, &result.InstallRevision)
-		if errors.Is(err, sql.ErrNoRows) {
+		if _, ok := results[version.SessionID]; !ok {
 			results[version.SessionID] = usageFillResult{Deleted: true}
-			continue
 		}
-		if err != nil {
-			return nil, err
-		}
-		result.source.SessionID = version.SessionID
-		results[version.SessionID] = result
 	}
 	return results, nil
 }
@@ -557,35 +552,36 @@ func installUsageRollupBuilds(
 			"%w: dedup identities gained members during rollup build",
 			errUsageCacheSourceChanged)
 	}
+	sessionIDs := make([]string, 0, len(builds))
+	for _, build := range builds {
+		if build.SessionID != usageRollupCursorSessionID {
+			sessionIDs = append(sessionIDs, build.SessionID)
+		}
+	}
+	cachedSessions, err := readUsageCachedSessions(ctx, conn, sessionIDs)
+	if err != nil {
+		return err
+	}
 	for _, build := range builds {
 		if build.SessionID == usageRollupCursorSessionID {
 			continue
 		}
-		var current usageFillResult
-		err := conn.QueryRowContext(ctx, `SELECT source_sync_marker,
-			source_transcript_rev, usage_event_fingerprint, install_revision
-			FROM usage_cached_sessions WHERE session_id = ?`, build.SessionID).Scan(
-			&current.source.SyncMarker, &current.source.TranscriptRevision,
-			&current.source.UsageEventFingerprint, &current.InstallRevision)
-		current.source.SessionID = build.SessionID
-		if errors.Is(err, sql.ErrNoRows) || err == nil &&
-			(current.InstallRevision != build.FactRevision ||
-				!current.source.Equal(build.Source)) {
+		current, ok := cachedSessions[build.SessionID]
+		if !ok || current.InstallRevision != build.FactRevision ||
+			!current.source.Equal(build.Source) {
 			return fmt.Errorf(
 				"%w: usage facts changed during rollup build",
 				errUsageCacheSourceChanged)
 		}
-		if err != nil {
-			return err
-		}
 	}
+	// Background rebuilds install here too, so only a new zone takes the
+	// install time; recordUsageTimezoneRequest owns later recency stamps.
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := conn.ExecContext(ctx, `INSERT INTO usage_rollup_timezones(
 		timezone_key, timezone_name, interval_fingerprint, last_requested_at
 	) VALUES (?, ?, ?, ?) ON CONFLICT(timezone_key) DO UPDATE SET
 		timezone_name=excluded.timezone_name,
-		interval_fingerprint=excluded.interval_fingerprint,
-		last_requested_at=excluded.last_requested_at`,
+		interval_fingerprint=excluded.interval_fingerprint`,
 		identity.Key, identity.Name, identity.IntervalFingerprint, now); err != nil {
 		return err
 	}

@@ -21,6 +21,7 @@ import (
 	"go.kenn.io/agentsview/internal/signals"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/timeutil"
+	"golang.org/x/sync/errgroup"
 )
 
 // directBackend implements SessionService by wrapping a db.Store
@@ -251,6 +252,14 @@ func (b *directBackend) List(
 			f.OrderBy, err, strings.Join(db.SortKeys(), ", "),
 		)
 	}
+	pr, err := db.ParsePRFilter(f.PR)
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
+	f.Labels, err = db.LabelFilterValues(f.Labels)
+	if err != nil {
+		return nil, fmt.Errorf("list: %w", err)
+	}
 	// Match the HTTP handler's clampLimit semantics: values over
 	// MaxSessionLimit clamp to the max, not reset to the default.
 	if f.Limit > db.MaxSessionLimit {
@@ -261,6 +270,7 @@ func (b *directBackend) List(
 	}
 
 	filter := listFilterToDB(f)
+	filter.PR = pr
 	page, err := b.db.ListSessions(ctx, filter)
 	if err != nil {
 		return nil, err
@@ -293,6 +303,8 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		MaxMessages:          f.MaxMessages,
 		MinUserMessages:      f.MinUserMessages,
 		ExcludeOneShot:       !f.IncludeOneShot,
+		OneShotFilterSet:     f.OneShotFilterSet,
+		AutomatedFilterSet:   f.AutomatedFilterSet,
 		ExcludeAutomated:     !f.IncludeAutomated,
 		IncludeChildren:      f.IncludeChildren,
 		IncludeSource:        f.IncludeSource,
@@ -301,6 +313,7 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		MinToolFailures:      f.MinToolFailures,
 		HasSecret:            f.HasSecret,
 		Starred:              f.Starred,
+		Labels:               f.Labels,
 		SecretsRulesVersions: secrets.ActiveRulesVersions(),
 	}
 	// Parse the public sort spec into the structured, per-key form. The spec is
@@ -564,6 +577,15 @@ func (b *directBackend) Sync(
 	}
 	if in.Subagents && in.ID == "" {
 		return nil, errors.New("sync: subagents requires id")
+	}
+	if err := ValidateUsageRefresh(in); err != nil {
+		return nil, err
+	}
+	if in.UsageRefresh {
+		if err := b.engine.TrySyncSessionWithSubagentsContext(ctx, in.ID); err != nil {
+			return nil, err
+		}
+		return b.Get(ctx, in.ID)
 	}
 	if in.Subagents {
 		if err := b.engine.SyncSessionWithSubagentsContext(
@@ -939,11 +961,52 @@ func (b *directBackend) UsagePairwiseComparison(
 	if err != nil {
 		return nil, err
 	}
-	req, err = ResolveUsagePairwiseProjectKeys(ctx, b.db, req)
+	req.UsageRequest, err = ResolveUsageProjectKeys(ctx, b.db, req.UsageRequest)
 	if err != nil {
 		return nil, err
 	}
-	leftFilter, leftEmpty, rightFilter, rightEmpty, err := BuildUsagePairwiseFilters(req)
+	base, err := BuildUsageFilter(req.UsageRequest)
+	if err != nil {
+		return nil, err
+	}
+	useDefault := req.LeftDimension == "" && req.LeftValue == "" && req.RightDimension == "" && req.RightValue == ""
+	if req.FallbackToDefault && !useDefault {
+		if err := validatePairwiseDimension(req.LeftDimension, req.LeftValue, "left"); err != nil {
+			return nil, err
+		}
+		if err := validatePairwiseDimension(req.RightDimension, req.RightValue, "right"); err != nil {
+			return nil, err
+		}
+	}
+	if useDefault || req.FallbackToDefault {
+		rankingFilter := base
+		rankingFilter.Breakdowns = true
+		rankingFilter.SkipSessionCounts = true
+		rankingResult, err := b.db.GetDailyUsage(ctx, rankingFilter)
+		if err != nil {
+			return nil, err
+		}
+		summary, err := buildUsageSummary(rankingFilter, rankingResult)
+		if err != nil {
+			return nil, err
+		}
+		if useDefault || !usagePairwiseSideInRanking(summary, req.LeftDimension, req.LeftValue) || !usagePairwiseSideInRanking(summary, req.RightDimension, req.RightValue) {
+			req.LeftDimension, req.LeftValue, req.RightDimension, req.RightValue = defaultUsagePairwiseSelection(summary)
+		}
+		if req.LeftDimension == "" {
+			out, err := BuildUsagePairwiseComparisonResult(db.DailyUsageResult{}, db.DailyUsageResult{})
+			return &out, err
+		}
+	}
+	req.LeftProjectLabels, err = resolvePairwiseProjectLabels(ctx, b.db, req.LeftDimension, req.LeftValue)
+	if err != nil {
+		return nil, err
+	}
+	req.RightProjectLabels, err = resolvePairwiseProjectLabels(ctx, b.db, req.RightDimension, req.RightValue)
+	if err != nil {
+		return nil, err
+	}
+	leftFilter, leftEmpty, rightFilter, rightEmpty, err := buildUsagePairwiseFilters(req, base)
 	if err != nil {
 		return nil, err
 	}
@@ -953,24 +1016,32 @@ func (b *directBackend) UsagePairwiseComparison(
 	rightFilter.SkipSessionCounts = false
 
 	var leftResult db.DailyUsageResult
-	if !leftEmpty {
-		leftResult, err = b.db.GetDailyUsage(ctx, leftFilter)
-		if err != nil {
-			return nil, err
-		}
-	}
 	var rightResult db.DailyUsageResult
+	group, groupCtx := errgroup.WithContext(ctx)
+	if !leftEmpty {
+		group.Go(func() error {
+			var readErr error
+			leftResult, readErr = b.db.GetDailyUsage(groupCtx, leftFilter)
+			return readErr
+		})
+	}
 	if !rightEmpty {
-		rightResult, err = b.db.GetDailyUsage(ctx, rightFilter)
-		if err != nil {
-			return nil, err
-		}
+		group.Go(func() error {
+			var readErr error
+			rightResult, readErr = b.db.GetDailyUsage(groupCtx, rightFilter)
+			return readErr
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
 	}
 
 	out, err := BuildUsagePairwiseComparisonResult(leftResult, rightResult)
 	if err != nil {
 		return nil, err
 	}
+	out.Left.Dimension, out.Left.Value = req.LeftDimension, req.LeftValue
+	out.Right.Dimension, out.Right.Value = req.RightDimension, req.RightValue
 	return &out, nil
 }
 

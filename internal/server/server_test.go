@@ -1467,8 +1467,9 @@ type projectListResponse struct {
 }
 
 type syncStatusResponse struct {
-	LastSync string         `json:"last_sync"`
-	Progress *sync.Progress `json:"progress"`
+	StartupPending bool           `json:"startup_pending"`
+	LastSync       string         `json:"last_sync"`
+	Progress       *sync.Progress `json:"progress"`
 }
 
 type githubConfigResponse struct {
@@ -2588,15 +2589,20 @@ func TestListMachines_ExcludeOneShotDefault(t *testing.T) {
 
 func TestSyncStatus(t *testing.T) {
 	te := setup(t)
+	w := te.get(t, "/api/v1/sync/status")
+	assertStatus(t, w, http.StatusOK)
+	resp := decode[syncStatusResponse](t, w)
+	assert.True(t, resp.StartupPending)
 
 	// Trigger a sync so LastSync is set
-	w := te.post(t, "/api/v1/sync", "{}")
+	w = te.post(t, "/api/v1/sync?wait=true", "{}")
 	assertStatus(t, w, http.StatusOK)
 
 	w = te.get(t, "/api/v1/sync/status")
 	assertStatus(t, w, http.StatusOK)
 
-	resp := decode[syncStatusResponse](t, w)
+	resp = decode[syncStatusResponse](t, w)
+	assert.False(t, resp.StartupPending)
 	if resp.LastSync == "" {
 		require.FailNow(t, "expected last_sync field")
 	}
@@ -4861,7 +4867,7 @@ func TestWatchSession_Events(t *testing.T) {
 		close(done)
 	}()
 
-	w.WaitForWrite(t)
+	te.waitForSSEEvent(t, w, "session_ready", 5*time.Second)
 
 	updated := content + testjsonl.NewSessionBuilder().
 		AddClaudeAssistant(tsZeroS5, "response").
@@ -5527,9 +5533,9 @@ func TestEvents_StreamsDataChangedAfterSync(t *testing.T) {
 		close(done)
 	}()
 
-	// Emit directly via the broadcaster to isolate the handler
-	// from sync engine timing.
-	te.emitUntilSSEEvent(t, w, "messages", "data_changed", 3*time.Second)
+	te.waitForSSEEvent(t, w, "events_ready", 5*time.Second)
+	te.broadcaster.Emit("messages")
+	te.waitForSSEEvent(t, w, "data_changed", 5*time.Second)
 	cancel()
 	<-done
 }

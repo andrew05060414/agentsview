@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/friction"
 )
 
 func messageCountWrite(id string, count int) SessionBatchWrite {
@@ -663,4 +665,64 @@ func TestExtendImageContent(t *testing.T) {
 
 	_, ok = ExtendImageContent("", "anything")
 	assert.False(t, ok)
+}
+
+func TestUsageOnlyBatchWritesClearExistingFriction(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		atomic bool
+	}{
+		{name: "context batch"},
+		{name: "atomic batch", atomic: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			_, err := d.WriteSessionBatchAtomic(t.Context(), []SessionBatchWrite{
+				messageCountWrite("session", 4),
+			})
+			require.NoError(t, err)
+
+			findings := frictionFixture("session")
+			require.NoError(t, d.replaceSessionFriction(
+				t.Context(), "session", findings,
+				friction.RulesVersion,
+				FrictionHash(findings, friction.RulesVersion),
+			))
+			existingFindings, err := d.SessionFrictionFindings(
+				t.Context(), "session",
+			)
+			require.NoError(t, err)
+			require.Len(t, existingFindings, len(findings))
+			d.SetArchiveContent(config.ArchiveContentUsage)
+
+			write := messageCountWrite("session", 4)
+			var result SessionBatchResult
+			if tc.atomic {
+				result, err = d.WriteSessionBatchAtomic(
+					t.Context(), []SessionBatchWrite{write},
+				)
+			} else {
+				result, err = d.WriteSessionBatchContext(
+					t.Context(), []SessionBatchWrite{write},
+				)
+			}
+			require.NoError(t, err)
+			require.Equal(t, 1, result.WrittenSessions)
+
+			storedFindings, err := d.SessionFrictionFindings(
+				t.Context(), "session",
+			)
+			require.NoError(t, err)
+			assert.Empty(t, storedFindings)
+			stored, err := d.GetSessionFull(t.Context(), "session")
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			assert.Zero(t, stored.FrictionCount)
+			assert.Equal(t, friction.RulesVersion, stored.FrictionRulesVersion)
+			assert.Equal(t,
+				FrictionHash(nil, friction.RulesVersion),
+				stored.FrictionHash,
+			)
+		})
+	}
 }

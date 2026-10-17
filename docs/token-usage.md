@@ -35,8 +35,8 @@ coding yesterday?" — across multiple coding agents from one archive.
     IDE/CLI**, **Zed**, **VS Code Copilot**, **Visual Studio Copilot**, **Mistral
     Vibe**, **gptme**, **Amp**, **Junie CLI**, **OMO**, and **StepCode**. Coverage
     also includes **Cline CLI**, **Tencent CodeBuddy CN**, **Augure Code**,
-    **Augure Desktop 3 beta**, and **Charm Crush**, and reads **DeepSeek Harness**
-    formats through version 3.
+    **Augure Desktop 3 beta**, **Charm Crush**, **fx**, and **Muse Code**, and
+    reads **DeepSeek Harness** formats through version 3.
 
     Coverage depends on what each agent records. AgentsView uses recorded costs
     when available; otherwise it estimates cost from usable token counts and a
@@ -48,6 +48,23 @@ Crush contributes recorded session totals and cost, with no per-message token or
 cache breakdown. Its aggregate usage is attributed to the most recent assistant
 model, so it does not provide a model-by-model account of a session that
 switched models.
+
+fx stopped writing `usage-v2.json` in
+[vercel-labs/fx#1226](https://github.com/vercel-labs/fx/pull/1226).
+AgentsView reads it when an older session has one, as cumulative totals per
+model dated at the earlier of the session's latest event and the usage file's
+modification time. Sessions from current fx have no token usage. An old session
+resumed in newer fx keeps its old totals. Costs use AgentsView's pricing catalog.
+Tool results use saved `.txt` output only when it is a regular UTF-8 file that
+matches the saved byte count or reaches the 16 MiB cap. Otherwise, the preview
+stays. Restored files refresh the result on the next sync. Freshness checks
+cover entry names, sizes, and modification times in `tool-results/`. This
+suffices because fx names result files by content hash.
+
+Muse Code records token counts for each model call but no cost. AgentsView
+prices them from Meta's published Muse Spark and Muse Wonder rates. Muse counts
+cached prompt tokens inside its input total, so AgentsView bills those tokens
+once, at the cached rate. Automated approval reviews are not counted.
 
 Augure Code and Augure Desktop retain recorded usage. Proprietary Augure models
 have no catalog price, so token-based cost estimates remain unpriced unless you
@@ -267,7 +284,16 @@ GET /api/v1/usage/pairwise-comparison
 
 Pass the normal usage filters plus `left_dimension`, `left_value`,
 `right_dimension`, and `right_value`. Supported dimensions are `project` and
-`model`. Branch-scoped comparisons use the shared `git_branch` usage filter with
+`model`. Supply all four side parameters together, or omit all four to use the
+server's default pair. The default uses the two models with the highest cost,
+then two projects, then a model and a project. Each response side includes its
+`dimension` and `value`. With too few options, both sides have zero totals and
+omit `dimension` and `value`.
+
+Set `fallback_to_default=true` with a full pair to use the default if either
+side is absent from the scope's cost ranking. The response echoes the pair used.
+
+Branch-scoped comparisons use the shared `git_branch` usage filter with
 an opaque token from `GET /api/v1/branches`.
 
 ### Top Sessions by Cost
@@ -1064,12 +1090,18 @@ when it must include new source changes. Full parser rebuilds serve the retained
 archive with a stale warning; scoped upgrades and schema repairs finish before
 the daemon serves requests.
 
-`session usage`, `token-use`, and `usage statusline` complete pending startup
-ingestion before querying. This also applies when a previous daily report
-started the daemon. Once startup ingestion is complete, subsequent queries do
-not repeat a full sync; the daemon's file watcher handles later source changes.
-During a full parser rebuild, these commands skip startup ingestion and read the
+`usage statusline` completes pending startup ingestion before querying. This
+also applies when a previous daily report started the daemon. Once startup
+ingestion is complete, subsequent queries do not repeat a full sync; the
+daemon's file watcher handles later source changes.
+During a full parser rebuild, statusline skips startup ingestion and reads the
 retained archive with a stale warning.
+
+`session usage` and its `token-use` alias refresh known sessions without
+waiting for startup ingestion. Combined totals include archived descendants.
+See the [session usage contract](/docs/session-api/#agentsview-session-usage)
+for refresh behavior, missing-session exit codes, and the `refresh_incomplete`
+JSON field.
 
 `--no-sync` skips source refresh and starts any new daemon without automatic
 sync. It does not disable sync on an already-running daemon. `--offline` reads

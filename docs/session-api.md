@@ -109,6 +109,9 @@ known.
 
 ## Shared metadata endpoints
 
+The HTTP `/api/v1/events` stream sends `events_ready` on every connection
+after subscribing to changes.
+
 The web UI and generated API clients use shared metadata endpoints for filter
 options:
 
@@ -194,7 +197,9 @@ agentsview session get host~freebuff:myproject:1704067200 --server http://remote
   "health_score_basis": ["..."],
   "health_penalties": {"tool_retries": 5},
   "parser_malformed_lines": 3,
-  "secret_leak_count": 0
+  "secret_leak_count": 0,
+  "labels": [],
+  "pr_links": []
 }
 ```
 
@@ -208,6 +213,11 @@ while still recovering the session and is omitted when zero. Antigravity detail
 responses may also include `decode_confidence`; the value `low` means the
 session came from an unrecognized Antigravity schema fingerprint and was decoded
 heuristically.
+
+`labels` lists the session's [labels](#agentsview-session-label) and
+`pr_links` its [pull request links](#pull-request-links). Both are always
+present and are `[]` when empty. Human output prints them, plus the parent
+session when there is one.
 
 `secret_leak_count` (added in 0.30.0) counts definite-tier findings from
 [secret scanning](#secret-scanning) and is stamped inline during sync.
@@ -283,7 +293,9 @@ Compare `cwd`, `is_truncated`, `message_count`, `file_size`,
 `local_modified_at`, and the session timestamps when choosing a copy. Source
 metadata and timestamps help compare copies; they do not guarantee a complete
 transcript. `local_modified_at` records changes to the archived session row,
-including later metadata edits. It is not the source file's modification time.
+including custom names and later metadata edits. Labels and launcher parent links
+advance only the mirror sync marker. It is not the source file's modification
+time.
 
 Date filters match a session when its activity window overlaps the selected date
 or range. Sessions that start before midnight and remain active after it
@@ -314,6 +326,8 @@ therefore appear on both dates.
 | `--health-grade`      | `health_grade`      | comma-separated                                                                                                                                                                   |
 | `--min-tool-failures` | `min_tool_failures` | int; `0` is a meaningful filter                                                                                                                                                   |
 | `--has-secret`        | `has_secret`        | bool — only sessions with at least one definite [secret finding](#secret-scanning)                                                                                                |
+| `--label`             | `label`             | repeatable; exact label match, every listed label required                                                                                                                        |
+| `--pr`                | `pr`                | `owner/repo`, `owner/repo#123`, or `github.com::owner/repo#123`; see [Pull request links](#pull-request-links)                                                                              |
 | `--sort`              | `order_by`          | comma-separated keys; optional `:asc` / `:desc` suffix per key                                                                                                                    |
 | `--reverse`, `-r`     | `descending`        | flips the default direction for unsuffixed sort keys                                                                                                                              |
 | `--cursor`            | `cursor`            | opaque string from prior response                                                                                                                                                 |
@@ -582,10 +596,142 @@ sessions already present there.
   detached daemon when no compatible daemon is running. It then proxies to
   `POST /api/v1/sessions/sync` so parsing and signal computation remain
   daemon-owned.
+- If the local archive needs a rebuild, `POST /api/v1/sessions/sync` returns
+  HTTP 409 with `X-Agentsview-Resync-Required: true`. Wait for the rebuild or
+  run `agentsview sync --full`, then retry the session sync.
 - If a [`pg serve`](/docs/pg-sync/#agentsview-pg-serve) daemon is running
   (read-only), sync refuses with a clear error.
 - If `AGENTSVIEW_NO_DAEMON=1` is set, the CLI runs the sync in-process only
   after acquiring the local write-owner lock.
+
+______________________________________________________________________
+
+### Pull request links
+
+Sessions list the pull requests their agent recorded in the transcript, in
+`pr_links`:
+
+```json
+"pr_links": [
+  {
+    "url": "https://github.com/owner/repo/pull/123",
+    "host": "github.com",
+    "repository": "owner/repo",
+    "number": 123
+  }
+]
+```
+
+Claude Code is the only agent that records these today, as `pr-link` entries
+in its transcripts. AgentsView keeps one link per URL. The link says the session was associated with the pull request. It
+does not say whether the session opened it.
+Claude Code records these links for the whole transcript, so every session
+split from one transcript, such as a rewind's fork, carries them, like its name
+and git branch.
+
+Filter by pull request with `session list --pr` or the `pr` query parameter.
+The value is `owner/repo` for any pull request in that repository,
+`owner/repo#123` for one pull request, or `github.com::owner/repo#123` to
+restrict it to a host. Matching ignores case. Omitting the host matches any
+host, including nested repository paths such as `group/subgroup/repo`.
+Separate a host from the repository with `::`; dotted group names such as
+`my.org/sub/repo` remain hostless.
+
+#### Filtering by label or pull request
+
+Label and pull request filters name the sessions you want, the way `ids` does.
+Hosted raw sync carries no archive labels or launcher parent links. Its label
+filter matches nothing.
+
+- In a flat list (`session list`, `GET /api/v1/sessions`, MCP `list_sessions`)
+  they match each session directly. Child sessions, automated sessions, and
+  one-shot sessions are included, so a headless worker that an orchestrator
+  launched appears even though it is a child of the launching session. An explicit
+  `include_one_shot=false` still excludes one-shot sessions, and explicit
+  `include_automated=false` excludes automated sessions.
+- In tree views (the web UI sidebar and `include_children=true`) they keep a
+  top-level session when it or any session below it matches, and show its
+  whole tree. Filtering by a worker's pull request shows the orchestrator
+  session with that worker inside it.
+
+______________________________________________________________________
+
+### `agentsview session label`
+
+Annotation commands use the ID exactly as given, with no prefix lookup, so pass the archive session ID, e.g. `codex:<uuid>` for Codex.
+
+Add or remove free-form labels on a session. Use labels to find every session
+for one ticket, role, or kind of run. A `key=value` form such as
+`ticket=example` is a convention, not a requirement. `session get` and the
+session JSON show a session's labels.
+
+```bash
+agentsview session label <id> ticket=example role=reviewer
+agentsview session label <id> --remove role=reviewer
+agentsview session label <id> --replace nightly          # replace every label
+agentsview session label <id> --clear
+agentsview session list --label ticket=example --label role=reviewer
+```
+
+The API is `PATCH /api/v1/sessions/{id}/labels` with
+`{"add": ["nightly"], "remove": ["x"], "clear": false}`. `clear` removes every
+existing label first, so `{"clear": true, "add": [...]}` replaces the set and
+`{"clear": true}` empties it. Removing a label the session does not carry is
+not an error. The response is `{"session_id", "labels", "session_found"}`.
+
+- Labels are trimmed. A label may not be empty, start with `=`, contain control
+  characters, or exceed 200 bytes. A session holds at most 64 labels. Invalid
+  input returns HTTP 400.
+- The session does not have to exist yet. A launcher can label a session as soon
+  as it knows the ID; the labels appear when sync imports the session.
+  `session_found: false` reports that case, which also exposes a mistyped ID.
+- Labels are stored apart from the transcript, so a reparse or full resync never
+  changes them. PostgreSQL, DuckDB, and ClickHouse receive them on push and
+  serve the `label` filter, but labels are written only through the local
+  archive. Read-only daemons return HTTP 501.
+- See [Filtering by label or pull request](#filtering-by-label-or-pull-request)
+  for which sessions the filters return.
+
+______________________________________________________________________
+
+### `agentsview session parent`
+
+Record which session launched this one. Use it when an orchestrator starts
+worker sessions as separate processes, so the session tree shows them under the
+session that started them. `session get` and the session JSON show the
+resulting parent.
+
+```bash
+agentsview session parent <worker-id> <manager-id>
+agentsview session parent <worker-id> --clear
+```
+
+The API is `PUT /api/v1/sessions/{id}/parent` with
+`{"parent_session_id": "<id>"}`. An empty or omitted `parent_session_id`
+removes the link. The body accepts only `parent_session_id`;
+`relationship_type` is rejected, and links always record `subagent`.
+
+An applied link makes the worker a subagent of the launching session, and
+the response reports `relationship_type` as
+`subagent`. The worker nests under that session in the sidebar, and
+`session usage` includes its cost in the launcher's total. The response also
+reports `session_found` and `applied`.
+
+- The link applies only while the transcript names no parent of its own.
+  Subagent, fork, and continuation links that AgentsView derives from the
+  transcript win, and `applied` is `false` in that case.
+- AgentsView recomputes the link when writing sessions, linking spawn edges,
+  and setting or clearing launcher links.
+  When the transcript parent or loop that blocked it goes away, the session
+  goes back under the linked parent.
+- Either session may be missing when the link is recorded. It stays pending
+  with `applied=false` until both rows exist. A pending launcher link leaves
+  the worker's parent and classification unchanged.
+- The link is stored apart from the transcript and survives reparses and full
+  resyncs. Mirrors receive the resulting parent on push.
+- A session cannot be its own parent, and a link that would make a session its
+  own ancestor returns HTTP 400. Clearing an absent link succeeds without changing
+  the session.
 
 ______________________________________________________________________
 
@@ -607,6 +753,9 @@ Recognized `event` values today: `session_updated`, `heartbeat`. New events may
 be added; consumers should ignore unknown events. The command runs until
 interrupted (Ctrl+C) or the context is cancelled. Like `session export`, it
 streams a fixed format and rejects `--format`/`--json`.
+
+On every connection, the HTTP session watch sends `session_ready` after
+taking its baseline; the CLI filters it out.
 
 Watch validates the session id before opening the stream. An unknown id fails
 fast with a `watch: session not found: <id>` error and non-zero exit instead of
@@ -792,7 +941,8 @@ agentsview session usage <id> [--format json] [--own-only] [--no-sync]
       "has_cost": true
     }
   ],
-  "server_running": false
+  "server_running": false,
+  "refresh_incomplete": true
 }
 ```
 
@@ -812,6 +962,7 @@ agentsview session usage <id> [--format json] [--own-only] [--no-sync]
 | `subagent_count`        | Number of subagent descendant sessions folded in; omitted when zero, so own-session results are byte-identical to before                                                                                                                         |
 | `breakdown`             | Per-step usage rows ordered by timestamp across all included sessions (the queried session wins ties); when a reported session total exists, row costs are estimated allocations that sum to it; CLI JSON always includes them (added in 0.37.1) |
 | `server_running`        | `true` when the report came from an already-running daemon                                                                                                                                                                                       |
+| `refresh_incomplete`   | Present as `true` when a requested source refresh was refused or failed; the result still contains archived totals                                                                                                                                 |
 | `rollup_cost`           | REST only, with `rollup=true`; integer microdollar object present only when `has_rollup_cost` is true, carrying the complete cost across the root and explicit subagent descendants                                                              |
 | `has_rollup_cost`       | REST only, with `rollup=true`; true only when at least one contributing row exists and every contributing row is priced                                                                                                                          |
 | `rollup_subagent_count` | REST only, with `rollup=true`; count of reachable explicit subagent descendants, including those without usage rows                                                                                                                              |
@@ -853,6 +1004,8 @@ The `Subagents` line appears only when the figures cover subagent transcripts,
 so a session without them (or a `--own-only` run) prints the same five lines it
 always has.
 
+When refresh is incomplete, human output adds `Usage refresh: incomplete; showing archived totals`.
+
 The leading `~` on the cost line marks a computed or mixed figure. A reported
 cost omits it. The parenthesized model list is shown only when contributing
 models exist, so a cost-only reported session does not render empty parentheses.
@@ -893,21 +1046,36 @@ sessions return `404` with:
 Unexpected usage-query failures return `500` with
 `error.code = "usage_query_failed"`.
 
-**Exit codes** — `usage` keeps the older `token-use` contract:
+**Exit codes**:
 
 | Code | Meaning                                            |
 | ---- | -------------------------------------------------- |
 | `0`  | Token data or cost present and reported            |
-| `2`  | Session not found in the local archive             |
+| `1`  | Query error or session unavailable during startup ingestion or archive rebuild |
+| `2`  | Session missing after startup or rebuild, or from an archive-only/direct lookup |
 | `3`  | Session exists but has neither token data nor cost |
 
 The codes classify the reported document, so a session whose only token data
 lives in its subagents exits `0`, not `3`. With `--own-only` it exits `3`, as it
 did before.
 
-Before querying, the local backend refreshes the session's own transcript and
-the `agent-*.jsonl` files under its `subagents/` directory, so a session that
-just finished reports complete numbers. `--own-only` skips the subagent refresh.
+Combined usage refreshes a known session and nearby Claude subagent transcripts
+without waiting for startup ingestion. The CLI requests this with
+`usage_refresh: true`, `id`, and `subagents: true` on
+`POST /api/v1/sessions/sync`. If refresh is refused or fails, the command
+returns archived totals with a warning; JSON sets `refresh_incomplete: true`.
+A missing daemon ID returns a retry error while
+`GET /api/v1/sync/status` reports `startup_pending` or `archive_stale`. Once
+both are clear, it returns exit 2. Scheduled ingestion owns retries.
+
+HTTP `--own-only` and `--no-sync` read only the archive and return exit 2 for
+missing IDs. Direct mode still refreshes the named transcript. Combined HTTP
+refresh requires daemon API 12; upgrade or restart older servers, or use
+`--no-sync`. Archived combined reads require API 6. `POST /api/v1/sessions/sync`
+returns HTTP 409 for a stale local archive for every caller, including
+`session sync`. A usage refresh also returns HTTP 409 while startup ingestion
+is incomplete or another sync holds the engine. When startup ingestion is
+deferred, its automatic fallback starts after a 30-second grace period.
 
 Pass `--no-sync` to read archived usage without refreshing source transcripts.
 This preserves the full subagent rollup and the exit codes above; combine it

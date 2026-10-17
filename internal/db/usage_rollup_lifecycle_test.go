@@ -163,7 +163,7 @@ func TestUsageLocalRequestsShareNamedZoneIdentity(t *testing.T) {
 		UsageFilter{Timezone: "UTC"}.Location(), nil).Name)
 }
 
-func TestUsageBackfillLocationsPrunesStaleLocalTimezones(t *testing.T) {
+func TestUsageCacheBackfillPrunesStaleLocalTimezones(t *testing.T) {
 	newYork, err := time.LoadLocation("America/New_York")
 	require.NoError(t, err)
 	anonymous := time.FixedZone("Local", -5*60*60)
@@ -219,6 +219,8 @@ func TestUsageBackfillLocationsPrunesStaleLocalTimezones(t *testing.T) {
 			require.Equal(t, 3, usageCacheCount(t, cache, "usage_rollup_installs"))
 			require.Equal(t, 3, usageCacheCount(t, cache, "usage_rollup_days"))
 
+			snapshot.location = tt.local
+			require.NoError(t, database.runUsageCacheBackfillPass(t.Context(), time.Now(), snapshot))
 			locations, err := usageBackfillLocations(t.Context(), cache, tt.local)
 			require.NoError(t, err)
 
@@ -249,6 +251,38 @@ func TestUsageBackfillLocationsPrunesStaleLocalTimezones(t *testing.T) {
 				"pruned timezones must cascade to their days")
 		})
 	}
+}
+
+func TestUsageRollupCompletionWaitsForCallRemoval(t *testing.T) {
+	database := testDB(t)
+	seedUsageSnapshotSession(t, database, "session", "project-a",
+		"2026-08-10T09:00:00Z", 0, 10, "model-a")
+	snapshot, fills, cache := prepareUsageRollupTest(t, database)
+	started := make(chan struct{})
+	cache.rollup.observer.beforeEnsure = func() {
+		cache.rollup.mu.Lock()
+		close(started)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := cache.rollup.Ensure(t.Context(), snapshot, fills,
+			export.NewPricingResolver(snapshot.PricingRows))
+		done <- err
+	}()
+	<-started
+	func() {
+		defer cache.rollup.mu.Unlock()
+		// Hold call removal until the worker has finished writing the rollup.
+		require.Eventually(t, func() bool {
+			return usageCacheCount(t, cache, "usage_rollup_installs") == 1
+		}, 5*time.Second, time.Millisecond)
+		select {
+		case <-done:
+			require.FailNow(t, "a completed request must be removed before its caller can request another rollup")
+		case <-time.After(100 * time.Millisecond): //nolint:kennlint // absence check; the held rollup mutex keeps call removal and completion waiting
+		}
+	}()
+	require.NoError(t, <-done)
 }
 
 func TestUsageRollupCallKeyIncludesCursorHighWater(t *testing.T) {
