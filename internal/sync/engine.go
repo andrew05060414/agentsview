@@ -591,6 +591,11 @@ type Engine struct {
 	// changes for archived Antigravity sessions. Qoder titles stay in
 	// deferredNativeTitles.
 	deferredAntigravitySummaries map[string]deferredAntigravitySummary
+	// antigravityWorkspaceChanges maps session IDs to the external workspace
+	// a parse wrote over a different stored one, until reconciliation
+	// replaces the old workspace's identity snapshot.
+	antigravityWorkspaceChangesMu gosync.Mutex
+	antigravityWorkspaceChanges   map[string]string
 	// Providers have distinct title-store paths, checked only while enabled.
 	appliedNativeTitles map[string]appliedNativeTitleStore
 	// sourceSet holds the provider set and session roots this engine
@@ -18025,27 +18030,38 @@ func (e *Engine) keepStoredWorkspaceBeforeCwdFilter(
 	return nil
 }
 
-// deferExternalWorkspaceChange keeps the stored working directory and project
-// when an externally supplied workspace differs from a stored one. The parse
-// write would keep the old directory's immutable identity snapshot, so the
-// change is left to the metadata reconciliation that runs after parsing (and,
-// in a rebuild, after the metadata copy), which records the new identity. A
-// new workspace outside the cwd allow-list is left as parsed so the filter
-// still vetoes it.
-func (e *Engine) deferExternalWorkspaceChange(
+// noteExternalWorkspaceChange records a parse that writes an externally
+// supplied workspace different from the stored one. The write itself, and the
+// cwd allow-list that admits it, use the workspace the row will store; but the
+// write keeps the old directory's immutable identity snapshot, so the summary
+// reconciliation that follows replaces it. A rebuild compares against the old
+// archive instead and needs no note.
+func (e *Engine) noteExternalWorkspaceChange(
 	sess *parser.ParsedSession, stored db.SessionWriteIdentity,
 ) {
 	if !sess.ExternalWorkspace || stored.Cwd == "" || sess.Cwd == stored.Cwd ||
-		!e.cwdFilter.allows(sess.Cwd) {
+		e.deferredAntigravitySummaries != nil {
 		return
 	}
-	sess.Cwd = stored.Cwd
-	if sess.ExternalWorkspaceProject {
-		sess.Project = stored.SourceProject
-		if sess.Project == "" {
-			sess.Project = stored.Project
-		}
+	id := applyIDPrefixToID(e.idPrefix, sess.ID)
+	e.antigravityWorkspaceChangesMu.Lock()
+	defer e.antigravityWorkspaceChangesMu.Unlock()
+	if e.antigravityWorkspaceChanges == nil {
+		e.antigravityWorkspaceChanges = make(map[string]string)
 	}
+	e.antigravityWorkspaceChanges[id] = sess.Cwd
+}
+
+// takeExternalWorkspaceChange returns and clears the workspace a parse wrote
+// for id since the last reconciliation, if any.
+func (e *Engine) takeExternalWorkspaceChange(id string) (string, bool) {
+	e.antigravityWorkspaceChangesMu.Lock()
+	defer e.antigravityWorkspaceChangesMu.Unlock()
+	cwd, ok := e.antigravityWorkspaceChanges[id]
+	if ok {
+		delete(e.antigravityWorkspaceChanges, id)
+	}
+	return cwd, ok
 }
 
 // keepStoredExternalWorkspaceProject keeps the stored parser-time project for
@@ -18143,7 +18159,7 @@ func (e *Engine) normalizePendingWriteMachines(
 				}
 				if !batch[i].sourceIdentityUnverified {
 					keepStoredExternalSessionMetadata(&batch[i].sess, stored)
-					e.deferExternalWorkspaceChange(&batch[i].sess, stored)
+					e.noteExternalWorkspaceChange(&batch[i].sess, stored)
 					e.keepStoredExternalWorkspaceProject(&batch[i], stored)
 				}
 			}

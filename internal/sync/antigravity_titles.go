@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"log"
 	"maps"
 	"path/filepath"
 	"slices"
@@ -117,20 +118,28 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		cwdChanged := summary.Cwd != "" && session.Cwd != summary.Cwd
 		rebuildWorkspaceChange := ok && e.deferredAntigravitySummaries != nil &&
 			summary.Cwd != "" && previous.Cwd != summary.Cwd
+		// A parse that already wrote the new workspace still left the old
+		// workspace's identity snapshot behind.
+		parsedCwd, parsedChange := e.takeExternalWorkspaceChange(id)
+		parsedWorkspaceChange := parsedChange && !cwdChanged &&
+			summary.Cwd != "" && parsedCwd == summary.Cwd
+		workspaceChange := cwdChanged || rebuildWorkspaceChange || parsedWorkspaceChange
 		parentID := ""
 		if summary.ParentConversationID != "" {
 			parentID = prefix + summary.ParentConversationID
 		}
-		parentChanged := parentID != "" && session.ParentSessionID == ""
+		// The native parent source is the parser parent; a launcher link may
+		// already fill the effective parent and must not hide a native one.
+		parentChanged := parentID != "" && session.ParserParentSessionID == ""
 		// A workspace stored before its identity was recorded completely
 		// (or by an older build) still needs a publishable snapshot.
 		// In a rebuild the metadata copy puts the old archive's snapshot back,
 		// so a placeholder there needs the repair even when the fresh parse
 		// already recorded a complete identity.
-		identityRepair := summary.Cwd != "" && !cwdChanged && !rebuildWorkspaceChange &&
+		identityRepair := summary.Cwd != "" && !workspaceChange &&
 			(session.IdentityNeedsRepair || previous.IdentityNeedsRepair)
 
-		if !titleChanged && !cwdChanged && !parentChanged && !identityRepair && !rebuildWorkspaceChange {
+		if !titleChanged && !workspaceChange && !parentChanged && !identityRepair {
 			continue
 		}
 		targetCwd := session.Cwd
@@ -146,7 +155,7 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		}
 		// Only a changed workspace is rewritten, so a rename alone never
 		// replaces the stored project.
-		if cwdChanged || identityRepair || rebuildWorkspaceChange {
+		if workspaceChange || identityRepair {
 			update.cwd = summary.Cwd
 			update.project = summary.Project
 			update.identityOnly = identityRepair

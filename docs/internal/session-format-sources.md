@@ -3992,16 +3992,20 @@ schemas keep their existing ordering behavior.
     parse marks it absent and sync keeps the stored working directory, parent
     and parser-time project label (from the session's identity snapshot)
     before the cwd allow-list judges the session, in ordinary syncs and
-    rebuilds alike. A parse whose workspace differs from a stored one keeps
-    the stored workspace and leaves the change to reconciliation. An
+    rebuilds alike. A parse whose workspace differs from a stored one writes
+    the new workspace, so the cwd allow-list judges the workspace the row
+    will store; reconciliation then replaces the old workspace's identity
+    snapshot. An
     unchanged workspace that can no longer be probed (its checkout is gone)
     keeps the stored project instead of a directory-name fallback. Worktree
     mappings then apply as for any write.
   - **Reconciliation** runs after parsing on every sync pass, including
     usage-only archives (which keep no titles), and an explicit
     single-session refresh reconciles that session too. It copies a changed
-    workspace or a parent onto stored sessions (a parent only when none is
-    stored), so existing archives pick them up without a parser resync. A
+    workspace or a parent onto stored sessions (a native parent only when the
+    session has no parser parent; it then takes precedence over a launcher
+    link, as a reparse would), so existing archives pick them up without a
+    parser resync. A
     changed workspace takes its project through active worktree mappings and replaces
     the identity snapshot recorded for the old workspace, republishing the
     affected aggregate evidence under the project each session stores (so a

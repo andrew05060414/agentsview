@@ -2795,9 +2795,11 @@ func (db *DB) refreshNativeSessionSummary(
 	if err != nil {
 		return fmt.Errorf("checking session %s: %w", id, err)
 	}
-	// A new parent turns the row into a subagent, so friction results computed
-	// for a root session are cleared like the session upsert and hierarchy
-	// linking paths do. An identity-only repair leaves the row untouched.
+	// The native parent is the parser parent: it applies whenever none is
+	// recorded and takes precedence over a launcher link already filling the
+	// effective parent, as a reparse would. A moved parent turns the row into a
+	// subagent, so friction results computed for it are cleared like the
+	// session upsert and hierarchy linking paths do. An identity-only repair leaves the row untouched.
 	updatesRow := summary.UpdateTitle || cwd != "" || project != "" || parentSessionID != ""
 	if updatesRow {
 		_, err = tx.ExecContext(ctx,
@@ -2806,21 +2808,22 @@ func (db *DB) refreshNativeSessionSummary(
 		     cwd = CASE WHEN ? != '' THEN ? ELSE cwd END,
 		     project = CASE WHEN ? != '' THEN ? ELSE project END,
 		     parent_session_id = CASE
-		         WHEN ? != '' AND (parent_session_id IS NULL OR parent_session_id = '')
+		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
 		         THEN ? ELSE parent_session_id END,
 		     parser_parent_session_id = CASE
-		         WHEN ? != '' AND (parser_parent_session_id IS NULL OR parser_parent_session_id = '')
+		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
 		         THEN ? ELSE parser_parent_session_id END,
 		     relationship_type = CASE
-		         WHEN ? != '' AND (parent_session_id IS NULL OR parent_session_id = '')
-		              AND (relationship_type IS NULL OR relationship_type = '')
+		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
+		              AND COALESCE(relationship_type, '') = ''
 		         THEN 'subagent' ELSE relationship_type END,
 		     parser_relationship_type = CASE
-		         WHEN ? != '' AND (parser_parent_session_id IS NULL OR parser_parent_session_id = '')
-		              AND (parser_relationship_type IS NULL OR parser_relationship_type = '')
+		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
+		              AND COALESCE(parser_relationship_type, '') = ''
 		         THEN 'subagent' ELSE parser_relationship_type END,
 		     friction_rules_version = CASE
-		         WHEN ? != '' AND (parent_session_id IS NULL OR parent_session_id = '')
+		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
+		              AND parent_session_id IS NOT ?
 		         THEN '' ELSE friction_rules_version END,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = ? AND (? OR deleted_at IS NULL)`,
@@ -2831,7 +2834,7 @@ func (db *DB) refreshNativeSessionSummary(
 			parentSessionID, parentSessionID,
 			parentSessionID,
 			parentSessionID,
-			parentSessionID,
+			parentSessionID, parentSessionID,
 			id, includeTrashed,
 		)
 		if err != nil {

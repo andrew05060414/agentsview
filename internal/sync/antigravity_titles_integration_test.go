@@ -713,7 +713,7 @@ func TestAntigravitySingleSessionRefreshAppliesWorkspaceChange(t *testing.T) {
 	transcript := dbtest.WriteAntigravityTitleTranscript(t, root, "hello")
 	setAntigravitySummary(t, root, "Title", antigravityWorkspaceURIs(first), "")
 	archive := dbtest.OpenTestDB(t)
-	engine := newAntigravityTitleEngine(t, archive, root)
+	engine := newNativeTitleEngine(t, archive, parser.AgentAntigravity, root)
 	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
 	id := "antigravity:" + dbtest.AntigravityTitleID
 
@@ -743,7 +743,7 @@ func TestAntigravityRepairsRootedPlaceholderIdentity(t *testing.T) {
 			store := setAntigravitySummary(t, root, "Title", antigravityWorkspaceURIs(workspace), "")
 			archivePath := filepath.Join(t.TempDir(), "archive.db")
 			archive := dbtest.OpenTestDBAt(t, archivePath)
-			engine := newAntigravityTitleEngine(t, archive, root)
+			engine := newNativeTitleEngine(t, archive, parser.AgentAntigravity, root)
 			require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
 			id := "antigravity:" + dbtest.AntigravityTitleID
 
@@ -782,4 +782,76 @@ func TestAntigravityRepairsRootedPlaceholderIdentity(t *testing.T) {
 			assert.Equal(t, "synthetic_workspace", observations[0].Project)
 		})
 	}
+}
+
+func TestAntigravityWorkspaceMovingIntoCwdFilterWritesTranscript(t *testing.T) {
+	for _, mode := range []string{"single-refresh", "sync-paths"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			excluded := filepath.Join(t.TempDir(), "synthetic-excluded")
+			allowedRoot := t.TempDir()
+			allowed := filepath.Join(allowedRoot, "synthetic-allowed")
+			transcript := dbtest.WriteAntigravityTitleTranscript(t, root, "hello")
+			store := setAntigravitySummary(t, root, "Title", antigravityWorkspaceURIs(excluded), "")
+			archive := dbtest.OpenTestDB(t)
+			// Stored before the allow-list was configured.
+			require.NoError(t, newNativeTitleEngine(t, archive, parser.AgentAntigravity, root).SyncPathsContext(t.Context(), []string{transcript}))
+			require.Equal(t, filepath.Clean(excluded), antigravityStoredSession(t, archive).Cwd)
+
+			engine := sync.NewEngine(t.Context(), archive, sync.EngineConfig{
+				AgentDirs:          map[parser.AgentType][]string{parser.AgentAntigravity: {root}},
+				Machine:            "host-a",
+				IncludeCwdPrefixes: []string{allowedRoot},
+			})
+			t.Cleanup(engine.Close)
+			setAntigravitySummary(t, root, "Title", antigravityWorkspaceURIs(allowed), "")
+			dbtest.WriteAntigravityTitleTranscript(t, root, "hello again")
+			id := "antigravity:" + dbtest.AntigravityTitleID
+			if mode == "single-refresh" {
+				require.NoError(t, engine.SyncSingleSessionContext(t.Context(), id))
+			} else {
+				require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript, store}))
+			}
+
+			session := antigravityStoredSession(t, archive)
+			require.NotNil(t, session.FirstMessage)
+			assert.Equal(t, "hello again", *session.FirstMessage,
+				"admission follows the workspace the write stores")
+			assert.Equal(t, filepath.Clean(allowed), session.Cwd)
+			assert.Equal(t, "synthetic_allowed", session.Project)
+			snapshots, err := archive.ListPublishableSessionProjectIdentitySnapshots(t.Context(), []string{id}, nil, nil)
+			require.NoError(t, err)
+			require.Len(t, snapshots, 1)
+			assert.True(t, strings.EqualFold(filepath.Clean(allowed), filepath.Clean(filepath.FromSlash(snapshots[0].RootPath))),
+				"the old workspace's identity is replaced: %s", snapshots[0].RootPath)
+		})
+	}
+}
+
+func TestAntigravityNativeParentOverridesLauncherLink(t *testing.T) {
+	root := t.TempDir()
+	transcript := dbtest.WriteAntigravityTitleTranscript(t, root, "hello")
+	archive := dbtest.OpenTestDB(t)
+	engine := newNativeTitleEngine(t, archive, parser.AgentAntigravity, root)
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
+	id := "antigravity:" + dbtest.AntigravityTitleID
+	for _, other := range []string{"launcher-session", "antigravity:synthetic-parent"} {
+		require.NoError(t, archive.UpsertSession(t.Context(), db.Session{
+			ID: other, Project: "p", Machine: "host-a", Agent: string(parser.AgentAntigravity), MessageCount: 1,
+		}))
+	}
+	_, err := archive.SetSessionExternalParent(t.Context(), id, "launcher-session")
+	require.NoError(t, err)
+	require.Equal(t, new("launcher-session"), antigravityStoredSession(t, archive).ParentSessionID)
+
+	store := setAntigravitySummary(t, root, "Title", "", "synthetic-parent")
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{store}))
+	after := antigravityStoredSession(t, archive)
+	assert.Equal(t, new("antigravity:synthetic-parent"), after.ParentSessionID,
+		"a native parent from the store takes precedence over the launcher link")
+
+	// A reparse of the transcript reaches the same hierarchy.
+	dbtest.WriteAntigravityTitleTranscript(t, root, "hello again")
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
+	assert.Equal(t, new("antigravity:synthetic-parent"), antigravityStoredSession(t, archive).ParentSessionID)
 }
