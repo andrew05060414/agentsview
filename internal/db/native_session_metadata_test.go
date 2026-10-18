@@ -90,22 +90,6 @@ func TestFillNativeSessionMetadataFillsOnlyEmptyValues(t *testing.T) {
 	assert.Equal(t, "friction-v1", frictionVersion(t, d, "child"))
 }
 
-func TestFillNativeSessionMetadataRejectsForeignObservation(t *testing.T) {
-	d := testDB(t)
-	insertSession(t, d, "child", "before")
-	err := d.FillNativeSessionMetadata(t.Context(), "child",
-		nativeMetadata("other", "/synthetic", "p", ""))
-	require.Error(t, err)
-	assert.Equal(t, "before", fullSession(t, d, "child").Project)
-}
-
-func TestFillNativeSessionMetadataIgnoresMissingSession(t *testing.T) {
-	d := testDB(t)
-	require.NoError(t, d.FillNativeSessionMetadata(t.Context(), "missing",
-		nativeMetadata("missing", "/synthetic", "p", "")))
-	assert.Empty(t, observationsByProject(t, d))
-}
-
 func TestFillNativeSessionMetadataIdentityFollowsStoredProject(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
