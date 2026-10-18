@@ -80,7 +80,8 @@ The latest release is
   conversations whose transcript is gone. Names set in AgentsView still win.
   The same file also supplies each conversation's workspace folder and parent
   conversation, so Antigravity sessions group under their project and
-  sub-conversations link to their parent.
+  sub-conversations link to their parent. A workspace or parent already
+  recorded is kept; later changes to it in Antigravity are not followed yet.
 - See costs for each Hermes cron job in the `hermes-cron` Usage drill-down.
   Renamed runs and continuations stay together through recorded parent links.
   Each job shows its latest recorded name in the selected range, including on

@@ -425,7 +425,9 @@ Antigravity sessions show the conversation title Antigravity saves in
 `conversation_summaries.db`. Renames appear shortly after that file changes,
 or on the next `agentsview sync`. Names set in AgentsView still win. The same
 file also gives each session its workspace folder, which sets the project, and
-its parent conversation when it has one.
+its parent conversation when it has one. AgentsView records these once: a
+workspace or parent already recorded is kept even if Antigravity later changes
+or drops it.
 
 When a session has a native resume target, the sidebar also exposes a direct
 native session link so supported agents can reopen their own session instead of
