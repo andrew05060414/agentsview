@@ -121,3 +121,72 @@ func TestAntigravityStoreSummariesWithWorkspace(t *testing.T) {
 	assert.Equal(t, "antigravity:"+parentID, sess.ParentSessionID)
 	assert.Equal(t, RelSubagent, sess.RelationshipType)
 }
+
+func TestExtractAntigravityWorkspace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "empty column", raw: "", want: ""},
+		{name: "empty array", raw: "[]", want: ""},
+		{name: "json null", raw: "null", want: ""},
+		{name: "json empty string", raw: `""`, want: ""},
+		{name: "json blank string", raw: `"  "`, want: ""},
+		{name: "json string uri", raw: `"file:///srv/synthetic"`, want: filepath.Clean(filepath.FromSlash("/srv/synthetic"))},
+		{name: "array skips blank uris", raw: `["", "file:///srv/synthetic"]`, want: filepath.Clean(filepath.FromSlash("/srv/synthetic"))},
+		{name: "raw path fallback", raw: "/srv/raw-synthetic", want: filepath.Clean(filepath.FromSlash("/srv/raw-synthetic"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, extractAntigravityWorkspace(tc.raw))
+		})
+	}
+}
+
+func TestApplyAntigravitySummaryMarksAbsentMetadata(t *testing.T) {
+	const id = "synthetic-conv-uuid-2"
+	writeStore := func(t *testing.T, root, workspace, parent string) {
+		t.Helper()
+		conn, err := sql.Open("sqlite3", filepath.Join(root, AntigravitySummariesDBName))
+		require.NoError(t, err)
+		defer conn.Close()
+		_, err = conn.ExecContext(t.Context(), `CREATE TABLE conversation_summaries (
+			conversation_id TEXT PRIMARY KEY, title TEXT,
+			workspace_uris TEXT NOT NULL DEFAULT '',
+			parent_conversation_id TEXT NOT NULL DEFAULT '')`)
+		require.NoError(t, err)
+		_, err = conn.ExecContext(t.Context(),
+			`INSERT INTO conversation_summaries VALUES (?, 'Title', ?, ?)`,
+			id, workspace, parent)
+		require.NoError(t, err)
+	}
+	for _, tc := range []struct {
+		name          string
+		workspace     string
+		parent        string
+		noStore       bool
+		keepWorkspace bool
+		keepParent    bool
+	}{
+		{name: "metadata present", workspace: `["file:///srv/synthetic"]`, parent: "parent-1"},
+		{name: "blank metadata", keepWorkspace: true, keepParent: true},
+		{name: "json empty string workspace", workspace: `""`, parent: "parent-1", keepWorkspace: true},
+		{name: "no store", noStore: true, keepWorkspace: true, keepParent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if !tc.noStore {
+				writeStore(t, root, tc.workspace, tc.parent)
+			}
+			sess := &ParsedSession{ID: antigravityIDPrefix + id, Agent: AgentAntigravity}
+			applyAntigravitySummary(t.Context(), sess, antigravitySource{Root: root, ID: id})
+			assert.Equal(t, tc.keepWorkspace, sess.KeepStoredWorkspace)
+			assert.Equal(t, tc.keepParent, sess.KeepStoredParent)
+			if tc.keepWorkspace {
+				assert.Empty(t, sess.Cwd)
+			} else {
+				assert.NotEmpty(t, sess.Cwd)
+			}
+		})
+	}
+}

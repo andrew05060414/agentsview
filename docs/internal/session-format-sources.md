@@ -3980,12 +3980,22 @@ schemas keep their existing ordering behavior.
   session's working directory (percent-decoding, Windows drive letters,
   `localhost` and UNC hosts handled) and the project is derived from it; a
   non-empty parent ID links the session to that conversation as a subagent.
-  At parse time the store only fills an empty working directory, project or
-  parent. Each sync pass also copies a changed workspace or parent onto stored
-  sessions (a parent only when none is stored), so existing archives pick them
-  up without a parser resync, and an empty or missing value never clears
+  A JSON string value, even a blank one, is read as that URI; only text that
+  is not JSON is read as a raw path. At parse time the store only fills an
+  empty working directory, project or parent. When neither the transcript nor
+  the store supplies one (blank value, missing row or column, unreadable
+  store), the parse marks it absent and sync keeps the stored working
+  directory, project and parent, in ordinary syncs and rebuilds alike. Each
+  sync pass also copies a changed workspace or parent onto stored sessions (a
+  parent only when none is stored), so existing archives pick them up without
+  a parser resync; a rebuild replays these changes onto archived sessions
+  without a transcript after the orphan copy. A copied workspace takes its
+  project through active worktree mappings and records a complete project
+  identity snapshot, a rename alone leaves the project untouched, and a new
+  parent clears stale friction results. An empty or missing value never clears
   stored data.
-  Checked 2026-10-17 with synthetic stores covering the URI shapes above and
+  Checked 2026-10-17 with synthetic stores covering the URI shapes above,
+  blank and JSON-empty-string values, missing rows, unreadable stores, and
   stores that lack the optional columns.
 
 ## Antigravity CLI (`antigravity-cli`)

@@ -86,34 +86,17 @@ func readAntigravitySummaries(ctx context.Context, path string) (map[string]Anti
 	}
 	defer store.Close()
 
-	// Inspect available columns so stores without workspace_uris or
-	// parent_conversation_id still yield titles.
-	rows, err := store.QueryContext(ctx, "PRAGMA table_info(conversation_summaries)")
+	var tableExists bool
+	if err := store.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversation_summaries')`).Scan(&tableExists); err != nil {
+		return nil, err
+	}
+	if !tableExists {
+		// Same as the shared title reader: a database without the summaries
+		// table is empty metadata, not a failed read.
+		return nil, nil
+	}
+	hasWorkspace, hasParent, err := antigravitySummaryColumns(ctx, store)
 	if err != nil {
-		return nil, err
-	}
-	hasWorkspace := false
-	hasParent := false
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull, pk int
-		var dfltValue sql.NullString
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		if name == "workspace_uris" {
-			hasWorkspace = true
-		} else if name == "parent_conversation_id" {
-			hasParent = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 
@@ -173,6 +156,32 @@ func readAntigravitySummaries(ctx context.Context, path string) (map[string]Anti
 	return summaries, nil
 }
 
+// antigravitySummaryColumns reports which optional columns the store has, so
+// older schemas without workspace_uris or parent_conversation_id still work.
+func antigravitySummaryColumns(ctx context.Context, store *sql.DB) (hasWorkspace, hasParent bool, err error) {
+	rows, err := store.QueryContext(ctx, "PRAGMA table_info(conversation_summaries)")
+	if err != nil {
+		return false, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return false, false, err
+		}
+		switch name {
+		case "workspace_uris":
+			hasWorkspace = true
+		case "parent_conversation_id":
+			hasParent = true
+		}
+	}
+	return hasWorkspace, hasParent, rows.Err()
+}
+
 // parseAntigravityWorkspaceURI decodes a file:// URI into a clean filesystem path.
 // It handles percent-encoded characters, Windows drive letters with leading slashes,
 // UNC network shares (file://server/share), and localhost authority.
@@ -218,8 +227,10 @@ func extractAntigravityWorkspace(workspaceURIsJSON string) string {
 	}
 	var uris []string
 	if err := json.Unmarshal([]byte(workspaceURIsJSON), &uris); err != nil {
+		// A decoded JSON string is authoritative even when blank; only text
+		// that is not JSON at all falls back to being read as a raw path.
 		var singleURI string
-		if jsonErr := json.Unmarshal([]byte(workspaceURIsJSON), &singleURI); jsonErr == nil && singleURI != "" {
+		if jsonErr := json.Unmarshal([]byte(workspaceURIsJSON), &singleURI); jsonErr == nil {
 			return parseAntigravityWorkspaceURI(singleURI)
 		}
 		return parseAntigravityWorkspaceURI(workspaceURIsJSON)
@@ -254,8 +265,14 @@ func applyAntigravityTitle(ctx context.Context, sess *ParsedSession, src antigra
 
 // applyAntigravitySummary sets the session's title, cwd, project, and parent from its root's store.
 // An unreadable store or missing entry leaves no title signal, so the stored
-// name survives the write.
+// name survives the write. A parse that ends without a workspace or parent
+// marks those fields as absent signals, so sync keeps the stored values
+// instead of clearing them.
 func applyAntigravitySummary(ctx context.Context, sess *ParsedSession, src antigravitySource) {
+	defer func() {
+		sess.KeepStoredWorkspace = sess.Cwd == ""
+		sess.KeepStoredParent = sess.ParentSessionID == ""
+	}()
 	summaries, _, err := AntigravityStoreSummaries(ctx, filepath.Join(src.Root, AntigravitySummariesDBName))
 	if err != nil {
 		return

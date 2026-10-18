@@ -587,6 +587,10 @@ type Engine struct {
 	// sessions that reach the replacement only through the orphan copy.
 	// Agents share it because every key carries its own agent prefix.
 	deferredNativeTitles map[string]*string
+	// deferredAntigravitySummaries holds rebuild title, workspace, and parent
+	// changes for archived Antigravity sessions. Qoder titles stay in
+	// deferredNativeTitles.
+	deferredAntigravitySummaries map[string]deferredAntigravitySummary
 	// Providers have distinct title-store paths, checked only while enabled.
 	appliedNativeTitles map[string]appliedNativeTitleStore
 	// sourceSet holds the provider set and session roots this engine
@@ -3500,6 +3504,9 @@ func (e *Engine) resyncBuildLocked(
 	deferredTitles := make(map[string]*string)
 	e.deferredNativeTitles = deferredTitles
 	defer func() { e.deferredNativeTitles = nil }()
+	deferredSummaries := make(map[string]deferredAntigravitySummary)
+	e.deferredAntigravitySummaries = deferredSummaries
+	defer func() { e.deferredAntigravitySummaries = nil }()
 	e.db = newDB
 	reportResyncPhase(
 		PhaseDiscovering,
@@ -3549,6 +3556,7 @@ func (e *Engine) resyncBuildLocked(
 		contributorEngine.archiveRebuildIndex = archiveIndex
 		contributorEngine.deferredSourceCwd = deferredSourceCwd
 		contributorEngine.deferredNativeTitles = deferredTitles
+		contributorEngine.deferredAntigravitySummaries = deferredSummaries
 		contributorEngine.forceFullParse = contributor.ForceParse ||
 			contributor.ForceFullParseAfterCache
 		contributorEngine.forceFullParseAllowsCache =
@@ -3824,6 +3832,17 @@ func (e *Engine) resyncBuildLocked(
 			e.mu.Unlock()
 			return stats, fmt.Errorf("apply deferred native title: %w", err)
 		}
+	}
+	if err := e.applyDeferredAntigravitySummaries(ctx, newDB, deferredSummaries); err != nil {
+		stats.RecordFailed()
+		stats.Aborted = true
+		newDB.Close()
+		removeTempDB(tempPath)
+		restoreSkipCache()
+		e.mu.Lock()
+		e.lastSyncStats = stats
+		e.mu.Unlock()
+		return stats, fmt.Errorf("apply deferred antigravity summary: %w", err)
 	}
 	deferredCwdUpdated, err := e.applyDeferredSourceCwd(ctx,
 		newDB, deferredSourceCwd,
@@ -17999,6 +18018,9 @@ func (e *Engine) normalizePendingWriteMachines(
 						batch[i].sess.SessionName = *stored.SessionName
 					}
 				}
+				if !batch[i].sourceIdentityUnverified {
+					e.keepStoredExternalSessionMetadata(ctx, &batch[i].sess, stored)
+				}
 			}
 			continue
 		}
@@ -18012,6 +18034,34 @@ func (e *Engine) normalizePendingWriteMachines(
 		}
 	}
 	return batch, nil
+}
+
+// keepStoredExternalSessionMetadata carries the stored working directory and
+// parent link into a parse whose provider keeps them outside the transcript
+// and supplied none this time, so the upsert does not clear them. It runs in
+// both ordinary syncs and rebuilds, before worktree mapping and cwd filtering
+// see the session. The project is derived from the kept directory the same way
+// the parser derives it from a supplied one; an explicit project still wins.
+func (e *Engine) keepStoredExternalSessionMetadata(
+	ctx context.Context,
+	sess *parser.ParsedSession,
+	stored db.SessionWriteIdentity,
+) {
+	if sess.KeepStoredWorkspace && sess.Cwd == "" && stored.Cwd != "" {
+		sess.Cwd = stored.Cwd
+		if sess.Project == "" {
+			sess.Project = parser.ExtractProjectFromCwdWithBranchContext(
+				e.parsePolicyContext(ctx), stored.Cwd, sess.GitBranch,
+			)
+		}
+	}
+	if sess.KeepStoredParent && sess.ParentSessionID == "" &&
+		stored.ParserParentSessionID != "" {
+		sess.ParentSessionID = stored.ParserParentSessionID
+		if sess.RelationshipType == "" {
+			sess.RelationshipType = parser.RelSubagent
+		}
+	}
 }
 
 type writeBatchOutcome struct {

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/lockctx"
 	"go.kenn.io/agentsview/internal/parser"
 )
@@ -2704,33 +2705,48 @@ func (db *DB) RefreshNativeSessionName(ctx context.Context, id string, sessionNa
 	return db.refreshSessionName(ctx, id, sessionName, true)
 }
 
-// RefreshNativeSessionSummary updates the native session title, cwd, project, and parent
-// owned by the agent's external metadata store (e.g. Antigravity conversation_summaries.db).
-// It updates trashed rows as well so a restore displays the current title and workspace.
+// NativeSessionSummary is session metadata owned by an agent's external
+// metadata store (e.g. Antigravity conversation_summaries.db). Empty Cwd,
+// Project, or ParentSessionID values leave the stored fields unchanged.
+type NativeSessionSummary struct {
+	SessionName *string
+	// UpdateTitle applies SessionName, including a nil (cleared) title.
+	UpdateTitle bool
+	Cwd         string
+	// Project is the effective project after worktree mappings.
+	Project string
+	// ParentSessionID links the session as a subagent when no parent is stored.
+	ParentSessionID string
+	// IdentityObservation, when its Project is set, records the workspace's
+	// project identity through the same normalization and persistence the
+	// session write path uses, so the snapshot is complete and publishable.
+	IdentityObservation export.ProjectIdentityObservation
+	// IdentitySnapshotProject labels the parser-time snapshot.
+	IdentitySnapshotProject string
+}
+
+// RefreshNativeSessionSummary applies the native title, workspace, project,
+// and parent owned by the agent's external metadata store. It updates trashed
+// rows as well so a restore displays the current title and workspace.
 func (db *DB) RefreshNativeSessionSummary(
-	ctx context.Context,
-	id string,
-	sessionName *string,
-	updateTitle bool,
-	cwd, project string,
-	parentSessionID string,
+	ctx context.Context, id string, summary NativeSessionSummary,
 ) error {
-	return db.refreshNativeSessionSummary(ctx, id, sessionName, updateTitle, cwd, project, parentSessionID, true)
+	return db.refreshNativeSessionSummary(ctx, id, summary, true)
 }
 
 func (db *DB) refreshSessionName(ctx context.Context, id string, sessionName *string, includeTrashed bool) error {
-	return db.refreshNativeSessionSummary(ctx, id, sessionName, true, "", "", "", includeTrashed)
+	return db.refreshNativeSessionSummary(ctx, id, NativeSessionSummary{
+		SessionName: sessionName, UpdateTitle: true,
+	}, includeTrashed)
 }
 
 func (db *DB) refreshNativeSessionSummary(
 	ctx context.Context,
 	id string,
-	sessionName *string,
-	updateTitle bool,
-	cwd, project string,
-	parentSessionID string,
+	summary NativeSessionSummary,
 	includeTrashed bool,
 ) error {
+	sessionName := summary.SessionName
 	if db.usageOnlyStorage() {
 		sessionName = nil
 	}
@@ -2740,6 +2756,22 @@ func (db *DB) refreshNativeSessionSummary(
 		sanitizeStringField(&clean, &stats)
 		sessionName = &clean
 	}
+	cwd, project, parentSessionID := summary.Cwd, summary.Project, summary.ParentSessionID
+	identity := summary.IdentityObservation
+	hasIdentity := strings.TrimSpace(identity.Project) != ""
+	if hasIdentity {
+		normalized, err := normalizeProjectIdentityObservation(identity)
+		if err != nil {
+			return err
+		}
+		if normalized.SessionID != id {
+			return fmt.Errorf(
+				"identity observation session id %q does not match session id %q",
+				normalized.SessionID, id,
+			)
+		}
+		identity = normalized
+	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -2748,6 +2780,20 @@ func (db *DB) refreshNativeSessionSummary(
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var previousProject string
+	err = tx.QueryRowContext(ctx,
+		`SELECT project FROM sessions WHERE id = ? AND (? OR deleted_at IS NULL)`,
+		id, includeTrashed,
+	).Scan(&previousProject)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking session %s: %w", id, err)
+	}
+	// A new parent turns the row into a subagent, so friction results computed
+	// for a root session are cleared like the session upsert and hierarchy
+	// linking paths do.
 	_, err = tx.ExecContext(ctx,
 		`UPDATE sessions
 		 SET session_name = CASE WHEN ? THEN ? ELSE session_name END,
@@ -2767,13 +2813,17 @@ func (db *DB) refreshNativeSessionSummary(
 		         WHEN ? != '' AND (parser_parent_session_id IS NULL OR parser_parent_session_id = '')
 		              AND (parser_relationship_type IS NULL OR parser_relationship_type = '')
 		         THEN 'subagent' ELSE parser_relationship_type END,
+		     friction_rules_version = CASE
+		         WHEN ? != '' AND (parent_session_id IS NULL OR parent_session_id = '')
+		         THEN '' ELSE friction_rules_version END,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = ? AND (? OR deleted_at IS NULL)`,
-		updateTitle, sessionName,
+		summary.UpdateTitle, sessionName,
 		cwd, cwd,
 		project, project,
 		parentSessionID, parentSessionID,
 		parentSessionID, parentSessionID,
+		parentSessionID,
 		parentSessionID,
 		parentSessionID,
 		id, includeTrashed,
@@ -2781,25 +2831,26 @@ func (db *DB) refreshNativeSessionSummary(
 	if err != nil {
 		return err
 	}
-	if cwd != "" || project != "" {
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO session_project_identity_snapshots (
-				session_id, project, machine, root_path, worktree_relationship,
-				checkout_state, git_branch, remote_resolution, observed_at
-			) SELECT id, project, machine, cwd, 'unknown',
-			         CASE WHEN git_branch != '' THEN 'branch' ELSE 'unknown' END,
-			         git_branch, 'unknown', strftime('%Y-%m-%dT%H:%M:%fZ','now')
-			  FROM sessions WHERE id = ?
-			ON CONFLICT(session_id) DO UPDATE SET
-				project = CASE WHEN excluded.project != '' THEN excluded.project ELSE session_project_identity_snapshots.project END,
-				root_path = CASE WHEN excluded.root_path != '' THEN excluded.root_path ELSE session_project_identity_snapshots.root_path END,
-				observed_at = excluded.observed_at
-			WHERE (session_project_identity_snapshots.project = '' OR session_project_identity_snapshots.project IS NULL)
-			   OR (session_project_identity_snapshots.root_path = '' OR session_project_identity_snapshots.root_path IS NULL)`,
-			id,
-		)
-		if err != nil {
+	if hasIdentity {
+		if err := upsertProjectIdentityObservationWithSnapshotProjectTx(
+			tx, identity, summary.IdentitySnapshotProject, false, true,
+		); err != nil {
 			return err
+		}
+	}
+	if project != "" {
+		var currentProject string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT project FROM sessions WHERE id = ?`, id,
+		).Scan(&currentProject); err != nil {
+			return fmt.Errorf("reading refreshed project for %s: %w", id, err)
+		}
+		if currentProject != previousProject {
+			if err := reconcileSessionProjectIdentityAggregatesTx(
+				ctx, tx, id, []string{previousProject, currentProject},
+			); err != nil {
+				return err
+			}
 		}
 	}
 	if db.usageOnlyStorage() {
@@ -4446,15 +4497,19 @@ func (db *DB) ListStaleForkSessionIDsByFilePath(ctx context.Context,
 const sessionMachineBatchSize = 500
 
 // SessionWriteIdentity is the stored state used to preserve immutable source
-// attribution and parser-owned Codex titles across session writes and rebuilds.
+// attribution, parser-owned titles, and provider metadata kept outside the
+// transcript (working directory and parent link) across session writes and
+// rebuilds.
 type SessionWriteIdentity struct {
-	Machine         string
-	Agent           string
-	Cwd             string
-	FilePath        string
-	FileHash        string
-	SessionName     *string
-	ParentSessionID string
+	Machine               string
+	Agent                 string
+	Cwd                   string
+	GitBranch             string
+	FilePath              string
+	FileHash              string
+	SessionName           *string
+	ParentSessionID       string
+	ParserParentSessionID string
 }
 
 // ListSessionWriteIdentitiesByID returns stored source attribution and parser
@@ -4492,8 +4547,10 @@ func (db *DB) ListSessionWriteIdentitiesByID(
 			}
 			rows, err := db.getReader().QueryContext(ctx, `
 			SELECT id, machine, agent, COALESCE(cwd, ''),
+			       COALESCE(git_branch, ''),
 			       COALESCE(file_path, ''), COALESCE(file_hash, ''),
-			       session_name, COALESCE(parent_session_id, '')
+			       session_name, COALESCE(parent_session_id, ''),
+			       COALESCE(parser_parent_session_id, '')
 			FROM sessions
 			WHERE id IN (`+placeholders+`)
 			ORDER BY id`, args...)
@@ -4506,8 +4563,9 @@ func (db *DB) ListSessionWriteIdentitiesByID(
 				var identity SessionWriteIdentity
 				if err := rows.Scan(
 					&id, &identity.Machine, &identity.Agent, &identity.Cwd,
+					&identity.GitBranch,
 					&identity.FilePath, &identity.FileHash, &identity.SessionName,
-					&identity.ParentSessionID,
+					&identity.ParentSessionID, &identity.ParserParentSessionID,
 				); err != nil {
 					_ = rows.Close()
 					return fmt.Errorf(

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -303,5 +304,160 @@ func TestAntigravitySummariesSyncWorkspaceAndProject(t *testing.T) {
 	).Scan(&snapProject, &snapRoot)
 	require.NoError(t, err)
 	assert.Equal(t, "synthetic_workspace", snapProject)
-	assert.Equal(t, filepath.Clean(filepath.FromSlash("d:/synthetic-workspace")), snapRoot)
+	// The root is stored in its normalized form, as for parsed writes.
+	assert.True(t, strings.EqualFold(filepath.Clean(filepath.FromSlash("d:/synthetic-workspace")), filepath.Clean(filepath.FromSlash(snapRoot))), snapRoot)
+
+	// The snapshot is complete, so mirrors and reporting exports publish it.
+	publishable, err := archive.ListPublishableSessionProjectIdentitySnapshots(
+		t.Context(), []string{sessionID}, nil, nil,
+	)
+	require.NoError(t, err)
+	require.Len(t, publishable, 1)
+	assert.NotEmpty(t, publishable[0].KeySource)
+	assert.NotEmpty(t, publishable[0].Key)
+}
+
+// setAntigravitySummary writes a conversation_summaries row with the optional
+// workspace and parent columns the Antigravity desktop app records.
+func setAntigravitySummary(t *testing.T, root, title, workspaceURIs, parent string) string {
+	t.Helper()
+	store := filepath.Join(root, parser.AntigravitySummariesDBName)
+	conn, err := sql.Open("sqlite3", store)
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.ExecContext(t.Context(), `CREATE TABLE IF NOT EXISTS conversation_summaries (
+		conversation_id TEXT PRIMARY KEY,
+		title TEXT,
+		workspace_uris TEXT NOT NULL DEFAULT '',
+		parent_conversation_id TEXT NOT NULL DEFAULT ''
+	)`)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(),
+		`INSERT INTO conversation_summaries VALUES (?, ?, ?, ?)
+		 ON CONFLICT(conversation_id) DO UPDATE SET title = excluded.title,
+		     workspace_uris = excluded.workspace_uris,
+		     parent_conversation_id = excluded.parent_conversation_id`,
+		dbtest.AntigravityTitleID, title, workspaceURIs, parent,
+	)
+	require.NoError(t, err)
+	return store
+}
+
+func antigravityWorkspaceURIs(dir string) string {
+	slashed := filepath.ToSlash(dir)
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed
+	}
+	return `["file://` + slashed + `"]`
+}
+
+func antigravityStoredSession(t *testing.T, archive *db.DB) *db.Session {
+	t.Helper()
+	session, err := archive.GetSessionFull(t.Context(), "antigravity:"+dbtest.AntigravityTitleID)
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	return session
+}
+
+func TestAntigravityReparseKeepsWorkspaceWhenSummaryLosesIt(t *testing.T) {
+	for _, mode := range []string{"sync", "rebuild"} {
+		for _, variant := range []string{"blank", "json-empty-string", "row-missing", "store-unreadable"} {
+			t.Run(mode+"/"+variant, func(t *testing.T) {
+				root := t.TempDir()
+				workspace := filepath.Join(t.TempDir(), "synthetic-workspace")
+				transcript := dbtest.WriteAntigravityTitleTranscript(t, root, "hello")
+				store := setAntigravitySummary(t, root, "Title", antigravityWorkspaceURIs(workspace), "synthetic-parent")
+				archive := dbtest.OpenTestDB(t)
+				engine := newNativeTitleEngine(t, archive, parser.AgentAntigravity, root)
+				require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
+				before := antigravityStoredSession(t, archive)
+				require.Equal(t, filepath.Clean(workspace), before.Cwd)
+				require.NotEmpty(t, before.Project)
+				require.NotNil(t, before.ParentSessionID)
+
+				switch variant {
+				case "blank":
+					setAntigravitySummary(t, root, "Title", "", "")
+				case "json-empty-string":
+					setAntigravitySummary(t, root, "Title", `""`, "")
+				case "row-missing":
+					conn, err := sql.Open("sqlite3", store)
+					require.NoError(t, err)
+					_, err = conn.ExecContext(t.Context(), `DELETE FROM conversation_summaries`)
+					require.NoError(t, err)
+					require.NoError(t, conn.Close())
+				case "store-unreadable":
+					require.NoError(t, os.WriteFile(store, []byte("not a database"), 0o644))
+				}
+				dbtest.WriteAntigravityTitleTranscript(t, root, "hello again")
+				if mode == "rebuild" {
+					stats := engine.ResyncAll(t.Context(), nil)
+					require.False(t, stats.Aborted)
+				} else {
+					require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript, store}))
+				}
+
+				after := antigravityStoredSession(t, archive)
+				require.NotNil(t, after.FirstMessage)
+				assert.Equal(t, "hello again", *after.FirstMessage, "the transcript was reparsed")
+				assert.Equal(t, before.Cwd, after.Cwd)
+				assert.Equal(t, before.Project, after.Project)
+				require.NotNil(t, after.ParentSessionID)
+				assert.Equal(t, "antigravity:synthetic-parent", *after.ParentSessionID)
+				assert.Equal(t, "subagent", after.RelationshipType)
+			})
+		}
+	}
+}
+
+func TestAntigravityRebuildAppliesSummaryToSessionsWithoutTranscript(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(t.TempDir(), "synthetic-workspace")
+	transcript := dbtest.WriteAntigravityTitleTranscript(t, root, "hello")
+	archive := dbtest.OpenTestDB(t)
+	engine := newNativeTitleEngine(t, archive, parser.AgentAntigravity, root)
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
+
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "brain")))
+	// A rebuild with no live sources refuses to swap.
+	dbtest.WriteTestFile(t, filepath.Join(root, "brain", "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", ".system_generated", "logs", "transcript.jsonl"),
+		[]byte(`{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"live"}`+"\n"))
+	setAntigravitySummary(t, root, "Later", antigravityWorkspaceURIs(workspace), "synthetic-parent")
+	stats := engine.ResyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+
+	after := antigravityStoredSession(t, archive)
+	assert.Equal(t, new("Later"), after.SessionName)
+	assert.Equal(t, filepath.Clean(workspace), after.Cwd)
+	assert.Equal(t, "synthetic_workspace", after.Project)
+	require.NotNil(t, after.ParentSessionID)
+	assert.Equal(t, "antigravity:synthetic-parent", *after.ParentSessionID)
+	assert.Equal(t, "subagent", after.RelationshipType)
+}
+
+func TestAntigravitySummaryWorkspaceFollowsWorktreeMapping(t *testing.T) {
+	root := t.TempDir()
+	mapped := t.TempDir()
+	workspace := filepath.Join(mapped, "synthetic-checkout")
+	transcript := dbtest.WriteAntigravityTitleTranscript(t, root, "hello")
+	archive := dbtest.OpenTestDB(t)
+	_, err := archive.CreateWorktreeProjectMapping(t.Context(), db.WorktreeProjectMapping{
+		Machine: "host-a", PathPrefix: mapped, Project: "configured_project", Enabled: true,
+	})
+	require.NoError(t, err)
+	engine := newNativeTitleEngine(t, archive, parser.AgentAntigravity, root)
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
+	require.Empty(t, antigravityStoredSession(t, archive).Cwd)
+
+	store := setAntigravitySummary(t, root, "First", antigravityWorkspaceURIs(workspace), "")
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{store}))
+	session := antigravityStoredSession(t, archive)
+	assert.Equal(t, filepath.Clean(workspace), session.Cwd)
+	assert.Equal(t, "configured_project", session.Project, "a summary workspace takes the mapped project")
+
+	setAntigravitySummary(t, root, "Renamed", antigravityWorkspaceURIs(workspace), "")
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{store}))
+	session = antigravityStoredSession(t, archive)
+	assert.Equal(t, new("Renamed"), session.SessionName)
+	assert.Equal(t, "configured_project", session.Project, "a rename keeps the mapped project")
 }
