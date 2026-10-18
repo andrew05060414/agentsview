@@ -587,15 +587,10 @@ type Engine struct {
 	// sessions that reach the replacement only through the orphan copy.
 	// Agents share it because every key carries its own agent prefix.
 	deferredNativeTitles map[string]*string
-	// deferredAntigravitySummaries holds rebuild title, workspace, and parent
+	// deferredAntigravityChanges holds rebuild title, workspace, and parent
 	// changes for archived Antigravity sessions. Qoder titles stay in
 	// deferredNativeTitles.
-	deferredAntigravitySummaries map[string]deferredAntigravitySummary
-	// antigravityWorkspaceChanges maps session IDs to the external workspace
-	// a parse wrote over a different stored one, until reconciliation
-	// replaces the old workspace's identity snapshot.
-	antigravityWorkspaceChangesMu gosync.Mutex
-	antigravityWorkspaceChanges   map[string]string
+	deferredAntigravityChanges map[string]antigravitySessionChange
 	// Providers have distinct title-store paths, checked only while enabled.
 	appliedNativeTitles map[string]appliedNativeTitleStore
 	// sourceSet holds the provider set and session roots this engine
@@ -3509,9 +3504,9 @@ func (e *Engine) resyncBuildLocked(
 	deferredTitles := make(map[string]*string)
 	e.deferredNativeTitles = deferredTitles
 	defer func() { e.deferredNativeTitles = nil }()
-	deferredSummaries := make(map[string]deferredAntigravitySummary)
-	e.deferredAntigravitySummaries = deferredSummaries
-	defer func() { e.deferredAntigravitySummaries = nil }()
+	deferredAntigravity := make(map[string]antigravitySessionChange)
+	e.deferredAntigravityChanges = deferredAntigravity
+	defer func() { e.deferredAntigravityChanges = nil }()
 	e.db = newDB
 	reportResyncPhase(
 		PhaseDiscovering,
@@ -3561,7 +3556,7 @@ func (e *Engine) resyncBuildLocked(
 		contributorEngine.archiveRebuildIndex = archiveIndex
 		contributorEngine.deferredSourceCwd = deferredSourceCwd
 		contributorEngine.deferredNativeTitles = deferredTitles
-		contributorEngine.deferredAntigravitySummaries = deferredSummaries
+		contributorEngine.deferredAntigravityChanges = deferredAntigravity
 		contributorEngine.forceFullParse = contributor.ForceParse ||
 			contributor.ForceFullParseAfterCache
 		contributorEngine.forceFullParseAllowsCache =
@@ -3838,6 +3833,19 @@ func (e *Engine) resyncBuildLocked(
 			return stats, fmt.Errorf("apply deferred native title: %w", err)
 		}
 	}
+	for id, change := range deferredAntigravity {
+		if err := e.applyAntigravitySessionChange(ctx, newDB, id, change); err != nil {
+			stats.RecordFailed()
+			stats.Aborted = true
+			newDB.Close()
+			removeTempDB(tempPath)
+			restoreSkipCache()
+			e.mu.Lock()
+			e.lastSyncStats = stats
+			e.mu.Unlock()
+			return stats, fmt.Errorf("apply deferred antigravity title: %w", err)
+		}
+	}
 	deferredCwdUpdated, err := e.applyDeferredSourceCwd(ctx,
 		newDB, deferredSourceCwd,
 	)
@@ -3960,21 +3968,6 @@ func (e *Engine) resyncBuildLocked(
 		e.lastSyncStats = stats
 		e.mu.Unlock()
 		return stats, err
-	}
-	// Antigravity workspace, project, and parent changes found during this
-	// rebuild replay only now: the metadata copy and snapshot restore above
-	// would otherwise put back the old archive's identity and project. The
-	// worktree mapping pass below then applies to the replayed projects.
-	if err := e.applyDeferredAntigravitySummaries(ctx, newDB, deferredSummaries); err != nil {
-		stats.RecordFailed()
-		stats.Aborted = true
-		newDB.Close()
-		removeTempDB(tempPath)
-		restoreSkipCache()
-		e.mu.Lock()
-		e.lastSyncStats = stats
-		e.mu.Unlock()
-		return stats, fmt.Errorf("apply deferred antigravity summary: %w", err)
 	}
 	mappingMachines, err := ops.listActiveWorktreeMappingMachines(ctx, newDB)
 	if err != nil {
@@ -11135,8 +11128,8 @@ func (e *Engine) collectAndBatchWithOptions(
 			storedCwd:  r.sourceCwdStored,
 			storedOK:   r.sourceCwdStoredOK,
 		}
-		if err := e.keepStoredWorkspaceBeforeCwdFilter(ctx, r.results); err != nil {
-			log.Printf("restore kept workspace before cwd filter: %v", err)
+		if err := e.keepStoredExternalMetadataBeforeCwdFilter(ctx, r.results); err != nil {
+			log.Printf("keep stored external metadata: %v", err)
 			stats.RecordFailed()
 			e.noteSQLiteContainerResult(r.containerResultPath(), false)
 			r.releaseRetention()
@@ -17927,10 +17920,10 @@ type sessionWriteIdentityReader interface {
 }
 
 func (e *Engine) pendingWriteIdentity(pw pendingWrite) db.SessionWriteIdentity {
-	return e.parsedSessionWriteIdentity(pw.sess)
+	return e.parsedWriteIdentity(pw.sess)
 }
 
-func (e *Engine) parsedSessionWriteIdentity(sess parser.ParsedSession) db.SessionWriteIdentity {
+func (e *Engine) parsedWriteIdentity(sess parser.ParsedSession) db.SessionWriteIdentity {
 	return db.SessionWriteIdentity{
 		Machine:  sess.Machine,
 		Agent:    string(sess.Agent),
@@ -17939,11 +17932,11 @@ func (e *Engine) parsedSessionWriteIdentity(sess parser.ParsedSession) db.Sessio
 	}
 }
 
-// loadStoredSessionWriteIdentities reads stored attribution for ids. A
-// rebuild reads preexisting attribution from archiveStore while writing into
-// e.db. An ID first seen earlier in this rebuild is absent from the old
-// archive, so the replacement is consulted before treating it as new.
-func (e *Engine) loadStoredSessionWriteIdentities(
+// storedSessionWriteIdentities reads stored attribution for ids. A rebuild
+// reads preexisting attribution from archiveStore while writing into e.db. An
+// ID first seen earlier in this rebuild is absent from the old archive, so
+// consult the replacement before treating it as a new ingestion.
+func (e *Engine) storedSessionWriteIdentities(
 	ctx context.Context, ids []string,
 ) (map[string]db.SessionWriteIdentity, error) {
 	var archive any = e.db
@@ -17982,112 +17975,57 @@ func (e *Engine) loadStoredSessionWriteIdentities(
 	return identities, nil
 }
 
-// keepStoredWorkspaceBeforeCwdFilter restores the stored working directory
-// of parses that kept no workspace signal before the cwd allow-list judges
-// them; otherwise an empty cwd would veto the update and leave the archived
-// row (or, in a rebuild, an orphan copy) behind. Only sessions whose stored
-// attribution matches the incoming source borrow the stored values.
-func (e *Engine) keepStoredWorkspaceBeforeCwdFilter(
+// keepStoredExternalMetadata keeps a stored working directory and parent over
+// those a parse took from outside the transcript, so that store only fills
+// empty values and a blank or unreadable one never clears them. The project
+// is the stored parser-time label rather than one derived again from a
+// checkout that may be gone; worktree mappings apply as for any write.
+func keepStoredExternalMetadata(sess *parser.ParsedSession, stored db.SessionWriteIdentity) {
+	if sess.KeepStoredWorkspace && stored.Cwd != "" {
+		sess.Cwd = stored.Cwd
+		if stored.SourceProject != "" {
+			sess.Project = stored.SourceProject
+		}
+	}
+	if sess.KeepStoredParent && stored.ParserParentSessionID != "" {
+		sess.ParentSessionID = stored.ParserParentSessionID
+		if sess.RelationshipType == "" {
+			sess.RelationshipType = parser.RelSubagent
+		}
+	}
+}
+
+// keepStoredExternalMetadataBeforeCwdFilter applies keepStoredExternalMetadata
+// before the cwd allow-list judges parsed sessions, so the filter sees the
+// working directory the write will store.
+func (e *Engine) keepStoredExternalMetadataBeforeCwdFilter(
 	ctx context.Context, results []parser.ParseResult,
 ) error {
 	if e.cwdFilter.empty() {
 		return nil
 	}
-	indexes := make(map[string][]int)
-	ids := make([]string, 0)
-	for i := range results {
-		sess := results[i].Session
-		if !sess.KeepStoredWorkspace || sess.Cwd != "" || sess.ID == "" {
-			continue
+	var ids []string
+	for _, result := range results {
+		if result.Session.KeepStoredWorkspace && result.Session.ID != "" {
+			ids = append(ids, applyIDPrefixToID(e.idPrefix, result.Session.ID))
 		}
-		id := applyIDPrefixToID(e.idPrefix, sess.ID)
-		if _, exists := indexes[id]; !exists {
-			ids = append(ids, id)
-		}
-		indexes[id] = append(indexes[id], i)
 	}
 	if len(ids) == 0 {
 		return nil
 	}
-	identities, err := e.loadStoredSessionWriteIdentities(ctx, ids)
+	identities, err := e.storedSessionWriteIdentities(ctx, ids)
 	if err != nil {
 		return err
 	}
-	for id, matching := range indexes {
-		stored, ok := identities[id]
-		if !ok {
-			continue
-		}
-		for _, i := range matching {
-			if !sessionWriteIdentitySupportsStoredAttribution(
-				stored, e.parsedSessionWriteIdentity(results[i].Session),
-			) {
-				continue
-			}
-			keepStoredExternalSessionMetadata(&results[i].Session, stored)
+	for i := range results {
+		stored, ok := identities[applyIDPrefixToID(e.idPrefix, results[i].Session.ID)]
+		if ok && sessionWriteIdentitySupportsStoredAttribution(
+			stored, e.parsedWriteIdentity(results[i].Session),
+		) {
+			keepStoredExternalMetadata(&results[i].Session, stored)
 		}
 	}
 	return nil
-}
-
-// noteExternalWorkspaceChange records a parse that writes an externally
-// supplied workspace different from the stored one. The write itself, and the
-// cwd allow-list that admits it, use the workspace the row will store; but the
-// write keeps the old directory's immutable identity snapshot, so the summary
-// reconciliation that follows replaces it. A rebuild compares against the old
-// archive instead and needs no note.
-func (e *Engine) noteExternalWorkspaceChange(
-	sess *parser.ParsedSession, stored db.SessionWriteIdentity,
-) {
-	if !sess.ExternalWorkspace || stored.Cwd == "" || sess.Cwd == stored.Cwd ||
-		e.deferredAntigravitySummaries != nil {
-		return
-	}
-	id := applyIDPrefixToID(e.idPrefix, sess.ID)
-	e.antigravityWorkspaceChangesMu.Lock()
-	defer e.antigravityWorkspaceChangesMu.Unlock()
-	if e.antigravityWorkspaceChanges == nil {
-		e.antigravityWorkspaceChanges = make(map[string]string)
-	}
-	e.antigravityWorkspaceChanges[id] = sess.Cwd
-}
-
-// takeExternalWorkspaceChange returns and clears the workspace a parse wrote
-// for id since the last reconciliation, if any.
-func (e *Engine) takeExternalWorkspaceChange(id string) (string, bool) {
-	e.antigravityWorkspaceChangesMu.Lock()
-	defer e.antigravityWorkspaceChangesMu.Unlock()
-	cwd, ok := e.antigravityWorkspaceChanges[id]
-	if ok {
-		delete(e.antigravityWorkspaceChanges, id)
-	}
-	return cwd, ok
-}
-
-// keepStoredExternalWorkspaceProject keeps the stored parser-time project for
-// an unchanged externally supplied working directory that can no longer be
-// probed (its checkout is gone, or probing is not allowed). Deriving it again
-// would fall back to the directory name and split a repository subdirectory
-// off its stored repository. The write path then applies worktree mappings.
-func (e *Engine) keepStoredExternalWorkspaceProject(
-	pw *pendingWrite, stored db.SessionWriteIdentity,
-) {
-	sess := &pw.sess
-	if !sess.ExternalWorkspaceProject || sess.Cwd == "" ||
-		sess.Cwd != stored.Cwd || stored.SourceProject == "" ||
-		sess.Project == stored.SourceProject {
-		return
-	}
-	if !e.skipSourceProjectProbe(pw) {
-		stat := e.stat
-		if stat == nil {
-			stat = os.Stat
-		}
-		if _, err := stat(sess.Cwd); err == nil {
-			return
-		}
-	}
-	sess.Project = stored.SourceProject
 }
 
 func sessionWriteIdentitySupportsStoredAttribution(
@@ -18132,7 +18070,7 @@ func (e *Engine) normalizePendingWriteMachines(
 		return batch, nil
 	}
 
-	identities, err := e.loadStoredSessionWriteIdentities(ctx, ids)
+	identities, err := e.storedSessionWriteIdentities(ctx, ids)
 	if err != nil {
 		return batch, err
 	}
@@ -18158,9 +18096,7 @@ func (e *Engine) normalizePendingWriteMachines(
 					}
 				}
 				if !batch[i].sourceIdentityUnverified {
-					keepStoredExternalSessionMetadata(&batch[i].sess, stored)
-					e.noteExternalWorkspaceChange(&batch[i].sess, stored)
-					e.keepStoredExternalWorkspaceProject(&batch[i], stored)
+					keepStoredExternalMetadata(&batch[i].sess, stored)
 				}
 			}
 			continue
@@ -18175,37 +18111,6 @@ func (e *Engine) normalizePendingWriteMachines(
 		}
 	}
 	return batch, nil
-}
-
-// keepStoredExternalSessionMetadata carries the stored working directory and
-// parent link into a parse whose provider keeps them outside the transcript
-// and supplied none this time, so the upsert does not clear them. It runs in
-// both ordinary syncs and rebuilds, before worktree mapping and cwd filtering
-// see the session. The kept project is the stored parser-time label from the
-// session's identity snapshot (or the stored project when none exists), not
-// one derived again from the filesystem: a checkout that is gone would
-// otherwise turn a repository subdirectory into its own project. The write
-// path then applies the active worktree mappings; an explicit project wins.
-func keepStoredExternalSessionMetadata(
-	sess *parser.ParsedSession,
-	stored db.SessionWriteIdentity,
-) {
-	if sess.KeepStoredWorkspace && sess.Cwd == "" && stored.Cwd != "" {
-		sess.Cwd = stored.Cwd
-		if sess.Project == "" {
-			sess.Project = stored.SourceProject
-			if sess.Project == "" {
-				sess.Project = stored.Project
-			}
-		}
-	}
-	if sess.KeepStoredParent && sess.ParentSessionID == "" &&
-		stored.ParserParentSessionID != "" {
-		sess.ParentSessionID = stored.ParserParentSessionID
-		if sess.RelationshipType == "" {
-			sess.RelationshipType = parser.RelSubagent
-		}
-	}
 }
 
 type writeBatchOutcome struct {
@@ -21618,15 +21523,6 @@ func (e *Engine) syncSingleSessionContext(ctx context.Context, sessionID string,
 	preserved, sessionsChanged, err = e.processAndWriteSessionFile(
 		ctx, file, sessionID,
 	)
-	if err == nil && agent == parser.AgentAntigravity {
-		// The write leaves a changed workspace to summary reconciliation, so
-		// an explicit refresh reconciles this session's summary as well.
-		updated, reconcileErr := e.reconcileAntigravitySessionLocked(ctx, sessionID)
-		if reconcileErr != nil {
-			return fmt.Errorf("reconcile antigravity summary for %s: %w", sessionID, reconcileErr)
-		}
-		sessionsChanged = sessionsChanged || updated > 0
-	}
 	return err
 }
 

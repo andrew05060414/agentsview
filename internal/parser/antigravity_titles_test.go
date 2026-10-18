@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,9 +15,9 @@ import (
 
 func TestAntigravityTitleCacheExpiresMatchingMarkers(t *testing.T) {
 	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
-	priorNow := sqliteTitleNow
-	sqliteTitleNow = func() time.Time { return now }
-	t.Cleanup(func() { sqliteTitleNow = priorNow })
+	priorNow := antigravityTitleNow
+	antigravityTitleNow = func() time.Time { return now }
+	t.Cleanup(func() { antigravityTitleNow = priorNow })
 	store := filepath.Join(t.TempDir(), AntigravitySummariesDBName)
 	conn, err := sql.Open("sqlite3", store)
 	require.NoError(t, err)
@@ -33,9 +34,9 @@ func TestAntigravityTitleCacheExpiresMatchingMarkers(t *testing.T) {
 		}
 	}
 	checkpoint()
-	titles, _, err := AntigravityStoreTitles(t.Context(), store)
+	summaries, _, err := AntigravityStoreSummaries(t.Context(), store)
 	require.NoError(t, err)
-	require.Equal(t, "First", titles["conversation-a"])
+	require.Equal(t, "First", summaries["conversation-a"].Title)
 	before, ok := StatSQLiteContainerState(store)
 	require.True(t, ok)
 	_, err = conn.ExecContext(t.Context(), "UPDATE conversation_summaries SET title = 'Later'")
@@ -44,85 +45,16 @@ func TestAntigravityTitleCacheExpiresMatchingMarkers(t *testing.T) {
 	after, ok := StatSQLiteContainerState(store)
 	require.True(t, ok)
 	require.Equal(t, before, after)
-	titles, _, err = AntigravityStoreTitles(t.Context(), store)
+	summaries, _, err = AntigravityStoreSummaries(t.Context(), store)
 	require.NoError(t, err)
-	assert.Equal(t, "First", titles["conversation-a"])
+	assert.Equal(t, "First", summaries["conversation-a"].Title)
 	now = now.Add(SQLiteContainerDigestVerifyInterval)
-	titles, _, err = AntigravityStoreTitles(t.Context(), store)
+	summaries, _, err = AntigravityStoreSummaries(t.Context(), store)
 	require.NoError(t, err)
-	assert.Equal(t, "Later", titles["conversation-a"])
+	assert.Equal(t, "Later", summaries["conversation-a"].Title)
 }
 
-func TestParseAntigravityWorkspaceURI(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		raw  string
-		want string
-	}{
-		{name: "empty", raw: "", want: ""},
-		{name: "unix file uri", raw: "file:///home/user/code/myproject", want: filepath.Clean("/home/user/code/myproject")},
-		{name: "windows file uri with encoded colon", raw: "file:///d%3A/synthetic-workspace", want: filepath.Clean(filepath.FromSlash("d:/synthetic-workspace"))},
-		{name: "windows file uri with plain colon", raw: "file:///d:/synthetic-corp/projects/app", want: filepath.Clean(filepath.FromSlash("d:/synthetic-corp/projects/app"))},
-		{name: "windows unc network share", raw: "file://server/share/repo", want: filepath.Clean(filepath.FromSlash("//server/share/repo"))},
-		{name: "windows unc network share localhost", raw: "file://localhost/d:/local/repo", want: filepath.Clean(filepath.FromSlash("d:/local/repo"))},
-		{name: "encoded unicode path", raw: "file:///c%3A/%E6%96%B0%E5%BB%BA%E6%96%87%E4%BB%B6%E5%A4%B9", want: filepath.Clean(filepath.FromSlash("c:/新建文件夹"))},
-		{name: "plain path", raw: "/var/log/app", want: filepath.Clean("/var/log/app")},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := parseAntigravityWorkspaceURI(tc.raw)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
-
-func TestAntigravityStoreSummariesWithWorkspace(t *testing.T) {
-	root := t.TempDir()
-	store := filepath.Join(root, AntigravitySummariesDBName)
-	conn, err := sql.Open("sqlite3", store)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	schema := `CREATE TABLE conversation_summaries (
-		conversation_id TEXT PRIMARY KEY,
-		title TEXT NOT NULL DEFAULT '',
-		workspace_uris TEXT NOT NULL DEFAULT '',
-		parent_conversation_id TEXT NOT NULL DEFAULT ''
-	)`
-	_, err = conn.ExecContext(t.Context(), schema)
-	require.NoError(t, err)
-
-	targetID := "synthetic-conv-uuid-1"
-	parentID := "synthetic-parent-uuid-1"
-	workspaceJSON := `["file:///d%3A/synthetic-workspace"]`
-	_, err = conn.ExecContext(t.Context(),
-		`INSERT INTO conversation_summaries (conversation_id, title, workspace_uris, parent_conversation_id)
-		 VALUES (?, ?, ?, ?)`,
-		targetID, "Synthetic Task Title", workspaceJSON, parentID,
-	)
-	require.NoError(t, err)
-
-	summaries, _, err := AntigravityStoreSummaries(t.Context(), store)
-	require.NoError(t, err)
-	require.Contains(t, summaries, targetID)
-
-	s := summaries[targetID]
-	assert.Equal(t, "Synthetic Task Title", s.Title)
-	assert.Equal(t, filepath.Clean(filepath.FromSlash("d:/synthetic-workspace")), s.Cwd)
-	assert.Equal(t, "synthetic_workspace", s.Project)
-	assert.Equal(t, parentID, s.ParentConversationID)
-
-	// Verify applyAntigravitySummary populates ParsedSession
-	sess := &ParsedSession{ID: "antigravity:" + targetID}
-	applyAntigravitySummary(t.Context(), sess, antigravitySource{Root: root, ID: targetID})
-	assert.Equal(t, "Synthetic Task Title", sess.SessionName)
-	assert.True(t, sess.SessionNamePresent)
-	assert.Equal(t, filepath.Clean(filepath.FromSlash("d:/synthetic-workspace")), sess.Cwd)
-	assert.Equal(t, "synthetic_workspace", sess.Project)
-	assert.Equal(t, "antigravity:"+parentID, sess.ParentSessionID)
-	assert.Equal(t, RelSubagent, sess.RelationshipType)
-}
-
-func TestExtractAntigravityWorkspace(t *testing.T) {
+func TestAntigravityWorkspace(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		raw  string
@@ -132,62 +64,77 @@ func TestExtractAntigravityWorkspace(t *testing.T) {
 		{name: "empty array", raw: "[]", want: ""},
 		{name: "json null", raw: "null", want: ""},
 		{name: "json empty string", raw: `""`, want: ""},
-		{name: "json blank string", raw: `"  "`, want: ""},
-		{name: "json string uri", raw: `"file:///srv/synthetic"`, want: filepath.Clean(filepath.FromSlash("/srv/synthetic"))},
-		{name: "array skips blank uris", raw: `["", "file:///srv/synthetic"]`, want: filepath.Clean(filepath.FromSlash("/srv/synthetic"))},
-		{name: "raw path fallback", raw: "/srv/raw-synthetic", want: filepath.Clean(filepath.FromSlash("/srv/raw-synthetic"))},
+		{name: "array skips blank uris", raw: `["", "file:///srv/synthetic"]`, want: filepath.Clean("/srv/synthetic")},
+		{name: "json string uri", raw: `"file:///srv/synthetic"`, want: filepath.Clean("/srv/synthetic")},
+		{name: "bare uri", raw: "file:///srv/synthetic", want: filepath.Clean("/srv/synthetic")},
+		{name: "bare path", raw: "/srv/raw-synthetic", want: filepath.Clean("/srv/raw-synthetic")},
+		{name: "encoded windows drive", raw: `["file:///d%3A/synthetic-workspace"]`, want: filepath.Clean(filepath.FromSlash("d:/synthetic-workspace"))},
+		{name: "plain windows drive", raw: `["file:///D:/synthetic/app"]`, want: filepath.Clean(filepath.FromSlash("D:/synthetic/app"))},
+		{name: "localhost authority", raw: `["file://localhost/d:/local/repo"]`, want: filepath.Clean(filepath.FromSlash("d:/local/repo"))},
+		{name: "unc share", raw: `["file://server/share/repo"]`, want: filepath.Clean(filepath.FromSlash("//server/share/repo"))},
+		{name: "encoded unicode", raw: `["file:///c%3A/%E6%96%B0%E5%BB%BA"]`, want: filepath.Clean(filepath.FromSlash("c:/新建"))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, extractAntigravityWorkspace(tc.raw))
+			assert.Equal(t, tc.want, antigravityWorkspace(tc.raw))
 		})
 	}
 }
 
-func TestApplyAntigravitySummaryMarksAbsentMetadata(t *testing.T) {
-	const id = "synthetic-conv-uuid-2"
-	writeStore := func(t *testing.T, root, workspace, parent string) {
-		t.Helper()
-		conn, err := sql.Open("sqlite3", filepath.Join(root, AntigravitySummariesDBName))
-		require.NoError(t, err)
-		defer conn.Close()
-		_, err = conn.ExecContext(t.Context(), `CREATE TABLE conversation_summaries (
-			conversation_id TEXT PRIMARY KEY, title TEXT,
-			workspace_uris TEXT NOT NULL DEFAULT '',
-			parent_conversation_id TEXT NOT NULL DEFAULT '')`)
-		require.NoError(t, err)
-		_, err = conn.ExecContext(t.Context(),
-			`INSERT INTO conversation_summaries VALUES (?, 'Title', ?, ?)`,
-			id, workspace, parent)
-		require.NoError(t, err)
-	}
+func writeAntigravitySummaryStore(t *testing.T, root, schema string, values ...any) {
+	t.Helper()
+	conn, err := sql.Open("sqlite3", filepath.Join(root, AntigravitySummariesDBName))
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = conn.ExecContext(t.Context(), schema)
+	require.NoError(t, err)
+	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(values)), ", ")
+	_, err = conn.ExecContext(t.Context(), "INSERT INTO conversation_summaries VALUES ("+placeholders+")", values...)
+	require.NoError(t, err)
+}
+
+func TestApplyAntigravityTitleFillsWorkspaceAndParent(t *testing.T) {
+	const id = "synthetic-conv"
+	const fullSchema = `CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY,
+		title TEXT, workspace_uris TEXT NOT NULL DEFAULT '', parent_conversation_id TEXT NOT NULL DEFAULT '')`
+	workspace := filepath.Clean(filepath.FromSlash("d:/synthetic-workspace"))
 	for _, tc := range []struct {
-		name          string
-		workspace     string
-		parent        string
-		noStore       bool
-		keepWorkspace bool
-		keepParent    bool
+		name        string
+		schema      string
+		values      []any
+		session     ParsedSession
+		wantCwd     string
+		wantProject string
+		wantParent  string
 	}{
-		{name: "metadata present", workspace: `["file:///srv/synthetic"]`, parent: "parent-1"},
-		{name: "blank metadata", keepWorkspace: true, keepParent: true},
-		{name: "json empty string workspace", workspace: `""`, parent: "parent-1", keepWorkspace: true},
-		{name: "no store", noStore: true, keepWorkspace: true, keepParent: true},
+		{
+			name:   "fills an empty session",
+			schema: fullSchema, values: []any{id, "Title", `["file:///d%3A/synthetic-workspace"]`, "parent"},
+			wantCwd: workspace, wantProject: "synthetic_workspace", wantParent: "antigravity:parent",
+		},
+		{
+			name:   "keeps transcript values and a project hint",
+			schema: fullSchema, values: []any{id, "Title", `["file:///d%3A/synthetic-workspace"]`, "parent"},
+			session: ParsedSession{Project: "hint", ParentSessionID: "antigravity:own"},
+			wantCwd: workspace, wantProject: "hint", wantParent: "antigravity:own",
+		},
+		{
+			name:   "store without the optional columns",
+			schema: testjsonl.AntigravityTitleSchema, values: []any{id, "Title"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			if !tc.noStore {
-				writeStore(t, root, tc.workspace, tc.parent)
-			}
-			sess := &ParsedSession{ID: antigravityIDPrefix + id, Agent: AgentAntigravity}
-			applyAntigravitySummary(t.Context(), sess, antigravitySource{Root: root, ID: id})
-			assert.Equal(t, tc.keepWorkspace, sess.KeepStoredWorkspace)
-			assert.Equal(t, tc.keepParent, sess.KeepStoredParent)
-			assert.Equal(t, !tc.keepWorkspace, sess.ExternalWorkspace)
-			assert.Equal(t, !tc.keepWorkspace, sess.ExternalWorkspaceProject)
-			if tc.keepWorkspace {
-				assert.Empty(t, sess.Cwd)
-			} else {
-				assert.NotEmpty(t, sess.Cwd)
+			writeAntigravitySummaryStore(t, root, tc.schema, tc.values...)
+			sess := tc.session
+			applyAntigravityTitle(t.Context(), &sess, antigravitySource{Root: root, ID: id})
+			assert.Equal(t, "Title", sess.SessionName)
+			assert.Equal(t, tc.wantCwd, sess.Cwd)
+			assert.Equal(t, tc.wantProject, sess.Project)
+			assert.Equal(t, tc.wantParent, sess.ParentSessionID)
+			assert.True(t, sess.KeepStoredWorkspace, "the transcript supplied no working directory")
+			assert.Equal(t, tc.session.ParentSessionID == "", sess.KeepStoredParent)
+			if tc.wantParent == "antigravity:parent" {
+				assert.Equal(t, RelSubagent, sess.RelationshipType)
 			}
 		})
 	}

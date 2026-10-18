@@ -3,7 +3,6 @@ package sync
 import (
 	"context"
 	"fmt"
-	"log"
 	"maps"
 	"path/filepath"
 	"slices"
@@ -44,29 +43,16 @@ func (e *Engine) InjectAntigravityTitleStates(states map[string]parser.SQLiteCon
 	}
 }
 
-// antigravitySummaryUpdate is one session's change from its root's
-// conversation_summaries.db. Empty workspace and parent fields leave the
-// stored values in place.
-type antigravitySummaryUpdate struct {
-	name        *string
-	updateTitle bool
-	cwd         string
+// antigravitySessionChange is what a store row changes on one stored session:
+// its title, and a working directory and parent it did not have yet.
+type antigravitySessionChange struct {
+	retitle bool
+	name    *string
+	machine string
+	cwd     string
 	// project is the parser-derived project for cwd, before worktree mappings.
 	project  string
 	parentID string
-	// identityOnly repairs an unpublishable identity snapshot for a session
-	// whose stored cwd already matches; the session row stays as it is.
-	identityOnly bool
-	// replaceIdentity marks a changed workspace: the identity recorded for
-	// the old workspace no longer describes the session.
-	replaceIdentity bool
-}
-
-// deferredAntigravitySummary is a rebuild change for an archived session that
-// reaches the replacement only through the orphan copy.
-type deferredAntigravitySummary struct {
-	stored db.SessionWriteIdentity
-	update antigravitySummaryUpdate
 }
 
 func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string, summaries map[string]parser.AntigravitySummary) (updated int, err error) {
@@ -74,7 +60,6 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		return 0, nil
 	}
 	prefix := e.idPrefix + string(parser.AgentAntigravity) + ":"
-	usageOnly := e.db.ArchiveContent().UsageOnly()
 	ids := make([]string, 0, len(summaries))
 	for id := range maps.Keys(summaries) {
 		ids = append(ids, prefix+id)
@@ -85,12 +70,13 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		return 0, err
 	}
 	var archived map[string]db.SessionWriteIdentity
-	if reader, ok := e.archiveStore.(sessionWriteIdentityReader); ok && e.deferredAntigravitySummaries != nil {
+	if reader, ok := e.archiveStore.(sessionWriteIdentityReader); ok && e.deferredAntigravityChanges != nil {
 		// A rebuild copies archived sessions without sources only after this pass.
 		if archived, err = reader.ListSessionWriteIdentitiesByID(ctx, ids); err != nil {
 			return 0, err
 		}
 	}
+	usageOnly := e.db.ArchiveContent().UsageOnly()
 	for _, id := range ids {
 		session, ok := stored[id]
 		deferred := false
@@ -100,190 +86,72 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		if !ok && !deferred {
 			continue
 		}
-		// A rebuild restores the old archive's identity and project after this
-		// pass, so a workspace that differs from the old archive is replayed
-		// afterwards even when the fresh parse already wrote it.
-		previous := session
-		if prior, had := archived[id]; ok && had {
-			previous = prior
-		}
 		summary := summaries[strings.TrimPrefix(id, prefix)]
-		if usageOnly {
-			summary.TitlePresent = false
-		}
+		change := antigravitySessionChange{machine: session.Machine}
 		title := db.SanitizeUTF8(summary.Title)
-
-		titleChanged := summary.TitlePresent && ((session.SessionName != nil && *session.SessionName != title) ||
-			(session.SessionName == nil && title != ""))
-		cwdChanged := summary.Cwd != "" && session.Cwd != summary.Cwd
-		rebuildWorkspaceChange := ok && e.deferredAntigravitySummaries != nil &&
-			summary.Cwd != "" && previous.Cwd != summary.Cwd
-		// A parse that already wrote the new workspace still left the old
-		// workspace's identity snapshot behind.
-		parsedCwd, parsedChange := e.takeExternalWorkspaceChange(id)
-		parsedWorkspaceChange := parsedChange && !cwdChanged &&
-			summary.Cwd != "" && parsedCwd == summary.Cwd
-		workspaceChange := cwdChanged || rebuildWorkspaceChange || parsedWorkspaceChange
-		parentID := ""
-		if summary.ParentConversationID != "" {
-			parentID = prefix + summary.ParentConversationID
+		change.retitle = summary.TitlePresent && !usageOnly &&
+			!(session.SessionName != nil && *session.SessionName == title ||
+				session.SessionName == nil && title == "")
+		if change.retitle && title != "" {
+			change.name = &title
 		}
-		// The native parent source is the parser parent; a launcher link may
-		// already fill the effective parent and must not hide a native one.
-		parentChanged := parentID != "" && session.ParserParentSessionID == ""
-		// A workspace stored before its identity was recorded completely
-		// (or by an older build) still needs a publishable snapshot.
-		// In a rebuild the metadata copy puts the old archive's snapshot back,
-		// so a placeholder there needs the repair even when the fresh parse
-		// already recorded a complete identity.
-		identityRepair := summary.Cwd != "" && !workspaceChange &&
-			(session.IdentityNeedsRepair || previous.IdentityNeedsRepair)
-
-		if !titleChanged && !workspaceChange && !parentChanged && !identityRepair {
+		// The store only fills what the session does not have yet.
+		cwd := session.Cwd
+		if cwd == "" {
+			cwd = summary.Cwd
+			change.cwd, change.project = summary.Cwd, summary.Project
+		}
+		if session.ParserParentSessionID == "" && summary.ParentConversationID != "" {
+			change.parentID = prefix + summary.ParentConversationID
+		}
+		if !change.retitle && change.cwd == "" && change.parentID == "" {
 			continue
 		}
-		targetCwd := session.Cwd
-		if cwdChanged {
-			targetCwd = summary.Cwd
-		}
-		if !e.antigravityRootOwns(root, session.FilePath) || !e.cwdFilter.allows(targetCwd) {
+		if !e.antigravityRootOwns(root, session.FilePath) || !e.cwdFilter.allows(cwd) {
 			continue
 		}
-		update := antigravitySummaryUpdate{updateTitle: titleChanged}
-		if titleChanged && title != "" {
-			update.name = &title
-		}
-		// Only a changed workspace is rewritten, so a rename alone never
-		// replaces the stored project.
-		if workspaceChange || identityRepair {
-			update.cwd = summary.Cwd
-			update.project = summary.Project
-			update.identityOnly = identityRepair
-			update.replaceIdentity = !identityRepair
-		}
-		if parentChanged {
-			update.parentID = parentID
-		}
-		// A rebuild replays workspace changes and identity repairs after the
-		// metadata copy, which would otherwise restore the old snapshot.
-		if deferred || rebuildWorkspaceChange ||
-			(identityRepair && e.deferredAntigravitySummaries != nil) {
-			e.deferredAntigravitySummaries[id] = deferredAntigravitySummary{stored: session, update: update}
+		if deferred {
+			e.deferredAntigravityChanges[id] = change
 			continue
 		}
 		// Trashed sessions take the change too, so restoring one needs no store change.
-		if err := e.refreshAntigravitySummary(ctx, e.db, id, session, update); err != nil {
+		if err := e.applyAntigravitySessionChange(ctx, e.db, id, change); err != nil {
 			return updated, err
 		}
-		if !update.identityOnly || titleChanged || parentChanged {
-			updated++
-		}
+		updated++
 	}
 	return updated, nil
 }
 
-// refreshAntigravitySummary writes one summary change into target. A changed
-// workspace takes its project through the active worktree mappings, as a
-// parsed write does, and records a complete project identity observation.
-func (e *Engine) refreshAntigravitySummary(
-	ctx context.Context,
-	target *db.DB,
-	id string,
-	stored db.SessionWriteIdentity,
-	update antigravitySummaryUpdate,
+// applyAntigravitySessionChange writes change into target. A filled working
+// directory takes its project through the active worktree mappings and
+// records a complete project identity, as a parsed write does.
+func (e *Engine) applyAntigravitySessionChange(
+	ctx context.Context, target *db.DB, id string, change antigravitySessionChange,
 ) error {
-	refresh := db.NativeSessionSummary{
-		SessionName:     update.name,
-		UpdateTitle:     update.updateTitle,
-		ParentSessionID: update.parentID,
-	}
-	if !update.identityOnly {
-		refresh.Cwd = update.cwd
-	}
-	if update.cwd != "" && update.project != "" {
-		project := update.project
-		if update.identityOnly && stored.Project != "" {
-			// Publish evidence under the label the session already carries.
-			project = stored.Project
-		} else if stored.Machine != "" {
-			mapped, ok, err := target.ResolveWorktreeProjectMapping(
-				ctx, stored.Machine, update.cwd, project,
-			)
-			if err != nil {
-				return fmt.Errorf("resolve worktree project for %s: %w", id, err)
-			}
-			if ok {
-				project = mapped
-			}
-		}
-		if !update.identityOnly {
-			refresh.Project = project
-		}
-		if obs, ok := e.projectIdentityObservation(db.Session{
-			ID:        id,
-			Project:   project,
-			Machine:   stored.Machine,
-			Cwd:       update.cwd,
-			GitBranch: stored.GitBranch,
-		}); ok {
-			refresh.IdentityObservation = obs
-			refresh.IdentitySnapshotProject = update.project
-			refresh.ReplaceIdentitySnapshot = update.replaceIdentity
-		}
-	}
-	return target.RefreshNativeSessionSummary(ctx, id, refresh)
-}
-
-// applyDeferredAntigravitySummaries replays rebuild summary changes once the
-// orphan copy has placed the archived sessions in target.
-func (e *Engine) applyDeferredAntigravitySummaries(
-	ctx context.Context,
-	target *db.DB,
-	deferred map[string]deferredAntigravitySummary,
-) error {
-	for _, id := range slices.Sorted(maps.Keys(deferred)) {
-		change := deferred[id]
-		if err := e.refreshAntigravitySummary(ctx, target, id, change.stored, change.update); err != nil {
+	if change.retitle {
+		if err := target.RefreshNativeSessionName(ctx, id, change.name); err != nil {
 			return err
 		}
 	}
-	return nil
-}
-
-// reconcileAntigravitySessionLocked applies the current summary of one
-// session from each configured root's store, rereading the store so an
-// explicit refresh sees its latest workspace, project, parent, and title.
-func (e *Engine) reconcileAntigravitySessionLocked(ctx context.Context, sessionID string) (int, error) {
-	sources := e.sources()
-	if _, enabled := sources.providerFactories[parser.AgentAntigravity]; !enabled {
-		return 0, nil
-	}
-	rawID, ok := strings.CutPrefix(sessionID, e.idPrefix+string(parser.AgentAntigravity)+":")
-	if !ok || rawID == "" {
-		return 0, nil
-	}
-	updated := 0
-	for _, root := range sources.agentDirs[parser.AgentAntigravity] {
-		store := filepath.Join(root, parser.AntigravitySummariesDBName)
-		parser.InvalidateAntigravityTitles(store)
-		summaries, _, err := parser.AntigravityStoreSummaries(ctx, store)
+	fill := db.NativeSessionMetadata{Cwd: change.cwd, ParentSessionID: change.parentID}
+	if change.cwd != "" && change.project != "" {
+		fill.Project = change.project
+		mapped, ok, err := target.ResolveWorktreeProjectMapping(ctx, change.machine, change.cwd, change.project)
 		if err != nil {
-			// An unreadable store carries no signal; the refreshed row keeps
-			// its stored metadata, as in a sync pass.
-			log.Printf("antigravity titles %s: %v", store, err)
-			continue
+			return fmt.Errorf("resolve worktree project for %s: %w", id, err)
 		}
-		summary, ok := summaries[rawID]
-		if !ok {
-			continue
+		if ok {
+			fill.Project = mapped
 		}
-		n, err := e.applyAntigravityStoreSummaries(ctx, root, map[string]parser.AntigravitySummary{rawID: summary})
-		updated += n
-		if err != nil {
-			return updated, err
+		if obs, ok := e.projectIdentityObservation(db.Session{
+			ID: id, Project: fill.Project, Machine: change.machine, Cwd: change.cwd,
+		}); ok {
+			fill.Identity = obs
+			fill.IdentitySnapshotProject = change.project
 		}
 	}
-	return updated, nil
+	return target.FillNativeSessionMetadata(ctx, id, fill)
 }
 
 // antigravityRootOwns keeps a store from renaming a same-ID session that

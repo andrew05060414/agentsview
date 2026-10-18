@@ -23,7 +23,8 @@ The latest release is
   Claude-format sources are reprocessed on upgrade.
 - Antigravity sessions group under their project, and sub-conversations link to
   their parent, using the workspace folder and parent conversation Antigravity
-  saves in `conversation_summaries.db`.
+  saves in `conversation_summaries.db`. A workspace or parent already recorded
+  is kept; later changes to it in Antigravity are not followed yet.
 
 ## 0.46.1
 

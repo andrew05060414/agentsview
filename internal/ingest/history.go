@@ -60,26 +60,6 @@ func ReconcileProviderHistory(
 		result.Candidate = candidate
 		result.PriorContributed = true
 	}
-	if candidate.Parsed.Session.KeepStoredWorkspace &&
-		candidate.Session.Cwd == "" && prior.Session.Cwd != "" {
-		candidate.Session.Cwd = prior.Session.Cwd
-		if candidate.Parsed.Session.Project == "" {
-			candidate.Session.Project = prior.Session.Project
-		}
-		result.Candidate = candidate
-		result.PriorContributed = true
-	}
-	if candidate.Parsed.Session.KeepStoredParent &&
-		stringPtrEmpty(candidate.Session.ParentSessionID) &&
-		!stringPtrEmpty(prior.Session.ParserParentSessionID) {
-		candidate.Session.ParentSessionID = cloneStringPtr(prior.Session.ParserParentSessionID)
-		candidate.Session.ParserParentSessionID = cloneStringPtr(prior.Session.ParserParentSessionID)
-		if candidate.Session.RelationshipType == "" {
-			candidate.Session.RelationshipType = string(parser.RelSubagent)
-		}
-		result.Candidate = candidate
-		result.PriorContributed = true
-	}
 	agent := candidate.Parsed.Session.Agent
 	if agent == "" {
 		agent = parser.AgentType(candidate.Session.Agent)

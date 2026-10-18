@@ -1494,23 +1494,12 @@ type ParsedSession struct {
 	SourceVersion      string
 	GroupKey           string `json:"group_key,omitempty"`
 	KeepStoredGroupKey bool   `json:"keep_stored_group_key,omitempty"`
-	// KeepStoredWorkspace and KeepStoredParent mark a parse whose provider
-	// keeps the working directory or parent outside the transcript and
-	// supplied no value this time (Antigravity's conversation_summaries.db).
-	// Sync then keeps the stored cwd, project, and parent link instead of
-	// clearing them; an explicit value still replaces them.
+	// KeepStoredWorkspace and KeepStoredParent mark a working directory or
+	// parent supplied outside the transcript (Antigravity's
+	// conversation_summaries.db). Sync keeps a stored value, so the store only
+	// fills an empty one and a missing or blank value never clears it.
 	KeepStoredWorkspace bool `json:"keep_stored_workspace,omitempty"`
 	KeepStoredParent    bool `json:"keep_stored_parent,omitempty"`
-	// ExternalWorkspace marks a Cwd supplied outside the transcript. Sync
-	// lets such a parse fill a session with no stored working directory but
-	// leaves a change of an existing one to the metadata reconciliation,
-	// which also replaces the identity recorded for the old directory.
-	ExternalWorkspace bool `json:"external_workspace,omitempty"`
-	// ExternalWorkspaceProject marks a Project derived from a working
-	// directory supplied outside the transcript. When that directory is
-	// unchanged but can no longer be probed, sync keeps the stored
-	// parser-time project instead of the directory-name fallback.
-	ExternalWorkspaceProject bool `json:"external_workspace_project,omitempty"`
 	// TranscriptFidelity classifies how complete a stored transcript is
 	// relative to the agent's full session data: "full" when the
 	// high-resolution source was used, "summary" for a degraded/fallback

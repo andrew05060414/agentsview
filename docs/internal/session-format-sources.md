@@ -3975,61 +3975,23 @@ schemas keep their existing ordering behavior.
   `workspace_uris` column (a JSON array of `file://` URIs, or a single URI
   string) and a `parent_conversation_id` column. Both are observed in the
   Antigravity desktop app's store; neither is documented upstream, so the
-  reader checks `PRAGMA table_info` and falls back to the title-only query
-  when a column is absent. The first non-empty workspace URI becomes the
-  session's working directory (percent-decoding, Windows drive letters,
-  `localhost` and UNC hosts handled) and the project is derived from it; a
-  non-empty parent ID links the session to that conversation as a subagent.
-  A JSON string value, even a blank one, is read as that URI; only text that
-  is not JSON is read as a raw path.
-
-  The store's workspace can change after a session is stored, so sync treats
-  it as mutable metadata with one owner for each step:
-
-  - **Parse** fills a working directory, project or parent only when the
-    session has none stored. When neither the transcript nor the store
-    supplies one (blank value, missing row or column, unreadable store), the
-    parse marks it absent and sync keeps the stored working directory, parent
-    and parser-time project label (from the session's identity snapshot)
-    before the cwd allow-list judges the session, in ordinary syncs and
-    rebuilds alike. A parse whose workspace differs from a stored one writes
-    the new workspace, so the cwd allow-list judges the workspace the row
-    will store; reconciliation then replaces the old workspace's identity
-    snapshot. An
-    unchanged workspace that can no longer be probed (its checkout is gone)
-    keeps the stored project instead of a directory-name fallback. Worktree
-    mappings then apply as for any write.
-  - **Reconciliation** runs after parsing on every sync pass, including
-    usage-only archives (which keep no titles), and an explicit
-    single-session refresh reconciles that session too. It copies a changed
-    workspace or a parent onto stored sessions (a native parent only when the
-    session has no parser parent; it then takes precedence over a launcher
-    link, as a reparse would), so existing archives pick them up without a
-    parser resync. A
-    changed workspace takes its project through active worktree mappings and replaces
-    the identity snapshot recorded for the old workspace, republishing the
-    affected aggregate evidence under the project each session stores (so a
-    user-assigned project keeps its identity and trashed sessions publish
-    none) whenever the evidence or project changes; a matching workspace
-    whose snapshot is a keyless placeholder gets its identity repaired without
-    touching the session row and publishes its aggregate evidence. A rename
-    alone leaves the project untouched, and a new parent clears stale
-    friction results and recomputes launcher parent links, so it cannot close
-    a cycle with one.
-  - **Rebuild** records workspace, project and parent changes, and identity
-    repairs for snapshots the old archive held as placeholders, against the
-    old archive for live and orphaned sessions, and replays them after the
-    metadata copy and identity-snapshot project restore, before worktree
-    mappings apply. The metadata copy never replaces a publishable snapshot
-    with an old placeholder that recorded neither a key nor a root.
-
-  An empty or missing value never clears stored data. Checked 2026-10-18 with
-  synthetic stores covering the URI shapes above, blank and JSON-empty-string
-  values, missing rows, unreadable stores, removed checkouts with and without
-  a changed store, workspace changes between Git repositories in syncs and
-  rebuilds and single-session refreshes, assigned projects, trashed sessions,
-  placeholder identity snapshots, cwd allow-lists, usage-only archives, and
-  stores that lack the optional columns.
+  reader checks `PRAGMA table_info` and reads titles alone when a column is
+  absent. The first non-empty workspace URI becomes the session's working
+  directory (percent-decoding, Windows drive letters, `localhost` and UNC
+  hosts handled) and the project is derived from it, through active worktree
+  mappings; a JSON string, even a blank one, is read as that URI, and only
+  text that is not JSON is read as a raw path. A non-empty parent ID links the
+  session to that conversation as a subagent, ahead of a launcher link.
+  These values only fill a session that has none: parsing and each sync pass
+  (including usage-only archives and rebuilds) copy them onto stored sessions
+  without a working directory or parser parent, and keep a recorded working
+  directory, its stored project and parent when the store later changes,
+  blanks or loses them, or cannot be read. The cwd allow-list judges the
+  recorded working directory. Following later workspace changes is not
+  supported. Checked 2026-10-18 with synthetic stores covering the URI shapes
+  above, blank and JSON-empty-string values, missing rows, unreadable stores,
+  changed workspaces, removed checkouts, worktree mappings, cwd allow-lists,
+  usage-only archives, rebuilds, and stores that lack the optional columns.
 
 ## Antigravity CLI (`antigravity-cli`)
 

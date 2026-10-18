@@ -12,46 +12,50 @@ import (
 )
 
 // AntigravitySummariesDBName is the per-root store where Antigravity keeps
-// conversation titles and workspace metadata, apart from each conversation's transcript.
+// conversation titles, workspaces, and parents, apart from each
+// conversation's transcript.
 const AntigravitySummariesDBName = "conversation_summaries.db"
 
 const antigravityTitleQuery = "SELECT conversation_id, title FROM conversation_summaries"
 
-// AntigravitySummary holds metadata extracted from conversation_summaries.db.
+// AntigravitySummary is one conversation's row in AntigravitySummariesDBName.
 type AntigravitySummary struct {
-	Title                string
-	TitlePresent         bool
+	Title string
+	// TitlePresent distinguishes a stored (possibly blank) title from NULL.
+	TitlePresent bool
+	// Cwd is the first workspace folder; Project is derived from it.
 	Cwd                  string
 	Project              string
 	ParentConversationID string
 }
 
-type antigravitySummarySnapshot struct {
+type antigravityTitleSnapshot struct {
 	state     SQLiteContainerState
 	summaries map[string]AntigravitySummary
 	err       error
 	readAt    time.Time
 }
 
-var antigravitySummaryCache = struct {
+var antigravityTitleNow = time.Now
+
+var antigravityTitleCache = struct {
 	sync.Mutex
-	stores map[string]antigravitySummarySnapshot
-}{stores: make(map[string]antigravitySummarySnapshot)}
+	stores map[string]antigravityTitleSnapshot
+}{stores: make(map[string]antigravityTitleSnapshot)}
 
 func InvalidateAntigravityTitles(path string) {
-	antigravitySummaryCache.Lock()
-	defer antigravitySummaryCache.Unlock()
-	delete(antigravitySummaryCache.stores, path)
+	antigravityTitleCache.Lock()
+	defer antigravityTitleCache.Unlock()
+	delete(antigravityTitleCache.stores, path)
 }
 
-// AntigravityStoreSummaries returns the cached or freshly read conversation summaries.
 // Matching markers can hide writes, so cached summaries expire.
 func AntigravityStoreSummaries(ctx context.Context, path string) (map[string]AntigravitySummary, SQLiteContainerState, error) {
 	state, ok := StatSQLiteContainerState(path)
-	antigravitySummaryCache.Lock()
-	defer antigravitySummaryCache.Unlock()
-	now := sqliteTitleNow()
-	if prior, cached := antigravitySummaryCache.stores[path]; ok && cached && prior.state == state && now.Sub(prior.readAt) < SQLiteContainerDigestVerifyInterval {
+	antigravityTitleCache.Lock()
+	defer antigravityTitleCache.Unlock()
+	now := antigravityTitleNow()
+	if prior, cached := antigravityTitleCache.stores[path]; ok && cached && prior.state == state && now.Sub(prior.readAt) < SQLiteContainerDigestVerifyInterval {
 		return prior.summaries, prior.state, prior.err
 	}
 	summaries, err := readAntigravitySummaries(ctx, path)
@@ -60,17 +64,17 @@ func AntigravityStoreSummaries(ctx context.Context, path string) (map[string]Ant
 	}
 	if ok {
 		// Remote imports extract stores into fresh temp roots; bound what stays cached.
-		if _, cached := antigravitySummaryCache.stores[path]; !cached && len(antigravitySummaryCache.stores) >= 16 {
-			clear(antigravitySummaryCache.stores)
+		if _, cached := antigravityTitleCache.stores[path]; !cached && len(antigravityTitleCache.stores) >= 16 {
+			clear(antigravityTitleCache.stores)
 		}
-		antigravitySummaryCache.stores[path] = antigravitySummarySnapshot{state: state, summaries: summaries, err: err, readAt: now}
+		antigravityTitleCache.stores[path] = antigravityTitleSnapshot{state: state, summaries: summaries, err: err, readAt: now}
 	} else {
-		delete(antigravitySummaryCache.stores, path)
+		delete(antigravityTitleCache.stores, path)
 	}
 	return summaries, state, err
 }
 
-// Matching markers can hide writes, so cached titles expire.
+// AntigravityStoreTitles reads conversation titles through the shared native title cache.
 func AntigravityStoreTitles(ctx context.Context, path string) (map[string]string, SQLiteContainerState, error) {
 	return sqliteStoreTitles(ctx, path, "conversation_summaries", "conversation_id", antigravityTitleQuery)
 }
@@ -85,7 +89,6 @@ func readAntigravitySummaries(ctx context.Context, path string) (map[string]Anti
 		return nil, err
 	}
 	defer store.Close()
-
 	var tableExists bool
 	if err := store.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversation_summaries')`).Scan(&tableExists); err != nil {
 		return nil, err
@@ -95,153 +98,99 @@ func readAntigravitySummaries(ctx context.Context, path string) (map[string]Anti
 		// table is empty metadata, not a failed read.
 		return nil, nil
 	}
-	hasWorkspace, hasParent, err := antigravitySummaryColumns(ctx, store)
+	// The workspace and parent columns are undocumented, so stores without
+	// them still yield titles.
+	workspaceColumn, parentColumn := "NULL", "NULL"
+	columns, err := store.QueryContext(ctx, "SELECT name FROM pragma_table_info('conversation_summaries')")
 	if err != nil {
 		return nil, err
 	}
-
-	query := "SELECT conversation_id, title"
-	if hasWorkspace {
-		query += ", workspace_uris"
-	}
-	if hasParent {
-		query += ", parent_conversation_id"
-	}
-	query += " FROM conversation_summaries"
-
-	queryRows, err := store.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer queryRows.Close()
-
-	summaries := make(map[string]AntigravitySummary)
-	for queryRows.Next() {
-		var id string
-		var title sql.NullString
-		var workspaceURIs sql.NullString
-		var parentID sql.NullString
-
-		scanDests := []any{&id, &title}
-		if hasWorkspace {
-			scanDests = append(scanDests, &workspaceURIs)
-		}
-		if hasParent {
-			scanDests = append(scanDests, &parentID)
-		}
-		if err := queryRows.Scan(scanDests...); err != nil {
+	defer columns.Close()
+	for columns.Next() {
+		var name string
+		if err := columns.Scan(&name); err != nil {
 			return nil, err
 		}
-
-		var summary AntigravitySummary
-		if title.Valid {
-			summary.TitlePresent = true
-			summary.Title = strings.TrimSpace(title.String)
+		switch name {
+		case "workspace_uris":
+			workspaceColumn = name
+		case "parent_conversation_id":
+			parentColumn = name
 		}
-		if hasWorkspace && workspaceURIs.Valid && workspaceURIs.String != "" {
-			cwd := extractAntigravityWorkspace(workspaceURIs.String)
-			summary.Cwd = cwd
-			if cwd != "" {
-				summary.Project = ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
-			}
+	}
+	if err := columns.Err(); err != nil {
+		return nil, err
+	}
+	rows, err := store.QueryContext(ctx, "SELECT conversation_id, title, "+
+		workspaceColumn+", "+parentColumn+" FROM conversation_summaries")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	summaries := make(map[string]AntigravitySummary)
+	for rows.Next() {
+		var id string
+		var title, workspaceURIs, parentID sql.NullString
+		if err := rows.Scan(&id, &title, &workspaceURIs, &parentID); err != nil {
+			return nil, err
 		}
-		if hasParent && parentID.Valid {
-			summary.ParentConversationID = strings.TrimSpace(parentID.String)
+		summary := AntigravitySummary{
+			Title:                strings.TrimSpace(title.String),
+			TitlePresent:         title.Valid,
+			Cwd:                  antigravityWorkspace(workspaceURIs.String),
+			ParentConversationID: strings.TrimSpace(parentID.String),
+		}
+		if summary.Cwd != "" {
+			summary.Project = ExtractProjectFromCwdWithBranchContext(ctx, summary.Cwd, "")
 		}
 		summaries[id] = summary
 	}
-	if err := queryRows.Err(); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return summaries, nil
 }
 
-// antigravitySummaryColumns reports which optional columns the store has, so
-// older schemas without workspace_uris or parent_conversation_id still work.
-func antigravitySummaryColumns(ctx context.Context, store *sql.DB) (hasWorkspace, hasParent bool, err error) {
-	rows, err := store.QueryContext(ctx, "PRAGMA table_info(conversation_summaries)")
-	if err != nil {
-		return false, false, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull, pk int
-		var dfltValue sql.NullString
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			return false, false, err
-		}
-		switch name {
-		case "workspace_uris":
-			hasWorkspace = true
-		case "parent_conversation_id":
-			hasParent = true
-		}
-	}
-	return hasWorkspace, hasParent, rows.Err()
-}
-
-// parseAntigravityWorkspaceURI decodes a file:// URI into a clean filesystem path.
-// It handles percent-encoded characters, Windows drive letters with leading slashes,
-// UNC network shares (file://server/share), and localhost authority.
-func parseAntigravityWorkspaceURI(rawURI string) string {
-	rawURI = strings.TrimSpace(rawURI)
-	if rawURI == "" {
-		return ""
-	}
-	if !strings.HasPrefix(rawURI, "file://") {
-		return filepath.Clean(filepath.FromSlash(rawURI))
-	}
-	parsed, err := url.Parse(rawURI)
-	if err != nil {
-		unescaped, uerr := url.PathUnescape(rawURI)
-		if uerr == nil {
-			rawURI = unescaped
-		}
-		p := strings.TrimPrefix(rawURI, "file://")
-		return filepath.Clean(filepath.FromSlash(p))
-	}
-
-	// Handle Windows UNC network share: file://server/share/repo -> \\server\share\repo
-	if parsed.Host != "" && parsed.Host != "localhost" {
-		unc := "//" + parsed.Host + parsed.Path
-		return filepath.Clean(filepath.FromSlash(unc))
-	}
-
-	p := parsed.Path
-	// On Windows, file:///D:/foo or file:///d%3A/foo produces /D:/foo or /d:/foo.
-	if len(p) >= 3 && p[0] == '/' && (p[2] == ':' || p[2] == '|') &&
-		((p[1] >= 'a' && p[1] <= 'z') || (p[1] >= 'A' && p[1] <= 'Z')) {
-		drive := p[1]
-		rest := p[3:]
-		p = string(drive) + ":" + rest
-	}
-	return filepath.Clean(filepath.FromSlash(p))
-}
-
-func extractAntigravityWorkspace(workspaceURIsJSON string) string {
-	workspaceURIsJSON = strings.TrimSpace(workspaceURIsJSON)
-	if workspaceURIsJSON == "" || workspaceURIsJSON == "[]" {
-		return ""
-	}
+// antigravityWorkspace returns the first workspace in a workspace_uris value:
+// a JSON array of URIs, a JSON string, or (when not JSON) a bare URI or path.
+func antigravityWorkspace(value string) string {
 	var uris []string
-	if err := json.Unmarshal([]byte(workspaceURIsJSON), &uris); err != nil {
-		// A decoded JSON string is authoritative even when blank; only text
-		// that is not JSON at all falls back to being read as a raw path.
-		var singleURI string
-		if jsonErr := json.Unmarshal([]byte(workspaceURIsJSON), &singleURI); jsonErr == nil {
-			return parseAntigravityWorkspaceURI(singleURI)
+	if err := json.Unmarshal([]byte(value), &uris); err != nil {
+		var uri string
+		if err := json.Unmarshal([]byte(value), &uri); err != nil {
+			uri = value
 		}
-		return parseAntigravityWorkspaceURI(workspaceURIsJSON)
+		uris = []string{uri}
 	}
-	for _, u := range uris {
-		p := parseAntigravityWorkspaceURI(u)
-		if p != "" {
-			return p
+	for _, uri := range uris {
+		if path := antigravityWorkspacePath(uri); path != "" {
+			return path
 		}
 	}
 	return ""
+}
+
+// antigravityWorkspacePath turns a file:// URI (percent-encoded, with an
+// optional localhost or UNC host and Windows drive letter) into a path.
+func antigravityWorkspacePath(uri string) string {
+	uri = strings.TrimSpace(uri)
+	if !strings.HasPrefix(uri, "file://") {
+		if uri == "" {
+			return ""
+		}
+		return filepath.Clean(filepath.FromSlash(uri))
+	}
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return ""
+	}
+	path := parsed.Path
+	if parsed.Host != "" && parsed.Host != "localhost" {
+		path = "//" + parsed.Host + path
+	} else if len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+		path = path[1:]
+	}
+	return filepath.Clean(filepath.FromSlash(path))
 }
 
 // AntigravitySessionRoot returns the Antigravity root that owns a stored
@@ -258,21 +207,14 @@ func AntigravitySessionRoot(path string) (string, bool) {
 	return "", false
 }
 
-// applyAntigravityTitle sets the session's title and workspace from its root's store.
+// applyAntigravityTitle sets the session's title, and fills its working
+// directory, project, and parent, from its root's store. An unreadable store
+// or missing entry leaves no title signal, so the stored name survives the
+// write. The workspace and parent come from outside the transcript, so sync
+// keeps any stored values instead of these.
 func applyAntigravityTitle(ctx context.Context, sess *ParsedSession, src antigravitySource) {
-	applyAntigravitySummary(ctx, sess, src)
-}
-
-// applyAntigravitySummary sets the session's title, cwd, project, and parent from its root's store.
-// An unreadable store or missing entry leaves no title signal, so the stored
-// name survives the write. A parse that ends without a workspace or parent
-// marks those fields as absent signals, so sync keeps the stored values
-// instead of clearing them.
-func applyAntigravitySummary(ctx context.Context, sess *ParsedSession, src antigravitySource) {
-	defer func() {
-		sess.KeepStoredWorkspace = sess.Cwd == ""
-		sess.KeepStoredParent = sess.ParentSessionID == ""
-	}()
+	sess.KeepStoredWorkspace = sess.Cwd == ""
+	sess.KeepStoredParent = sess.ParentSessionID == ""
 	summaries, _, err := AntigravityStoreSummaries(ctx, filepath.Join(src.Root, AntigravitySummariesDBName))
 	if err != nil {
 		return
@@ -285,18 +227,11 @@ func applyAntigravitySummary(ctx context.Context, sess *ParsedSession, src antig
 		sess.SessionName = summary.Title
 		sess.SessionNamePresent = true
 	}
-	externalCwd := sess.Cwd == "" && summary.Cwd != ""
-	if externalCwd {
+	if sess.Cwd == "" {
 		sess.Cwd = summary.Cwd
-		sess.ExternalWorkspace = true
-	}
-	if sess.Project == "" {
-		if summary.Project != "" {
+		if sess.Project == "" {
 			sess.Project = summary.Project
-		} else if sess.Cwd != "" {
-			sess.Project = ExtractProjectFromCwdWithBranchContext(ctx, sess.Cwd, "")
 		}
-		sess.ExternalWorkspaceProject = externalCwd && sess.Project != ""
 	}
 	if sess.ParentSessionID == "" && summary.ParentConversationID != "" {
 		sess.ParentSessionID = antigravityIDPrefix + summary.ParentConversationID
