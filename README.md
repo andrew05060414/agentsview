@@ -388,6 +388,7 @@ local Amp thread JSON files.
 | OpenClaude            | `~/.openclaude/projects/`                                                                                                                                                                                                                            |
 | Claude Cowork         | `~/Library/Application Support/Claude/local-agent-mode-sessions/` (macOS)                                                                                                                                                                            |
 | Codex                 | `~/.codex/sessions/`                                                                                                                                                                                                                                 |
+| Codex Cloud           | Fetched from OpenAI (ChatGPT dot, Codex web and cloud tasks); off until `[agents.codex-cloud] enabled = true`                                                                                                                                        |
 | Copilot CLI           | `~/.copilot/`                                                                                                                                                                                                                                        |
 | Devin CLI             | `~/.local/share/devin/` (Linux), `~/Library/Application Support/devin/` (macOS); point `DEVIN_DIR` / `agents.devin.dirs` at the root that contains `cli/`                                                                                            |
 | Evener                | `~/.local/state/evener/projects/` (or `$XDG_STATE_HOME/evener/projects/`; semantic transcript v2)                                                                                                                                                    |
@@ -811,7 +812,9 @@ searches (search mode), session views (the session's agent type), screen views
 (screen name, once per install per UTC day), exports (format), generated
 insights (insight kind) and analytics page views (page name), each with one
 value from a fixed list in the server that drops anything else. All events use a
-stable random install ID as the event `DistinctId`. The events include
+stable random install ID as the event `DistinctId`.
+[Feature outcomes](docs/configuration.md#anonymous-daemon-telemetry) also count
+empty searches, visible errors, and failed sync attempts. The events include
 `application=agentsview`, app version, commit, OS, and CPU architecture, with
 `$process_person_profile=false` and `$geoip_disable=true`. It does not include
 session, project, prompt, file path, account, or machine identity. Disable

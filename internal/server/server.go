@@ -24,6 +24,7 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 
 	"go.kenn.io/agentsview/internal/apiclient"
+	"go.kenn.io/agentsview/internal/codexcloud"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
@@ -210,6 +211,7 @@ type Server struct {
 	rawSyncDeviceAuth      RawSyncDeviceAuth
 	rawSyncCustody         RawSyncCustody
 	rawSyncStatus          RawSyncStatusReader
+	codexCloudStatus       *codexcloud.StatusBoard
 	rawSyncSchemaOnly      bool
 	rawSyncUploads         RawSyncUploads
 	rawSyncJobHealth       RawSyncJobHealth
@@ -1371,7 +1373,7 @@ func (s *Server) ListenAndServe() error {
 			Network: daemon.NetworkTCP,
 			Address: addr,
 		},
-		daemon.WithRuntimeStore(daemon.RuntimeStore{Dir: s.dataDir}),
+		daemon.WithRuntimeStore(daemon.RuntimeStore{Dir: config.RuntimeDir(s.dataDir)}),
 	)
 	if err != nil {
 		return err

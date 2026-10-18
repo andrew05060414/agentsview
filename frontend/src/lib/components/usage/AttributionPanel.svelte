@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import {
     usage,
     type GroupBy,
@@ -36,6 +37,8 @@
     value: number;
     color: string;
     pct: number;
+    // Billed only as plan usage: no tokens or cost to show.
+    planOnly: boolean;
   }
 
   let panel: HTMLElement;
@@ -92,6 +95,7 @@
       id: string;
       label: string;
       value: number;
+      planOnly?: boolean;
     }> = [];
 
     if (zoomedProject && groupBy === "project") {
@@ -119,6 +123,13 @@
         value: isTokenMode
           ? sumSelectedTokens(m, usage.selectedTokenTypes)
           : m.cost.microdollars,
+        // In cost mode a tokenless row with a reported cost keeps its cost:
+        // another agent can report only a dollar total under the same model
+        // name. Token mode has no tokens to show for that row either way.
+        planOnly:
+          (m.planOnlySessions ?? 0) > 0 &&
+          m.inputTokens + m.outputTokens + m.cacheCreationTokens + m.cacheReadTokens === 0 &&
+          (isTokenMode || m.cost.microdollars === 0),
       }));
     } else {
       items = s!.agentTotals.map((a) => ({
@@ -146,6 +157,7 @@
         ? colorMap.get(zoomedProject.key) ?? "var(--text-muted)"
         : colorMap.get(d.id) ?? "var(--text-muted)",
       pct: total > 0 ? d.value / total : 0,
+      planOnly: d.planOnly ?? false,
     }));
   });
 
@@ -270,7 +282,7 @@
     </div>
   </div>
   {#if zoomedProject && usage.errors.zoom}
-    <div class="empty">{usage.errors.zoom}</div>
+    <div class="empty" {@attach errorTelemetry("analytics")}>{usage.errors.zoom}</div>
   {:else if zoomedProject && usage.loading.zoom && usage.zoomRows === null}
     <div class="empty">{m.usage_loading()}</div>
   {:else if rows.length === 0}
@@ -311,9 +323,11 @@
               ></span>
               <span class="rail-label">{row.label}</span>
               <span class="rail-cost">
-                {isTokenMode
-                  ? formatTokenCount(row.value)
-                  : formatMoney(moneyFromMicrodollars(row.value))}
+                {row.planOnly
+                  ? m.plan_usage_title()
+                  : isTokenMode
+                    ? formatTokenCount(row.value)
+                    : formatMoney(moneyFromMicrodollars(row.value))}
               </span>
             </div>
           {/each}
@@ -346,18 +360,20 @@
               <div class="list-bar-track">
                 <div
                   class="list-bar-fill"
-                  style="width: {Math.max(row.pct * 100, 1)}%;
+                  style="width: {row.planOnly ? 0 : Math.max(row.pct * 100, 1)}%;
                          background: {row.color};"
                 ></div>
               </div>
             </div>
             <span class="list-pct">
-              {(row.pct * 100).toFixed(1)}%
+              {row.planOnly ? "" : `${(row.pct * 100).toFixed(1)}%`}
             </span>
             <span class="list-cost">
-              {isTokenMode
-                ? formatTokenCount(row.value)
-                : formatMoney(moneyFromMicrodollars(row.value))}
+              {row.planOnly
+                ? m.plan_usage_title()
+                : isTokenMode
+                  ? formatTokenCount(row.value)
+                  : formatMoney(moneyFromMicrodollars(row.value))}
             </span>
           </div>
         {/each}

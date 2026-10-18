@@ -11,6 +11,8 @@ The latest release is
 
 **Upgrade notes**
 
+- On Windows, stop the daemon before switching back to 0.45.0 or earlier.
+  Older versions can't see a daemon started by this version.
 - The container image now requires a bearer token. Read `auth_token` from
   `/data/config.toml` or set `AGENTSVIEW_AUTH_TOKEN_FILE` to a mounted token file.
   The image keeps its defaults when you pass flags:
@@ -23,6 +25,11 @@ The latest release is
   [container deployment](/docs/configuration/#container-deployment).
 
 **New features**
+
+- Anonymous telemetry now counts empty searches, visible errors in supported
+  workflows, and failed sync attempts. Query and error details stay local. The
+  existing [telemetry opt-out](https://agentsview.io/docs/configuration/#privacy-and-telemetry)
+  applies to these counts.
 
 - Reporting export version 5 keeps verified repository activity selectable when
   another session with the same project name has missing or different identity
@@ -78,6 +85,30 @@ The latest release is
 - Antigravity sessions show the conversation title Antigravity saves in
   `conversation_summaries.db`, and follow renames there, including for
   conversations whose transcript is gone. Names set in AgentsView still win.
+- Import ChatGPT dot, Codex web, and Codex cloud task chats that live only on
+  OpenAI's servers. Turn it on with `[agents.codex-cloud] enabled = true` in
+  `config.toml`; it uses the ChatGPT login of your local Codex homes. Live
+  capture is opt-in: with `live_tokens = true`, AgentsView connects to a running
+  chat on OpenAI's side to listen in and record its token usage, so its cost
+  appears in usage totals. Connecting to a chat whose turn just ended can make
+  Codex continue the chat, so AgentsView skips chats with an active goal; see
+  the configuration guide for the remaining case. Chats that ran while
+  AgentsView was not listening in show their share of your plan's weekly and
+  five-hour limits instead, and token totals say how many chats were left out
+  for that reason. The endpoints are private and undocumented, so a change on
+  OpenAI's side can stop the import until AgentsView is updated. Enable the
+  source, or at least live capture, on one machine only. Every machine gives a
+  chat the same session ID. A second machine listens in on the same chats, and
+  its copies of them can conflict when synced to PostgreSQL or ClickHouse. See
+  [Codex Cloud](/docs/configuration/#codex-cloud) for what it sends to OpenAI,
+  how listening in can show on OpenAI's side, such as AgentsView appearing as a
+  chat's client, and its limits. `agentsview export sessions` now reports schema
+  version 7, because `model_usage` is `null` for a Codex cloud chat whose token
+  counts are unknown; update consumers that expect an object there.
+  [Artifact folder sync](/docs/artifact-sync/) now carries each Codex cloud
+  chat's plan usage, so the receiving archive shows the same plan shares and the
+  same count of chats left out of usage totals. Upgrade the receiving AgentsView
+  as well. An older version does not import these chats until it is upgraded.
 - See costs for each Hermes cron job in the `hermes-cron` Usage drill-down.
   Renamed runs and continuations stay together through recorded parent links.
   Each job shows its latest recorded name in the selected range, including on
@@ -164,9 +195,17 @@ The latest release is
   `discarded an unfinished rebuild` the same way.
   A summary that reports ownership conflicts now also shows how many sessions
   were unchanged, already pushed by the interrupted run, or removed.
+- `agentsview prune --agent <name>` removes an agent you no longer use from
+  search and the archive in one pass, including its sessions in trash and their
+  subagent sessions. Like other prunes, it also deletes each session's source
+  file from disk, except shared app databases such as Hermes `state.db`. A
+  parent session stays when a session outside the filters still belongs to it.
+  The prune summary now shows how many matches are in trash.
 
 **Bug fixes**
 
+- On Windows, daemon commands no longer make backup and sync tools treat the
+  whole data directory as changed.
 - `agentsview prune` no longer deletes the shared `state.db` of Hermes or
   Augure Desktop. Sessions synced by 0.45.0 or earlier record the bare
   `state.db` path, and pruning one deleted the whole app database. The prune
