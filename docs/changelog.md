@@ -30,7 +30,8 @@ The latest release is
 
 - Sync ChatGPT chats through the Chrome extension from Import > ChatGPT or
   `agentsview import --type chatgpt --sync`. Sync pages active and archived chats
-  and keeps the previous version of each chat it replaces in Trash.
+  and keeps the previous version in Trash when it replaces a chat's history with
+  a different branch. Appending turns makes no copy.
 - Anonymous telemetry now counts empty searches, visible errors in supported
   workflows, and failed sync attempts. Query and error details stay local. The
   existing [telemetry opt-out](https://agentsview.io/docs/configuration/#privacy-and-telemetry)
