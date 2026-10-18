@@ -621,6 +621,7 @@ func TestSyncClaudeAIUsageArchiveShorterBranchRefreshesMetadata(t *testing.T) {
 	before, err := d.GetAllMessages(t.Context(), id)
 	require.NoError(t, err)
 	require.Len(t, before, 1)
+	assert.Empty(t, before[0].Model, "Claude.ai imports do not supply a model")
 	selected = "reply"
 	updated = "2026-03-01T10:06:00Z"
 	stats, err := SyncClaudeAI(t.Context(), d, fetch, nil)
