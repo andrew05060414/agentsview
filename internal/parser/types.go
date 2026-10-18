@@ -1501,6 +1501,16 @@ type ParsedSession struct {
 	// clearing them; an explicit value still replaces them.
 	KeepStoredWorkspace bool `json:"keep_stored_workspace,omitempty"`
 	KeepStoredParent    bool `json:"keep_stored_parent,omitempty"`
+	// ExternalWorkspace marks a Cwd supplied outside the transcript. Sync
+	// lets such a parse fill a session with no stored working directory but
+	// leaves a change of an existing one to the metadata reconciliation,
+	// which also replaces the identity recorded for the old directory.
+	ExternalWorkspace bool `json:"external_workspace,omitempty"`
+	// ExternalWorkspaceProject marks a Project derived from a working
+	// directory supplied outside the transcript. When that directory is
+	// unchanged but can no longer be probed, sync keeps the stored
+	// parser-time project instead of the directory-name fallback.
+	ExternalWorkspaceProject bool `json:"external_workspace_project,omitempty"`
 	// TranscriptFidelity classifies how complete a stored transcript is
 	// relative to the agent's full session data: "full" when the
 	// high-resolution source was used, "summary" for a degraded/fallback

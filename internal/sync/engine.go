@@ -3833,17 +3833,6 @@ func (e *Engine) resyncBuildLocked(
 			return stats, fmt.Errorf("apply deferred native title: %w", err)
 		}
 	}
-	if err := e.applyDeferredAntigravitySummaries(ctx, newDB, deferredSummaries); err != nil {
-		stats.RecordFailed()
-		stats.Aborted = true
-		newDB.Close()
-		removeTempDB(tempPath)
-		restoreSkipCache()
-		e.mu.Lock()
-		e.lastSyncStats = stats
-		e.mu.Unlock()
-		return stats, fmt.Errorf("apply deferred antigravity summary: %w", err)
-	}
 	deferredCwdUpdated, err := e.applyDeferredSourceCwd(ctx,
 		newDB, deferredSourceCwd,
 	)
@@ -3966,6 +3955,21 @@ func (e *Engine) resyncBuildLocked(
 		e.lastSyncStats = stats
 		e.mu.Unlock()
 		return stats, err
+	}
+	// Antigravity workspace, project, and parent changes found during this
+	// rebuild replay only now: the metadata copy and snapshot restore above
+	// would otherwise put back the old archive's identity and project. The
+	// worktree mapping pass below then applies to the replayed projects.
+	if err := e.applyDeferredAntigravitySummaries(ctx, newDB, deferredSummaries); err != nil {
+		stats.RecordFailed()
+		stats.Aborted = true
+		newDB.Close()
+		removeTempDB(tempPath)
+		restoreSkipCache()
+		e.mu.Lock()
+		e.lastSyncStats = stats
+		e.mu.Unlock()
+		return stats, fmt.Errorf("apply deferred antigravity summary: %w", err)
 	}
 	mappingMachines, err := ops.listActiveWorktreeMappingMachines(ctx, newDB)
 	if err != nil {
@@ -11126,6 +11130,13 @@ func (e *Engine) collectAndBatchWithOptions(
 			storedCwd:  r.sourceCwdStored,
 			storedOK:   r.sourceCwdStoredOK,
 		}
+		if err := e.keepStoredWorkspaceBeforeCwdFilter(ctx, r.results); err != nil {
+			log.Printf("restore kept workspace before cwd filter: %v", err)
+			stats.RecordFailed()
+			e.noteSQLiteContainerResult(r.containerResultPath(), false)
+			r.releaseRetention()
+			continue
+		}
 		allowed, vetoed := e.splitResultsByCwdFilter(r.results, sourceCwd)
 		stats.cwdFilteredSessions += vetoed
 		cwdChanged, err := e.reconcileFilteredSourceCwd(ctx, r.results, sourceCwd)
@@ -17911,12 +17922,156 @@ type sessionWriteIdentityReader interface {
 }
 
 func (e *Engine) pendingWriteIdentity(pw pendingWrite) db.SessionWriteIdentity {
+	return e.parsedSessionWriteIdentity(pw.sess)
+}
+
+func (e *Engine) parsedSessionWriteIdentity(sess parser.ParsedSession) db.SessionWriteIdentity {
 	return db.SessionWriteIdentity{
-		Machine:  pw.sess.Machine,
-		Agent:    string(pw.sess.Agent),
-		FilePath: e.effectiveSourcePath(pw.sess.File.Path),
-		FileHash: pw.sess.File.Hash,
+		Machine:  sess.Machine,
+		Agent:    string(sess.Agent),
+		FilePath: e.effectiveSourcePath(sess.File.Path),
+		FileHash: sess.File.Hash,
 	}
+}
+
+// loadStoredSessionWriteIdentities reads stored attribution for ids. A
+// rebuild reads preexisting attribution from archiveStore while writing into
+// e.db. An ID first seen earlier in this rebuild is absent from the old
+// archive, so the replacement is consulted before treating it as new.
+func (e *Engine) loadStoredSessionWriteIdentities(
+	ctx context.Context, ids []string,
+) (map[string]db.SessionWriteIdentity, error) {
+	var archive any = e.db
+	if e.archiveStore != nil {
+		archive = e.archiveStore
+	}
+	reader, ok := archive.(sessionWriteIdentityReader)
+	if !ok {
+		return nil, fmt.Errorf(
+			"archive %T does not support session write identity lookup", archive,
+		)
+	}
+	identities, err := reader.ListSessionWriteIdentitiesByID(ctx, ids)
+	if err != nil {
+		return nil, fmt.Errorf("load immutable session write identities: %w", err)
+	}
+	if e.archiveStore != nil {
+		unresolved := make([]string, 0, len(ids))
+		for _, id := range ids {
+			if _, exists := identities[id]; !exists {
+				unresolved = append(unresolved, id)
+			}
+		}
+		if len(unresolved) > 0 {
+			replacementIdentities, err := e.db.ListSessionWriteIdentitiesByID(
+				ctx, unresolved,
+			)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"load replacement session write identities: %w", err,
+				)
+			}
+			maps.Copy(identities, replacementIdentities)
+		}
+	}
+	return identities, nil
+}
+
+// keepStoredWorkspaceBeforeCwdFilter restores the stored working directory
+// of parses that kept no workspace signal before the cwd allow-list judges
+// them; otherwise an empty cwd would veto the update and leave the archived
+// row (or, in a rebuild, an orphan copy) behind. Only sessions whose stored
+// attribution matches the incoming source borrow the stored values.
+func (e *Engine) keepStoredWorkspaceBeforeCwdFilter(
+	ctx context.Context, results []parser.ParseResult,
+) error {
+	if e.cwdFilter.empty() {
+		return nil
+	}
+	indexes := make(map[string][]int)
+	ids := make([]string, 0)
+	for i := range results {
+		sess := results[i].Session
+		if !sess.KeepStoredWorkspace || sess.Cwd != "" || sess.ID == "" {
+			continue
+		}
+		id := applyIDPrefixToID(e.idPrefix, sess.ID)
+		if _, exists := indexes[id]; !exists {
+			ids = append(ids, id)
+		}
+		indexes[id] = append(indexes[id], i)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	identities, err := e.loadStoredSessionWriteIdentities(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for id, matching := range indexes {
+		stored, ok := identities[id]
+		if !ok {
+			continue
+		}
+		for _, i := range matching {
+			if !sessionWriteIdentitySupportsStoredAttribution(
+				stored, e.parsedSessionWriteIdentity(results[i].Session),
+			) {
+				continue
+			}
+			keepStoredExternalSessionMetadata(&results[i].Session, stored)
+		}
+	}
+	return nil
+}
+
+// deferExternalWorkspaceChange keeps the stored working directory and project
+// when an externally supplied workspace differs from a stored one. The parse
+// write would keep the old directory's immutable identity snapshot, so the
+// change is left to the metadata reconciliation that runs after parsing (and,
+// in a rebuild, after the metadata copy), which records the new identity. A
+// new workspace outside the cwd allow-list is left as parsed so the filter
+// still vetoes it.
+func (e *Engine) deferExternalWorkspaceChange(
+	sess *parser.ParsedSession, stored db.SessionWriteIdentity,
+) {
+	if !sess.ExternalWorkspace || stored.Cwd == "" || sess.Cwd == stored.Cwd ||
+		!e.cwdFilter.allows(sess.Cwd) {
+		return
+	}
+	sess.Cwd = stored.Cwd
+	if sess.ExternalWorkspaceProject {
+		sess.Project = stored.SourceProject
+		if sess.Project == "" {
+			sess.Project = stored.Project
+		}
+	}
+}
+
+// keepStoredExternalWorkspaceProject keeps the stored parser-time project for
+// an unchanged externally supplied working directory that can no longer be
+// probed (its checkout is gone, or probing is not allowed). Deriving it again
+// would fall back to the directory name and split a repository subdirectory
+// off its stored repository. The write path then applies worktree mappings.
+func (e *Engine) keepStoredExternalWorkspaceProject(
+	pw *pendingWrite, stored db.SessionWriteIdentity,
+) {
+	sess := &pw.sess
+	if !sess.ExternalWorkspaceProject || sess.Cwd == "" ||
+		sess.Cwd != stored.Cwd || stored.SourceProject == "" ||
+		sess.Project == stored.SourceProject {
+		return
+	}
+	if !e.skipSourceProjectProbe(pw) {
+		stat := e.stat
+		if stat == nil {
+			stat = os.Stat
+		}
+		if _, err := stat(sess.Cwd); err == nil {
+			return
+		}
+	}
+	sess.Project = stored.SourceProject
 }
 
 func sessionWriteIdentitySupportsStoredAttribution(
@@ -17961,41 +18116,9 @@ func (e *Engine) normalizePendingWriteMachines(
 		return batch, nil
 	}
 
-	var archive any = e.db
-	if e.archiveStore != nil {
-		archive = e.archiveStore
-	}
-	reader, ok := archive.(sessionWriteIdentityReader)
-	if !ok {
-		return batch, fmt.Errorf(
-			"archive %T does not support session write identity lookup", archive,
-		)
-	}
-	identities, err := reader.ListSessionWriteIdentitiesByID(ctx, ids)
+	identities, err := e.loadStoredSessionWriteIdentities(ctx, ids)
 	if err != nil {
-		return batch, fmt.Errorf("load immutable session write identities: %w", err)
-	}
-	// A rebuild reads preexisting attribution from archiveStore while writing
-	// into e.db. An ID first seen earlier in this rebuild is absent from the old
-	// archive, so consult the replacement before treating it as a new ingestion.
-	if e.archiveStore != nil {
-		unresolved := make([]string, 0, len(ids))
-		for _, id := range ids {
-			if _, exists := identities[id]; !exists {
-				unresolved = append(unresolved, id)
-			}
-		}
-		if len(unresolved) > 0 {
-			replacementIdentities, err := e.db.ListSessionWriteIdentitiesByID(
-				ctx, unresolved,
-			)
-			if err != nil {
-				return batch, fmt.Errorf(
-					"load replacement session write identities: %w", err,
-				)
-			}
-			maps.Copy(identities, replacementIdentities)
-		}
+		return batch, err
 	}
 	for _, id := range ids {
 		matchingIndexes := indexes[id]
@@ -18020,6 +18143,8 @@ func (e *Engine) normalizePendingWriteMachines(
 				}
 				if !batch[i].sourceIdentityUnverified {
 					keepStoredExternalSessionMetadata(&batch[i].sess, stored)
+					e.deferExternalWorkspaceChange(&batch[i].sess, stored)
+					e.keepStoredExternalWorkspaceProject(&batch[i], stored)
 				}
 			}
 			continue

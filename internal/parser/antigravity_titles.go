@@ -285,8 +285,10 @@ func applyAntigravitySummary(ctx context.Context, sess *ParsedSession, src antig
 		sess.SessionName = summary.Title
 		sess.SessionNamePresent = true
 	}
-	if sess.Cwd == "" && summary.Cwd != "" {
+	externalCwd := sess.Cwd == "" && summary.Cwd != ""
+	if externalCwd {
 		sess.Cwd = summary.Cwd
+		sess.ExternalWorkspace = true
 	}
 	if sess.Project == "" {
 		if summary.Project != "" {
@@ -294,6 +296,7 @@ func applyAntigravitySummary(ctx context.Context, sess *ParsedSession, src antig
 		} else if sess.Cwd != "" {
 			sess.Project = ExtractProjectFromCwdWithBranchContext(ctx, sess.Cwd, "")
 		}
+		sess.ExternalWorkspaceProject = externalCwd && sess.Project != ""
 	}
 	if sess.ParentSessionID == "" && summary.ParentConversationID != "" {
 		sess.ParentSessionID = antigravityIDPrefix + summary.ParentConversationID

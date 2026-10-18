@@ -3981,30 +3981,43 @@ schemas keep their existing ordering behavior.
   `localhost` and UNC hosts handled) and the project is derived from it; a
   non-empty parent ID links the session to that conversation as a subagent.
   A JSON string value, even a blank one, is read as that URI; only text that
-  is not JSON is read as a raw path. At parse time the store only fills an
-  empty working directory, project or parent. When neither the transcript nor
-  the store supplies one (blank value, missing row or column, unreadable
-  store), the parse marks it absent and sync keeps the stored working
-  directory, parent and parser-time project label (from the session's project
-  identity snapshot) in ordinary syncs and rebuilds alike, then applies the
-  active worktree mappings; it does not derive the project again from a
-  checkout that may be gone. Each sync pass also copies a changed workspace or
-  parent onto stored sessions (a parent only when none is stored), so existing
-  archives pick them up without a parser resync; a rebuild replays these
-  changes onto archived sessions without a transcript after the orphan copy.
-  Usage-only archives reconcile workspace and parent too and keep no titles. A
-  copied workspace takes its project through active worktree mappings and
-  records a complete project identity snapshot; a session whose stored
-  workspace already matches but whose snapshot is a keyless placeholder gets
-  its identity repaired without touching the session row, and a rebuild's
-  metadata copy never replaces a publishable snapshot with an old placeholder
-  that recorded neither a key nor a root.
-  A rename alone leaves the project untouched, and a new parent clears stale
-  friction results. An empty or missing value never clears stored data.
-  Checked 2026-10-17 with synthetic stores covering the URI shapes above,
-  blank and JSON-empty-string values, missing rows, unreadable stores, a
-  removed checkout, placeholder identity snapshots across rebuilds,
-  usage-only archives, and stores that lack the optional columns.
+  is not JSON is read as a raw path.
+
+  The store's workspace can change after a session is stored, so sync treats
+  it as mutable metadata with one owner for each step:
+
+  - **Parse** fills a working directory, project or parent only when the
+    session has none stored. When neither the transcript nor the store
+    supplies one (blank value, missing row or column, unreadable store), the
+    parse marks it absent and sync keeps the stored working directory, parent
+    and parser-time project label (from the session's identity snapshot)
+    before the cwd allow-list judges the session, in ordinary syncs and
+    rebuilds alike. A parse whose workspace differs from a stored one keeps
+    the stored workspace and leaves the change to reconciliation. An
+    unchanged workspace that can no longer be probed (its checkout is gone)
+    keeps the stored project instead of a directory-name fallback. Worktree
+    mappings then apply as for any write.
+  - **Reconciliation** runs after parsing on every sync pass, including
+    usage-only archives (which keep no titles). It copies a changed workspace
+    or a parent onto stored sessions (a parent only when none is stored), so
+    existing archives pick them up without a parser resync. A changed
+    workspace takes its project through active worktree mappings and replaces
+    the identity snapshot recorded for the old workspace; a matching workspace
+    whose snapshot is a keyless placeholder gets its identity repaired without
+    touching the session row. A rename alone leaves the project untouched,
+    and a new parent clears stale friction results.
+  - **Rebuild** records workspace, project and parent changes against the old
+    archive, for live and orphaned sessions, and replays them after the
+    metadata copy and identity-snapshot project restore, before worktree
+    mappings apply. The metadata copy never replaces a publishable snapshot
+    with an old placeholder that recorded neither a key nor a root.
+
+  An empty or missing value never clears stored data. Checked 2026-10-18 with
+  synthetic stores covering the URI shapes above, blank and JSON-empty-string
+  values, missing rows, unreadable stores, removed checkouts with and without
+  a changed store, workspace changes between Git repositories in syncs and
+  rebuilds, placeholder identity snapshots, cwd allow-lists, usage-only
+  archives, and stores that lack the optional columns.
 
 ## Antigravity CLI (`antigravity-cli`)
 

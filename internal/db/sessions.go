@@ -2723,6 +2723,10 @@ type NativeSessionSummary struct {
 	IdentityObservation export.ProjectIdentityObservation
 	// IdentitySnapshotProject labels the parser-time snapshot.
 	IdentitySnapshotProject string
+	// ReplaceIdentitySnapshot drops the stored snapshot before recording
+	// IdentityObservation. The store's workspace changed, so the evidence
+	// recorded for the old workspace no longer describes this session.
+	ReplaceIdentitySnapshot bool
 }
 
 // RefreshNativeSessionSummary applies the native title, workspace, project,
@@ -2835,10 +2839,41 @@ func (db *DB) refreshNativeSessionSummary(
 		}
 	}
 	if hasIdentity {
+		var replaced struct {
+			found                             bool
+			project, machine, root, gitRemote string
+		}
+		if summary.ReplaceIdentitySnapshot {
+			err := tx.QueryRowContext(ctx, `
+				SELECT project, machine, root_path, git_remote
+				FROM session_project_identity_snapshots WHERE session_id = ?`, id,
+			).Scan(&replaced.project, &replaced.machine, &replaced.root, &replaced.gitRemote)
+			switch {
+			case err == nil:
+				replaced.found = true
+				if _, err := tx.ExecContext(ctx,
+					`DELETE FROM session_project_identity_snapshots WHERE session_id = ?`, id,
+				); err != nil {
+					return fmt.Errorf("replacing session project identity snapshot: %w", err)
+				}
+			case !errors.Is(err, sql.ErrNoRows):
+				return fmt.Errorf("reading replaced project identity snapshot: %w", err)
+			}
+		}
 		if err := upsertProjectIdentityObservationWithSnapshotProjectTx(
 			tx, identity, summary.IdentitySnapshotProject, false, true,
 		); err != nil {
 			return err
+		}
+		if replaced.found {
+			// Republish the old evidence key from the snapshots that still
+			// carry it, so the replaced workspace leaves no stale aggregate.
+			if err := reconcileProjectIdentityAggregateKeyExec(
+				ctx, tx, replaced.machine, replaced.root, replaced.gitRemote,
+				[]string{replaced.project, previousProject, identity.Project},
+			); err != nil {
+				return err
+			}
 		}
 	}
 	if project != "" {

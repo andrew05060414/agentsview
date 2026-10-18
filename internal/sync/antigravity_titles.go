@@ -56,6 +56,9 @@ type antigravitySummaryUpdate struct {
 	// identityOnly repairs an unpublishable identity snapshot for a session
 	// whose stored cwd already matches; the session row stays as it is.
 	identityOnly bool
+	// replaceIdentity marks a changed workspace: the identity recorded for
+	// the old workspace no longer describes the session.
+	replaceIdentity bool
 }
 
 // deferredAntigravitySummary is a rebuild change for an archived session that
@@ -96,6 +99,13 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		if !ok && !deferred {
 			continue
 		}
+		// A rebuild restores the old archive's identity and project after this
+		// pass, so a workspace that differs from the old archive is replayed
+		// afterwards even when the fresh parse already wrote it.
+		previous := session
+		if prior, had := archived[id]; ok && had {
+			previous = prior
+		}
 		summary := summaries[strings.TrimPrefix(id, prefix)]
 		if usageOnly {
 			summary.TitlePresent = false
@@ -105,6 +115,8 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		titleChanged := summary.TitlePresent && ((session.SessionName != nil && *session.SessionName != title) ||
 			(session.SessionName == nil && title != ""))
 		cwdChanged := summary.Cwd != "" && session.Cwd != summary.Cwd
+		rebuildWorkspaceChange := ok && e.deferredAntigravitySummaries != nil &&
+			summary.Cwd != "" && previous.Cwd != summary.Cwd
 		parentID := ""
 		if summary.ParentConversationID != "" {
 			parentID = prefix + summary.ParentConversationID
@@ -112,9 +124,10 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		parentChanged := parentID != "" && session.ParentSessionID == ""
 		// A workspace stored before its identity was recorded completely
 		// (or by an older build) still needs a publishable snapshot.
-		identityRepair := summary.Cwd != "" && !cwdChanged && session.IdentityNeedsRepair
+		identityRepair := summary.Cwd != "" && !cwdChanged && !rebuildWorkspaceChange &&
+			session.IdentityNeedsRepair
 
-		if !titleChanged && !cwdChanged && !parentChanged && !identityRepair {
+		if !titleChanged && !cwdChanged && !parentChanged && !identityRepair && !rebuildWorkspaceChange {
 			continue
 		}
 		targetCwd := session.Cwd
@@ -130,15 +143,16 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		}
 		// Only a changed workspace is rewritten, so a rename alone never
 		// replaces the stored project.
-		if cwdChanged || identityRepair {
+		if cwdChanged || identityRepair || rebuildWorkspaceChange {
 			update.cwd = summary.Cwd
 			update.project = summary.Project
 			update.identityOnly = identityRepair
+			update.replaceIdentity = !identityRepair
 		}
 		if parentChanged {
 			update.parentID = parentID
 		}
-		if deferred {
+		if deferred || rebuildWorkspaceChange {
 			e.deferredAntigravitySummaries[id] = deferredAntigravitySummary{stored: session, update: update}
 			continue
 		}
@@ -199,6 +213,7 @@ func (e *Engine) refreshAntigravitySummary(
 		}); ok {
 			refresh.IdentityObservation = obs
 			refresh.IdentitySnapshotProject = update.project
+			refresh.ReplaceIdentitySnapshot = update.replaceIdentity
 		}
 	}
 	return target.RefreshNativeSessionSummary(ctx, id, refresh)

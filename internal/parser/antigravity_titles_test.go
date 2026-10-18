@@ -182,6 +182,8 @@ func TestApplyAntigravitySummaryMarksAbsentMetadata(t *testing.T) {
 			applyAntigravitySummary(t.Context(), sess, antigravitySource{Root: root, ID: id})
 			assert.Equal(t, tc.keepWorkspace, sess.KeepStoredWorkspace)
 			assert.Equal(t, tc.keepParent, sess.KeepStoredParent)
+			assert.Equal(t, !tc.keepWorkspace, sess.ExternalWorkspace)
+			assert.Equal(t, !tc.keepWorkspace, sess.ExternalWorkspaceProject)
 			if tc.keepWorkspace {
 				assert.Empty(t, sess.Cwd)
 			} else {
