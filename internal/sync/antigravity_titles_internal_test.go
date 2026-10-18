@@ -37,7 +37,7 @@ func TestAntigravityUnrelatedChangedPathSkipsUnchangedStoreQueries(t *testing.T)
 	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
 	spy := &antigravityTitleQuerySpy{Store: archive, reader: archive}
 	engine.archiveStore = spy
-	engine.deferredAntigravityTitles = make(map[string]*string)
+	engine.deferredAntigravityChanges = make(map[string]antigravitySessionChange)
 	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{store}))
 	require.Equal(t, [][]string{{"antigravity:" + dbtest.AntigravityTitleID}}, spy.queries)
 	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{filepath.Join(root, "unrelated")}))
@@ -59,7 +59,7 @@ func TestAntigravityFramelessWALEventsDoNotRereadStore(t *testing.T) {
 	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
 	spy := &antigravityTitleQuerySpy{Store: archive, reader: archive}
 	engine.archiveStore = spy
-	engine.deferredAntigravityTitles = make(map[string]*string)
+	engine.deferredAntigravityChanges = make(map[string]antigravitySessionChange)
 	for _, size := range []int{0, 32} {
 		require.NoError(t, os.WriteFile(store+"-wal", make([]byte, size), 0o600))
 		require.NoError(t, engine.SyncPathsContext(t.Context(), []string{store + "-wal"}))
@@ -108,7 +108,7 @@ func TestAntigravityTitleFailureDoesNotRetryOtherAgents(t *testing.T) {
 				require.NoError(t, err)
 				spy := &antigravityTitleQuerySpy{Store: archive, reader: archive}
 				engine.archiveStore = spy
-				engine.deferredAntigravityTitles = make(map[string]*string)
+				engine.deferredAntigravityChanges = make(map[string]antigravitySessionChange)
 				calls := make(chan WatchBatch, 2)
 				switch mode {
 				case "watcher", "watcher-read":

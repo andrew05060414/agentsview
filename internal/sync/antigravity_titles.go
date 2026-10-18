@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"maps"
 	"path/filepath"
@@ -42,7 +43,8 @@ func (e *Engine) invalidateAntigravityTitleCache(paths []string) {
 // Reconcile after parsing so an older parsed title cannot win.
 func (e *Engine) reconcileAntigravityTitlesLocked(ctx context.Context, stats *SyncStats) {
 	sources := e.sources()
-	if _, enabled := sources.providerFactories[parser.AgentAntigravity]; !enabled || e.db.ArchiveContent().UsageOnly() {
+	// Usage-only archives keep no titles, but still take workspaces and parents.
+	if _, enabled := sources.providerFactories[parser.AgentAntigravity]; !enabled {
 		return
 	}
 	if e.appliedAntigravityTitles == nil {
@@ -60,10 +62,10 @@ func (e *Engine) reconcileAntigravityTitlesLocked(ctx context.Context, stats *Sy
 		}
 		delete(e.appliedAntigravityTitles, store)
 		parser.InvalidateAntigravityTitles(store)
-		titles, state, err := parser.AntigravityStoreTitles(ctx, store)
+		summaries, state, err := parser.AntigravityStoreSummaries(ctx, store)
 		if err == nil {
 			var n int
-			n, err = e.applyAntigravityStoreTitles(ctx, root, titles)
+			n, err = e.applyAntigravityStoreSummaries(ctx, root, summaries)
 			stats.TitlesUpdated += n
 		}
 		if err != nil {
@@ -117,13 +119,25 @@ func (e *Engine) recordAntigravityTitleUpdates(stats SyncStats) {
 	}
 }
 
-func (e *Engine) applyAntigravityStoreTitles(ctx context.Context, root string, titles map[string]string) (updated int, err error) {
-	if len(titles) == 0 {
+// antigravitySessionChange is what a store row changes on one stored session:
+// its title, and a working directory and parent it did not have yet.
+type antigravitySessionChange struct {
+	retitle bool
+	name    *string
+	machine string
+	cwd     string
+	// project is the parser-derived project for cwd, before worktree mappings.
+	project  string
+	parentID string
+}
+
+func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string, summaries map[string]parser.AntigravitySummary) (updated int, err error) {
+	if len(summaries) == 0 {
 		return 0, nil
 	}
 	prefix := e.idPrefix + string(parser.AgentAntigravity) + ":"
-	ids := make([]string, 0, len(titles))
-	for id := range maps.Keys(titles) {
+	ids := make([]string, 0, len(summaries))
+	for id := range maps.Keys(summaries) {
 		ids = append(ids, prefix+id)
 	}
 	slices.Sort(ids)
@@ -132,12 +146,13 @@ func (e *Engine) applyAntigravityStoreTitles(ctx context.Context, root string, t
 		return 0, err
 	}
 	var archived map[string]db.SessionWriteIdentity
-	if reader, ok := e.archiveStore.(sessionWriteIdentityReader); ok && e.deferredAntigravityTitles != nil {
+	if reader, ok := e.archiveStore.(sessionWriteIdentityReader); ok && e.deferredAntigravityChanges != nil {
 		// A rebuild copies archived sessions without sources only after this pass.
 		if archived, err = reader.ListSessionWriteIdentitiesByID(ctx, ids); err != nil {
 			return 0, err
 		}
 	}
+	usageOnly := e.db.ArchiveContent().UsageOnly()
 	for _, id := range ids {
 		session, ok := stored[id]
 		deferred := false
@@ -147,29 +162,72 @@ func (e *Engine) applyAntigravityStoreTitles(ctx context.Context, root string, t
 		if !ok && !deferred {
 			continue
 		}
-		title := db.SanitizeUTF8(titles[strings.TrimPrefix(id, prefix)])
-		if session.SessionName != nil && *session.SessionName == title ||
-			session.SessionName == nil && title == "" {
+		summary := summaries[strings.TrimPrefix(id, prefix)]
+		change := antigravitySessionChange{machine: session.Machine}
+		title := db.SanitizeUTF8(summary.Title)
+		change.retitle = summary.TitlePresent && !usageOnly &&
+			!(session.SessionName != nil && *session.SessionName == title ||
+				session.SessionName == nil && title == "")
+		if change.retitle && title != "" {
+			change.name = &title
+		}
+		// The store only fills what the session does not have yet.
+		cwd := session.Cwd
+		if cwd == "" {
+			cwd = summary.Cwd
+			change.cwd, change.project = summary.Cwd, summary.Project
+		}
+		if session.ParserParentSessionID == "" && summary.ParentConversationID != "" {
+			change.parentID = prefix + summary.ParentConversationID
+		}
+		if !change.retitle && change.cwd == "" && change.parentID == "" {
 			continue
 		}
-		if !e.antigravityRootOwns(root, session.FilePath) || !e.cwdFilter.allows(session.Cwd) {
+		if !e.antigravityRootOwns(root, session.FilePath) || !e.cwdFilter.allows(cwd) {
 			continue
-		}
-		var name *string
-		if title != "" {
-			name = &title
 		}
 		if deferred {
-			e.deferredAntigravityTitles[id] = name
+			e.deferredAntigravityChanges[id] = change
 			continue
 		}
-		// Trashed sessions take the title too, so restoring one needs no store change.
-		if err := e.db.RefreshNativeSessionName(ctx, id, name); err != nil {
+		// Trashed sessions take the change too, so restoring one needs no store change.
+		if err := e.applyAntigravitySessionChange(ctx, e.db, id, change); err != nil {
 			return updated, err
 		}
 		updated++
 	}
 	return updated, nil
+}
+
+// applyAntigravitySessionChange writes change into target. A filled working
+// directory takes its project through the active worktree mappings and
+// records a complete project identity, as a parsed write does.
+func (e *Engine) applyAntigravitySessionChange(
+	ctx context.Context, target *db.DB, id string, change antigravitySessionChange,
+) error {
+	if change.retitle {
+		if err := target.RefreshNativeSessionName(ctx, id, change.name); err != nil {
+			return err
+		}
+	}
+	fill := db.NativeSessionMetadata{Cwd: change.cwd, ParentSessionID: change.parentID}
+	if change.cwd != "" && change.project != "" {
+		fill.Project = change.project
+		mapped, ok, err := target.ResolveWorktreeProjectMapping(ctx, change.machine, change.cwd, change.project)
+		if err != nil {
+			return fmt.Errorf("resolve worktree project for %s: %w", id, err)
+		}
+		if ok {
+			fill.Project = mapped
+		}
+		if obs, ok := e.projectIdentityObservation(db.Session{
+			ID: id, Project: fill.Project, Machine: change.machine, Cwd: change.cwd,
+		}); ok {
+			fill.Identity = obs
+			fill.IdentitySnapshotProject = change.project
+		}
+	}
+	return target.FillNativeSessionMetadata(ctx, id, fill)
 }
 
 // antigravityRootOwns keeps a store from renaming a same-ID session that

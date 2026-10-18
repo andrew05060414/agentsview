@@ -582,10 +582,11 @@ type Engine struct {
 	sourceClaimsMu    gosync.Mutex
 	sourceClaims      map[string]string
 	deferredSourceCwd *sourceCwdReconciliationBatch
-	// deferredAntigravityTitles holds rebuild title changes for archived
-	// sessions that reach the replacement only through the orphan copy.
-	deferredAntigravityTitles map[string]*string
-	appliedAntigravityTitles  map[string]appliedAntigravityTitles
+	// deferredAntigravityChanges holds rebuild title, workspace, and parent
+	// changes for archived sessions that reach the replacement only through
+	// the orphan copy.
+	deferredAntigravityChanges map[string]antigravitySessionChange
+	appliedAntigravityTitles   map[string]appliedAntigravityTitles
 	// sourceSet holds the provider set and session roots this engine
 	// discovers from. ReconfigureSources replaces it as one snapshot.
 	sourceSet atomic.Pointer[engineSources]
@@ -3494,9 +3495,9 @@ func (e *Engine) resyncBuildLocked(
 	deferredSourceCwd := newSourceCwdReconciliationBatch()
 	e.deferredSourceCwd = deferredSourceCwd
 	defer func() { e.deferredSourceCwd = nil }()
-	deferredTitles := make(map[string]*string)
-	e.deferredAntigravityTitles = deferredTitles
-	defer func() { e.deferredAntigravityTitles = nil }()
+	deferredAntigravity := make(map[string]antigravitySessionChange)
+	e.deferredAntigravityChanges = deferredAntigravity
+	defer func() { e.deferredAntigravityChanges = nil }()
 	e.db = newDB
 	reportResyncPhase(
 		PhaseDiscovering,
@@ -3545,7 +3546,7 @@ func (e *Engine) resyncBuildLocked(
 		contributorEngine.archiveStore = origDB
 		contributorEngine.archiveRebuildIndex = archiveIndex
 		contributorEngine.deferredSourceCwd = deferredSourceCwd
-		contributorEngine.deferredAntigravityTitles = deferredTitles
+		contributorEngine.deferredAntigravityChanges = deferredAntigravity
 		contributorEngine.forceFullParse = contributor.ForceParse ||
 			contributor.ForceFullParseAfterCache
 		contributorEngine.forceFullParseAllowsCache =
@@ -3809,8 +3810,8 @@ func (e *Engine) resyncBuildLocked(
 	}
 	stats.OrphanedCopied = len(orphaned)
 	copiedSessionIDs = append(copiedSessionIDs, orphaned...)
-	for id, name := range deferredTitles {
-		if err := newDB.RefreshNativeSessionName(ctx, id, name); err != nil {
+	for id, change := range deferredAntigravity {
+		if err := e.applyAntigravitySessionChange(ctx, newDB, id, change); err != nil {
 			stats.RecordFailed()
 			stats.Aborted = true
 			newDB.Close()
@@ -11055,6 +11056,13 @@ func (e *Engine) collectAndBatchWithOptions(
 			storedCwd:  r.sourceCwdStored,
 			storedOK:   r.sourceCwdStoredOK,
 		}
+		if err := e.keepStoredExternalMetadataBeforeCwdFilter(ctx, r.results); err != nil {
+			log.Printf("keep stored external metadata: %v", err)
+			stats.RecordFailed()
+			e.noteSQLiteContainerResult(r.containerResultPath(), false)
+			r.releaseRetention()
+			continue
+		}
 		allowed, vetoed := e.splitResultsByCwdFilter(r.results, sourceCwd)
 		stats.cwdFilteredSessions += vetoed
 		cwdChanged, err := e.reconcileFilteredSourceCwd(ctx, r.results, sourceCwd)
@@ -17947,6 +17955,9 @@ func (e *Engine) normalizePendingWriteMachines(
 						batch[i].sess.SessionName = *stored.SessionName
 					}
 				}
+				if !batch[i].sourceIdentityUnverified {
+					keepStoredExternalMetadata(&batch[i].sess, stored)
+				}
 			}
 			continue
 		}
@@ -17960,6 +17971,59 @@ func (e *Engine) normalizePendingWriteMachines(
 		}
 	}
 	return batch, nil
+}
+
+// keepStoredExternalMetadata keeps a stored working directory and parent over
+// those a parse took from outside the transcript, so that store only fills
+// empty values and a blank or unreadable one never clears them. The project
+// is the stored parser-time label rather than one derived again from a
+// checkout that may be gone; worktree mappings apply as for any write.
+func keepStoredExternalMetadata(sess *parser.ParsedSession, stored db.SessionWriteIdentity) {
+	if sess.KeepStoredWorkspace && stored.Cwd != "" {
+		sess.Cwd = stored.Cwd
+		if stored.SourceProject != "" {
+			sess.Project = stored.SourceProject
+		}
+	}
+	if sess.KeepStoredParent && stored.ParserParentSessionID != "" {
+		sess.ParentSessionID = stored.ParserParentSessionID
+		if sess.RelationshipType == "" {
+			sess.RelationshipType = parser.RelSubagent
+		}
+	}
+}
+
+// keepStoredExternalMetadataBeforeCwdFilter resolves stored attribution, and
+// with it keepStoredExternalMetadata, before the cwd allow-list judges parsed
+// sessions, so the filter sees the working directory the write will store.
+// The write path resolves it again with the same result.
+func (e *Engine) keepStoredExternalMetadataBeforeCwdFilter(
+	ctx context.Context, results []parser.ParseResult,
+) error {
+	if e.cwdFilter.empty() {
+		return nil
+	}
+	batch := make([]pendingWrite, 0, len(results))
+	for _, result := range results {
+		if result.Session.KeepStoredWorkspace {
+			batch = append(batch, pendingWrite{sess: result.Session})
+		}
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+	batch, err := e.normalizePendingWriteMachines(ctx, batch)
+	if err != nil {
+		return err
+	}
+	next := 0
+	for i := range results {
+		if results[i].Session.KeepStoredWorkspace {
+			results[i].Session = batch[next].sess
+			next++
+		}
+	}
+	return nil
 }
 
 type writeBatchOutcome struct {
