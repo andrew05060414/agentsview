@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json/v2"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"path/filepath"
@@ -168,7 +169,7 @@ func (h *chromeHost) fetch(ctx context.Context, platform chromehost.Platform, pa
 	defer func() { conn.mu.Lock(); delete(conn.pending, id); conn.mu.Unlock() }()
 	if err != nil {
 		_ = conn.Close()
-		return importer.ClaudeAIResponse{}, err
+		return importer.ClaudeAIResponse{}, fmt.Errorf("writing Chrome request: %w", err)
 	}
 	return awaitBrowserResponse(ctx, answer)
 }
