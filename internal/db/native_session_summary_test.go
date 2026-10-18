@@ -317,3 +317,29 @@ func TestRefreshNativeSessionSummaryIdentityFollowsStoredProject(t *testing.T) {
 		})
 	}
 }
+
+func TestRefreshNativeSessionSummaryNativeParentOverridesLauncherLink(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	insertSession(t, d, "child", "p")
+	insertSession(t, d, "launcher", "p")
+	insertSession(t, d, "native", "p")
+	_, err := d.SetSessionExternalParent(ctx, "child", "launcher")
+	require.NoError(t, err)
+	child := fullSession(t, d, "child")
+	require.Equal(t, new("launcher"), child.ParentSessionID)
+	require.Nil(t, child.ParserParentSessionID, "the launcher link is not a native parent")
+	setFrictionVersion(t, d, "child")
+
+	require.NoError(t, d.RefreshNativeSessionSummary(ctx, "child", NativeSessionSummary{
+		ParentSessionID: "native",
+	}))
+	child = fullSession(t, d, "child")
+	assert.Equal(t, new("native"), child.ParentSessionID, "a native parent takes precedence over a launcher link")
+	assert.Equal(t, new("native"), child.ParserParentSessionID)
+	assert.Equal(t, "subagent", child.RelationshipType)
+	assert.Empty(t, frictionVersion(t, d, "child"))
+	link, err := d.GetSessionExternalParent(ctx, "child")
+	require.NoError(t, err)
+	assert.False(t, link.Applied, "the launcher link stays recorded but no longer applies")
+}
