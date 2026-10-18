@@ -212,3 +212,80 @@ func TestRefreshNativeSessionSummaryReplacesIdentityForChangedWorkspace(t *testi
 		assert.NotEqual(t, "first", obs.Project, "no aggregate evidence remains for the replaced workspace")
 	}
 }
+
+func observationsByProject(t *testing.T, d *DB) map[string][]export.ProjectIdentityObservation {
+	t.Helper()
+	observations, err := d.ListProjectIdentityObservations(t.Context(), nil)
+	require.NoError(t, err)
+	byProject := make(map[string][]export.ProjectIdentityObservation)
+	for _, obs := range observations {
+		byProject[obs.Project] = append(byProject[obs.Project], obs)
+	}
+	return byProject
+}
+
+func TestRefreshNativeSessionSummaryIdentityFollowsStoredProject(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		assigned bool
+		trashed  bool
+	}{
+		{name: "assigned project", assigned: true},
+		{name: "trashed session", trashed: true},
+		{name: "assigned and trashed", assigned: true, trashed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			ctx := t.Context()
+			first := filepath.Join(t.TempDir(), "first")
+			second := filepath.Join(t.TempDir(), "second")
+			insertSession(t, d, "child", "first", func(s *Session) { s.Cwd = first })
+			require.NoError(t, d.UpsertProjectIdentityObservation(ctx, export.ProjectIdentityObservation{
+				SessionID: "child", Project: "first", Machine: defaultMachine, RootPath: first,
+			}))
+			stored := "first"
+			if tc.assigned {
+				_, err := d.AssignSessionProject(ctx, "child", "chosen")
+				require.NoError(t, err)
+				stored = "chosen"
+			}
+			if tc.trashed {
+				require.NoError(t, d.SoftDeleteSession(ctx, "child"))
+			}
+
+			require.NoError(t, d.RefreshNativeSessionSummary(ctx, "child", NativeSessionSummary{
+				Cwd: second, Project: "first", // the derived name may equal the stored one
+				IdentityObservation: export.ProjectIdentityObservation{
+					SessionID: "child", Project: "first", Machine: defaultMachine, RootPath: second,
+				},
+				IdentitySnapshotProject: "second",
+				ReplaceIdentitySnapshot: true,
+			}))
+
+			s := fullSession(t, d, "child")
+			assert.Equal(t, stored, s.Project)
+			assert.Equal(t, second, s.Cwd)
+			snapshots, err := d.listSessionProjectIdentitySnapshots(ctx, []string{"child"})
+			require.NoError(t, err)
+			require.Contains(t, snapshots, "child")
+			assert.Equal(t, second, snapshots["child"].RootPath)
+			assert.Equal(t, "second", snapshots["child"].Project, "the snapshot keeps its parser-time label")
+
+			byProject := observationsByProject(t, d)
+			for project, observations := range byProject {
+				for _, obs := range observations {
+					assert.NotEqual(t, first, obs.RootPath, "%s still publishes the replaced workspace", project)
+				}
+			}
+			if tc.trashed {
+				assert.Empty(t, byProject, "a trashed session publishes no aggregate evidence")
+				return
+			}
+			require.Len(t, byProject[stored], 1, "evidence is published under the stored project")
+			assert.Equal(t, second, byProject[stored][0].RootPath)
+			for project := range byProject {
+				assert.Equal(t, stored, project)
+			}
+		})
+	}
+}
