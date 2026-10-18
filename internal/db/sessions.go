@@ -2762,25 +2762,6 @@ type NativeSessionMetadata struct {
 func (db *DB) FillNativeSessionMetadata(
 	ctx context.Context, id string, m NativeSessionMetadata,
 ) error {
-	if m.Cwd == "" && m.ParentSessionID == "" {
-		return nil
-	}
-	identity := m.Identity
-	hasIdentity := m.Cwd != "" && strings.TrimSpace(identity.Project) != ""
-	if hasIdentity {
-		normalized, err := normalizeProjectIdentityObservation(identity)
-		if err != nil {
-			return err
-		}
-		if normalized.SessionID != id {
-			return fmt.Errorf(
-				"identity observation session id %q does not match session id %q",
-				normalized.SessionID, id,
-			)
-		}
-		identity = normalized
-	}
-
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	tx, err := db.getWriter().Begin(ctx)
@@ -2788,113 +2769,113 @@ func (db *DB) FillNativeSessionMetadata(
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	queryRow := func(ctx context.Context, query string, args ...any) rowScanner {
-		return tx.QueryRowContext(ctx, query, args...)
-	}
-	var previousProject, previousCwd string
-	err = tx.QueryRowContext(ctx,
-		`SELECT project, COALESCE(cwd, '') FROM sessions WHERE id = ?`, id,
-	).Scan(&previousProject, &previousCwd)
+	var s struct{ project, cwd, parent, parserParent, relationship, parserRelationship string }
+	err = tx.QueryRowContext(ctx, `
+		SELECT project, COALESCE(cwd, ''), COALESCE(parent_session_id, ''),
+		       COALESCE(parser_parent_session_id, ''), COALESCE(relationship_type, ''),
+		       COALESCE(parser_relationship_type, '')
+		FROM sessions WHERE id = ?`, id,
+	).Scan(&s.project, &s.cwd, &s.parent, &s.parserParent, &s.relationship, &s.parserRelationship)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("checking session %s: %w", id, err)
 	}
-	fillCwd := previousCwd == "" && m.Cwd != ""
-	project := ""
-	if fillCwd {
-		project = m.Project
+	fillCwd := s.cwd == "" && m.Cwd != ""
+	fillParent := s.parserParent == "" && m.ParentSessionID != ""
+	if !fillCwd && !fillParent {
+		return nil
 	}
-	// Adding a parent moves the row in the hierarchy, so friction results
-	// computed for it are cleared as the session upsert and linking paths do.
-	_, err = tx.ExecContext(ctx,
-		`UPDATE sessions
-		 SET cwd = CASE WHEN ? THEN ? ELSE cwd END,
-		     project = CASE WHEN ? != '' THEN ? ELSE project END,
-		     parent_session_id = CASE
-		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
-		         THEN ? ELSE parent_session_id END,
-		     parser_parent_session_id = CASE
-		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
-		         THEN ? ELSE parser_parent_session_id END,
-		     relationship_type = CASE
-		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
-		              AND COALESCE(relationship_type, '') = ''
-		         THEN 'subagent' ELSE relationship_type END,
-		     parser_relationship_type = CASE
-		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
-		              AND COALESCE(parser_relationship_type, '') = ''
-		         THEN 'subagent' ELSE parser_relationship_type END,
-		     friction_rules_version = CASE
-		         WHEN ? != '' AND COALESCE(parser_parent_session_id, '') = ''
-		              AND parent_session_id IS NOT ?
-		         THEN '' ELSE friction_rules_version END,
-		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		 WHERE id = ?`,
-		fillCwd, m.Cwd,
-		project, project,
-		m.ParentSessionID, m.ParentSessionID,
-		m.ParentSessionID, m.ParentSessionID,
-		m.ParentSessionID,
-		m.ParentSessionID,
-		m.ParentSessionID, m.ParentSessionID,
-		id,
-	)
-	if err != nil {
+	cwd, project := s.cwd, s.project
+	if fillCwd {
+		cwd = m.Cwd
+		if m.Project != "" {
+			project = m.Project
+		}
+	}
+	parent, parserParent := s.parent, s.parserParent
+	relationship, parserRelationship := s.relationship, s.parserRelationship
+	if fillParent {
+		parent, parserParent = m.ParentSessionID, m.ParentSessionID
+		if relationship == "" {
+			relationship = "subagent"
+		}
+		if parserRelationship == "" {
+			parserRelationship = "subagent"
+		}
+	}
+	// A moved parent changes the hierarchy, so friction results are cleared
+	// as the session upsert and linking paths do.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE sessions SET cwd = ?, project = ?,
+		    parent_session_id = ?, parser_parent_session_id = ?,
+		    relationship_type = ?, parser_relationship_type = ?,
+		    friction_rules_version = CASE WHEN ? THEN '' ELSE friction_rules_version END,
+		    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE id = ?`,
+		cwd, project, parent, parserParent, relationship, parserRelationship,
+		parent != s.parent, id,
+	); err != nil {
 		return err
 	}
-	if m.ParentSessionID != "" {
+	queryRow := func(ctx context.Context, query string, args ...any) rowScanner {
+		return tx.QueryRowContext(ctx, query, args...)
+	}
+	if fillParent {
 		// A native parent can close a cycle with a launcher link, so the
 		// affected launcher links are recomputed as session upserts do.
 		if _, err := applySessionExternalParentsFor(ctx, tx.ExecContext, queryRow, []string{id}); err != nil {
 			return err
 		}
 	}
+	// A user project assignment may have kept the stored project.
 	var currentProject string
 	if err := tx.QueryRowContext(ctx,
 		`SELECT project FROM sessions WHERE id = ?`, id,
 	).Scan(&currentProject); err != nil {
 		return fmt.Errorf("reading filled project for %s: %w", id, err)
 	}
-	if fillCwd && hasIdentity {
+	projects := []string{s.project, currentProject}
+	writeIdentity := fillCwd && strings.TrimSpace(m.Identity.Project) != ""
+	if writeIdentity {
 		// The filled workspace replaces the insert-time placeholder snapshot.
 		// Aggregates are republished from snapshots for the placeholder's and
 		// the new evidence key, so they follow the project each session stores
 		// (a user assignment keeps its identity) and skip trashed sessions.
 		var machine, root, gitRemote string
-		hadPlaceholder := true
 		err := tx.QueryRowContext(ctx, `
 			SELECT machine, root_path, git_remote
 			FROM session_project_identity_snapshots WHERE session_id = ?`, id,
 		).Scan(&machine, &root, &gitRemote)
-		if errors.Is(err, sql.ErrNoRows) {
-			hadPlaceholder = false
-		} else if err != nil {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("reading session project identity snapshot: %w", err)
+		}
+		identity := m.Identity
+		identity.SessionID, identity.Project = id, currentProject
+		identity, err = normalizeProjectIdentityObservation(identity)
+		if err != nil {
+			return err
 		}
 		label := m.IdentitySnapshotProject
 		if strings.TrimSpace(label) == "" {
 			label = currentProject
 		}
-		identity.Project = currentProject
 		if err := writeSessionProjectIdentitySnapshotExec(
 			ctx, tx, queryRow, identity, label, false, true,
 		); err != nil {
 			return err
 		}
-		if hadPlaceholder {
+		if machine != "" {
 			if err := reconcileProjectIdentityAggregateKeyExec(
-				ctx, tx, machine, root, gitRemote, []string{previousProject, currentProject},
+				ctx, tx, machine, root, gitRemote, projects,
 			); err != nil {
 				return err
 			}
 		}
 	}
-	if fillCwd && hasIdentity || currentProject != previousProject {
-		if err := reconcileSessionProjectIdentityAggregatesTx(
-			ctx, tx, id, []string{previousProject, currentProject},
-		); err != nil {
+	if writeIdentity || currentProject != s.project {
+		if err := reconcileSessionProjectIdentityAggregatesTx(ctx, tx, id, projects); err != nil {
 			return err
 		}
 	}

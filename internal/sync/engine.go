@@ -17920,112 +17920,12 @@ type sessionWriteIdentityReader interface {
 }
 
 func (e *Engine) pendingWriteIdentity(pw pendingWrite) db.SessionWriteIdentity {
-	return e.parsedWriteIdentity(pw.sess)
-}
-
-func (e *Engine) parsedWriteIdentity(sess parser.ParsedSession) db.SessionWriteIdentity {
 	return db.SessionWriteIdentity{
-		Machine:  sess.Machine,
-		Agent:    string(sess.Agent),
-		FilePath: e.effectiveSourcePath(sess.File.Path),
-		FileHash: sess.File.Hash,
+		Machine:  pw.sess.Machine,
+		Agent:    string(pw.sess.Agent),
+		FilePath: e.effectiveSourcePath(pw.sess.File.Path),
+		FileHash: pw.sess.File.Hash,
 	}
-}
-
-// storedSessionWriteIdentities reads stored attribution for ids. A rebuild
-// reads preexisting attribution from archiveStore while writing into e.db. An
-// ID first seen earlier in this rebuild is absent from the old archive, so
-// consult the replacement before treating it as a new ingestion.
-func (e *Engine) storedSessionWriteIdentities(
-	ctx context.Context, ids []string,
-) (map[string]db.SessionWriteIdentity, error) {
-	var archive any = e.db
-	if e.archiveStore != nil {
-		archive = e.archiveStore
-	}
-	reader, ok := archive.(sessionWriteIdentityReader)
-	if !ok {
-		return nil, fmt.Errorf(
-			"archive %T does not support session write identity lookup", archive,
-		)
-	}
-	identities, err := reader.ListSessionWriteIdentitiesByID(ctx, ids)
-	if err != nil {
-		return nil, fmt.Errorf("load immutable session write identities: %w", err)
-	}
-	if e.archiveStore != nil {
-		unresolved := make([]string, 0, len(ids))
-		for _, id := range ids {
-			if _, exists := identities[id]; !exists {
-				unresolved = append(unresolved, id)
-			}
-		}
-		if len(unresolved) > 0 {
-			replacementIdentities, err := e.db.ListSessionWriteIdentitiesByID(
-				ctx, unresolved,
-			)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"load replacement session write identities: %w", err,
-				)
-			}
-			maps.Copy(identities, replacementIdentities)
-		}
-	}
-	return identities, nil
-}
-
-// keepStoredExternalMetadata keeps a stored working directory and parent over
-// those a parse took from outside the transcript, so that store only fills
-// empty values and a blank or unreadable one never clears them. The project
-// is the stored parser-time label rather than one derived again from a
-// checkout that may be gone; worktree mappings apply as for any write.
-func keepStoredExternalMetadata(sess *parser.ParsedSession, stored db.SessionWriteIdentity) {
-	if sess.KeepStoredWorkspace && stored.Cwd != "" {
-		sess.Cwd = stored.Cwd
-		if stored.SourceProject != "" {
-			sess.Project = stored.SourceProject
-		}
-	}
-	if sess.KeepStoredParent && stored.ParserParentSessionID != "" {
-		sess.ParentSessionID = stored.ParserParentSessionID
-		if sess.RelationshipType == "" {
-			sess.RelationshipType = parser.RelSubagent
-		}
-	}
-}
-
-// keepStoredExternalMetadataBeforeCwdFilter applies keepStoredExternalMetadata
-// before the cwd allow-list judges parsed sessions, so the filter sees the
-// working directory the write will store.
-func (e *Engine) keepStoredExternalMetadataBeforeCwdFilter(
-	ctx context.Context, results []parser.ParseResult,
-) error {
-	if e.cwdFilter.empty() {
-		return nil
-	}
-	var ids []string
-	for _, result := range results {
-		if result.Session.KeepStoredWorkspace && result.Session.ID != "" {
-			ids = append(ids, applyIDPrefixToID(e.idPrefix, result.Session.ID))
-		}
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	identities, err := e.storedSessionWriteIdentities(ctx, ids)
-	if err != nil {
-		return err
-	}
-	for i := range results {
-		stored, ok := identities[applyIDPrefixToID(e.idPrefix, results[i].Session.ID)]
-		if ok && sessionWriteIdentitySupportsStoredAttribution(
-			stored, e.parsedWriteIdentity(results[i].Session),
-		) {
-			keepStoredExternalMetadata(&results[i].Session, stored)
-		}
-	}
-	return nil
 }
 
 func sessionWriteIdentitySupportsStoredAttribution(
@@ -18070,9 +17970,41 @@ func (e *Engine) normalizePendingWriteMachines(
 		return batch, nil
 	}
 
-	identities, err := e.storedSessionWriteIdentities(ctx, ids)
+	var archive any = e.db
+	if e.archiveStore != nil {
+		archive = e.archiveStore
+	}
+	reader, ok := archive.(sessionWriteIdentityReader)
+	if !ok {
+		return batch, fmt.Errorf(
+			"archive %T does not support session write identity lookup", archive,
+		)
+	}
+	identities, err := reader.ListSessionWriteIdentitiesByID(ctx, ids)
 	if err != nil {
-		return batch, err
+		return batch, fmt.Errorf("load immutable session write identities: %w", err)
+	}
+	// A rebuild reads preexisting attribution from archiveStore while writing
+	// into e.db. An ID first seen earlier in this rebuild is absent from the old
+	// archive, so consult the replacement before treating it as a new ingestion.
+	if e.archiveStore != nil {
+		unresolved := make([]string, 0, len(ids))
+		for _, id := range ids {
+			if _, exists := identities[id]; !exists {
+				unresolved = append(unresolved, id)
+			}
+		}
+		if len(unresolved) > 0 {
+			replacementIdentities, err := e.db.ListSessionWriteIdentitiesByID(
+				ctx, unresolved,
+			)
+			if err != nil {
+				return batch, fmt.Errorf(
+					"load replacement session write identities: %w", err,
+				)
+			}
+			maps.Copy(identities, replacementIdentities)
+		}
 	}
 	for _, id := range ids {
 		matchingIndexes := indexes[id]
@@ -18111,6 +18043,59 @@ func (e *Engine) normalizePendingWriteMachines(
 		}
 	}
 	return batch, nil
+}
+
+// keepStoredExternalMetadata keeps a stored working directory and parent over
+// those a parse took from outside the transcript, so that store only fills
+// empty values and a blank or unreadable one never clears them. The project
+// is the stored parser-time label rather than one derived again from a
+// checkout that may be gone; worktree mappings apply as for any write.
+func keepStoredExternalMetadata(sess *parser.ParsedSession, stored db.SessionWriteIdentity) {
+	if sess.KeepStoredWorkspace && stored.Cwd != "" {
+		sess.Cwd = stored.Cwd
+		if stored.SourceProject != "" {
+			sess.Project = stored.SourceProject
+		}
+	}
+	if sess.KeepStoredParent && stored.ParserParentSessionID != "" {
+		sess.ParentSessionID = stored.ParserParentSessionID
+		if sess.RelationshipType == "" {
+			sess.RelationshipType = parser.RelSubagent
+		}
+	}
+}
+
+// keepStoredExternalMetadataBeforeCwdFilter resolves stored attribution, and
+// with it keepStoredExternalMetadata, before the cwd allow-list judges parsed
+// sessions, so the filter sees the working directory the write will store.
+// The write path resolves it again with the same result.
+func (e *Engine) keepStoredExternalMetadataBeforeCwdFilter(
+	ctx context.Context, results []parser.ParseResult,
+) error {
+	if e.cwdFilter.empty() {
+		return nil
+	}
+	batch := make([]pendingWrite, 0, len(results))
+	for _, result := range results {
+		if result.Session.KeepStoredWorkspace {
+			batch = append(batch, pendingWrite{sess: result.Session})
+		}
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+	batch, err := e.normalizePendingWriteMachines(ctx, batch)
+	if err != nil {
+		return err
+	}
+	next := 0
+	for i := range results {
+		if results[i].Session.KeepStoredWorkspace {
+			results[i].Session = batch[next].sess
+			next++
+		}
+	}
+	return nil
 }
 
 type writeBatchOutcome struct {
