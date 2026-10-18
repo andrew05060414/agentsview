@@ -577,6 +577,25 @@ fixtures retain this field; missing identities remain source-local.
 
 ## Codex (`codex`)
 
+- **Repeated session metadata (checked 2026-10-17 at rust-v0.47.0,
+  `c71297b9a9b3f7995445eff8d768837814ac06f8`):** The
+  [reader](https://github.com/openai/codex/blob/c71297b9a9b3f7995445eff8d768837814ac06f8/codex-rs/core/src/rollout/recorder.rs#L223-L229)
+  uses the first `session_meta` as the canonical conversation identity.
+  [Fork initialization](https://github.com/openai/codex/blob/c71297b9a9b3f7995445eff8d768837814ac06f8/codex-rs/core/src/codex.rs#L571-L585)
+  persists copied rollout items, including metadata allowed by the
+  [persistence policy](https://github.com/openai/codex/blob/c71297b9a9b3f7995445eff8d768837814ac06f8/codex-rs/core/src/rollout/policy.rs#L6-L15).
+  Its
+  [metadata schema](https://github.com/openai/codex/blob/c71297b9a9b3f7995445eff8d768837814ac06f8/codex-rs/protocol/src/protocol.rs#L971-L980)
+  has no `forked_from_id`. AgentsView keeps the first nonempty metadata ID and
+  ignores later metadata with a different or empty ID. Same-thread metadata can
+  still update the working directory and branch; existing fork replay filtering
+  and revert-page identities remain in effect. This establishes a producer path
+  for the shape reported in
+  [issue #2248](https://github.com/kenn-io/agentsview/issues/2248); the
+  particular file's history remains unverified.
+  `TestCodexMisfiledPageUpgradeRetainsTranscriptMetadata` verifies that a proven
+  page correction preserves transcript metadata during upgrade.
+
 - **Compressed rollouts (checked 2026-10-16, source at commit
   `6b991972c5b539198dcea9bac4fc14e57559c3af`):** A background worker started
   by the Codex app compresses rollouts whose modification time is at least
@@ -872,9 +891,10 @@ fixtures retain this field; missing identities remain source-local.
   call per file. `custom_tool_call` items carry the same patch text under
   `input` instead of a JSON `patch` argument.
 
-- **Git branch (2026-10-09):** Issue
-  [#2161](https://github.com/kenn-io/agentsview/issues/2161) reports that
-  Codex sessions never store `git_branch`. The pinned recorder's
+- **Git metadata (branch checked 2026-10-09, repository URL checked
+  2026-10-15):** Issue
+  [#2161](https://github.com/kenn-io/agentsview/issues/2161) reports that Codex
+  sessions never store `git_branch`. The pinned recorder's
   [`write_session_meta`](https://github.com/openai/codex/blob/406dc9239492aff6d295cca5eebe2a548548d42f/codex-rs/rollout/src/recorder.rs#L1806-L1823)
   writes a
   [`SessionMetaLine`](https://github.com/openai/codex/blob/406dc9239492aff6d295cca5eebe2a548548d42f/codex-rs/protocol/src/protocol.rs#L3157-L3161)
@@ -889,6 +909,18 @@ fixtures retain this field; missing identities remain source-local.
   clears it. When the branch is absent, project identity falls back to probing
   the local checkout. Reverified the same
   [`GitInfo` shape on upstream `main`](https://github.com/openai/codex/blob/5fe4fc8f7cd16688b5c661d8cdb76e2a340b046d/codex-rs/protocol/src/protocol.rs#L3534-L3549).
+  The optional
+  [`repository_url`](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/protocol/src/protocol.rs#L3106-L3121)
+  records the remote available at session time. AgentsView keeps its
+  sanitized URL and uses it for session project identity, even when that
+  checkout has since disappeared or changed remotes. A later metadata record
+  without `git` keeps the URL, matching
+  [Codex replay](https://github.com/openai/codex/blob/b5115cdd669d37a8635a9742851e97ba4fb1d42c/codex-rs/thread-store/src/local/update_thread_metadata.rs#L198-L206),
+  which keeps the previous git info when a memory-mode marker omits the
+  field. A later `git` object replaces it, and clears it when that object has
+  no `repository_url`. Data version 138 reparses Codex, TraeX, and Augure Code
+  sources in place to recover this evidence without changing source or session
+  IDs.
 
 - **Evidence:** `source`.
 

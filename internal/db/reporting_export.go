@@ -336,8 +336,13 @@ func reportingHoursFromSource(
 	}
 	projects := source.projects
 	var references map[string]export.ProjectReference
+	var groupLabels map[string]string
 	if schemaVersion == export.ReportingJointSchemaVersion {
-		references = source.references
+		projects, references, groupLabels = partitionReportingProjects(sessionByID, projects, source.references)
+		sessions = slices.Clone(sessions)
+		for i := range sessions {
+			sessions[i] = sessionByID[sessions[i].SessionID]
+		}
 		sessions, ids, events, usage = scopeJointReporting(sessions, events, usage, sessionByID, projects, projectKeys)
 		for i := range sessions {
 			sessions[i].ProjectKey = export.ProjectKeyForEntry(projects[sessions[i].Project])
@@ -355,6 +360,7 @@ func reportingHoursFromSource(
 		createdAt,
 		events,
 		activityUsage,
+		groupLabels,
 	)
 	// Pair once for the whole range. Prior-model inheritance does not depend on
 	// the pruning window, and each hour's window [hourStart-gapCap, hourEnd)
@@ -427,6 +433,7 @@ func reportingHoursFromSource(
 			if err != nil {
 				return nil, err
 			}
+			restoreReportingProjectLabels(&hour, projects, groupLabels)
 		}
 		hours[i] = hour
 	}
@@ -848,6 +855,7 @@ func buildReportingFirstSeen(
 	createdAt map[string]time.Time,
 	events []activity.ActivityEvent,
 	usage []activity.UsageRow,
+	groupLabels map[string]string,
 ) map[int]reportingFirstSeenCounts {
 	sessionFirst := make(map[string]time.Time, len(sessions))
 	timed := make(map[string]bool, len(sessions))
@@ -923,8 +931,13 @@ func buildReportingFirstSeen(
 	sessionByID := make(map[string]activity.SessionMeta, len(sessions))
 	for _, session := range sessions {
 		sessionByID[session.SessionID] = session
-		if at, ok := sessionFirst[session.SessionID]; ok && session.Project != "" {
-			setEarlierReportingTime(projectFirst, session.Project, at)
+		// Identity groups split a project; count the project, not each group.
+		project := session.Project
+		if label, grouped := groupLabels[project]; grouped {
+			project = label
+		}
+		if at, ok := sessionFirst[session.SessionID]; ok && project != "" {
+			setEarlierReportingTime(projectFirst, project, at)
 		}
 	}
 	for _, event := range events {

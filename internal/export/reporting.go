@@ -16,8 +16,9 @@ const (
 	// ReportingSchemaVersion is the current wire version for hour, day, and
 	// digest exports consumed by downstream integrations.
 	ReportingSchemaVersion = 3
-	// ReportingJointSchemaVersion adds opt-in session-free joint bucket cells.
-	ReportingJointSchemaVersion = 4
+	// ReportingJointSchemaVersion adds opt-in session-free joint bucket cells,
+	// with project contributions partitioned by identity evidence.
+	ReportingJointSchemaVersion = 5
 )
 
 // IsSupportedReportingSchemaVersion reports whether reporting exports can

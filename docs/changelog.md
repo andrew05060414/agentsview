@@ -24,6 +24,12 @@ The latest release is
 
 **New features**
 
+- Reporting export version 5 keeps verified repository activity selectable when
+  another session with the same project name has missing or different identity
+  evidence. It replaces version 4, which is no longer available: integrations
+  using version 4 must switch to version 5, obtain new project keys, and refresh
+  saved digests. Version 3 is unchanged.
+
 - Browse and search fx sessions, including tool results and child runs. Schema
   4 sessions sync from `~/.fx/sessions/`, with token costs from the pricing catalog.
 - Assistants connected over MCP can see which tools a session ran, find which
@@ -177,6 +183,10 @@ The latest release is
   whenever the archive's database id changes, so any full rebuild causes one.
 - Hidden tabs release their live connections so new tabs load, and catch up when
   shown again.
+- Codex rollouts that carry another thread's metadata stay under their own
+  thread. Upgrading runs a one-time full archive rebuild at data version 137.
+  Pins, Recall entries, and export message IDs move from misfiled rows when a
+  fresh parse at the stored source path proves the corrected thread.
 - DeepSeek Harness v4 sessions now appear after sync, with tool results and
   recorded token usage.
 - ClickHouse usage reports read prepared usage again for a machine whose

@@ -239,14 +239,14 @@ func bindReportingSchemaVersion(command *cobra.Command) *int {
 func bindReportingProjectKeys(command *cobra.Command) *[]string {
 	keys := new([]string)
 	command.Flags().StringArrayVar(keys, "project-key", nil,
-		"Limit the complete export to an archive project key (repeatable; schema 4)")
+		"Limit the complete export to an archive project key (repeatable; schema 5)")
 	return keys
 }
 
 func bindReportingBucket(command *cobra.Command) *string {
 	bucket := new(string)
 	command.Flags().StringVar(bucket, "bucket", "",
-		"Bucket duration: whole-minute divisor of one hour (schema 4; default 5m)")
+		"Bucket duration: whole-minute divisor of one hour (schema 5; default 5m)")
 	return bucket
 }
 

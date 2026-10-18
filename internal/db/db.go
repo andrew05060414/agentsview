@@ -584,7 +584,12 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // state to the new id.)
 // (135: reparse Vibe sessions in place so existing search_replace tool calls
 // gain the corrected Edit category without changing session identities.)
-const dataVersion = 135
+// (137: rebuild Codex rollouts under their first session_meta identity.
+// Version 136 was used by unreleased builds of this fix and is skipped.)
+// (138: preserve the repository URL recorded in Codex-format session_meta.
+// Re-parse those sources in place to repair missing session identity evidence
+// even when the original checkout is gone. Source and session IDs are unchanged.)
+const dataVersion = 138
 
 const archiveOnlyVersionBase = 1 << 20
 
@@ -1627,6 +1632,7 @@ CREATE TABLE IF NOT EXISTS session_project_identity_snapshots (
     root_path          TEXT NOT NULL DEFAULT '',
     git_remote         TEXT NOT NULL DEFAULT '',
     git_remote_name    TEXT NOT NULL DEFAULT '',
+    recorded_git_remote TEXT NOT NULL DEFAULT '',
     repository_path    TEXT NOT NULL DEFAULT '',
     worktree_name      TEXT NOT NULL DEFAULT '',
     worktree_root_path TEXT NOT NULL DEFAULT '',
@@ -1668,6 +1674,7 @@ var exportIdentityColumnMigrations = []schemaColumnMigration{
 	{"project_identity_observations", "git_branch", "ALTER TABLE project_identity_observations ADD COLUMN git_branch TEXT NOT NULL DEFAULT ''"},
 	{"project_identity_observations", "remote_resolution", "ALTER TABLE project_identity_observations ADD COLUMN remote_resolution TEXT NOT NULL DEFAULT 'unknown'"},
 	{"project_identity_observations", "remote_candidate_count", "ALTER TABLE project_identity_observations ADD COLUMN remote_candidate_count INTEGER NOT NULL DEFAULT 0"},
+	{"session_project_identity_snapshots", "recorded_git_remote", "ALTER TABLE session_project_identity_snapshots ADD COLUMN recorded_git_remote TEXT NOT NULL DEFAULT ''"},
 }
 
 var exportIdentityUpgradeTables = map[string]struct{}{
@@ -2807,6 +2814,10 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"sessions", "sync_marker",
 			"ALTER TABLE sessions ADD COLUMN sync_marker TEXT",
 		},
+		{
+			"session_project_identity_snapshots", "recorded_git_remote",
+			"ALTER TABLE session_project_identity_snapshots ADD COLUMN recorded_git_remote TEXT NOT NULL DEFAULT ''",
+		},
 	}
 }
 
@@ -3297,6 +3308,7 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
 			root_path          TEXT NOT NULL DEFAULT '',
 			git_remote         TEXT NOT NULL DEFAULT '',
 			git_remote_name    TEXT NOT NULL DEFAULT '',
+			recorded_git_remote TEXT NOT NULL DEFAULT '',
 			repository_path    TEXT NOT NULL DEFAULT '',
 			worktree_name      TEXT NOT NULL DEFAULT '',
 			worktree_root_path TEXT NOT NULL DEFAULT '',

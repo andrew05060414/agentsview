@@ -18,6 +18,7 @@ import (
 
 	"github.com/tidwall/gjson"
 	"go.kenn.io/agentsview/internal/ctxio"
+	"go.kenn.io/agentsview/internal/export"
 )
 
 // Codex JSONL entry types.
@@ -83,6 +84,7 @@ type codexSessionBuilder struct {
 	sessionKind                 string
 	project                     string
 	gitBranch                   string
+	gitRemote                   string
 	callNames                   map[string]string
 	agentSpawnCalls             map[string]string
 	agentWaitCalls              map[string]string
@@ -424,10 +426,23 @@ func (b *codexSessionBuilder) processLine(ctx context.Context,
 	return false, nil
 }
 
+// codexAcceptSessionMetaID keeps the first nonempty ID as the file's owner.
+// Repeated metadata for that owner can still update the session.
+func codexAcceptSessionMetaID(sessionID *string, id string) bool {
+	if *sessionID != "" && id != *sessionID {
+		return false
+	}
+	*sessionID = id
+	return true
+}
+
 func (b *codexSessionBuilder) handleSessionMeta(
 	payload gjson.Result, envelopeTS time.Time,
 ) (skip bool) {
-	b.sessionID = payload.Get("id").Str
+	// Legacy forks copy foreign metadata without explicit lineage fields.
+	if !codexAcceptSessionMetaID(&b.sessionID, payload.Get("id").Str) {
+		return false
+	}
 	b.metaSessionID = payload.Get("session_id").Str
 	b.historyBase = strings.TrimSpace(payload.Get("history_base.thread_id").Str)
 	b.forkedFromID = strings.TrimSpace(payload.Get("forked_from_id").Str)
@@ -454,6 +469,11 @@ func (b *codexSessionBuilder) handleSessionMeta(
 		b.cwd = cwd
 		branch := payload.Get("git.branch").Str
 		b.gitBranch = branch
+		// Codex replays omit git to keep the previous repository; only a
+		// git object replaces the recorded URL.
+		if git := payload.Get("git"); git.Exists() {
+			b.gitRemote = export.SanitizeGitRemoteForStorage(git.Get("repository_url").Str)
+		}
 		if proj := ExtractProjectFromCwdWithBranchContext(
 			b.projectContext, cwd, branch,
 		); proj != "" {
@@ -1806,6 +1826,7 @@ func codexReplayParentIDContext(
 	}
 	defer f.Close()
 
+	sessionID := ""
 	parentID := ""
 	resolutionNeeded := false
 	scanner := bufio.NewScanner(ctxio.Reader{Context: ctx, Reader: f})
@@ -1822,6 +1843,15 @@ func codexReplayParentIDContext(
 			continue
 		}
 		payload := gjson.Get(line, "payload")
+		id := payload.Get("id").Str
+		if !codexAcceptSessionMetaID(&sessionID, id) {
+			// Copied parent metadata proves replay only when the owning
+			// header already declared that parent. Its lineage is foreign.
+			if parentID != "" && id == parentID {
+				resolutionNeeded = true
+			}
+			continue
+		}
 		forkedFromID := strings.TrimSpace(payload.Get("forked_from_id").Str)
 		if forkedFromID != "" {
 			parentID = forkedFromID
@@ -1831,9 +1861,6 @@ func codexReplayParentIDContext(
 		if parentID == "" {
 			parentID = codexSubagentParentThreadID(payload)
 			continue
-		}
-		if payload.Get("id").Str == parentID {
-			resolutionNeeded = true
 		}
 	}
 	if scanner.Err() != nil || parentID == "" || !resolutionNeeded {
@@ -2079,6 +2106,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 		SessionKind:        b.sessionKind,
 		Cwd:                b.cwd,
 		GitBranch:          b.gitBranch,
+		GitRemote:          b.gitRemote,
 		FirstMessage:       b.firstMessage,
 		SessionName:        sessionName,
 		SessionNamePresent: sessionNamePresent,
