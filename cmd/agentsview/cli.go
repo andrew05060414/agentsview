@@ -517,10 +517,7 @@ func newImportCommand() *cobra.Command {
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if syncBrowser {
-				if importType == "chatgpt" {
-					return syncChatGPTChrome(cmd.Context())
-				}
-				return syncClaudeAIChrome(cmd.Context())
+				return syncChrome(cmd.Context(), importType)
 			}
 			return importSessions(ImportConfig{Type: importType, Path: args[0], Replace: replace})
 		},

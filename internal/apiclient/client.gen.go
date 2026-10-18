@@ -637,50 +637,6 @@ func (o *GetAPIV1EmbeddingsStatusRequestOptions) GetHeader() (map[string]string,
 	return nil, nil
 }
 
-// PostAPIV1ImportChatgptSyncRequestOptions is the options needed to make a request to PostAPIV1ImportChatgptSync.
-type PostAPIV1ImportChatgptSyncRequestOptions struct {
-	Query *PostAPIV1ImportChatgptSyncQuery
-}
-
-// Validate validates all the fields in the options.
-// Use it if fields validation was not run.
-func (o *PostAPIV1ImportChatgptSyncRequestOptions) Validate() error {
-	var errors runtime.ValidationErrors
-
-	if o.Query != nil {
-		if v, ok := any(o.Query).(runtime.Validator); ok {
-			if err := v.Validate(); err != nil {
-				errors = errors.Append("Query", err)
-			}
-		}
-	}
-	if len(errors) == 0 {
-		return nil
-	}
-
-	return errors
-}
-
-// GetPathParams returns the path params as a map.
-func (o *PostAPIV1ImportChatgptSyncRequestOptions) GetPathParams() (map[string]any, error) {
-	return nil, nil
-}
-
-// GetQuery returns the query params as a map.
-func (o *PostAPIV1ImportChatgptSyncRequestOptions) GetQuery() (map[string]any, error) {
-	return runtime.AsMap[any](o.Query)
-}
-
-// GetBody returns the payload in any type that can be marshalled to JSON by the client.
-func (o *PostAPIV1ImportChatgptSyncRequestOptions) GetBody() any {
-	return nil
-}
-
-// GetHeader returns the headers as a map.
-func (o *PostAPIV1ImportChatgptSyncRequestOptions) GetHeader() (map[string]string, error) {
-	return nil, nil
-}
-
 // PostAPIV1ImportClaudeAiSyncRequestOptions is the options needed to make a request to PostAPIV1ImportClaudeAiSync.
 type PostAPIV1ImportClaudeAiSyncRequestOptions struct {
 	Query *PostAPIV1ImportClaudeAiSyncQuery
@@ -2946,18 +2902,12 @@ func (c *Client) GetAPIV1ActivityReportStreamWithResponse(ctx context.Context, o
 
 // PostAPIV1ImportChatgptSyncStreamWithResponse is the envelope form: it populates
 // Stream200 instead of the buffered body field.
-func (c *Client) PostAPIV1ImportChatgptSyncStreamWithResponse(ctx context.Context, options *PostAPIV1ImportChatgptSyncRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportChatgptSyncResp, error) {
+func (c *Client) PostAPIV1ImportChatgptSyncStreamWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportChatgptSyncResp, error) {
 	var err error
-
-	queryEncoding := map[string]runtime.QueryEncoding{
-		"browser": {Style: "form", Explode: &[]bool{false}[0]},
-	}
 	reqParams := runtime.RequestOptionsParameters{
-		RequestURL:    c.apiClient.GetBaseURL() + "/api/v1/import/chatgpt/sync",
-		Method:        "POST",
-		Stream:        "text/event-stream",
-		Options:       options,
-		QueryEncoding: queryEncoding,
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/import/chatgpt/sync",
+		Method:     "POST",
+		Stream:     "text/event-stream",
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
@@ -3059,22 +3009,6 @@ func (c *Client) PostAPIV1ImportChatgptSyncStreamWithResponse(ctx context.Contex
 					ContentType:   resp.Headers.Get("Content-Type"),
 					ContentLength: len(bodyBytes),
 					TargetType:    "PostAPIV1ImportChatgptSyncErrorResponseJSON409",
-					Body:          bodyBytes,
-					Err:           err,
-				}
-			}
-		}
-		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
-	case 422:
-		out.JSON422 = new(PostAPIV1ImportChatgptSyncErrorResponseJSON422)
-		bodyBytes := resp.Content
-		if len(bodyBytes) > 0 {
-			if err := json.Unmarshal(bodyBytes, out.JSON422); err != nil {
-				return out, &runtime.ResponseDecodeError{
-					StatusCode:    resp.StatusCode,
-					ContentType:   resp.Headers.Get("Content-Type"),
-					ContentLength: len(bodyBytes),
-					TargetType:    "PostAPIV1ImportChatgptSyncErrorResponseJSON422",
 					Body:          bodyBytes,
 					Err:           err,
 				}
@@ -5449,8 +5383,8 @@ type ClientInterface interface {
 	PostAPIV1EmbeddingsGenerationsIDRetireWithResponse(ctx context.Context, options *PostAPIV1EmbeddingsGenerationsIDRetireRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1EmbeddingsGenerationsIDRetireResp, error)
 	GetAPIV1EmbeddingsStatusWithResponse(ctx context.Context, options *GetAPIV1EmbeddingsStatusRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAPIV1EmbeddingsStatusResp, error)
 	PostAPIV1ExportConversationsInitializeWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ExportConversationsInitializeResp, error)
-	PostAPIV1ImportChatgptSyncWithResponse(ctx context.Context, options *PostAPIV1ImportChatgptSyncRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportChatgptSyncResp, error)
-	PostAPIV1ImportChatgptSyncStreamWithResponse(ctx context.Context, options *PostAPIV1ImportChatgptSyncRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportChatgptSyncResp, error)
+	PostAPIV1ImportChatgptSyncWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportChatgptSyncResp, error)
+	PostAPIV1ImportChatgptSyncStreamWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportChatgptSyncResp, error)
 	PostAPIV1ImportClaudeAiSyncWithResponse(ctx context.Context, options *PostAPIV1ImportClaudeAiSyncRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportClaudeAiSyncResp, error)
 	PostAPIV1ImportClaudeAiSyncStreamWithResponse(ctx context.Context, options *PostAPIV1ImportClaudeAiSyncRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportClaudeAiSyncResp, error)
 	GetAPIV1MachinesWithResponse(ctx context.Context, options *GetAPIV1MachinesRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAPIV1MachinesResp, error)
@@ -8274,12 +8208,11 @@ func (c *Client) PostAPIV1ExportConversationsInitializeWithResponse(ctx context.
 }
 
 // PostAPIV1ImportChatgptSync Sync ChatGPT conversations
-func (c *Client) PostAPIV1ImportChatgptSyncWithResponse(ctx context.Context, options *PostAPIV1ImportChatgptSyncRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportChatgptSyncResp, error) {
+func (c *Client) PostAPIV1ImportChatgptSyncWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ImportChatgptSyncResp, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/import/chatgpt/sync",
 		Method:     "POST",
-		Options:    options,
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
@@ -8375,22 +8308,6 @@ func (c *Client) PostAPIV1ImportChatgptSyncWithResponse(ctx context.Context, opt
 					ContentType:   resp.Headers.Get("Content-Type"),
 					ContentLength: len(bodyBytes),
 					TargetType:    "PostAPIV1ImportChatgptSyncErrorResponseJSON409",
-					Body:          bodyBytes,
-					Err:           err,
-				}
-			}
-		}
-		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
-	case 422:
-		out.JSON422 = new(PostAPIV1ImportChatgptSyncErrorResponseJSON422)
-		bodyBytes := resp.Content
-		if len(bodyBytes) > 0 {
-			if err := json.Unmarshal(bodyBytes, out.JSON422); err != nil {
-				return out, &runtime.ResponseDecodeError{
-					StatusCode:    resp.StatusCode,
-					ContentType:   resp.Headers.Get("Content-Type"),
-					ContentLength: len(bodyBytes),
-					TargetType:    "PostAPIV1ImportChatgptSyncErrorResponseJSON422",
 					Body:          bodyBytes,
 					Err:           err,
 				}
@@ -18700,32 +18617,16 @@ func (g GetAPIV1AnalyticsToolsQueryAutomatedScope) Validate() error {
 	}
 }
 
-type PostAPIV1ImportChatgptSyncQueryBrowser string
-
-const (
-	Chrome PostAPIV1ImportChatgptSyncQueryBrowser = "chrome"
-)
-
-// Validate checks if the PostAPIV1ImportChatgptSyncQueryBrowser value is valid
-func (p PostAPIV1ImportChatgptSyncQueryBrowser) Validate() error {
-	switch p {
-	case Chrome:
-		return nil
-	default:
-		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid PostAPIV1ImportChatgptSyncQueryBrowser value, got: %v", p))
-	}
-}
-
 type PostAPIV1ImportClaudeAiSyncQueryBrowser string
 
 const (
-	PostAPIV1ImportClaudeAiSyncQueryBrowserChrome PostAPIV1ImportClaudeAiSyncQueryBrowser = "chrome"
+	Chrome PostAPIV1ImportClaudeAiSyncQueryBrowser = "chrome"
 )
 
 // Validate checks if the PostAPIV1ImportClaudeAiSyncQueryBrowser value is valid
 func (p PostAPIV1ImportClaudeAiSyncQueryBrowser) Validate() error {
 	switch p {
-	case PostAPIV1ImportClaudeAiSyncQueryBrowserChrome:
+	case Chrome:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid PostAPIV1ImportClaudeAiSyncQueryBrowser value, got: %v", p))
@@ -19487,23 +19388,6 @@ type PostAPIV1EmbeddingsGenerationsIDRetireQuery struct {
 
 type GetAPIV1EmbeddingsStatusQuery struct {
 	Store *string `json:"store,omitempty"`
-}
-
-type PostAPIV1ImportChatgptSyncQuery struct {
-	Browser PostAPIV1ImportChatgptSyncQueryBrowser `json:"browser" validate:"required"`
-}
-
-func (p PostAPIV1ImportChatgptSyncQuery) Validate() error {
-	var errors runtime.ValidationErrors
-	if v, ok := any(p.Browser).(runtime.Validator); ok {
-		if err := v.Validate(); err != nil {
-			errors = errors.Append("Browser", err)
-		}
-	}
-	if len(errors) == 0 {
-		return nil
-	}
-	return errors
 }
 
 type PostAPIV1ImportClaudeAiSyncQuery struct {
@@ -20782,8 +20666,6 @@ type PostAPIV1ImportChatgptSyncErrorResponseJSON403 = APIErrorResponse
 type PostAPIV1ImportChatgptSyncErrorResponseJSON404 = APIErrorResponse
 
 type PostAPIV1ImportChatgptSyncErrorResponseJSON409 = APIErrorResponse
-
-type PostAPIV1ImportChatgptSyncErrorResponseJSON422 = APIErrorResponse
 
 type PostAPIV1ImportChatgptSyncErrorResponseJSON500 = APIErrorResponse
 
@@ -22159,7 +22041,6 @@ type PostAPIV1ImportChatgptSyncResp struct {
 	JSON403      *PostAPIV1ImportChatgptSyncErrorResponseJSON403
 	JSON404      *PostAPIV1ImportChatgptSyncErrorResponseJSON404
 	JSON409      *PostAPIV1ImportChatgptSyncErrorResponseJSON409
-	JSON422      *PostAPIV1ImportChatgptSyncErrorResponseJSON422
 	JSON500      *PostAPIV1ImportChatgptSyncErrorResponseJSON500
 	JSON501      *PostAPIV1ImportChatgptSyncErrorResponseJSON501
 	JSON502      *PostAPIV1ImportChatgptSyncErrorResponseJSON502
