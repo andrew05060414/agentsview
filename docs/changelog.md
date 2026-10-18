@@ -11,6 +11,8 @@ The latest release is
 
 **Upgrade notes**
 
+- Claude.ai Chrome users must rerun `agentsview chrome setup` and reload the
+  extension once because the native-host protocol moved to version 2.
 - On Windows, stop the daemon before switching back to 0.45.0 or earlier.
   Older versions can't see a daemon started by this version.
 - The container image now requires a bearer token. Read `auth_token` from
@@ -26,6 +28,9 @@ The latest release is
 
 **New features**
 
+- Sync ChatGPT chats through the Chrome extension from Import > ChatGPT or
+  `agentsview import --type chatgpt --sync`. Sync pages active and archived chats
+  and keeps the previous version of each chat it replaces in Trash.
 - Anonymous telemetry now counts empty searches, visible errors in supported
   workflows, and failed sync attempts. Query and error details stay local. The
   existing [telemetry opt-out](https://agentsview.io/docs/configuration/#privacy-and-telemetry)
