@@ -3998,11 +3998,15 @@ schemas keep their existing ordering behavior.
     keeps the stored project instead of a directory-name fallback. Worktree
     mappings then apply as for any write.
   - **Reconciliation** runs after parsing on every sync pass, including
-    usage-only archives (which keep no titles). It copies a changed workspace
-    or a parent onto stored sessions (a parent only when none is stored), so
-    existing archives pick them up without a parser resync. A changed
-    workspace takes its project through active worktree mappings and replaces
-    the identity snapshot recorded for the old workspace; a matching workspace
+    usage-only archives (which keep no titles), and an explicit
+    single-session refresh reconciles that session too. It copies a changed
+    workspace or a parent onto stored sessions (a parent only when none is
+    stored), so existing archives pick them up without a parser resync. A
+    changed workspace takes its project through active worktree mappings and replaces
+    the identity snapshot recorded for the old workspace, republishing the
+    affected aggregate evidence under the project each session stores (so a
+    user-assigned project keeps its identity and trashed sessions publish
+    none) whenever the evidence or project changes; a matching workspace
     whose snapshot is a keyless placeholder gets its identity repaired without
     touching the session row. A rename alone leaves the project untouched,
     and a new parent clears stale friction results.
@@ -4016,8 +4020,9 @@ schemas keep their existing ordering behavior.
   synthetic stores covering the URI shapes above, blank and JSON-empty-string
   values, missing rows, unreadable stores, removed checkouts with and without
   a changed store, workspace changes between Git repositories in syncs and
-  rebuilds, placeholder identity snapshots, cwd allow-lists, usage-only
-  archives, and stores that lack the optional columns.
+  rebuilds and single-session refreshes, assigned projects, trashed sessions,
+  placeholder identity snapshots, cwd allow-lists, usage-only archives, and
+  stores that lack the optional columns.
 
 ## Antigravity CLI (`antigravity-cli`)
 

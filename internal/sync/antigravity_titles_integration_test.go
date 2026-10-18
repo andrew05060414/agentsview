@@ -702,3 +702,34 @@ func TestAntigravityCwdFilterKeepsWorkspaceWhenSummaryLosesIt(t *testing.T) {
 		})
 	}
 }
+
+func TestAntigravitySingleSessionRefreshAppliesWorkspaceChange(t *testing.T) {
+	root := t.TempDir()
+	repos := t.TempDir()
+	first := filepath.Join(repos, "synthetic-first")
+	second := filepath.Join(repos, "synthetic-second")
+	writeSyntheticGitRepo(t, first, "https://example.com/team/first.git")
+	writeSyntheticGitRepo(t, second, "https://example.com/team/second.git")
+	transcript := dbtest.WriteAntigravityTitleTranscript(t, root, "hello")
+	setAntigravitySummary(t, root, "Title", antigravityWorkspaceURIs(first), "")
+	archive := dbtest.OpenTestDB(t)
+	engine := newAntigravityTitleEngine(t, archive, root)
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
+	id := "antigravity:" + dbtest.AntigravityTitleID
+
+	setAntigravitySummary(t, root, "Title", antigravityWorkspaceURIs(second), "")
+	require.NoError(t, engine.SyncSingleSessionContext(t.Context(), id))
+
+	session := antigravityStoredSession(t, archive)
+	assert.Equal(t, filepath.Clean(second), session.Cwd)
+	assert.Equal(t, "synthetic_second", session.Project)
+	snapshots, err := archive.ListPublishableSessionProjectIdentitySnapshots(t.Context(), []string{id}, nil, nil)
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, "example.com/team/second", snapshots[0].NormalizedRemote)
+
+	// An unreadable store leaves the refreshed metadata in place.
+	require.NoError(t, os.WriteFile(filepath.Join(root, parser.AntigravitySummariesDBName), []byte("not a database"), 0o644))
+	require.NoError(t, engine.SyncSingleSessionContext(t.Context(), id))
+	assert.Equal(t, filepath.Clean(second), antigravityStoredSession(t, archive).Cwd)
+}

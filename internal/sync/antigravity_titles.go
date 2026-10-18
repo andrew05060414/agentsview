@@ -235,6 +235,42 @@ func (e *Engine) applyDeferredAntigravitySummaries(
 	return nil
 }
 
+// reconcileAntigravitySessionLocked applies the current summary of one
+// session from each configured root's store, rereading the store so an
+// explicit refresh sees its latest workspace, project, parent, and title.
+func (e *Engine) reconcileAntigravitySessionLocked(ctx context.Context, sessionID string) (int, error) {
+	sources := e.sources()
+	if _, enabled := sources.providerFactories[parser.AgentAntigravity]; !enabled {
+		return 0, nil
+	}
+	rawID, ok := strings.CutPrefix(sessionID, e.idPrefix+string(parser.AgentAntigravity)+":")
+	if !ok || rawID == "" {
+		return 0, nil
+	}
+	updated := 0
+	for _, root := range sources.agentDirs[parser.AgentAntigravity] {
+		store := filepath.Join(root, parser.AntigravitySummariesDBName)
+		parser.InvalidateAntigravityTitles(store)
+		summaries, _, err := parser.AntigravityStoreSummaries(ctx, store)
+		if err != nil {
+			// An unreadable store carries no signal; the refreshed row keeps
+			// its stored metadata, as in a sync pass.
+			log.Printf("antigravity titles %s: %v", store, err)
+			continue
+		}
+		summary, ok := summaries[rawID]
+		if !ok {
+			continue
+		}
+		n, err := e.applyAntigravityStoreSummaries(ctx, root, map[string]parser.AntigravitySummary{rawID: summary})
+		updated += n
+		if err != nil {
+			return updated, err
+		}
+	}
+	return updated, nil
+}
+
 // antigravityRootOwns keeps a store from renaming a same-ID session that
 // belongs to another configured root.
 func (e *Engine) antigravityRootOwns(root, storedPath string) bool {

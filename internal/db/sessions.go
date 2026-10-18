@@ -2838,57 +2838,79 @@ func (db *DB) refreshNativeSessionSummary(
 			return err
 		}
 	}
+	var currentProject string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT project FROM sessions WHERE id = ?`, id,
+	).Scan(&currentProject); err != nil {
+		return fmt.Errorf("reading refreshed project for %s: %w", id, err)
+	}
 	if hasIdentity {
-		var replaced struct {
-			found                             bool
-			project, machine, root, gitRemote string
+		queryRow := func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
 		}
-		if summary.ReplaceIdentitySnapshot {
-			err := tx.QueryRowContext(ctx, `
-				SELECT project, machine, root_path, git_remote
-				FROM session_project_identity_snapshots WHERE session_id = ?`, id,
-			).Scan(&replaced.project, &replaced.machine, &replaced.root, &replaced.gitRemote)
-			switch {
-			case err == nil:
-				replaced.found = true
-				if _, err := tx.ExecContext(ctx,
-					`DELETE FROM session_project_identity_snapshots WHERE session_id = ?`, id,
-				); err != nil {
-					return fmt.Errorf("replacing session project identity snapshot: %w", err)
-				}
-			case !errors.Is(err, sql.ErrNoRows):
-				return fmt.Errorf("reading replaced project identity snapshot: %w", err)
+		before, err := readSessionIdentityEvidenceTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if summary.ReplaceIdentitySnapshot && before.found {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM session_project_identity_snapshots WHERE session_id = ?`, id,
+			); err != nil {
+				return fmt.Errorf("replacing session project identity snapshot: %w", err)
 			}
 		}
-		if err := upsertProjectIdentityObservationWithSnapshotProjectTx(
-			tx, identity, summary.IdentitySnapshotProject, false, true,
+		// The snapshot keeps the parser-time label; aggregate evidence is
+		// republished below from snapshots under the project each session
+		// actually stores, so a user assignment keeps its identity and a
+		// trashed session publishes none.
+		label := summary.IdentitySnapshotProject
+		if strings.TrimSpace(label) == "" {
+			label = currentProject
+		}
+		snapshot := identity
+		snapshot.Project = currentProject
+		if err := writeSessionProjectIdentitySnapshotExec(
+			ctx, tx, queryRow, snapshot, label, false, true,
 		); err != nil {
 			return err
 		}
-		if replaced.found {
-			// Republish the old evidence key from the snapshots that still
-			// carry it, so the replaced workspace leaves no stale aggregate.
-			if err := reconcileProjectIdentityAggregateKeyExec(
-				ctx, tx, replaced.machine, replaced.root, replaced.gitRemote,
-				[]string{replaced.project, previousProject, identity.Project},
-			); err != nil {
-				return err
+		after, err := readSessionIdentityEvidenceTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if before.key() != after.key() || currentProject != previousProject {
+			projects := []string{previousProject, currentProject, before.project, after.project}
+			keys := make([]sessionIdentityEvidence, 0, 3)
+			if before.found {
+				keys = append(keys, before)
+			}
+			if after.found {
+				keys = append(keys, after)
+				if after.gitRemote != "" {
+					// A remote-backed key supersedes the root-only fallback.
+					fallback := after
+					fallback.gitRemote = ""
+					keys = append(keys, fallback)
+				}
+			}
+			seen := make(map[string]struct{}, len(keys))
+			for _, key := range keys {
+				if _, ok := seen[key.key()]; ok {
+					continue
+				}
+				seen[key.key()] = struct{}{}
+				if err := reconcileProjectIdentityAggregateKeyExec(
+					ctx, tx, key.machine, key.root, key.gitRemote, projects,
+				); err != nil {
+					return err
+				}
 			}
 		}
-	}
-	if project != "" {
-		var currentProject string
-		if err := tx.QueryRowContext(ctx,
-			`SELECT project FROM sessions WHERE id = ?`, id,
-		).Scan(&currentProject); err != nil {
-			return fmt.Errorf("reading refreshed project for %s: %w", id, err)
-		}
-		if currentProject != previousProject {
-			if err := reconcileSessionProjectIdentityAggregatesTx(
-				ctx, tx, id, []string{previousProject, currentProject},
-			); err != nil {
-				return err
-			}
+	} else if project != "" && currentProject != previousProject {
+		if err := reconcileSessionProjectIdentityAggregatesTx(
+			ctx, tx, id, []string{previousProject, currentProject},
+		); err != nil {
+			return err
 		}
 	}
 	if db.usageOnlyStorage() {
@@ -2897,6 +2919,38 @@ func (db *DB) refreshNativeSessionSummary(
 		}
 	}
 	return tx.Commit()
+}
+
+// sessionIdentityEvidence is the evidence key a session's project identity
+// snapshot contributes to the aggregate observations.
+type sessionIdentityEvidence struct {
+	found                             bool
+	project, machine, root, gitRemote string
+}
+
+func (e sessionIdentityEvidence) key() string {
+	if !e.found {
+		return ""
+	}
+	return e.machine + "\x00" + e.root + "\x00" + e.gitRemote
+}
+
+func readSessionIdentityEvidenceTx(
+	ctx context.Context, tx *sql.Tx, id string,
+) (sessionIdentityEvidence, error) {
+	var evidence sessionIdentityEvidence
+	err := tx.QueryRowContext(ctx, `
+		SELECT project, machine, root_path, git_remote
+		FROM session_project_identity_snapshots WHERE session_id = ?`, id,
+	).Scan(&evidence.project, &evidence.machine, &evidence.root, &evidence.gitRemote)
+	if errors.Is(err, sql.ErrNoRows) {
+		return evidence, nil
+	}
+	if err != nil {
+		return evidence, fmt.Errorf("reading session project identity evidence: %w", err)
+	}
+	evidence.found = true
+	return evidence, nil
 }
 
 // FindSessionIDsByPartial returns up to limit session IDs that contain the

@@ -21602,6 +21602,15 @@ func (e *Engine) syncSingleSessionContext(ctx context.Context, sessionID string,
 	preserved, sessionsChanged, err = e.processAndWriteSessionFile(
 		ctx, file, sessionID,
 	)
+	if err == nil && agent == parser.AgentAntigravity {
+		// The write leaves a changed workspace to summary reconciliation, so
+		// an explicit refresh reconciles this session's summary as well.
+		updated, reconcileErr := e.reconcileAntigravitySessionLocked(ctx, sessionID)
+		if reconcileErr != nil {
+			return fmt.Errorf("reconcile antigravity summary for %s: %w", sessionID, reconcileErr)
+		}
+		sessionsChanged = sessionsChanged || updated > 0
+	}
 	return err
 }
 
