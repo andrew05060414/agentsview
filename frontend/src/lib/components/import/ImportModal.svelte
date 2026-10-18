@@ -45,9 +45,10 @@
   );
   let progressStats = $state<ImportStats | null>(null);
   const host = getBrowserHost();
+  const activeHost = $derived(provider === "claude-ai" ? host : undefined);
   let syncController = $state<AbortController>();
   let chromeRefused = $state(false);
-  const canSync = $derived(open && (provider === "claude-ai" || !host) && !isRemoteConnection() && !syncState.readOnly && !chromeRefused);
+  const canSync = $derived(open && !isRemoteConnection() && !syncState.readOnly && !chromeRefused);
   let chromeStatus = $state<ClaudeAIChromeOutputBody | null>(null);
   let syncFlag = $state<string | null>(null);
   let syncError = $state<string | null>(null);
@@ -58,14 +59,14 @@
   const chromeState = $derived(
     syncController ? "connected" :
     syncFlag === updateRequiredCode ? "extension-update" :
-    !host && !chromeStatus ? "checking" :
-    !host && !chromeStatus?.connected ? "disconnected" :
+    !activeHost && !chromeStatus ? "checking" :
+    !activeHost && !chromeStatus?.connected ? "disconnected" :
     syncFlag === authRequiredCode ? "signed-out" : "connected",
   );
   const syncDisabled = $derived(importing || ["checking", "disconnected"].includes(chromeState));
 
   async function refreshChrome() {
-    if (!canSync || host || syncController || document.hidden) return;
+    if (!canSync || activeHost || syncController || document.hidden) return;
     const signal = chromeRead.begin();
     try {
       const status = await ImportService.getApiV1ImportClaudeAiChrome({ signal });
@@ -82,7 +83,7 @@
   }
 
   $effect(() => {
-    if (!canSync || host || syncController) return;
+    if (!canSync || activeHost || syncController) return;
     let timer: ReturnType<typeof setInterval> | undefined;
     function resume() {
       if (timer !== undefined) clearInterval(timer);
@@ -114,7 +115,7 @@
   async function connect() {
     signInError = null;
     try {
-      if (host) await connectClaudeAI(host);
+      if (activeHost) await connectClaudeAI(activeHost);
       else window.open(provider === "chatgpt" ? "https://chatgpt.com/" : "https://claude.ai/login?return_url=%2Fnew", "_blank", "noopener,noreferrer");
     } catch (e) { signInError = e instanceof Error ? e.message : String(e); }
   }
@@ -135,7 +136,7 @@
       const onProgress = (stats: ImportStats) => { progressStats = stats; };
       const stats = provider === "chatgpt"
         ? await syncChatGPTChrome({ onProgress }, controller.signal)
-        : await syncClaudeAI(host, { onProgress }, controller.signal);
+        : await syncClaudeAI(activeHost, { onProgress }, controller.signal);
       if (!controller.signal.aborted) result = stats;
     } catch (e) {
       if (controller.signal.aborted) return;
@@ -424,7 +425,7 @@
       </div>
 
       {#if canSync}
-        <Card class="chrome-card" level="inset" padding="sm" title={host ? m.import_claude_desktop_title() : m.import_claude_chrome_title()}>
+        <Card class="chrome-card" level="inset" padding="sm" title={activeHost ? m.import_claude_desktop_title() : m.import_claude_chrome_title()}>
           {#snippet actions()}
             {#if chromeState === "signed-out"}
               <Chip size="xs" tone="warning">{m.import_claude_status_signed_out()}</Chip>
@@ -432,20 +433,20 @@
               <Chip size="xs" tone="warning">{m.import_claude_status_update()}</Chip>
             {:else if chromeState === "disconnected"}
               <Chip size="xs" tone="muted">{m.import_claude_status_disconnected()}</Chip>
-            {:else if !host && chromeState === "connected"}
+            {:else if !activeHost && chromeState === "connected"}
               <Chip size="xs" tone="success">{m.import_claude_status_connected()}</Chip>
             {/if}
             {#if syncController}
               <Button size="sm" label={m.import_claude_stop()} tone="neutral" surface="outline" onclick={() => syncController?.abort()} />
             {:else}
-              {#if host || chromeState === "signed-out"}
-                <Button size="sm" label={m.import_claude_connect()} ariaLabel={host ? undefined : provider === "chatgpt" ? m.import_chatgpt_signed_out() : m.import_claude_signed_out()} tone={chromeState === "signed-out" ? "info" : "neutral"} surface={chromeState === "signed-out" ? "soft" : "outline"} disabled={importing} onclick={connect} />
+              {#if activeHost || chromeState === "signed-out"}
+                <Button size="sm" label={m.import_claude_connect()} ariaLabel={activeHost ? undefined : provider === "chatgpt" ? m.import_chatgpt_signed_out() : m.import_claude_signed_out()} tone={chromeState === "signed-out" ? "info" : "neutral"} surface={chromeState === "signed-out" ? "soft" : "outline"} disabled={importing} onclick={connect} />
               {/if}
               <Button size="sm" label={m.import_claude_sync()} tone={chromeState === "signed-out" ? "neutral" : "info"} surface={chromeState === "signed-out" ? "outline" : "soft"} disabled={syncDisabled} onclick={sync} />
             {/if}
           {/snippet}
           <div class="chrome-body">
-            {#if host}
+            {#if activeHost}
               <p class="hint">{m.import_claude_desktop_note()}</p>
             {:else if chromeState === "disconnected"}
               <p class="hint">{m.import_claude_open_chrome()}</p>
@@ -456,7 +457,7 @@
             {:else if chromeState === "extension-update"}
               <p class="hint">{m.import_claude_update_app()}</p>
             {/if}
-            {#if !host && (chromeState === "extension-update" || chromeState === "disconnected")}
+            {#if !activeHost && (chromeState === "extension-update" || chromeState === "disconnected")}
               <CodeBlock code="agentsview chrome setup" title={m.import_claude_terminal()} wrapToggle={false} copyLabel={m.import_claude_copy_command()} />
               <p class="hint">
                 {chromeState === "extension-update" ? m.import_claude_reload_extension({ url: "chrome://extensions" }) : m.import_claude_setup_load({ url: "chrome://extensions" })}
