@@ -829,7 +829,7 @@ func fillEmptyToolResultsTx(
 	return filled, nil
 }
 
-// completeStoredMessagesTx extends text, updates models, and fills source identities at stored
+// completeStoredMessagesTx extends text and fills missing models and source identities at stored
 // ordinals up to maxOrd, preserving message IDs and unrelated fields.
 func completeStoredMessagesTx(
 	tx transactionQueries, sessionID string, msgs []Message, maxOrd int,
@@ -859,7 +859,7 @@ func completeStoredMessagesTx(
 		extended := IsTextExtension(stored, m.Content)
 		filledUUID := cmp.Or(sourceUUID, m.SourceUUID)
 		filledParentUUID := cmp.Or(sourceParentUUID, m.SourceParentUUID)
-		if !extended && model == cmp.Or(m.Model, model) && sourceUUID == filledUUID && sourceParentUUID == filledParentUUID {
+		if !extended && model == cmp.Or(model, m.Model) && sourceUUID == filledUUID && sourceParentUUID == filledParentUUID {
 			continue
 		}
 		if extended {
@@ -868,7 +868,7 @@ func completeStoredMessagesTx(
 		if _, err := tx.Exec(
 			`UPDATE messages SET content = ?, content_length = ?, model = ?, source_uuid = ?, source_parent_uuid = ?
 			 WHERE id = ?`,
-			stored, contentLength, cmp.Or(m.Model, model), filledUUID, filledParentUUID, id,
+			stored, contentLength, cmp.Or(model, m.Model), filledUUID, filledParentUUID, id,
 		); err != nil {
 			return 0, fmt.Errorf(
 				"completing message for %s ordinal %d: %w",
