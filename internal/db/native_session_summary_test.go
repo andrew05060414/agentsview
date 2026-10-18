@@ -121,3 +121,62 @@ func fullSession(t *testing.T, d *DB, id string) *Session {
 	require.NotNil(t, s)
 	return s
 }
+
+func TestRefreshNativeSessionSummaryIdentityOnlyRepair(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	cwd := filepath.Join(t.TempDir(), "synthetic-repo")
+	insertSession(t, d, "child", "synthetic_repo", func(s *Session) { s.Cwd = cwd })
+	_, err := d.getWriter().Exec(ctx,
+		`UPDATE sessions SET local_modified_at = '2026-01-01T00:00:00.000Z' WHERE id = 'child'`)
+	require.NoError(t, err)
+
+	before, err := d.ListSessionWriteIdentitiesByID(ctx, []string{"child"})
+	require.NoError(t, err)
+	assert.True(t, before["child"].IdentityNeedsRepair, "the insert placeholder has no identity key")
+	assert.Equal(t, "synthetic_repo", before["child"].Project)
+	assert.Equal(t, "synthetic_repo", before["child"].SourceProject)
+
+	require.NoError(t, d.RefreshNativeSessionSummary(ctx, "child", NativeSessionSummary{
+		IdentityObservation: export.ProjectIdentityObservation{
+			SessionID: "child", Project: "synthetic_repo", Machine: defaultMachine, RootPath: cwd,
+		},
+		IdentitySnapshotProject: "synthetic_repo",
+	}))
+
+	after, err := d.ListSessionWriteIdentitiesByID(ctx, []string{"child"})
+	require.NoError(t, err)
+	assert.False(t, after["child"].IdentityNeedsRepair)
+	var modified string
+	require.NoError(t, d.getReader().QueryRow(ctx,
+		`SELECT local_modified_at FROM sessions WHERE id = 'child'`).Scan(&modified))
+	assert.Equal(t, "2026-01-01T00:00:00.000Z", modified, "an identity-only repair leaves the session row alone")
+}
+
+func TestCopySessionMetadataKeepsFreshIdentityOverEmptyPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	ctx := t.Context()
+	oldPath := filepath.Join(dir, "old.db")
+	oldDB, err := Open(ctx, oldPath)
+	require.NoError(t, err)
+	// The insert trigger leaves a keyless placeholder with no root.
+	require.NoError(t, oldDB.UpsertSession(ctx, Session{
+		ID: "session-a", Project: "app", Machine: "host", Agent: "antigravity",
+	}))
+	require.NoError(t, oldDB.Close())
+
+	fresh := testDB(t)
+	root := filepath.Join(dir, "workspace")
+	require.NoError(t, fresh.UpsertSession(ctx, Session{
+		ID: "session-a", Project: "app", Machine: "host", Agent: "antigravity", Cwd: root,
+	}))
+	require.NoError(t, fresh.UpsertProjectIdentityObservation(ctx, export.ProjectIdentityObservation{
+		SessionID: "session-a", Project: "app", Machine: "host", RootPath: root,
+	}))
+
+	require.NoError(t, fresh.CopySessionMetadataFrom(oldPath))
+	publishable, err := fresh.ListPublishableSessionProjectIdentitySnapshots(ctx, []string{"session-a"}, nil, nil)
+	require.NoError(t, err)
+	require.Len(t, publishable, 1, "an evidence-free placeholder must not replace the fresh identity")
+	assert.Equal(t, root, publishable[0].RootPath)
+}
