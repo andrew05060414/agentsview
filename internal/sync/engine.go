@@ -582,10 +582,11 @@ type Engine struct {
 	sourceClaimsMu    gosync.Mutex
 	sourceClaims      map[string]string
 	deferredSourceCwd *sourceCwdReconciliationBatch
-	// deferredAntigravityTitles holds rebuild title changes for archived
-	// sessions that reach the replacement only through the orphan copy.
-	deferredAntigravityTitles map[string]*string
-	appliedAntigravityTitles  map[string]appliedAntigravityTitles
+	// deferredAntigravitySummaries holds rebuild title, workspace, and parent
+	// changes for archived sessions that reach the replacement only through
+	// the orphan copy.
+	deferredAntigravitySummaries map[string]deferredAntigravitySummary
+	appliedAntigravityTitles     map[string]appliedAntigravityTitles
 	// sourceSet holds the provider set and session roots this engine
 	// discovers from. ReconfigureSources replaces it as one snapshot.
 	sourceSet atomic.Pointer[engineSources]
@@ -3494,9 +3495,9 @@ func (e *Engine) resyncBuildLocked(
 	deferredSourceCwd := newSourceCwdReconciliationBatch()
 	e.deferredSourceCwd = deferredSourceCwd
 	defer func() { e.deferredSourceCwd = nil }()
-	deferredTitles := make(map[string]*string)
-	e.deferredAntigravityTitles = deferredTitles
-	defer func() { e.deferredAntigravityTitles = nil }()
+	deferredSummaries := make(map[string]deferredAntigravitySummary)
+	e.deferredAntigravitySummaries = deferredSummaries
+	defer func() { e.deferredAntigravitySummaries = nil }()
 	e.db = newDB
 	reportResyncPhase(
 		PhaseDiscovering,
@@ -3545,7 +3546,7 @@ func (e *Engine) resyncBuildLocked(
 		contributorEngine.archiveStore = origDB
 		contributorEngine.archiveRebuildIndex = archiveIndex
 		contributorEngine.deferredSourceCwd = deferredSourceCwd
-		contributorEngine.deferredAntigravityTitles = deferredTitles
+		contributorEngine.deferredAntigravitySummaries = deferredSummaries
 		contributorEngine.forceFullParse = contributor.ForceParse ||
 			contributor.ForceFullParseAfterCache
 		contributorEngine.forceFullParseAllowsCache =
@@ -3809,18 +3810,16 @@ func (e *Engine) resyncBuildLocked(
 	}
 	stats.OrphanedCopied = len(orphaned)
 	copiedSessionIDs = append(copiedSessionIDs, orphaned...)
-	for id, name := range deferredTitles {
-		if err := newDB.RefreshNativeSessionName(ctx, id, name); err != nil {
-			stats.RecordFailed()
-			stats.Aborted = true
-			newDB.Close()
-			removeTempDB(tempPath)
-			restoreSkipCache()
-			e.mu.Lock()
-			e.lastSyncStats = stats
-			e.mu.Unlock()
-			return stats, fmt.Errorf("apply deferred antigravity title: %w", err)
-		}
+	if err := e.applyDeferredAntigravitySummaries(ctx, newDB, deferredSummaries); err != nil {
+		stats.RecordFailed()
+		stats.Aborted = true
+		newDB.Close()
+		removeTempDB(tempPath)
+		restoreSkipCache()
+		e.mu.Lock()
+		e.lastSyncStats = stats
+		e.mu.Unlock()
+		return stats, fmt.Errorf("apply deferred antigravity summary: %w", err)
 	}
 	deferredCwdUpdated, err := e.applyDeferredSourceCwd(ctx,
 		newDB, deferredSourceCwd,
@@ -17947,6 +17946,9 @@ func (e *Engine) normalizePendingWriteMachines(
 						batch[i].sess.SessionName = *stored.SessionName
 					}
 				}
+				if !batch[i].sourceIdentityUnverified {
+					e.keepStoredExternalSessionMetadata(ctx, &batch[i].sess, stored)
+				}
 			}
 			continue
 		}
@@ -17960,6 +17962,34 @@ func (e *Engine) normalizePendingWriteMachines(
 		}
 	}
 	return batch, nil
+}
+
+// keepStoredExternalSessionMetadata carries the stored working directory and
+// parent link into a parse whose provider keeps them outside the transcript
+// and supplied none this time, so the upsert does not clear them. It runs in
+// both ordinary syncs and rebuilds, before worktree mapping and cwd filtering
+// see the session. The project is derived from the kept directory the same way
+// the parser derives it from a supplied one; an explicit project still wins.
+func (e *Engine) keepStoredExternalSessionMetadata(
+	ctx context.Context,
+	sess *parser.ParsedSession,
+	stored db.SessionWriteIdentity,
+) {
+	if sess.KeepStoredWorkspace && sess.Cwd == "" && stored.Cwd != "" {
+		sess.Cwd = stored.Cwd
+		if sess.Project == "" {
+			sess.Project = parser.ExtractProjectFromCwdWithBranchContext(
+				e.parsePolicyContext(ctx), stored.Cwd, sess.GitBranch,
+			)
+		}
+	}
+	if sess.KeepStoredParent && sess.ParentSessionID == "" &&
+		stored.ParserParentSessionID != "" {
+		sess.ParentSessionID = stored.ParserParentSessionID
+		if sess.RelationshipType == "" {
+			sess.RelationshipType = parser.RelSubagent
+		}
+	}
 }
 
 type writeBatchOutcome struct {
