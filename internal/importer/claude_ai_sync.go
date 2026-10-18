@@ -52,6 +52,9 @@ func claudeAIFreshness(updatedAt, leaf string, session *db.Session) uint64 {
 }
 
 func browserFreshness(marker string, session *db.Session) uint64 {
+	if session == nil {
+		session = &db.Session{}
+	}
 	hash := fnv.New64a()
 	fmt.Fprintf(hash, "%s\x00%d", marker, session.MessageCount)
 	for _, field := range []*string{session.TranscriptRevision, session.SessionName, session.EndedAt} {
