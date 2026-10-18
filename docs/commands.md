@@ -1565,10 +1565,10 @@ See [Chat Import](/docs/chat-import/) for full documentation.
 agentsview import --type <type> <path>
 ```
 
-| Flag        | Default | Description                                                                                           |
-| ----------- | ------- | ----------------------------------------------------------------------------------------------------- |
-| `--type`    |         | Import type: `claude-ai`, `chatgpt`, or `gemini-apps` (required)                                      |
-| `--replace` |         | Session ID to replace when the default import refuses it; repeatable (claude-ai, chatgpt)             |
+| Flag        | Default | Description                                                                                                      |
+| ----------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--type`    |         | Import type: `claude-ai`, `chatgpt`, or `gemini-apps` (required)                                                 |
+| `--replace` |         | Session ID to replace when the default import refuses it; repeatable (claude-ai, chatgpt)                        |
 | `--sync`    | `false` | Sync Claude.ai or ChatGPT through Chrome; requires a running server and Chrome host, with no path or `--replace` |
 
 Set up the
