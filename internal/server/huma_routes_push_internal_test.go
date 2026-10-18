@@ -453,7 +453,7 @@ func TestDuckDBPushSyncOptionsPassesThroughProjectFilters(t *testing.T) {
 	assert.Equal(t, []string{"beta"}, got.ExcludeProjects)
 }
 
-func TestSyncClaudeAIRouteIsSSEOnly(t *testing.T) {
+func TestBrowserSyncRoutesAreSSEOnly(t *testing.T) {
 	s := testServer(t, 30)
 	spec := readOpenAPISpec(t, s.Handler())
 	for _, path := range []string{"/api/v1/import/claude-ai/sync", "/api/v1/import/chatgpt/sync"} {
