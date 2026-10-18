@@ -859,7 +859,7 @@ func completeStoredMessagesTx(
 		extended := IsTextExtension(stored, m.Content)
 		filledUUID := cmp.Or(sourceUUID, m.SourceUUID)
 		filledParentUUID := cmp.Or(sourceParentUUID, m.SourceParentUUID)
-		if !extended && model == m.Model && sourceUUID == filledUUID && sourceParentUUID == filledParentUUID {
+		if !extended && model == cmp.Or(m.Model, model) && sourceUUID == filledUUID && sourceParentUUID == filledParentUUID {
 			continue
 		}
 		if extended {
@@ -868,7 +868,7 @@ func completeStoredMessagesTx(
 		if _, err := tx.Exec(
 			`UPDATE messages SET content = ?, content_length = ?, model = ?, source_uuid = ?, source_parent_uuid = ?
 			 WHERE id = ?`,
-			stored, contentLength, m.Model, filledUUID, filledParentUUID, id,
+			stored, contentLength, cmp.Or(m.Model, model), filledUUID, filledParentUUID, id,
 		); err != nil {
 			return 0, fmt.Errorf(
 				"completing message for %s ordinal %d: %w",
