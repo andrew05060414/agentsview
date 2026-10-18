@@ -208,8 +208,11 @@ func syncConversation(ctx context.Context, store db.Store, result parser.ParseRe
 	}
 	if sameMessages(archived, storedFormMessages(store, msgs)) {
 		status, err := upsertConversation(ctx, store, result, nil)
-		// A usage-only archive can't tell a shorter branch from a shorter export, so it keeps the longer copy.
 		if refusalReason(err) == RefusalShorterExport {
+			if storeArchiveContent(store).UsageOnly() {
+				// Browser snapshots are authoritative even when retained usage rows match.
+				return importUpdated, appendChatGPTMessages(ctx, store, chatGPTSession(result.Session), nil)
+			}
 			return importSkipped, nil
 		}
 
