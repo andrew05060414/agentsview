@@ -3198,10 +3198,10 @@ schemas keep their existing ordering behavior.
   or title triggers a detail fetch. Title-only repairs count as updates and
   send session refresh notifications. Reverified 2026-10-11 with reconstructed
   fixtures in `TestSyncClaudeAIZipTitleFreshness` and
-  `TestClaudeAISyncMutationNotifications`. Usage-only sync refreshes counts and
-  end time for shorter snapshots with unchanged retained rows before caching
-  freshness. Reverified 2026-10-18 with
-  `TestSyncClaudeAIUsageArchiveShorterBranchRefreshesMetadata`. Sync stores messages
+  `TestClaudeAISyncMutationNotifications`. Only ChatGPT usage-only sync refreshes
+  counts and end time for shorter snapshots with unchanged retained rows before
+  caching freshness. Claude.ai keeps the longer archive, verified by
+  `TestSyncClaudeAIUsageArchiveShorterBranchKeepsLonger`. Sync stores messages
   in the same
   shape as zip import, without source UUIDs. Pins match by role, text, and
   occurrence rank. Reverified 2026-10-08 against the reconstructed list and
