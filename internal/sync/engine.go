@@ -18019,7 +18019,7 @@ func (e *Engine) normalizePendingWriteMachines(
 					}
 				}
 				if !batch[i].sourceIdentityUnverified {
-					e.keepStoredExternalSessionMetadata(ctx, &batch[i].sess, stored)
+					keepStoredExternalSessionMetadata(&batch[i].sess, stored)
 				}
 			}
 			continue
@@ -18040,19 +18040,22 @@ func (e *Engine) normalizePendingWriteMachines(
 // parent link into a parse whose provider keeps them outside the transcript
 // and supplied none this time, so the upsert does not clear them. It runs in
 // both ordinary syncs and rebuilds, before worktree mapping and cwd filtering
-// see the session. The project is derived from the kept directory the same way
-// the parser derives it from a supplied one; an explicit project still wins.
-func (e *Engine) keepStoredExternalSessionMetadata(
-	ctx context.Context,
+// see the session. The kept project is the stored parser-time label from the
+// session's identity snapshot (or the stored project when none exists), not
+// one derived again from the filesystem: a checkout that is gone would
+// otherwise turn a repository subdirectory into its own project. The write
+// path then applies the active worktree mappings; an explicit project wins.
+func keepStoredExternalSessionMetadata(
 	sess *parser.ParsedSession,
 	stored db.SessionWriteIdentity,
 ) {
 	if sess.KeepStoredWorkspace && sess.Cwd == "" && stored.Cwd != "" {
 		sess.Cwd = stored.Cwd
 		if sess.Project == "" {
-			sess.Project = parser.ExtractProjectFromCwdWithBranchContext(
-				e.parsePolicyContext(ctx), stored.Cwd, sess.GitBranch,
-			)
+			sess.Project = stored.SourceProject
+			if sess.Project == "" {
+				sess.Project = stored.Project
+			}
 		}
 	}
 	if sess.KeepStoredParent && sess.ParentSessionID == "" &&

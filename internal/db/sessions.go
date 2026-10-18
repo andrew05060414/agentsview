@@ -2793,9 +2793,11 @@ func (db *DB) refreshNativeSessionSummary(
 	}
 	// A new parent turns the row into a subagent, so friction results computed
 	// for a root session are cleared like the session upsert and hierarchy
-	// linking paths do.
-	_, err = tx.ExecContext(ctx,
-		`UPDATE sessions
+	// linking paths do. An identity-only repair leaves the row untouched.
+	updatesRow := summary.UpdateTitle || cwd != "" || project != "" || parentSessionID != ""
+	if updatesRow {
+		_, err = tx.ExecContext(ctx,
+			`UPDATE sessions
 		 SET session_name = CASE WHEN ? THEN ? ELSE session_name END,
 		     cwd = CASE WHEN ? != '' THEN ? ELSE cwd END,
 		     project = CASE WHEN ? != '' THEN ? ELSE project END,
@@ -2818,18 +2820,19 @@ func (db *DB) refreshNativeSessionSummary(
 		         THEN '' ELSE friction_rules_version END,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = ? AND (? OR deleted_at IS NULL)`,
-		summary.UpdateTitle, sessionName,
-		cwd, cwd,
-		project, project,
-		parentSessionID, parentSessionID,
-		parentSessionID, parentSessionID,
-		parentSessionID,
-		parentSessionID,
-		parentSessionID,
-		id, includeTrashed,
-	)
-	if err != nil {
-		return err
+			summary.UpdateTitle, sessionName,
+			cwd, cwd,
+			project, project,
+			parentSessionID, parentSessionID,
+			parentSessionID, parentSessionID,
+			parentSessionID,
+			parentSessionID,
+			parentSessionID,
+			id, includeTrashed,
+		)
+		if err != nil {
+			return err
+		}
 	}
 	if hasIdentity {
 		if err := upsertProjectIdentityObservationWithSnapshotProjectTx(
@@ -4510,6 +4513,14 @@ type SessionWriteIdentity struct {
 	SessionName           *string
 	ParentSessionID       string
 	ParserParentSessionID string
+	// Project is the stored effective project. SourceProject is the
+	// parser-time label kept in the session's project identity snapshot.
+	Project       string
+	SourceProject string
+	// IdentityNeedsRepair reports a missing project identity snapshot or a
+	// placeholder without an identity key, which mirrors and exports never
+	// publish. Ambiguous snapshots are deliberate and need no repair.
+	IdentityNeedsRepair bool
 }
 
 // ListSessionWriteIdentitiesByID returns stored source attribution and parser
@@ -4546,14 +4557,21 @@ func (db *DB) ListSessionWriteIdentitiesByID(
 				args[i] = id
 			}
 			rows, err := db.getReader().QueryContext(ctx, `
-			SELECT id, machine, agent, COALESCE(cwd, ''),
-			       COALESCE(git_branch, ''),
-			       COALESCE(file_path, ''), COALESCE(file_hash, ''),
-			       session_name, COALESCE(parent_session_id, ''),
-			       COALESCE(parser_parent_session_id, '')
-			FROM sessions
-			WHERE id IN (`+placeholders+`)
-			ORDER BY id`, args...)
+			SELECT s.id, s.machine, s.agent, COALESCE(s.cwd, ''),
+			       COALESCE(s.git_branch, ''),
+			       COALESCE(s.file_path, ''), COALESCE(s.file_hash, ''),
+			       s.session_name, COALESCE(s.parent_session_id, ''),
+			       COALESCE(s.parser_parent_session_id, ''),
+			       COALESCE(s.project, ''), COALESCE(snap.project, ''),
+			       snap.session_id IS NULL OR (
+			           TRIM(snap.key_source) = ''
+			           AND TRIM(snap.worktree_root_path) = ''
+			           AND snap.remote_resolution != 'ambiguous')
+			FROM sessions s
+			LEFT JOIN session_project_identity_snapshots snap
+			    ON snap.session_id = s.id
+			WHERE s.id IN (`+placeholders+`)
+			ORDER BY s.id`, args...)
 			if err != nil {
 				return fmt.Errorf("listing session write identities by ID: %w", err)
 			}
@@ -4566,6 +4584,8 @@ func (db *DB) ListSessionWriteIdentitiesByID(
 					&identity.GitBranch,
 					&identity.FilePath, &identity.FileHash, &identity.SessionName,
 					&identity.ParentSessionID, &identity.ParserParentSessionID,
+					&identity.Project, &identity.SourceProject,
+					&identity.IdentityNeedsRepair,
 				); err != nil {
 					_ = rows.Close()
 					return fmt.Errorf(

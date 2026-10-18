@@ -53,6 +53,9 @@ type antigravitySummaryUpdate struct {
 	// project is the parser-derived project for cwd, before worktree mappings.
 	project  string
 	parentID string
+	// identityOnly repairs an unpublishable identity snapshot for a session
+	// whose stored cwd already matches; the session row stays as it is.
+	identityOnly bool
 }
 
 // deferredAntigravitySummary is a rebuild change for an archived session that
@@ -67,6 +70,7 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		return 0, nil
 	}
 	prefix := e.idPrefix + string(parser.AgentAntigravity) + ":"
+	usageOnly := e.db.ArchiveContent().UsageOnly()
 	ids := make([]string, 0, len(summaries))
 	for id := range maps.Keys(summaries) {
 		ids = append(ids, prefix+id)
@@ -93,6 +97,9 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 			continue
 		}
 		summary := summaries[strings.TrimPrefix(id, prefix)]
+		if usageOnly {
+			summary.TitlePresent = false
+		}
 		title := db.SanitizeUTF8(summary.Title)
 
 		titleChanged := summary.TitlePresent && ((session.SessionName != nil && *session.SessionName != title) ||
@@ -103,8 +110,11 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 			parentID = prefix + summary.ParentConversationID
 		}
 		parentChanged := parentID != "" && session.ParentSessionID == ""
+		// A workspace stored before its identity was recorded completely
+		// (or by an older build) still needs a publishable snapshot.
+		identityRepair := summary.Cwd != "" && !cwdChanged && session.IdentityNeedsRepair
 
-		if !titleChanged && !cwdChanged && !parentChanged {
+		if !titleChanged && !cwdChanged && !parentChanged && !identityRepair {
 			continue
 		}
 		targetCwd := session.Cwd
@@ -120,9 +130,10 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		}
 		// Only a changed workspace is rewritten, so a rename alone never
 		// replaces the stored project.
-		if cwdChanged {
+		if cwdChanged || identityRepair {
 			update.cwd = summary.Cwd
 			update.project = summary.Project
+			update.identityOnly = identityRepair
 		}
 		if parentChanged {
 			update.parentID = parentID
@@ -135,7 +146,9 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		if err := e.refreshAntigravitySummary(ctx, e.db, id, session, update); err != nil {
 			return updated, err
 		}
-		updated++
+		if !update.identityOnly || titleChanged || parentChanged {
+			updated++
+		}
 	}
 	return updated, nil
 }
@@ -153,12 +166,17 @@ func (e *Engine) refreshAntigravitySummary(
 	refresh := db.NativeSessionSummary{
 		SessionName:     update.name,
 		UpdateTitle:     update.updateTitle,
-		Cwd:             update.cwd,
 		ParentSessionID: update.parentID,
+	}
+	if !update.identityOnly {
+		refresh.Cwd = update.cwd
 	}
 	if update.cwd != "" && update.project != "" {
 		project := update.project
-		if stored.Machine != "" {
+		if update.identityOnly && stored.Project != "" {
+			// Publish evidence under the label the session already carries.
+			project = stored.Project
+		} else if stored.Machine != "" {
 			mapped, ok, err := target.ResolveWorktreeProjectMapping(
 				ctx, stored.Machine, update.cwd, project,
 			)
@@ -169,7 +187,9 @@ func (e *Engine) refreshAntigravitySummary(
 				project = mapped
 			}
 		}
-		refresh.Project = project
+		if !update.identityOnly {
+			refresh.Project = project
+		}
 		if obs, ok := e.projectIdentityObservation(db.Session{
 			ID:        id,
 			Project:   project,

@@ -3985,18 +3985,26 @@ schemas keep their existing ordering behavior.
   empty working directory, project or parent. When neither the transcript nor
   the store supplies one (blank value, missing row or column, unreadable
   store), the parse marks it absent and sync keeps the stored working
-  directory, project and parent, in ordinary syncs and rebuilds alike. Each
-  sync pass also copies a changed workspace or parent onto stored sessions (a
-  parent only when none is stored), so existing archives pick them up without
-  a parser resync; a rebuild replays these changes onto archived sessions
-  without a transcript after the orphan copy. A copied workspace takes its
-  project through active worktree mappings and records a complete project
-  identity snapshot, a rename alone leaves the project untouched, and a new
-  parent clears stale friction results. An empty or missing value never clears
-  stored data.
+  directory, parent and parser-time project label (from the session's project
+  identity snapshot) in ordinary syncs and rebuilds alike, then applies the
+  active worktree mappings; it does not derive the project again from a
+  checkout that may be gone. Each sync pass also copies a changed workspace or
+  parent onto stored sessions (a parent only when none is stored), so existing
+  archives pick them up without a parser resync; a rebuild replays these
+  changes onto archived sessions without a transcript after the orphan copy.
+  Usage-only archives reconcile workspace and parent too and keep no titles. A
+  copied workspace takes its project through active worktree mappings and
+  records a complete project identity snapshot; a session whose stored
+  workspace already matches but whose snapshot is a keyless placeholder gets
+  its identity repaired without touching the session row, and a rebuild's
+  metadata copy never replaces a publishable snapshot with an old placeholder
+  that recorded neither a key nor a root.
+  A rename alone leaves the project untouched, and a new parent clears stale
+  friction results. An empty or missing value never clears stored data.
   Checked 2026-10-17 with synthetic stores covering the URI shapes above,
-  blank and JSON-empty-string values, missing rows, unreadable stores, and
-  stores that lack the optional columns.
+  blank and JSON-empty-string values, missing rows, unreadable stores, a
+  removed checkout, placeholder identity snapshots across rebuilds,
+  usage-only archives, and stores that lack the optional columns.
 
 ## Antigravity CLI (`antigravity-cli`)
 
