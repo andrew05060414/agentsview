@@ -2838,6 +2838,17 @@ func (db *DB) refreshNativeSessionSummary(
 			return err
 		}
 	}
+	if parentSessionID != "" {
+		// A native parent can close a cycle with a launcher link (for
+		// example when the new parent was itself launched by this session),
+		// so recompute the affected launcher links as session upserts do.
+		if _, err := applySessionExternalParentsFor(ctx, tx.ExecContext,
+			func(ctx context.Context, query string, args ...any) rowScanner {
+				return tx.QueryRowContext(ctx, query, args...)
+			}, []string{id}); err != nil {
+			return err
+		}
+	}
 	var currentProject string
 	if err := tx.QueryRowContext(ctx,
 		`SELECT project FROM sessions WHERE id = ?`, id,
@@ -2878,7 +2889,7 @@ func (db *DB) refreshNativeSessionSummary(
 		if err != nil {
 			return err
 		}
-		if before.key() != after.key() || currentProject != previousProject {
+		if before.evidence() != after.evidence() || currentProject != previousProject {
 			projects := []string{previousProject, currentProject, before.project, after.project}
 			keys := make([]sessionIdentityEvidence, 0, 3)
 			if before.found {
@@ -2895,10 +2906,10 @@ func (db *DB) refreshNativeSessionSummary(
 			}
 			seen := make(map[string]struct{}, len(keys))
 			for _, key := range keys {
-				if _, ok := seen[key.key()]; ok {
+				if _, ok := seen[key.aggregateKey()]; ok {
 					continue
 				}
-				seen[key.key()] = struct{}{}
+				seen[key.aggregateKey()] = struct{}{}
 				if err := reconcileProjectIdentityAggregateKeyExec(
 					ctx, tx, key.machine, key.root, key.gitRemote, projects,
 				); err != nil {
@@ -2926,13 +2937,22 @@ func (db *DB) refreshNativeSessionSummary(
 type sessionIdentityEvidence struct {
 	found                             bool
 	project, machine, root, gitRemote string
+	// identityKey is the stored identity key; a placeholder has none, so a
+	// repair that keeps the same tuple still changes the evidence.
+	identityKey string
 }
 
-func (e sessionIdentityEvidence) key() string {
+// aggregateKey is the tuple the aggregate observations are keyed by.
+func (e sessionIdentityEvidence) aggregateKey() string {
 	if !e.found {
 		return ""
 	}
 	return e.machine + "\x00" + e.root + "\x00" + e.gitRemote
+}
+
+// evidence identifies everything the aggregate republishes from a snapshot.
+func (e sessionIdentityEvidence) evidence() string {
+	return e.aggregateKey() + "\x00" + e.identityKey
 }
 
 func readSessionIdentityEvidenceTx(
@@ -2940,9 +2960,10 @@ func readSessionIdentityEvidenceTx(
 ) (sessionIdentityEvidence, error) {
 	var evidence sessionIdentityEvidence
 	err := tx.QueryRowContext(ctx, `
-		SELECT project, machine, root_path, git_remote
+		SELECT project, machine, root_path, git_remote, key_source || ':' || key
 		FROM session_project_identity_snapshots WHERE session_id = ?`, id,
-	).Scan(&evidence.project, &evidence.machine, &evidence.root, &evidence.gitRemote)
+	).Scan(&evidence.project, &evidence.machine, &evidence.root, &evidence.gitRemote,
+		&evidence.identityKey)
 	if errors.Is(err, sql.ErrNoRows) {
 		return evidence, nil
 	}

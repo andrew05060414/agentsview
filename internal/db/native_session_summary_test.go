@@ -151,6 +151,34 @@ func TestRefreshNativeSessionSummaryIdentityOnlyRepair(t *testing.T) {
 	require.NoError(t, d.getReader().QueryRow(ctx,
 		`SELECT local_modified_at FROM sessions WHERE id = 'child'`).Scan(&modified))
 	assert.Equal(t, "2026-01-01T00:00:00.000Z", modified, "an identity-only repair leaves the session row alone")
+
+	// The placeholder already carried this root, so the evidence tuple is
+	// unchanged; the aggregate must still be published for the new key.
+	byProject := observationsByProject(t, d)
+	require.Len(t, byProject["synthetic_repo"], 1)
+	assert.Equal(t, cwd, byProject["synthetic_repo"][0].RootPath)
+	assert.NotEmpty(t, byProject["synthetic_repo"][0].Key)
+}
+
+func TestRefreshNativeSessionSummaryParentRespectsLauncherLinks(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	insertSession(t, d, "launched", "p")
+	insertSession(t, d, "launcher", "p")
+	// "launcher" started "launched", so "launched" has a launcher parent.
+	_, err := d.SetSessionExternalParent(ctx, "launched", "launcher")
+	require.NoError(t, err)
+	require.Equal(t, new("launcher"), fullSession(t, d, "launched").ParentSessionID)
+
+	// The store now names "launched" as the parent of "launcher".
+	require.NoError(t, d.RefreshNativeSessionSummary(ctx, "launcher", NativeSessionSummary{
+		ParentSessionID: "launched",
+	}))
+	launcher := fullSession(t, d, "launcher")
+	launched := fullSession(t, d, "launched")
+	require.NotNil(t, launcher.ParentSessionID)
+	assert.Equal(t, "launched", *launcher.ParentSessionID, "the native parent applies")
+	assert.Nil(t, launched.ParentSessionID, "the launcher link that would close a cycle no longer applies")
 }
 
 func TestCopySessionMetadataKeepsFreshIdentityOverEmptyPlaceholder(t *testing.T) {

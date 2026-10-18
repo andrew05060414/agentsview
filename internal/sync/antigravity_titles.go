@@ -124,8 +124,11 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		parentChanged := parentID != "" && session.ParentSessionID == ""
 		// A workspace stored before its identity was recorded completely
 		// (or by an older build) still needs a publishable snapshot.
+		// In a rebuild the metadata copy puts the old archive's snapshot back,
+		// so a placeholder there needs the repair even when the fresh parse
+		// already recorded a complete identity.
 		identityRepair := summary.Cwd != "" && !cwdChanged && !rebuildWorkspaceChange &&
-			session.IdentityNeedsRepair
+			(session.IdentityNeedsRepair || previous.IdentityNeedsRepair)
 
 		if !titleChanged && !cwdChanged && !parentChanged && !identityRepair && !rebuildWorkspaceChange {
 			continue
@@ -152,7 +155,10 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		if parentChanged {
 			update.parentID = parentID
 		}
-		if deferred || rebuildWorkspaceChange {
+		// A rebuild replays workspace changes and identity repairs after the
+		// metadata copy, which would otherwise restore the old snapshot.
+		if deferred || rebuildWorkspaceChange ||
+			(identityRepair && e.deferredAntigravitySummaries != nil) {
 			e.deferredAntigravitySummaries[id] = deferredAntigravitySummary{stored: session, update: update}
 			continue
 		}

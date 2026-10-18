@@ -4008,10 +4008,13 @@ schemas keep their existing ordering behavior.
     user-assigned project keeps its identity and trashed sessions publish
     none) whenever the evidence or project changes; a matching workspace
     whose snapshot is a keyless placeholder gets its identity repaired without
-    touching the session row. A rename alone leaves the project untouched,
-    and a new parent clears stale friction results.
-  - **Rebuild** records workspace, project and parent changes against the old
-    archive, for live and orphaned sessions, and replays them after the
+    touching the session row and publishes its aggregate evidence. A rename
+    alone leaves the project untouched, and a new parent clears stale
+    friction results and recomputes launcher parent links, so it cannot close
+    a cycle with one.
+  - **Rebuild** records workspace, project and parent changes, and identity
+    repairs for snapshots the old archive held as placeholders, against the
+    old archive for live and orphaned sessions, and replays them after the
     metadata copy and identity-snapshot project restore, before worktree
     mappings apply. The metadata copy never replaces a publishable snapshot
     with an old placeholder that recorded neither a key nor a root.

@@ -733,3 +733,53 @@ func TestAntigravitySingleSessionRefreshAppliesWorkspaceChange(t *testing.T) {
 	require.NoError(t, engine.SyncSingleSessionContext(t.Context(), id))
 	assert.Equal(t, filepath.Clean(second), antigravityStoredSession(t, archive).Cwd)
 }
+
+func TestAntigravityRepairsRootedPlaceholderIdentity(t *testing.T) {
+	for _, mode := range []string{"sync-store", "rebuild-live"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			workspace := filepath.Join(t.TempDir(), "synthetic-workspace")
+			transcript := dbtest.WriteAntigravityTitleTranscript(t, root, "hello")
+			store := setAntigravitySummary(t, root, "Title", antigravityWorkspaceURIs(workspace), "")
+			archivePath := filepath.Join(t.TempDir(), "archive.db")
+			archive := dbtest.OpenTestDBAt(t, archivePath)
+			engine := newAntigravityTitleEngine(t, archive, root)
+			require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
+			id := "antigravity:" + dbtest.AntigravityTitleID
+
+			// Reduce the snapshot to a keyless placeholder that still records
+			// the workspace root, with no aggregate evidence, as an older
+			// build left it.
+			conn, err := sql.Open("sqlite3", archivePath)
+			require.NoError(t, err)
+			_, err = conn.ExecContext(t.Context(), `UPDATE session_project_identity_snapshots
+				SET key_source = '', key = '', normalized_remote = '',
+				    worktree_name = '', worktree_root_path = '' WHERE session_id = ?`, id)
+			require.NoError(t, err)
+			_, err = conn.ExecContext(t.Context(), `DELETE FROM project_identity_observations`)
+			require.NoError(t, err)
+			require.NoError(t, conn.Close())
+			publishable, err := archive.ListPublishableSessionProjectIdentitySnapshots(t.Context(), []string{id}, nil, nil)
+			require.NoError(t, err)
+			require.Empty(t, publishable)
+
+			if mode == "rebuild-live" {
+				stats := engine.ResyncAll(t.Context(), nil)
+				require.False(t, stats.Aborted)
+			} else {
+				// A full pass rereads the unchanged store.
+				engine.SyncAll(t.Context(), nil)
+				require.NoError(t, engine.SyncPathsContext(t.Context(), []string{store}))
+			}
+
+			publishable, err = archive.ListPublishableSessionProjectIdentitySnapshots(t.Context(), []string{id}, nil, nil)
+			require.NoError(t, err)
+			require.Len(t, publishable, 1, "the repaired identity must be publishable")
+			observations, err := archive.ListProjectIdentityObservations(t.Context(), nil)
+			require.NoError(t, err)
+			require.Len(t, observations, 1, "the repair publishes aggregate evidence")
+			assert.Equal(t, publishable[0].Key, observations[0].Key)
+			assert.Equal(t, "synthetic_workspace", observations[0].Project)
+		})
+	}
+}
