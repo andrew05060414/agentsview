@@ -180,3 +180,35 @@ func TestCopySessionMetadataKeepsFreshIdentityOverEmptyPlaceholder(t *testing.T)
 	require.Len(t, publishable, 1, "an evidence-free placeholder must not replace the fresh identity")
 	assert.Equal(t, root, publishable[0].RootPath)
 }
+
+func TestRefreshNativeSessionSummaryReplacesIdentityForChangedWorkspace(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	first := filepath.Join(t.TempDir(), "first")
+	second := filepath.Join(t.TempDir(), "second")
+	insertSession(t, d, "child", "first", func(s *Session) { s.Cwd = first })
+	require.NoError(t, d.UpsertProjectIdentityObservation(ctx, export.ProjectIdentityObservation{
+		SessionID: "child", Project: "first", Machine: defaultMachine, RootPath: first,
+		GitRemote: "https://example.com/team/first.git",
+	}))
+
+	require.NoError(t, d.RefreshNativeSessionSummary(ctx, "child", NativeSessionSummary{
+		Cwd: second, Project: "second",
+		IdentityObservation: export.ProjectIdentityObservation{
+			SessionID: "child", Project: "second", Machine: defaultMachine, RootPath: second,
+		},
+		IdentitySnapshotProject: "second",
+		ReplaceIdentitySnapshot: true,
+	}))
+
+	snapshots, err := d.ListPublishableSessionProjectIdentitySnapshots(ctx, []string{"child"}, nil, nil)
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	assert.Equal(t, "second", snapshots[0].Project)
+	assert.Empty(t, snapshots[0].GitRemote, "the old workspace's repository no longer describes the session")
+	observations, err := d.ListProjectIdentityObservations(ctx, nil)
+	require.NoError(t, err)
+	for _, obs := range observations {
+		assert.NotEqual(t, "first", obs.Project, "no aggregate evidence remains for the replaced workspace")
+	}
+}
