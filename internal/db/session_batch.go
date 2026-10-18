@@ -1,6 +1,7 @@
 package db
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -828,7 +829,7 @@ func fillEmptyToolResultsTx(
 	return filled, nil
 }
 
-// completeStoredMessagesTx extends truncated text and updates models at stored
+// completeStoredMessagesTx extends text, updates models, and fills source identities at stored
 // ordinals up to maxOrd, preserving message IDs and unrelated fields.
 func completeStoredMessagesTx(
 	tx transactionQueries, sessionID string, msgs []Message, maxOrd int,
@@ -839,13 +840,13 @@ func completeStoredMessagesTx(
 			continue
 		}
 		var id int64
-		var stored, model string
+		var stored, model, sourceUUID, sourceParentUUID string
 		var contentLength int
 		err := tx.QueryRow(
-			`SELECT id, content, content_length, model FROM messages
+			`SELECT id, content, content_length, model, source_uuid, source_parent_uuid FROM messages
 			 WHERE session_id = ? AND ordinal = ?`,
 			sessionID, m.Ordinal,
-		).Scan(&id, &stored, &contentLength, &model)
+		).Scan(&id, &stored, &contentLength, &model, &sourceUUID, &sourceParentUUID)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -856,16 +857,18 @@ func completeStoredMessagesTx(
 			)
 		}
 		extended := IsTextExtension(stored, m.Content)
-		if !extended && model == m.Model {
+		filledUUID := cmp.Or(sourceUUID, m.SourceUUID)
+		filledParentUUID := cmp.Or(sourceParentUUID, m.SourceParentUUID)
+		if !extended && model == m.Model && sourceUUID == filledUUID && sourceParentUUID == filledParentUUID {
 			continue
 		}
 		if extended {
 			stored, contentLength = m.Content, m.ContentLength
 		}
 		if _, err := tx.Exec(
-			`UPDATE messages SET content = ?, content_length = ?, model = ?
+			`UPDATE messages SET content = ?, content_length = ?, model = ?, source_uuid = ?, source_parent_uuid = ?
 			 WHERE id = ?`,
-			stored, contentLength, m.Model, id,
+			stored, contentLength, m.Model, filledUUID, filledParentUUID, id,
 		); err != nil {
 			return 0, fmt.Errorf(
 				"completing message for %s ordinal %d: %w",
