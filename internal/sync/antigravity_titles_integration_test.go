@@ -242,3 +242,66 @@ func TestAntigravityTrashedSessionRestoresWithCurrentTitle(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, new("Renamed in trash"), nativeStoredTitle(t, archive, "antigravity:"+dbtest.AntigravityTitleID))
 }
+
+func TestAntigravitySummariesSyncWorkspaceAndProject(t *testing.T) {
+	root := t.TempDir()
+	transcript := dbtest.WriteAntigravityTitleTranscript(t, root, "hello")
+	archive := dbtest.OpenTestDB(t)
+	engine := newNativeTitleEngine(t, archive, parser.AgentAntigravity, root)
+
+	// Initial sync without summaries
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
+	sessionID := "antigravity:" + dbtest.AntigravityTitleID
+	before, err := archive.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	assert.Empty(t, before.Cwd)
+	assert.Empty(t, before.Project)
+	assert.Nil(t, before.SessionName)
+
+	// Now create conversation_summaries.db with workspace and title
+	store := filepath.Join(root, parser.AntigravitySummariesDBName)
+	conn, err := sql.Open("sqlite3", store)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	schema := `CREATE TABLE conversation_summaries (
+		conversation_id TEXT PRIMARY KEY,
+		title TEXT NOT NULL DEFAULT '',
+		workspace_uris TEXT NOT NULL DEFAULT '',
+		parent_conversation_id TEXT NOT NULL DEFAULT ''
+	)`
+	_, err = conn.ExecContext(t.Context(), schema)
+	require.NoError(t, err)
+
+	workspaceJSON := `["file:///d%3A/synthetic-workspace"]`
+	parentID := "synthetic-parent-123"
+	_, err = conn.ExecContext(t.Context(),
+		`INSERT INTO conversation_summaries (conversation_id, title, workspace_uris, parent_conversation_id)
+		 VALUES (?, ?, ?, ?)`,
+		dbtest.AntigravityTitleID, "Synthetic Task Title", workspaceJSON, parentID,
+	)
+	require.NoError(t, err)
+
+	// Sync the summaries store
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{store}))
+	after, err := archive.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, new("Synthetic Task Title"), after.SessionName)
+	assert.Equal(t, filepath.Clean(filepath.FromSlash("d:/synthetic-workspace")), after.Cwd)
+	assert.Equal(t, "synthetic_workspace", after.Project)
+	require.NotNil(t, after.ParentSessionID)
+	assert.Equal(t, "antigravity:"+parentID, *after.ParentSessionID)
+	assert.Equal(t, "subagent", after.RelationshipType)
+
+	// Verify session_project_identity_snapshots was populated
+	var snapProject, snapRoot string
+	err = archive.Reader().QueryRow(t.Context(),
+		`SELECT project, root_path FROM session_project_identity_snapshots WHERE session_id = ?`,
+		sessionID,
+	).Scan(&snapProject, &snapRoot)
+	require.NoError(t, err)
+	assert.Equal(t, "synthetic_workspace", snapProject)
+	assert.Equal(t, filepath.Clean(filepath.FromSlash("d:/synthetic-workspace")), snapRoot)
+}

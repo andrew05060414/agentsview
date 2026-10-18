@@ -3971,6 +3971,23 @@ schemas keep their existing ordering behavior.
   the collector read its own mirror. Main-database and WAL changes still
   resolve to their conversation or title refresh.
 
+- **Workspace evidence:** The same `conversation_summaries` table can carry a
+  `workspace_uris` column (a JSON array of `file://` URIs, or a single URI
+  string) and a `parent_conversation_id` column. Both are observed in the
+  Antigravity desktop app's store; neither is documented upstream, so the
+  reader checks `PRAGMA table_info` and falls back to the title-only query
+  when a column is absent. The first non-empty workspace URI becomes the
+  session's working directory (percent-decoding, Windows drive letters,
+  `localhost` and UNC hosts handled) and the project is derived from it; a
+  non-empty parent ID links the session to that conversation as a subagent.
+  At parse time the store only fills an empty working directory, project or
+  parent. Each sync pass also copies a changed workspace or parent onto stored
+  sessions (a parent only when none is stored), so existing archives pick them
+  up without a parser resync, and an empty or missing value never clears
+  stored data.
+  Checked 2026-10-17 with synthetic stores covering the URI shapes above and
+  stores that lack the optional columns.
+
 ## Antigravity CLI (`antigravity-cli`)
 
 - **Format:** Newer per-session SQLite databases or older encrypted protobuf

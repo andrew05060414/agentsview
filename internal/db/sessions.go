@@ -2704,7 +2704,33 @@ func (db *DB) RefreshNativeSessionName(ctx context.Context, id string, sessionNa
 	return db.refreshSessionName(ctx, id, sessionName, true)
 }
 
+// RefreshNativeSessionSummary updates the native session title, cwd, project, and parent
+// owned by the agent's external metadata store (e.g. Antigravity conversation_summaries.db).
+// It updates trashed rows as well so a restore displays the current title and workspace.
+func (db *DB) RefreshNativeSessionSummary(
+	ctx context.Context,
+	id string,
+	sessionName *string,
+	updateTitle bool,
+	cwd, project string,
+	parentSessionID string,
+) error {
+	return db.refreshNativeSessionSummary(ctx, id, sessionName, updateTitle, cwd, project, parentSessionID, true)
+}
+
 func (db *DB) refreshSessionName(ctx context.Context, id string, sessionName *string, includeTrashed bool) error {
+	return db.refreshNativeSessionSummary(ctx, id, sessionName, true, "", "", "", includeTrashed)
+}
+
+func (db *DB) refreshNativeSessionSummary(
+	ctx context.Context,
+	id string,
+	sessionName *string,
+	updateTitle bool,
+	cwd, project string,
+	parentSessionID string,
+	includeTrashed bool,
+) error {
 	if db.usageOnlyStorage() {
 		sessionName = nil
 	}
@@ -2724,13 +2750,57 @@ func (db *DB) refreshSessionName(ctx context.Context, id string, sessionName *st
 	defer func() { _ = tx.Rollback() }()
 	_, err = tx.ExecContext(ctx,
 		`UPDATE sessions
-		 SET session_name = ?,
+		 SET session_name = CASE WHEN ? THEN ? ELSE session_name END,
+		     cwd = CASE WHEN ? != '' THEN ? ELSE cwd END,
+		     project = CASE WHEN ? != '' THEN ? ELSE project END,
+		     parent_session_id = CASE
+		         WHEN ? != '' AND (parent_session_id IS NULL OR parent_session_id = '')
+		         THEN ? ELSE parent_session_id END,
+		     parser_parent_session_id = CASE
+		         WHEN ? != '' AND (parser_parent_session_id IS NULL OR parser_parent_session_id = '')
+		         THEN ? ELSE parser_parent_session_id END,
+		     relationship_type = CASE
+		         WHEN ? != '' AND (parent_session_id IS NULL OR parent_session_id = '')
+		              AND (relationship_type IS NULL OR relationship_type = '')
+		         THEN 'subagent' ELSE relationship_type END,
+		     parser_relationship_type = CASE
+		         WHEN ? != '' AND (parser_parent_session_id IS NULL OR parser_parent_session_id = '')
+		              AND (parser_relationship_type IS NULL OR parser_relationship_type = '')
+		         THEN 'subagent' ELSE parser_relationship_type END,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = ? AND (? OR deleted_at IS NULL)`,
-		sessionName, id, includeTrashed,
+		updateTitle, sessionName,
+		cwd, cwd,
+		project, project,
+		parentSessionID, parentSessionID,
+		parentSessionID, parentSessionID,
+		parentSessionID,
+		parentSessionID,
+		id, includeTrashed,
 	)
 	if err != nil {
 		return err
+	}
+	if cwd != "" || project != "" {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO session_project_identity_snapshots (
+				session_id, project, machine, root_path, worktree_relationship,
+				checkout_state, git_branch, remote_resolution, observed_at
+			) SELECT id, project, machine, cwd, 'unknown',
+			         CASE WHEN git_branch != '' THEN 'branch' ELSE 'unknown' END,
+			         git_branch, 'unknown', strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			  FROM sessions WHERE id = ?
+			ON CONFLICT(session_id) DO UPDATE SET
+				project = CASE WHEN excluded.project != '' THEN excluded.project ELSE session_project_identity_snapshots.project END,
+				root_path = CASE WHEN excluded.root_path != '' THEN excluded.root_path ELSE session_project_identity_snapshots.root_path END,
+				observed_at = excluded.observed_at
+			WHERE (session_project_identity_snapshots.project = '' OR session_project_identity_snapshots.project IS NULL)
+			   OR (session_project_identity_snapshots.root_path = '' OR session_project_identity_snapshots.root_path IS NULL)`,
+			id,
+		)
+		if err != nil {
+			return err
+		}
 	}
 	if db.usageOnlyStorage() {
 		if err := clearUsageOnlyTextTx(tx, id); err != nil {
@@ -4378,12 +4448,13 @@ const sessionMachineBatchSize = 500
 // SessionWriteIdentity is the stored state used to preserve immutable source
 // attribution and parser-owned Codex titles across session writes and rebuilds.
 type SessionWriteIdentity struct {
-	Machine     string
-	Agent       string
-	Cwd         string
-	FilePath    string
-	FileHash    string
-	SessionName *string
+	Machine         string
+	Agent           string
+	Cwd             string
+	FilePath        string
+	FileHash        string
+	SessionName     *string
+	ParentSessionID string
 }
 
 // ListSessionWriteIdentitiesByID returns stored source attribution and parser
@@ -4422,7 +4493,7 @@ func (db *DB) ListSessionWriteIdentitiesByID(
 			rows, err := db.getReader().QueryContext(ctx, `
 			SELECT id, machine, agent, COALESCE(cwd, ''),
 			       COALESCE(file_path, ''), COALESCE(file_hash, ''),
-			       session_name
+			       session_name, COALESCE(parent_session_id, '')
 			FROM sessions
 			WHERE id IN (`+placeholders+`)
 			ORDER BY id`, args...)
@@ -4436,6 +4507,7 @@ func (db *DB) ListSessionWriteIdentitiesByID(
 				if err := rows.Scan(
 					&id, &identity.Machine, &identity.Agent, &identity.Cwd,
 					&identity.FilePath, &identity.FileHash, &identity.SessionName,
+					&identity.ParentSessionID,
 				); err != nil {
 					_ = rows.Close()
 					return fmt.Errorf(

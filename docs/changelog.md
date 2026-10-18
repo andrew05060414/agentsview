@@ -21,6 +21,9 @@ The latest release is
   totals. Rewinding after a channel conversation keeps that conversation as a
   separate fork and preserves the retry's session ID and saved items. Existing
   Claude-format sources are reprocessed on upgrade.
+- Antigravity sessions group under their project, and sub-conversations link to
+  their parent, using the workspace folder and parent conversation Antigravity
+  saves in `conversation_summaries.db`.
 
 ## 0.46.1
 
