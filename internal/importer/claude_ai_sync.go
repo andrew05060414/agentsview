@@ -209,16 +209,16 @@ func syncConversation(ctx context.Context, store db.Store, result parser.ParseRe
 	stored := storedFormMessages(store, msgs)
 	if sameMessages(archived, stored) {
 		status, err := upsertConversation(ctx, store, result, nil)
+		rows := chatGPTModelRows(archived, stored)
 		if refusalReason(err) == RefusalShorterExport {
-			if storeArchiveContent(store).UsageOnly() {
-				// Browser snapshots are authoritative even when retained usage rows match.
-				rows := chatGPTModelRows(archived, stored)
-				return importUpdated, appendChatGPTMessages(ctx, store, chatGPTSession(result.Session), rows)
+			if !storeArchiveContent(store).UsageOnly() {
+				return importSkipped, nil
 			}
-			return importSkipped, nil
+		} else if err != nil || len(rows) == 0 {
+			return status, err
 		}
-
-		return status, err
+		// Browser snapshots are authoritative even when retained usage rows match.
+		return importUpdated, appendChatGPTMessages(ctx, store, chatGPTSession(result.Session), rows)
 	}
 	return replaceSyncedConversation(ctx, store, result, msgs)
 }
