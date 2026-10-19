@@ -89,9 +89,9 @@ func (e *Engine) applyAntigravityStoreSummaries(ctx context.Context, root string
 		summary := summaries[strings.TrimPrefix(id, prefix)]
 		change := antigravitySessionChange{machine: session.Machine}
 		title := db.SanitizeUTF8(summary.Title)
-		change.retitle = summary.TitlePresent && !usageOnly &&
-			!(session.SessionName != nil && *session.SessionName == title ||
-				session.SessionName == nil && title == "")
+		sameTitle := session.SessionName != nil && *session.SessionName == title ||
+			session.SessionName == nil && title == ""
+		change.retitle = summary.TitlePresent && !usageOnly && !sameTitle
 		if change.retitle && title != "" {
 			change.name = &title
 		}
