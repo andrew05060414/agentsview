@@ -118,6 +118,10 @@ export default defineConfig(({ command }) => {
             fileURLToPath(new URL("../internal/importer/chatgpt_requests.txt", import.meta.url)),
             fileURLToPath(new URL("./dist/chrome-extension/chatgpt_requests.txt", import.meta.url)),
           );
+          cpSync(
+            fileURLToPath(new URL("../internal/importer/gemini_requests.txt", import.meta.url)),
+            fileURLToPath(new URL("./dist/chrome-extension/gemini_requests.txt", import.meta.url)),
+          );
         },
       },
       svelte(),
