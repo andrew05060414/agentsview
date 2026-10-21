@@ -93,7 +93,10 @@ func (p *cursorProvider) parseSession(
 	hash := fmt.Sprintf("%x", sha256.Sum256(data))
 
 	mtime := info.ModTime()
-	startedAt, endedAt := cursorSessionBounds(messages, mtime)
+	// Cursor JSONL lines carry no timestamps, so an untagged transcript is
+	// bounded by when its file was created and last written.
+	created, _ := fileBirthTime(info)
+	startedAt, endedAt := cursorSessionBounds(messages, created, mtime)
 	sess := &ParsedSession{
 		ID:           sessionID,
 		Project:      project,
@@ -288,8 +291,15 @@ func parseCursorTimestamp(tag string) (time.Time, bool) {
 	).UTC(), true
 }
 
-func cursorSessionBounds(messages []ParsedMessage, fallback time.Time) (time.Time, time.Time) {
-	startedAt, endedAt := fallback, fallback
+// cursorSessionBounds uses the earliest and latest tagged turns. Without any,
+// it falls back to the file's creation and modification times; a missing
+// creation time, or one after the modification time (a copied file), leaves
+// both bounds at the modification time.
+func cursorSessionBounds(messages []ParsedMessage, created, modified time.Time) (time.Time, time.Time) {
+	startedAt, endedAt := modified, modified
+	if !created.IsZero() && !created.After(modified) {
+		startedAt = created
+	}
 	found := false
 	for _, message := range messages {
 		if message.Timestamp.IsZero() {

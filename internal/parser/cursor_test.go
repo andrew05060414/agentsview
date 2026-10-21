@@ -966,3 +966,54 @@ func TestCursorTranscriptLocationFromPath(t *testing.T) {
 		})
 	}
 }
+
+func TestCursorSessionBoundsFileTimes(t *testing.T) {
+	created := cursorTestTime(t, "2026-10-20T10:00:00Z")
+	modified := cursorTestTime(t, "2026-10-20T13:30:00Z")
+	turn := cursorTestTime(t, "2026-10-20T11:00:00Z")
+	tests := []struct {
+		name             string
+		messages         []ParsedMessage
+		created          time.Time
+		wantStart, wantE time.Time
+	}{
+		{"creation time starts an untagged session", []ParsedMessage{{Role: RoleUser}}, created, created, modified},
+		{"no creation time keeps modification time", []ParsedMessage{{Role: RoleUser}}, time.Time{}, modified, modified},
+		{"creation after modification is ignored", []ParsedMessage{{Role: RoleUser}}, modified.Add(time.Hour), modified, modified},
+		{"creation equal to modification", []ParsedMessage{{Role: RoleUser}}, modified, modified, modified},
+		{"tagged turns win over file times", []ParsedMessage{{Role: RoleUser, Timestamp: turn}, {Role: RoleAssistant}}, created, turn, turn},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			start, end := cursorSessionBounds(tt.messages, tt.created, modified)
+			assert.True(t, start.Equal(tt.wantStart), "start %s, want %s", start, tt.wantStart)
+			assert.True(t, end.Equal(tt.wantE), "end %s, want %s", end, tt.wantE)
+			assert.False(t, start.After(end))
+		})
+	}
+}
+
+func TestCursorUntaggedTranscriptStartsAtFileCreation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "11111111-2222-4333-8444-555555555555.jsonl")
+	data := strings.Join([]string{
+		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>Long task.</user_query>"}]}}`,
+		`{"role":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}`,
+	}, "\n")
+	require.NoError(t, os.WriteFile(path, []byte(data), 0o644))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	created, ok := fileBirthTime(info)
+	// A later write moves only the modification time.
+	modified := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(path, modified, modified))
+
+	session, _ := parseCursorTestFile(t, path)
+	require.NotNil(t, session)
+	assert.True(t, session.EndedAt.Equal(modified), "ended_at %s, want %s", session.EndedAt, modified)
+	if !ok {
+		assert.True(t, session.StartedAt.Equal(modified), "without a creation time, started_at stays at the modification time")
+		return
+	}
+	assert.True(t, session.StartedAt.Equal(created), "started_at %s, want creation time %s", session.StartedAt, created)
+	assert.True(t, session.StartedAt.Before(session.EndedAt))
+}
