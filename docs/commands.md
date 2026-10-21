@@ -1572,8 +1572,8 @@ ______________________________________________________________________
 
 ### `agentsview chrome setup`
 
-Install the native host and unpacked extension to sync Claude.ai, ChatGPT, and
-Gemini Apps through Google Chrome. The command prints the extension folder.
+Install the native host and unpacked extension to sync Claude.ai, ChatGPT,
+Gemini Apps, and Grok through Google Chrome. The command prints the extension folder.
 AgentsView opens its Chrome connection only after setup, so restart AgentsView
 if it is already running. Open `chrome://extensions`, enable **Developer mode**,
 choose **Load unpacked**, and select that folder. Keep Chrome open during Sync.
@@ -1591,7 +1591,8 @@ ______________________________________________________________________
 
 ### `agentsview import`
 
-Import Claude.ai, ChatGPT, or Gemini Apps conversations into the local database.
+Import Claude.ai, ChatGPT, or Gemini Apps conversations into the local database,
+or sync Grok chats through Chrome.
 See [Chat Import](/docs/chat-import/) for full documentation.
 
 ```bash
@@ -1602,13 +1603,14 @@ agentsview import --type <type> <path>
 | ----------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
 | `--type`    |         | Import type: `claude-ai`, `chatgpt`, or `gemini-apps` (required)                                                 |
 | `--replace` |         | Session ID to replace when the default import refuses it; repeatable (claude-ai, chatgpt)                        |
-| `--sync`    | `false` | Sync Claude.ai, ChatGPT, or Gemini Apps through Chrome; requires a running server and Chrome host, with no path or `--replace` |
+| `--sync`    | `false` | Sync Claude.ai, ChatGPT, Gemini Apps, or Grok (`grok-web`) through Chrome; requires a running server and Chrome host, with no path or `--replace` |
 
 Set up the
 [Chrome host](https://agentsview.io/docs/commands/#agentsview-chrome-setup) once
 and keep Chrome open for `agentsview import --type claude-ai --sync` or
 `agentsview import --type chatgpt --sync` or
-`agentsview import --type gemini-apps --sync`. The desktop app also syncs ChatGPT
+`agentsview import --type gemini-apps --sync` or
+`agentsview import --type grok-web --sync`. The desktop app also syncs ChatGPT
 through Chrome.
 
 The path can be a `.zip` file, a `conversations.json` file (Claude.ai only), a

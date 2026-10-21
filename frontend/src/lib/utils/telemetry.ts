@@ -48,6 +48,7 @@ const syncFailureReasons = new Map<string, SyncFailureReason>([
   ["chrome_sync_running", "already_running"],
   ["chatgpt_auth_required", "sign_in_required"],
   ["gemini_auth_required", "sign_in_required"],
+  ["grok_web_auth_required", "sign_in_required"],
   ["chrome_host_required", "browser_extension"],
   ["chrome_host_update_required", "browser_extension"],
 ]);
