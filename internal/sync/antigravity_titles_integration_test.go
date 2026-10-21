@@ -491,6 +491,55 @@ func TestAntigravityCwdFilterJudgesStoredWorkspace(t *testing.T) {
 	}
 }
 
+// A copy of a stored conversation from another machine, path, and content is
+// unverified: it keeps its own workspace instead of the stored one and does
+// not take the stored machine's worktree mapping, with or without a cwd filter.
+func TestAntigravityUnverifiedCopyKeepsOwnWorkspace(t *testing.T) {
+	for _, filter := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cwd-filter=%t", filter), func(t *testing.T) {
+			allowed := t.TempDir()
+			storedWorkspace := filepath.Join(allowed, "stored-workspace")
+			copyWorkspace := filepath.Join(allowed, "copy-workspace")
+			storedRoot, copyRoot := t.TempDir(), t.TempDir()
+			storedTranscript := dbtest.WriteAntigravityTitleTranscript(t, storedRoot, "hello from b")
+			setAntigravitySummary(t, storedRoot, "Title", antigravityWorkspaceURIs(storedWorkspace), "")
+			copyTranscript := dbtest.WriteAntigravityTitleTranscript(t, copyRoot, "hello from a")
+			setAntigravitySummary(t, copyRoot, "Title", antigravityWorkspaceURIs(copyWorkspace), "")
+
+			archive := dbtest.OpenTestDB(t)
+			storedEngine := sync.NewEngine(t.Context(), archive, sync.EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentAntigravity: {storedRoot}},
+				Machine:   "host-b",
+			})
+			t.Cleanup(storedEngine.Close)
+			require.NoError(t, storedEngine.SyncPathsContext(t.Context(), []string{storedTranscript}))
+			require.Equal(t, filepath.Clean(storedWorkspace), antigravityStoredSession(t, archive).Cwd)
+			_, err := archive.CreateWorktreeProjectMapping(t.Context(), db.WorktreeProjectMapping{
+				Machine: "host-b", PathPrefix: allowed, Project: "mapped_project", Enabled: true,
+			})
+			require.NoError(t, err)
+
+			cfg := sync.EngineConfig{
+				AgentDirs: map[parser.AgentType][]string{parser.AgentAntigravity: {copyRoot}},
+				Machine:   "host-a",
+			}
+			if filter {
+				cfg.IncludeCwdPrefixes = []string{allowed}
+			}
+			copyEngine := sync.NewEngine(t.Context(), archive, cfg)
+			t.Cleanup(copyEngine.Close)
+			require.NoError(t, copyEngine.SyncPathsContext(t.Context(), []string{copyTranscript}))
+
+			after := antigravityStoredSession(t, archive)
+			require.NotNil(t, after.FirstMessage)
+			assert.Equal(t, "hello from a", *after.FirstMessage, "the copy is written")
+			assert.Equal(t, "host-b", after.Machine, "the session keeps its archived machine")
+			assert.Equal(t, filepath.Clean(copyWorkspace), after.Cwd)
+			assert.Equal(t, "copy_workspace", after.Project)
+		})
+	}
+}
+
 func TestAntigravityUsageOnlyArchiveFillsWorkspaceAndParent(t *testing.T) {
 	root := t.TempDir()
 	workspace := filepath.Join(t.TempDir(), "synthetic-workspace")

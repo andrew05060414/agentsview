@@ -18068,7 +18068,8 @@ func keepStoredExternalMetadata(sess *parser.ParsedSession, stored db.SessionWri
 // keepStoredExternalMetadataBeforeCwdFilter resolves stored attribution, and
 // with it keepStoredExternalMetadata, before the cwd allow-list judges parsed
 // sessions, so the filter sees the working directory the write will store.
-// The write path resolves it again with the same result.
+// Only the kept metadata is copied back: the parsed machine must reach the
+// write path unchanged so it can still recognize an unverified copy.
 func (e *Engine) keepStoredExternalMetadataBeforeCwdFilter(
 	ctx context.Context, results []parser.ParseResult,
 ) error {
@@ -18091,7 +18092,11 @@ func (e *Engine) keepStoredExternalMetadataBeforeCwdFilter(
 	next := 0
 	for i := range results {
 		if results[i].Session.KeepStoredWorkspace {
-			results[i].Session = batch[next].sess
+			kept := batch[next].sess
+			results[i].Session.Cwd = kept.Cwd
+			results[i].Session.Project = kept.Project
+			results[i].Session.ParentSessionID = kept.ParentSessionID
+			results[i].Session.RelationshipType = kept.RelationshipType
 			next++
 		}
 	}
