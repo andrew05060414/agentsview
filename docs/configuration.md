@@ -20,6 +20,9 @@ AgentsView stores all persistent data under a single directory, defaulting to
 ├── vectors.db       # Semantic-search vector index (when [vector] is enabled)
 ├── usage-cache-v6-<id>.db # Disposable usage-aggregate cache
 ├── telemetry-install-id # Application installation ID
+├── telemetry-daemon-active.lock  # Serializes daily daemon reports
+├── telemetry-setup-finished.lock # Serializes the one-time setup report
+├── telemetry-screen-views.lock   # Serializes screen view claims
 ├── config.toml      # Configuration file
 ├── config.toml.lock # Serializes concurrent config writers
 ├── db.write.lock    # Per-data-dir SQLite write-owner lock
@@ -154,8 +157,14 @@ The display label defaults to the current hostname. Set `local_machine_name` in
 non-empty label is allowed, including `local`. Changing the label leaves session
 keys unchanged; PostgreSQL and DuckDB receive the label on the next push.
 Creating the identity does not rewrite `config.toml` or its comments. A missing
-cursor secret is still generated and saved. Machine filters use keys;
-`/api/v1/machines` returns display labels and known aliases separately.
+cursor secret is still generated and saved.
+
+Session filters accept an exact ID or alias, a comma-separated list of IDs and
+aliases, or one display label matched as the whole value, case-sensitively.
+Unknown names and labels shared by several machines return an error that lists
+known machines. Use `/api/v1/machines` to look up IDs, display labels, and aliases.
+
+Project rules and worktree mappings accept only IDs and aliases.
 
 ### Upgrading Historical Machine Keys
 
@@ -190,6 +199,26 @@ installation IDs to select machines unambiguously in a shared mirror.
 
 The config file at `~/.agentsview/config.toml` is auto-created on first run. It
 stores persistent settings that survive restarts.
+
+Commands validate the settings they use. For example, `export sessions` warns on
+stderr about invalid insights, vector, recall-extraction, or public/proxy settings
+and still exports the archive. It preserves those settings in `config.toml`.
+TOML syntax and type errors still fail loading, and unknown-key handling is
+unchanged. Server startup and reloads validate the complete configuration, so
+starting `serve` also checks settings unused by exports.
+Automatic daemon startup and replacement validate the effective server
+configuration, including deployment overrides, before launching or stopping a
+daemon.
+
+The full container deployment environment applies to `serve`, remote `serve`
+commands, and `pg push`, including its watch mode. Other PostgreSQL clients honor
+`AGENTSVIEW_PG_ALLOW_INSECURE` for the default target. Hosted raw reads and reparse
+commands honor `AGENTSVIEW_REQUIRE_AUTH` without reading the server token file.
+MCP HTTP listeners and daemon clients load the deployment authentication they
+use. Semantic and hybrid PostgreSQL reads, including `mcp --pg`, load deployment
+embeddings for published recipe adoption without reading listener token files.
+Direct archive exports skip deployment token files and
+`AGENTSVIEW_EMBEDDINGS_*` settings.
 
 !!! note
 
@@ -240,6 +269,7 @@ zoom_level = 120
 | `[[session_sources]]`               | Additional filesystem session roots with per-root machine keys — see [Filesystem Session Sync](/docs/filesystem-sync/)                                                                                                                                                                                                                                                                                                                                                           |
 | `[automated]`                       | Custom automated-session patterns — see [Automated Session Detection](#automated-session-detection)                                                                                                                                                                                                                                                                                                                                                                              |
 | `[custom_model_pricing]`            | Per-model price overrides for usage reports — see [Custom Model Pricing](/docs/token-usage/#custom-model-pricing)                                                                                                                                                                                                                                                                                                                                                                |
+| `[model_aliases]`                   | Model names mapped to display groups. See [Model aliases](/docs/token-usage/#model-aliases).                                                                                                                                                                                                                                                                                                                                                                                     |
 
 The `cursor_secret` is generated automatically on first run. For Gist
 publishing, AgentsView first uses a saved `github_token`. For local browser
@@ -283,6 +313,11 @@ deployment environment variables. They apply only when `AGENTSVIEW_MODE` is set
 to a non-blank value, so a desktop or native install ignores them, including
 invalid values and missing files. You can also set `AGENTSVIEW_MODE` yourself to
 use them with the native binary.
+
+An invalid `AGENTSVIEW_MODE` stops `serve` and `pg serve`. Other commands apply
+no deployment variables under it. A command that would read one, such as a
+daemon client with `AGENTSVIEW_AUTH_TOKEN_FILE` set, fails with the invalid
+mode instead.
 
 | Variable                             | Behavior                                                                                                                                                                                    |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2210,6 +2245,25 @@ not send another ping that day. The web UI also reports an anonymous
 UTC day. The server sends it to PostHog with the same fields and opt-out as the
 ping. The browser never contacts PostHog.
 
+The server sends `setup_finished` once per installation when the archive first
+has a session in the default session list. Sessions need messages to count;
+automated sessions and trash are excluded. Child sessions count when their
+parent is missing and the list shows them as roots. It checks at startup, after
+session changes, and every hour. After a failed attempt it waits for the hourly
+check before trying again. The `telemetry-setup-finished` file beside the
+installation identity records the claim across restarts and servers sharing the
+data directory. Captures, seeds, backups, and restores preserve the claim with
+the installation identity when the snapshot contains it. Restoring a snapshot
+from before the claim can queue `setup_finished` again for the same installation
+ID. Ordinary imports keep the receiving installation's claim. The event carries
+no session details and follows the same telemetry opt-out. Existing installs
+with such a session send it on their first start after upgrading.
+
+The claim records that the event entered the telemetry queue, not that PostHog
+received it. Delivery is best effort: if the server stops or the network fails
+before the queue flushes, the event is lost and is not sent again. Only the
+server sends `setup_finished`; the web UI's telemetry route rejects that event.
+
 The web UI reports `visit_ended` with `surface: web` and a `duration_bucket`
 of `under_1m`, `1_to_5m`, `5_to_30m`, or `over_30m`. These mean below 1 minute,
 1 to below 5 minutes, 5 to below 30 minutes, and 30 minutes or more. Visible
@@ -2225,17 +2279,21 @@ to this, so `over_30m` can undercount.
 The web UI also reports `screen_viewed` with `surface: web`. The server counts
 each screen once per installation per UTC day, across tabs and server restarts.
 It stores versioned JSON claims in `telemetry-screen-views` beside the
-installation identity. When telemetry is enabled, startup moves older
-plain-text claims, malformed claims, or claims from a newer format to a unique
+installation identity. When telemetry is enabled, the server checks the file
+once in the background after it starts serving; a web UI report that arrives
+first waits for that check. The check moves older plain-text claims, malformed
+claims, or claims from a newer format to a unique
 `telemetry-screen-views.unreadable-*` file and logs the move. Earlier copies
-stay intact. Valid plain-text counts carry over for the current installation.
-If the move fails, the server logs the error and preserves the claims.
-Otherwise, kit starts a fresh file when counts cannot carry over, which can
-count each screen one more time that day. If the file becomes unreadable while
-the server runs, screen reports return 500 until the next startup. Requests
-must use `application/json` with exactly one JSON value; a missing or unknown
-`screen` returns 400. The server reserves each claim before enqueueing its
-event. If reservation storage fails, the request returns 500 without
+stay intact. Valid plain-text counts carry over for the current installation. If
+the check fails, the server logs the error and continues forwarding reports. It
+tries the check only once per process; restarting the server starts a fresh
+attempt. Forwarded reports can replace malformed or plain-text claims with a
+fresh file, losing their counts. Reports return 500 while the file cannot be
+read or written, or uses a newer format. When counts cannot carry over, kit
+starts a fresh file, which can count each screen one more time that day.
+Requests must use `application/json` with exactly one JSON value; a missing or
+unknown `screen` returns 400. The server reserves each claim before enqueueing
+its event. If reservation storage fails, the request returns 500 without
 enqueueing; a later visit retries.
 
 The web UI reports five core actions the same way. Each carries one property,
@@ -2287,10 +2345,11 @@ information, or hostname, and the events are sent with person-profile processing
 and GeoIP lookup disabled. The ping runs in the background and never blocks
 startup or operation.
 
-Disable it with an environment variable:
+Only release builds send telemetry, and it stays off in CI. Disable it with an
+environment variable, then restart the server:
 
 ```bash
-export AGENTSVIEW_TELEMETRY_ENABLED=0
+export AGENTSVIEW_TELEMETRY_ENABLED=0  # or DO_NOT_TRACK=1
 ```
 
 This disables outbound telemetry, not the installation identity used for local

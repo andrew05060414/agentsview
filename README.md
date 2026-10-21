@@ -805,21 +805,26 @@ Troubleshooting:
 
 agentsview sends limited anonymous telemetry to PostHog: a `daemon_active` ping
 at most once per UTC day while the server runs, and an `app_opened` event when
-the web UI loads and on the first focus of a later UTC day. The web UI sends
-`visit_ended` with `surface: web` and visible visit duration in fixed buckets:
-`under_1m`, `1_to_5m`, `5_to_30m`, or `over_30m`. The web UI also reports
-searches (search mode), session views (the session's agent type), screen views
-(screen name, once per install per UTC day), exports (format), generated
-insights (insight kind) and analytics page views (page name), each with one
-value from a fixed list in the server that drops anything else. All events use a
-stable random install ID as the event `DistinctId`.
+the web UI loads and on the first focus of a later UTC day. The server also
+sends `setup_finished` once per installation when the archive first has a
+session in the default session list, including orphaned sessions and excluding
+automated sessions and trash. Existing installs with such a session send it on
+their first start after upgrading. The web UI sends `visit_ended` with
+`surface: web` and visible visit duration in fixed buckets: `under_1m`,
+`1_to_5m`, `5_to_30m`, or `over_30m`. The web UI also reports searches (search
+mode), session views (the session's agent type), screen views (screen name, once
+per install per UTC day), exports (format), generated insights (insight kind)
+and analytics page views (page name), each with one value from a fixed list in
+the server that drops anything else. All events use a stable random install ID
+as the event `DistinctId`.
 [Feature outcomes](docs/configuration.md#anonymous-daemon-telemetry) also count
 empty searches, visible errors, and failed sync attempts. The events include
 `application=agentsview`, app version, commit, OS, and CPU architecture, with
 `$process_person_profile=false` and `$geoip_disable=true`. It does not include
 session, project, prompt, file path, account, or machine identity. Disable
-telemetry with `AGENTSVIEW_TELEMETRY_ENABLED=0` or `TELEMETRY_ENABLED=0`.
-Telemetry is also hard-disabled in Go test binaries, regardless of environment.
+telemetry with `AGENTSVIEW_TELEMETRY_ENABLED=0`, `TELEMETRY_ENABLED=0`, or
+`DO_NOT_TRACK=1`. Only release builds send telemetry, and it stays off in CI and
+Go test binaries.
 
 All session data stays on your machine. The server binds to `127.0.0.1` by
 default. The update check is optional and can be disabled with

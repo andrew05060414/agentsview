@@ -40,7 +40,7 @@ type AnalyticsFilterInput struct {
 	From             string           `query:"from" format:"date" doc:"Range start date"`
 	To               string           `query:"to" format:"date" doc:"Range end date"`
 	Timezone         string           `query:"timezone" doc:"IANA timezone name"`
-	Machine          string           `query:"machine" doc:"Filter by machine"`
+	Machine          string           `query:"machine" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400."`
 	Project          string           `query:"project" doc:"Filter by project"`
 	GitBranch        string           `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	Agent            string           `query:"agent" doc:"Filter by agent"`
@@ -53,6 +53,16 @@ type AnalyticsFilterInput struct {
 	IncludeOneShot   bool             `query:"include_one_shot" doc:"Include one-shot sessions"`
 	IncludeAutomated bool             `query:"include_automated" doc:"Include automated sessions"`
 	Termination      string           `query:"termination" doc:"Filter by termination reason"`
+}
+
+type analyticsSummaryInput struct {
+	AnalyticsFilterInput
+	GroupModels bool `query:"group_models" doc:"Include model aliases for display grouping"`
+}
+
+type analyticsSummaryResponse struct {
+	db.AnalyticsSummary
+	ModelAliases map[string]string `json:"model_aliases,omitempty"`
 }
 
 type analyticsActivityInput struct {
@@ -113,7 +123,7 @@ func (s *Server) analyticsFilterFromInput(ctx context.Context, in AnalyticsFilte
 		Project:          in.Project,
 		GitBranch:        in.GitBranch,
 		Agent:            in.Agent,
-		Model:            in.Model,
+		Model:            s.modelGroups.Expand(in.Model),
 		Timezone:         tz,
 		DayOfWeek:        optionalIntValue(in.DayOfWeek),
 		Hour:             optionalIntValue(in.Hour),
@@ -128,9 +138,9 @@ func (s *Server) analyticsFilterFromInput(ctx context.Context, in AnalyticsFilte
 
 func (s *Server) humaAnalyticsSummary(
 	ctx context.Context,
-	in *AnalyticsFilterInput,
-) (*jsonOutput[db.AnalyticsSummary], error) {
-	f, err := s.analyticsFilterFromInput(ctx, *in)
+	in *analyticsSummaryInput,
+) (*jsonOutput[analyticsSummaryResponse], error) {
+	f, err := s.analyticsFilterFromInput(ctx, in.AnalyticsFilterInput)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +148,11 @@ func (s *Server) humaAnalyticsSummary(
 	if err != nil {
 		return nil, internalError("analytics error", err)
 	}
-	return &jsonOutput[db.AnalyticsSummary]{Body: result}, nil
+	response := analyticsSummaryResponse{AnalyticsSummary: result}
+	if in.GroupModels {
+		response.ModelAliases = s.modelGroups.Aliases()
+	}
+	return &jsonOutput[analyticsSummaryResponse]{Body: response}, nil
 }
 
 func (s *Server) humaAnalyticsActivity(

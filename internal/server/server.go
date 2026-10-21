@@ -83,6 +83,7 @@ const (
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
+	modelGroups          service.ModelGroups
 	mu                   gosync.RWMutex
 	cfg                  config.Config
 	activeDisabledAgents []parser.AgentType
@@ -92,6 +93,8 @@ type Server struct {
 	settingsApplyMu   gosync.Mutex
 	// onDemandReconfigureMu serializes source updates to onDemandEngine.
 	onDemandReconfigureMu gosync.Mutex
+	// pushTurn lets one archive push run at a time.
+	pushTurn              pushTurn
 	db                    db.Store
 	activityReports       *activityReportCache
 	assetCache            *assetCache
@@ -256,16 +259,18 @@ func New(
 	// returns db.ErrReadOnly without an engine, while read APIs such as stats
 	// still need the local handle. Non-SQLite stores use the generic read-only
 	// backend.
+	modelGroups := service.NewModelGroups(cfg.ModelAliases)
 	var sessions service.SessionService
 	if local, ok := database.(*db.DB); ok {
 		local.SetArchiveContent(cfg.ArchiveContent)
-		sessions = service.NewDirectBackend(local, engine)
+		sessions = service.NewDirectBackend(local, engine, service.WithModelGroups(modelGroups))
 	} else {
-		sessions = service.NewReadOnlyBackend(database)
+		sessions = service.NewReadOnlyBackend(database, service.WithModelGroups(modelGroups))
 	}
 
 	s := &Server{
 		cfg:                       cfg,
+		modelGroups:               modelGroups,
 		activeDisabledAgents:      append([]parser.AgentType(nil), cfg.DisabledAgents...),
 		db:                        database,
 		activityReports:           newActivityReportCache(),
@@ -1451,6 +1456,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for range shutdownCount {
 		err = errors.Join(err, <-shutdownErrors)
 	}
+	s.chrome.shutdown()
 	s.mu.Lock()
 	engine := s.onDemandEngine
 	s.onDemandEngine = nil

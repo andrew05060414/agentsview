@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
-import { attachResponseTiming } from "../api/runtime.js";
+import { ApiError, attachResponseTiming } from "../api/runtime.js";
 import { analytics } from "./analytics.svelte.js";
 import { sessions } from "./sessions.svelte.js";
 import { AnalyticsService } from "../api/generated/index";
 
 import type {
-  DbAnalyticsSummary as AnalyticsSummary,
+  AnalyticsSummaryResponse as AnalyticsSummary,
   DbActivityResponse as ActivityResponse,
   DbHeatmapResponse as HeatmapResponse,
   DbProjectsAnalyticsResponse as ProjectsAnalyticsResponse,
@@ -929,6 +929,28 @@ describe("AnalyticsStore automated scope params", () => {
 });
 
 describe("AnalyticsStore model filter", () => {
+  it("requests grouped model rows", async () => {
+    await analytics.fetchSummary();
+    expect(analyticsService.getApiV1AnalyticsSummary.mock.lastCall?.[0]).toEqual(
+      expect.objectContaining({ group_models: true }),
+    );
+  });
+
+  it("displays a saved member selection through its group", async () => {
+    analytics.model = "claude-opus-4-20250514";
+    analyticsService.getApiV1AnalyticsSummary.mockResolvedValue({
+      ...makeSummary(),
+      model_aliases: { "claude-opus-4-20250514": "claude-4" },
+    });
+    await analytics.fetchAll();
+    expect(analyticsService.getApiV1AnalyticsSummary).toHaveBeenCalledTimes(1);
+    expect(analytics.model).toBe("claude-opus-4-20250514");
+    expect(analytics.displayedModels).toBe("claude-4");
+    expect(analyticsService.getApiV1AnalyticsSummary.mock.lastCall?.[0]?.model).toBe(
+      "claude-opus-4-20250514",
+    );
+  });
+
   it.each([
     { name: "summary", fn: () => analyticsService.getApiV1AnalyticsSummary },
     { name: "activity", fn: () => analyticsService.getApiV1AnalyticsActivity },
@@ -1369,5 +1391,23 @@ describe("AnalyticsStore rolling default date range", () => {
         to: "2026-04-26",
       }),
     );
+  });
+});
+
+describe("invalid machine refetches", () => {
+  it("clears cached summary and shared quality signals on an input error", async () => {
+    analytics.machine = "host-a";
+    await analytics.fetchSummary();
+    await analytics.fetchSignals();
+    expect(analytics.summary?.total_sessions).toBe(10);
+    expect(analytics.signals).not.toBeNull();
+    analyticsService.getApiV1AnalyticsSummary.mockImplementationOnce((params) => {
+      expect(params.machine).toBe("host-a");
+      return Promise.reject(new ApiError(400, "unknown machine", "invalid_machine_filter"));
+    });
+    await analytics.fetchSummary();
+    expect(analytics.summary).toBeNull();
+    expect(analytics.signals).toBeNull();
+    expect(analytics.errors.summary).toBe("unknown machine");
   });
 });

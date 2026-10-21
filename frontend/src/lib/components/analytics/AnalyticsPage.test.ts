@@ -17,6 +17,7 @@ import AnalyticsPage from "./AnalyticsPage.svelte";
 // @ts-ignore
 import QualityPage from "../quality/QualityPage.svelte";
 import { requestUrl } from "../../test-support/request-url.js";
+import { MetadataService } from "../../api/generated/index.js";
 
 const source = sourceRaw.replace(/\r\n/g, "\n");
 
@@ -79,10 +80,61 @@ afterEach(() => {
   sessions.loading = false;
   sessions.filters.dateFrom = "";
   sessions.filters.dateTo = "";
+  sessions.filters.machine = "";
   yokedDates.setEnabled(false);
   analyticsPageDates.clear();
   ui.sidebarOpen = true;
   ui.isMobileViewport = false;
+});
+
+describe("AnalyticsPage grouped model filter", () => {
+  it("keeps a saved variant's group available after clearing an empty period", async () => {
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    vi.spyOn(outcomeTotals, "load").mockResolvedValue();
+    vi.spyOn(analytics, "fetchAll").mockResolvedValue();
+    analytics.model = "claude-opus-4-20250514";
+    analytics.summary = {
+      total_sessions: 0,
+      total_messages: 0,
+      total_output_tokens: 0,
+      token_reporting_sessions: 0,
+      models: [],
+      model_aliases: { "claude-opus-4-20250514": "claude-4" },
+      active_projects: 0,
+      active_days: 0,
+      avg_messages: 0,
+      median_messages: 0,
+      p90_messages: 0,
+      most_active_project: "",
+      concentration: 0,
+      agents: {},
+    };
+    sessions.loading = false;
+    router.route = "sessions";
+    component = mount(AnalyticsPage, { target: document.body });
+    await flushEffects();
+    document
+      .querySelector<HTMLButtonElement>('button[aria-label="Model: claude-opus-4-20250514"]')!
+      .click();
+    await flushEffects();
+    const groupRow = () =>
+      [...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__item")].find(
+        (row) =>
+          row.querySelector(".kit-filter-dropdown__label")?.textContent?.trim() === "claude-4",
+      );
+    const rows = [...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__item")];
+    const groups = rows.filter(
+      (row) => row.querySelector(".kit-filter-dropdown__label")?.textContent?.trim() === "claude-4",
+    );
+    expect(rows).toHaveLength(2);
+    expect(groups).toHaveLength(1);
+    expect(groupRow()!.querySelector(".kit-filter-dropdown__check.on")).not.toBeNull();
+    expect(groupRow()!.getAttribute("title")).toBe("claude-opus-4-20250514");
+    groupRow()!.click();
+    await flushEffects();
+    expect(analytics.model).toBe("");
+    expect(groupRow()).toBeDefined();
+  });
 });
 
 describe("AnalyticsPage outcome window", () => {
@@ -329,6 +381,74 @@ describe("AnalyticsPage outcome window", () => {
 });
 
 describe("AnalyticsPage initial load", () => {
+  it("loads unfiltered analytics while machine metadata is pending", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const fetch = vi.spyOn(analytics, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const metadata =
+      Promise.withResolvers<Awaited<ReturnType<typeof MetadataService.getApiV1Machines>>>();
+    vi.spyOn(MetadataService, "getApiV1Machines").mockReturnValue(metadata.promise);
+    router.isRootPath = true;
+    router.params = {};
+    sessions.initFromParams(router.params);
+    component = mount(AnalyticsPage, { target: document.body });
+
+    try {
+      await flushEffects();
+      expect(sessions.filters.machine).toBe("");
+      expect(sessions.machineFilterPending).toBe(false);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      metadata.resolve({
+        machines: [],
+        resolved_machines: [],
+        machine_labels: {},
+        machine_aliases: {},
+      });
+      await sessions.loadMachines();
+    }
+  });
+
+  it("loads analytics once with the resolved machine from a label deep link", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const requests: string[] = [];
+    vi.spyOn(analytics, "fetchAll").mockImplementation(async () => {
+      requests.push(analytics.machine);
+    });
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    const metadata =
+      Promise.withResolvers<Awaited<ReturnType<typeof MetadataService.getApiV1Machines>>>();
+    vi.spyOn(MetadataService, "getApiV1Machines").mockReturnValue(metadata.promise);
+    router.isRootPath = false;
+    router.params = { machine: "Workstation", date_from: "2026-03-01", date_to: "2026-03-31" };
+    sessions.initFromParams(router.params);
+    component = mount(AnalyticsPage, { target: document.body });
+    await flushEffects();
+
+    metadata.resolve({
+      machines: ["id-a"],
+      resolved_machines: ["id-a"],
+      machine_labels: { "id-a": "Workstation" },
+      machine_aliases: {},
+    });
+    await sessions.loadMachines();
+    await flushEffects();
+
+    expect(requests).toEqual(["id-a"]);
+  });
+
   async function start() {
     vi.useFakeTimers();
     vi.stubGlobal(

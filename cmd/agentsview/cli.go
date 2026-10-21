@@ -676,7 +676,7 @@ func newActivityReportCommand() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.Bucket, "bucket", "", "Bucket size: 5m, 15m, 1h, 1d, 1w")
 	cmd.Flags().StringVar(&cfg.Project, "project", "", "Filter by project")
 	cmd.Flags().StringVar(&cfg.Agent, "agent", "", "Filter by agent name")
-	cmd.Flags().StringVar(&cfg.Machine, "machine", "", "Filter by machine name")
+	cmd.Flags().StringVar(&cfg.Machine, "machine", "", machineFilterHelp)
 	cmd.Flags().IntVar(&cfg.SessionsLimit, "sessions-limit", activity.DefaultSessionPageLimit,
 		"Session rows per page (maximum 500)")
 	cmd.Flags().StringVar(&cfg.SessionsReportID, "sessions-report-id", "",
@@ -685,7 +685,7 @@ func newActivityReportCommand() *cobra.Command {
 		"Continue from an Activity session page cursor")
 	cmd.Flags().StringVar(&cfg.SessionsSort, "sessions-sort", "",
 		"Session sort (default agent_minutes): "+
-			"agent_minutes, cost, first_active, project, agent")
+			"agent_minutes, cost, first_active, project, agent, session, model")
 	cmd.Flags().StringVar(&cfg.SessionsDirection, "sessions-direction", "",
 		"Session sort direction (default desc): asc or desc")
 	cmd.Flags().StringVar(&cfg.SessionsBucketStart, "sessions-bucket-start", "",

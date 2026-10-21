@@ -35,8 +35,8 @@ recall_max_revision_lag = 256     # default; Recall corpus revisions the Recall 
 [vector.embeddings]
 model = "nomic-embed-text"
 dimension = 768                   # every returned vector must have this length
-max_input_chars = 8192            # per-chunk rune cap (default 8192)
-model_context_tokens = 32000      # optional model context used to cap build request size
+max_input_chars = 4000            # per-chunk rune cap (default 8192)
+model_context_tokens = 2048       # optional model context used to cap build request size
 query_prefix = "search_query: "    # prepended only to search queries
 document_prefix = "search_document: " # prepended only to indexed document chunks
 # request_dimensions = true      # ask for Matryoshka-reduced vectors of exactly `dimension` (see below)
@@ -61,6 +61,13 @@ run_after_sync = true             # daemon embeds deltas after each sync, deboun
 recall = false                    # default; set true to permit automatic Recall embedding
 backstop_interval = "24h"         # periodic full reconciliation scan; negative disables (default "24h")
 ```
+
+The 4,000-character cap usually fits nomic-embed-text's 2,048-token window in
+Ollama for English and code session text. Lower `max_input_chars` for
+token-dense text such as Chinese, Japanese, or Korean; Ollama silently truncates
+input beyond the window. Changing this cap on an existing index
+[creates a new generation and re-embeds the archive](#building-the-index) on the
+next build.
 
 `model`, `dimension`, and at least one `[vector.embeddings.servers.<name>]`
 entry with an `endpoint` are required once `enabled = true`; `agentsview` fails
@@ -333,6 +340,8 @@ ollama pull nomic-embed-text
 # Ollama serves an OpenAI-compatible endpoint at /v1; no API key needed.
 ```
 
+For `max_input_chars` guidance, see [Enabling `[vector]`](#enabling-vector).
+
 ```toml
 [vector]
 enabled = true
@@ -340,6 +349,7 @@ enabled = true
 [vector.embeddings]
 model = "nomic-embed-text"
 dimension = 768
+max_input_chars = 4000
 
 [vector.embeddings.servers.local]
 endpoint = "http://localhost:11434/v1"
@@ -431,18 +441,19 @@ The index embeds **unit documents**, not individual messages:
 
 - Every embeddable user message (non-system, not system-prefixed) is its own
   document.
-- Assistant messages between those user messages are concatenated — in order,
-  separated by blank lines — into one **run** document per stretch of work. A
-  run captures a whole narrative arc (analysis, tool narration, conclusions)
-  instead of scattering it across hundreds of short fragments.
+- Assistant messages between those user messages are joined in order,
+  separated by blank lines, into **run** documents. A run closes after the
+  message that brings its joined text to `4 × max_input_chars` runes or more.
+  The next assistant message starts a new piece, so appending to a long
+  session only re-embeds its trailing piece.
 
 This matters for both quality and cost. Most assistant messages are short,
 procedural narration that is meaningless as a standalone search hit; grouped
-into runs, roughly 1.1 million assistant messages collapse into ~44k documents —
-about 25x fewer assistant-side documents to embed and rank. Long documents are
-chunked at `max_input_chars` runes (default 8192) with a 15% overlap between
-consecutive chunks (1228 runes at the default; 375 at a 2500 cap), so an initial
-build sends several times fewer encode requests than a per-message scheme would.
+into runs, a hit carries the narration around it, and the cap keeps each piece
+to about five chunks. Long documents are chunked at `max_input_chars` runes
+(default 8192) with a 15% overlap between consecutive chunks (1228 runes at the
+default; 375 at a 2500 cap), so an initial build sends several times fewer
+encode requests than a per-message scheme would.
 
 Content from sidechains and delegated (subagent/fork) sessions is embedded too,
 but classified **subordinate**: still searchable, annotated in results, and
@@ -695,12 +706,13 @@ What the range *means* depends on the mode:
   vector index — the identity of the document that actually matched.
 - **Substring, regex, and FTS matches** (and hybrid hits whose message has no
   embedded unit) carry a **structurally derived** unit computed from the
-  archive's messages alone, using the same user-message/assistant-run rules
-  the index uses. Lexical citations therefore need no vector index and never
-  change with index state. Derived and embedded spans coincide except where
-  the index's scope diverges from structure: sessions excluded from the build
-  (`include_automated = false`) and messages newer than the last index
-  refresh.
+  archive's messages alone. It uses the index's user-message and
+  assistant-run boundaries but never applies the run size cap, so a derived
+  run spans the whole stretch of assistant messages. Lexical citations
+  therefore need no vector index and never change with index state. Derived
+  and embedded spans differ for assistant runs the index split into capped
+  pieces, sessions excluded from the build (`include_automated = false`), and
+  messages newer than the last index refresh.
 
 Lexical row cardinality is unchanged: substring/regex/FTS still return one row
 per matching source row, with the same snippets — the range and lineage fields
@@ -1004,11 +1016,10 @@ keyword leg is the mirror's recency-ordered term match, as on PostgreSQL.
   as new and re-embedded when their ordinal shifts. This only affects older
   parsed data predating per-message UUIDs and is an accepted cost rather than
   a bug.
-- **The active run re-embeds as it grows.** A run document is keyed on its first
-  message, so a session's trailing run keeps its identity as new assistant
-  messages append — but its content changes, so each build re-embeds the
-  current tail. That is the intended cost of grouping; finished runs never
-  re-embed.
+- **Only the last run piece re-embeds as it grows.** Assistant runs close after
+  the message that reaches `4 × max_input_chars` runes. An append re-embeds
+  only the trailing piece, bounded by that cap plus one message; earlier
+  pieces keep their vectors.
 - **DuckDB mirror has no vector backend.** `--semantic`/`--hybrid` against a
   DuckDB-backed server return the "not available" error (HTTP 501) described
   above. PostgreSQL is supported through pgvector — see

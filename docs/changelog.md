@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-16
+last_edited: 2026-10-17
 title: Changelog
 description: Release history for AgentsView
 ---
@@ -8,6 +8,9 @@ The latest release is
 [0.45.0](https://github.com/kenn-io/agentsview/releases/tag/v0.45.0).
 
 ## Unreleased
+
+- Telemetry now honors `DO_NOT_TRACK` and stays off in CI and non-release
+  builds.
 
 **Upgrade notes**
 
@@ -40,6 +43,19 @@ The latest release is
   workflows, and failed sync attempts. Query and error details stay local. The
   existing [telemetry opt-out](https://agentsview.io/docs/configuration/#privacy-and-telemetry)
   applies to these counts.
+
+- Combine model variants into one row in Usage and Analytics with
+  `[model_aliases]` in `config.toml`. Scripts, exports, `usage daily`, and MCP
+  keep raw model names.
+
+- Anonymous usage reports now distinguish installs waiting for their first
+  session. The server sends `setup_finished` once per installation when the
+  default session list has a session to show, including orphaned sessions and
+  excluding automated sessions and trash. The event follows the existing
+  telemetry opt-out and includes no session details. Existing installs with
+  sessions send it once on their first start after upgrading.
+
+- Open session lists now refresh after imports, uploads, and restores.
 
 - Reporting export version 5 keeps verified repository activity selectable when
   another session with the same project name has missing or different identity
@@ -87,8 +103,9 @@ The latest release is
   session syncs.
 - Sync Claude.ai chats from the desktop or Chrome Import dialog without
   downloading an export. Later runs fetch new or changed chats, including branch
-  switches. Run `agentsview chrome setup` once and load the printed folder in
-  Chrome. Chrome Sync also works from
+  switches. Run `agentsview chrome setup` once, restart AgentsView if it is
+  running, and load the printed folder in Chrome. AgentsView opens its Chrome
+  connection only after setup. Chrome Sync also works from
   `agentsview import --type claude-ai --sync` with no AgentsView tab open. See
   [Claude.ai Sync](https://agentsview.io/docs/chat-import/#sync-claudeai-chats)
   for setup, branch updates, Trash copies, and failure handling.
@@ -214,8 +231,20 @@ The latest release is
 
 **Bug fixes**
 
+- **Settings > Appearance > Chart colors** now works when AgentsView serves
+  a read-only store, such as `pg serve` or a ClickHouse or DuckDB mirror. The
+  server saves chart colors and the default zoom to `config.toml`; settings
+  that change ingestion, archive content, or access stay locked.
+- `agentsview mcp` and other auto-starting commands report that another process
+  holds the archive write lock instead of launching a server that can't start,
+  and the lock error no longer sends you to `agentsview daemon stop` when no
+  daemon is running.
 - On Windows, daemon commands no longer make backup and sync tools treat the
   whole data directory as changed.
+- A ClickHouse server whose data directory is on NFS no longer logs an
+  `UNSUPPORTED_METHOD` error for `EXCHANGE TABLES` on every push. AgentsView
+  checks once after each server start whether the server can swap tables, and
+  reuses that answer until the server restarts.
 - `agentsview prune` no longer deletes the shared `state.db` of Hermes or
   Augure Desktop. Sessions synced by 0.45.0 or earlier record the bare
   `state.db` path, and pruning one deleted the whole app database. The prune

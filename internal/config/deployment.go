@@ -44,6 +44,23 @@ func DeploymentMode() (mode string, set bool, err error) {
 	}
 }
 
+// deploymentVarsActive reports whether the named deployment variables apply.
+// Serving rejects an invalid AGENTSVIEW_MODE outright. Other commands report it
+// only when they would read one of names, so a client that needs none of them
+// keeps working, and none applies a deployment value under a mistyped mode.
+func deploymentVarsActive(names ...string) (bool, error) {
+	_, set, err := DeploymentMode()
+	if err == nil || !set {
+		return set, nil
+	}
+	for _, name := range names {
+		if _, ok := os.LookupEnv(name); ok {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
 // pgServeSelected keeps the image's legacy PG_SERVE selector.
 func pgServeSelected() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("PG_SERVE"))) {
@@ -54,8 +71,7 @@ func pgServeSelected() bool {
 }
 
 // applyDeploymentEnv runs after the file layer and before explicit flags.
-// It is the only reader of the container deployment variables and applies
-// nothing unless AGENTSVIEW_MODE is set. It never sets HostExplicit, so a
+// It applies nothing unless AGENTSVIEW_MODE is set. It never sets HostExplicit, so a
 // persistent non-loopback host from the environment still needs auth.
 func (c *Config) applyDeploymentEnv() error {
 	if _, set, err := DeploymentMode(); err != nil || !set {
@@ -68,20 +84,33 @@ func (c *Config) applyDeploymentEnv() error {
 		}
 		c.Host = host
 	}
-	if v, set, err := lookupEnvBool("AGENTSVIEW_REQUIRE_AUTH"); err != nil {
+	if err := c.ApplyDeploymentAuth(); err != nil {
 		return err
-	} else if set {
-		c.RequireAuth = v
 	}
 	if v, set, err := lookupEnvBool("AGENTSVIEW_NO_BROWSER"); err != nil {
 		return err
 	} else if set {
 		c.NoBrowser = v
 	}
-	if v, set, err := lookupEnvBool("AGENTSVIEW_PG_ALLOW_INSECURE"); err != nil {
+	// PG target resolution applies this; serving rejects a bad value at startup.
+	if _, _, err := lookupEnvBool("AGENTSVIEW_PG_ALLOW_INSECURE"); err != nil {
+		return err
+	}
+	return c.ApplyDeploymentEmbeddings()
+}
+
+// ApplyDeploymentAuth loads the deployment authentication used by listeners
+// and daemon clients. It applies nothing unless AGENTSVIEW_MODE is valid.
+func (c *Config) ApplyDeploymentAuth() error {
+	if active, err := deploymentVarsActive(
+		"AGENTSVIEW_REQUIRE_AUTH", "AGENTSVIEW_AUTH_TOKEN_FILE",
+	); err != nil || !active {
+		return err
+	}
+	if v, set, err := lookupEnvBool("AGENTSVIEW_REQUIRE_AUTH"); err != nil {
 		return err
 	} else if set {
-		c.pgEnvOverrides.AllowInsecure = &v
+		c.RequireAuth = v
 	}
 	if path, set := os.LookupEnv("AGENTSVIEW_AUTH_TOKEN_FILE"); set {
 		if os.Getenv("AGENTSVIEW_AUTH_TOKEN") != "" {
@@ -94,13 +123,20 @@ func (c *Config) applyDeploymentEnv() error {
 		}
 		c.AuthToken = token
 	}
-	return c.applyDeploymentEmbeddings()
+	return nil
 }
 
-// applyDeploymentEmbeddings builds the embeddings server named by
-// AGENTSVIEW_EMBEDDINGS_ENDPOINT. A [vector] section owns the recipe and
-// its servers, so the two never combine.
-func (c *Config) applyDeploymentEmbeddings() error {
+// ApplyDeploymentEmbeddings loads only the transport needed by PostgreSQL
+// recipe adoption, without loading listener authentication or network settings.
+// It applies nothing unless AGENTSVIEW_MODE is valid.
+// A [vector] section owns its recipe and servers, so the two never combine.
+func (c *Config) ApplyDeploymentEmbeddings() error {
+	if active, err := deploymentVarsActive(
+		"AGENTSVIEW_EMBEDDINGS_ENDPOINT", "AGENTSVIEW_EMBEDDINGS_API_KEY_FILE",
+		"AGENTSVIEW_EMBEDDINGS_BATCH_SIZE",
+	); err != nil || !active {
+		return err
+	}
 	endpoint, endpointSet := os.LookupEnv("AGENTSVIEW_EMBEDDINGS_ENDPOINT")
 	keyPath, keySet := os.LookupEnv("AGENTSVIEW_EMBEDDINGS_API_KEY_FILE")
 	batchSize, batchSet := os.LookupEnv("AGENTSVIEW_EMBEDDINGS_BATCH_SIZE")

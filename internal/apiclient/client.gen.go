@@ -5319,6 +5319,7 @@ func (c *Client) GetAPIV1UsageSummaryStreamStreamWithResponse(ctx context.Contex
 		"exclude_project_key": {Style: "form", Explode: &[]bool{false}[0]},
 		"from":                {Style: "form", Explode: &[]bool{false}[0]},
 		"git_branch":          {Style: "form", Explode: &[]bool{false}[0]},
+		"group_models":        {Style: "form", Explode: &[]bool{false}[0]},
 		"include_automated":   {Style: "form", Explode: &[]bool{false}[0]},
 		"include_one_shot":    {Style: "form", Explode: &[]bool{false}[0]},
 		"machine":             {Style: "form", Explode: &[]bool{false}[0]},
@@ -19134,13 +19135,15 @@ const (
 	AgentMinutes GetAPIV1ActivityReportReportIDSessionsQuerySort = "agent_minutes"
 	Cost         GetAPIV1ActivityReportReportIDSessionsQuerySort = "cost"
 	FirstActive  GetAPIV1ActivityReportReportIDSessionsQuerySort = "first_active"
+	Model        GetAPIV1ActivityReportReportIDSessionsQuerySort = "model"
 	Project      GetAPIV1ActivityReportReportIDSessionsQuerySort = "project"
+	Session      GetAPIV1ActivityReportReportIDSessionsQuerySort = "session"
 )
 
 // Validate checks if the GetAPIV1ActivityReportReportIDSessionsQuerySort value is valid
 func (g GetAPIV1ActivityReportReportIDSessionsQuerySort) Validate() error {
 	switch g {
-	case Agent, AgentMinutes, Cost, FirstActive, Project:
+	case Agent, AgentMinutes, Cost, FirstActive, Model, Project, Session:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid GetAPIV1ActivityReportReportIDSessionsQuerySort value, got: %v", g))
@@ -19573,7 +19576,7 @@ type GetAPIV1ActivityReportQuery struct {
 	// Agent Filter by agent
 	Agent *string `json:"agent,omitempty"`
 
-	// Machine Filter by machine
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
 	Machine *string `json:"machine,omitempty"`
 
 	// Automation Automation class: all, interactive, or automated
@@ -19688,7 +19691,7 @@ type GetAPIV1AnalyticsSignalSessionsQuery struct {
 	// Timezone IANA timezone name
 	Timezone *string `json:"timezone,omitempty"`
 
-	// Machine Filter by machine
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
 	Machine *string `json:"machine,omitempty"`
 
 	// Project Filter by project
@@ -19801,7 +19804,7 @@ type GetAPIV1AnalyticsSignalsQuery struct {
 	// Timezone IANA timezone name
 	Timezone *string `json:"timezone,omitempty"`
 
-	// Machine Filter by machine
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
 	Machine *string `json:"machine,omitempty"`
 
 	// Project Filter by project
@@ -19895,7 +19898,7 @@ type GetAPIV1AnalyticsToolsQuery struct {
 	// Timezone IANA timezone name
 	Timezone *string `json:"timezone,omitempty"`
 
-	// Machine Filter by machine
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
 	Machine *string `json:"machine,omitempty"`
 
 	// Project Filter by project
@@ -20020,6 +20023,9 @@ type GetAPIV1MachinesQuery struct {
 
 	// IncludeAutomated Include automated sessions
 	IncludeAutomated *bool `json:"include_automated,omitempty"`
+
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
+	Machine *string `json:"machine,omitempty"`
 }
 
 type GetAPIV1ProjectsQuery struct {
@@ -20166,7 +20172,7 @@ type GetAPIV1SearchContentQuery struct {
 	// ExcludeProject Exclude a project
 	ExcludeProject *string `json:"exclude_project,omitempty"`
 
-	// Machine Filter by machine
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
 	Machine *string `json:"machine,omitempty"`
 
 	// GitBranch Filter by git branch; opaque (project, branch) tokens from the /branches endpoint
@@ -20431,7 +20437,7 @@ type GetAPIV1SessionsQuery struct {
 	// ExcludeProject Exclude a project
 	ExcludeProject *string `json:"exclude_project,omitempty"`
 
-	// Machine Filter by machine
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
 	Machine *string `json:"machine,omitempty"`
 
 	// GitBranch Filter by git branch; opaque (project, branch) tokens from the /branches endpoint
@@ -20659,6 +20665,9 @@ type PostAPIV1SyncQuery struct {
 }
 
 type GetAPIV1UsagePairwiseComparisonQuery struct {
+	// GroupModels Group model aliases in report rows
+	GroupModels *bool `json:"group_models,omitempty"`
+
 	// From Range start date
 	From *runtime.Date `json:"from,omitempty"`
 
@@ -20677,7 +20686,7 @@ type GetAPIV1UsagePairwiseComparisonQuery struct {
 	// ProjectKey Filter by an opaque project key
 	ProjectKey *string `json:"project_key,omitempty"`
 
-	// Machine Filter by machine
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
 	Machine *string `json:"machine,omitempty"`
 
 	// GitBranch Filter by git branch; opaque (project, branch) tokens from the /branches endpoint
@@ -20766,6 +20775,9 @@ func (g GetAPIV1UsagePairwiseComparisonQuery) Validate() error {
 }
 
 type GetAPIV1UsageSummaryQuery struct {
+	// GroupModels Group model aliases in report rows
+	GroupModels *bool `json:"group_models,omitempty"`
+
 	// From Range start date
 	From *runtime.Date `json:"from,omitempty"`
 
@@ -20784,7 +20796,7 @@ type GetAPIV1UsageSummaryQuery struct {
 	// ProjectKey Filter by an opaque project key
 	ProjectKey *string `json:"project_key,omitempty"`
 
-	// Machine Filter by machine
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
 	Machine *string `json:"machine,omitempty"`
 
 	// GitBranch Filter by git branch; opaque (project, branch) tokens from the /branches endpoint
@@ -20858,6 +20870,9 @@ func (g GetAPIV1UsageSummaryQuery) Validate() error {
 }
 
 type GetAPIV1UsageSummaryStreamQuery struct {
+	// GroupModels Group model aliases in report rows
+	GroupModels *bool `json:"group_models,omitempty"`
+
 	// From Range start date
 	From *runtime.Date `json:"from,omitempty"`
 
@@ -20876,7 +20891,7 @@ type GetAPIV1UsageSummaryStreamQuery struct {
 	// ProjectKey Filter by an opaque project key
 	ProjectKey *string `json:"project_key,omitempty"`
 
-	// Machine Filter by machine
+	// Machine Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
 	Machine *string `json:"machine,omitempty"`
 
 	// GitBranch Filter by git branch; opaque (project, branch) tokens from the /branches endpoint
@@ -25318,7 +25333,12 @@ type FillStats struct {
 type MachinesResponse struct {
 	MachineAliases map[string]string `json:"machine_aliases"`
 	MachineLabels  map[string]string `json:"machine_labels"`
-	Machines       []string          `json:"machines" validate:"required"`
+
+	// Machines Picker catalog filtered by visibility flags
+	Machines []string `json:"machines" validate:"required"`
+
+	// ResolvedMachines Canonical IDs for the machine selector, independent of catalog visibility
+	ResolvedMachines []string `json:"resolved_machines,omitempty"`
 }
 
 func (m MachinesResponse) Validate() error {
@@ -26491,6 +26511,7 @@ type UsageSummaryResponse struct {
 	Daily                  []DBDailyUsageEntry              `json:"daily" validate:"required"`
 	From                   string                           `json:"from" validate:"required"`
 	ModelTotals            []ModelTotal                     `json:"modelTotals" validate:"required"`
+	ModelAliases           map[string]string                `json:"model_aliases,omitempty"`
 	PartlyCapturedSessions *int64                           `json:"partlyCapturedSessions,omitempty"`
 	PlanOnlySessions       *int64                           `json:"planOnlySessions,omitempty"`
 	Pricing                *ExportPricingBlock              `json:"pricing,omitempty"`

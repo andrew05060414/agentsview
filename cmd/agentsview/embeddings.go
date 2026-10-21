@@ -246,9 +246,9 @@ func requireVectorEnabled(cfg config.Config) error {
 // Generation identity Build/Fill fingerprint against. Defined once here so
 // the daemon serve wiring (Task 16) can reuse the exact same mapping.
 // doc_unit_scheme and chunk_overlap_chars are part of the fingerprint so
-// that changing the run-grouped document scheme or the chunk overlap
-// formula (vector.ChunkOverlap) cuts a new generation rather than silently
-// reusing embeddings built under the old scheme.
+// that changing either value cuts a new generation. Run caps preserve
+// run_v1 and reuse embeddings by content hash; run_max_runes metadata and
+// mirror schema version "4" track the cap separately.
 func vectorGeneration(c config.VectorEmbeddingsConfig) kitvec.Generation {
 	params := map[string]string{
 		"max_input_chars":     strconv.Itoa(c.MaxInputChars),
@@ -396,7 +396,7 @@ func vectorDocumentEncoderSet(c config.VectorEmbeddingsConfig) (vector.EncoderSe
 func runEmbeddingsBuild(
 	ctx context.Context, out io.Writer, in io.Reader, opts EmbeddingsBuildOptions,
 ) error {
-	cfg, err := config.LoadMinimal()
+	cfg, err := loadDaemonClientConfig(config.ScopeVector)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -478,7 +478,7 @@ func countEmbeddingStoreUnits(
 	}
 	var n int
 	if _, err := source.ScanEmbeddableUnits(
-		ctx, "", includeAutomated, func(db.EmbeddableUnit) error {
+		ctx, "", includeAutomated, vector.RunMaxRunes(cfg.Vector.Embeddings.MaxInputChars), func(db.EmbeddableUnit) error {
 			n++
 			return nil
 		},
@@ -533,7 +533,7 @@ type recallEmbeddingSource struct {
 }
 
 func (s recallEmbeddingSource) ScanEmbeddableUnits(
-	ctx context.Context, since string, _ bool,
+	ctx context.Context, since string, _ bool, _ int,
 	fn func(db.EmbeddableUnit) error,
 ) (string, error) {
 	return s.db.ScanRecallEmbeddingUnits(
@@ -784,7 +784,7 @@ func printBuildSummary(w io.Writer, result vector.BuildResult) {
 // display, including entries fetched from the daemon (which does not send
 // one because the selected store is already explicit in the request).
 func runEmbeddingsList(ctx context.Context, out io.Writer, jsonOutput bool, store string) error {
-	cfg, err := config.LoadMinimal()
+	cfg, err := loadDaemonClientConfig(config.ScopeVector)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -880,7 +880,7 @@ func truncateFingerprint(fp string) string {
 func runEmbeddingsGenerationAction(
 	ctx context.Context, out io.Writer, id int64, force, retire bool, store string,
 ) error {
-	cfg, err := config.LoadMinimal()
+	cfg, err := loadDaemonClientConfig(config.ScopeVector)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -950,6 +950,9 @@ func directGenerationAction(
 // HTTP client for its embeddings API. Callers only reach it after
 // IsLocalDaemonActive reported true.
 func resolveEmbeddingsDaemonClient(cfg config.Config) (embeddingsDaemonClient, error) {
+	if err := cfg.ApplyDeploymentAuth(); err != nil {
+		return embeddingsDaemonClient{}, fmt.Errorf("loading daemon auth: %w", err)
+	}
 	rt := FindWritableDaemonRuntime(cfg.DataDir, cfg.AuthToken)
 	if rt == nil {
 		if _, err := findIncompatibleWritableDaemonRuntime(
