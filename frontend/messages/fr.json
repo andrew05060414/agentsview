@@ -2972,5 +2972,8 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud\u202f: les jetons en direct demandent votre attention",
   "status_bar_codex_cloud_oldest_failure": "Plus ancien échec\u202f: {time}",
   "status_bar_codex_cloud_last_success": "Dernière synchronisation réussie\u202f: {time}",
-  "status_bar_codex_cloud_homes": "Dossiers Codex\u202f: {homes}"
+  "status_bar_codex_cloud_homes": "Dossiers Codex\u202f: {homes}",
+  "import_browser_signed_out": "Connectez-vous à {provider} dans le profil Chrome avec l’extension AgentsView. Activez l’extension dans un seul profil.",
+  "import_browser_tab_note": "La synchronisation ouvre si besoin un onglet {provider} en arrière-plan et le laisse ouvert.",
+  "import_browser_history_note": "Le texte est relu à chaque fois. Les versions précédentes vont à la corbeille. Les conversations incomplètes et les branches Grok conservent leur archive pour réessayer ; les pièces jointes ne sont pas importées."
 }

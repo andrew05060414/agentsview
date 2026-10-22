@@ -260,6 +260,12 @@ func fetchBrowser(ctx context.Context, fetch func(context.Context, string) (Clau
 	if platform == chromehost.ChatGPT {
 		tooLarge, authRequired = ErrChatGPTResponseTooLarge, ErrChatGPTAuthRequired
 	}
+	if platform == chromehost.Gemini {
+		tooLarge, authRequired = ErrWebResponseTooLarge, ErrGeminiAuthRequired
+	}
+	if platform == chromehost.Grok {
+		tooLarge, authRequired = ErrWebResponseTooLarge, ErrGrokAuthRequired
+	}
 	attempt := 0
 	body, err := backoff.Retry(ctx, func() ([]byte, error) {
 		response, err := fetch(ctx, path)
@@ -291,14 +297,20 @@ func fetchBrowser(ctx context.Context, fetch func(context.Context, string) (Clau
 		if platform == chromehost.ChatGPT {
 			service = "ChatGPT"
 		}
-		httpErr := &browserHTTPError{service: service, status: status, rateLimited: platform == chromehost.ChatGPT && status == 429}
+		if platform == chromehost.Gemini {
+			service = "Gemini"
+		}
+		if platform == chromehost.Grok {
+			service = "Grok"
+		}
+		httpErr := &browserHTTPError{service: service, status: status, rateLimited: platform != chromehost.ClaudeAI && status == 429}
 		if status != 429 && status < 500 {
 			return nil, backoff.Permanent(httpErr)
 		}
 		delay := time.Duration(1<<attempt) * time.Second
 		attempt++
 		if retryAfter := httputil.ParseRetryAfter(response.RetryAfter); retryAfter > 0 {
-			if platform == chromehost.ChatGPT && retryAfter > 60*time.Second {
+			if platform != chromehost.ClaudeAI && retryAfter > 60*time.Second {
 				httpErr.rateLimited = true
 				return nil, backoff.Permanent(httpErr)
 			}
@@ -313,7 +325,7 @@ func fetchBrowser(ctx context.Context, fetch func(context.Context, string) (Clau
 		err = retryErr.LastErr
 	}
 	if httpErr, ok := errors.AsType[*browserHTTPError](err); ok && httpErr.rateLimited {
-		err = fmt.Errorf("ChatGPT rate limited; sync stopped early, run Sync again later: %w", err)
+		err = fmt.Errorf("%s rate limited; sync stopped early, run Sync again later: %w", httpErr.service, err)
 	}
 	return body, err
 }

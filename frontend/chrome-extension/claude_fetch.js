@@ -1,10 +1,11 @@
 // worker.js injects this file, then calls claudeFetch from a second script.
-globalThis.claudeFetch = async function claudeFetch(url, headers) {
+globalThis.claudeFetch = async function claudeFetch(url, headers, request) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 45000);
   try {
     const response = await fetch(url, {
-      method: "GET",
+      method: request?.method ?? "GET",
+      body: request?.body,
       credentials: "include",
       redirect: "error",
       headers,

@@ -140,6 +140,39 @@ func TestChromeHostAbsent(t *testing.T) {
 	assert.JSONEq(t, `{"code":"claude_ai_chrome_host_required","error":"Run agentsview chrome setup, restart AgentsView, and keep Chrome open, then Sync again"}`, response.Body.String())
 }
 
+func TestWebChromeSyncAuthAndMutualExclusion(t *testing.T) {
+	for _, platform := range []chromehost.Platform{chromehost.Gemini, chromehost.Grok} {
+		t.Run(string(platform), func(t *testing.T) {
+			srv := testServer(t, 5*time.Second)
+			_, conn := testChromeConnection(t, srv)
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/import/"+string(platform)+"/sync", nil)
+				req.RemoteAddr = "127.0.0.1:1234"
+				srv.mux.ServeHTTP(response, req)
+			}()
+			id, _ := readChromePlatformRequest(t, conn, platform)
+			blocked := httptest.NewRecorder()
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/import/grok/sync", nil)
+			req.RemoteAddr = "127.0.0.1:1234"
+			srv.mux.ServeHTTP(blocked, req)
+			assert.Equal(t, http.StatusConflict, blocked.Code)
+			assert.Contains(t, blocked.Body.String(), "chrome_sync_running")
+			writeChromeReply(t, conn, id, 401, "browser-only-body")
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				require.FailNow(t, "Sync did not finish")
+			}
+			assert.Contains(t, response.Body.String(), string(platform)+"_auth_required")
+			assert.NotContains(t, response.Body.String(), "browser-only-body")
+			assert.NotContains(t, response.Body.String(), "event: fetch")
+		})
+	}
+}
+
 func TestClaudeAIChromeStatus(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
@@ -203,6 +236,8 @@ func TestChromeHostLocalOnly(t *testing.T) {
 		{"forwarded", http.MethodPost, "/api/v1/import/claude-ai/sync?browser=chrome", "127.0.0.1:1234", "for=192.0.2.10", true},
 		{"repeated browser", http.MethodPost, "/api/v1/import/claude-ai/sync?browser&browser=chrome", "192.0.2.10:1234", "", true},
 		{"chatgpt", http.MethodPost, "/api/v1/import/chatgpt/sync", "192.0.2.10:1234", "", true},
+		{"gemini", http.MethodPost, "/api/v1/import/gemini/sync", "192.0.2.10:1234", "", true},
+		{"grok", http.MethodPost, "/api/v1/import/grok/sync", "192.0.2.10:1234", "", true},
 		{"status", http.MethodGet, "/api/v1/import/claude-ai/chrome", "192.0.2.10:1234", "", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

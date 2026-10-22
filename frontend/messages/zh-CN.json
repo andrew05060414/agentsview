@@ -2854,5 +2854,8 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud：实时令牌需要处理",
   "status_bar_codex_cloud_oldest_failure": "最早的失败：{time}",
   "status_bar_codex_cloud_last_success": "上次成功同步：{time}",
-  "status_bar_codex_cloud_homes": "Codex 主目录：{homes}"
+  "status_bar_codex_cloud_homes": "Codex 主目录：{homes}",
+  "import_browser_signed_out": "请在安装了 AgentsView 扩展的 Chrome 个人资料中登录 {provider}。请仅在一个个人资料中启用扩展。",
+  "import_browser_tab_note": "同步会按需在后台打开 {provider} 标签页，并在同步后保留。",
+  "import_browser_history_note": "每次同步都会重读文字历史。会话有改动时，旧版本会保存在垃圾箱中。不完整的会话和 Grok 分支会保留原存档供重试；不导入附件。"
 }

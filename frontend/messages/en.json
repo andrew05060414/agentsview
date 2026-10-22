@@ -2948,5 +2948,8 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud: live tokens need attention",
   "status_bar_codex_cloud_oldest_failure": "Oldest failure: {time}",
   "status_bar_codex_cloud_last_success": "Last successful sync: {time}",
-  "status_bar_codex_cloud_homes": "Codex homes: {homes}"
+  "status_bar_codex_cloud_homes": "Codex homes: {homes}",
+  "import_browser_signed_out": "Sign in to {provider} in the Chrome profile with the AgentsView extension. Enable the extension in only one profile.",
+  "import_browser_tab_note": "Sync opens a background {provider} tab if needed and leaves it open.",
+  "import_browser_history_note": "Text history is re-read each time. Changed chats keep their previous version in Trash. Incomplete chats and Grok branches are kept for retry; attachments are not imported."
 }

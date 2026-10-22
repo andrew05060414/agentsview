@@ -2950,5 +2950,8 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud: canlı tokenlər diqqət tələb edir",
   "status_bar_codex_cloud_oldest_failure": "Ən köhnə uğursuzluq: {time}",
   "status_bar_codex_cloud_last_success": "Son uğurlu sinxronizasiya: {time}",
-  "status_bar_codex_cloud_homes": "Codex qovluqları: {homes}"
+  "status_bar_codex_cloud_homes": "Codex qovluqları: {homes}",
+  "import_browser_signed_out": "AgentsView genişlənməsi olan Chrome profilində {provider} hesabına daxil olun. Genişlənməni yalnız bir profildə aktiv edin.",
+  "import_browser_tab_note": "Sinxronizasiya lazım olduqda arxa planda {provider} vərəqini açır və açıq saxlayır.",
+  "import_browser_history_note": "Mətn tarixçəsi hər dəfə yenidən oxunur. Əvvəlki versiyalar səbətdə saxlanır. Natamam söhbətlər və Grok budaqları yenidən cəhd üçün arxivdə qalır; əlavələr idxal edilmir."
 }

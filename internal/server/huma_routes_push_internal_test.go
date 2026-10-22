@@ -458,7 +458,7 @@ func TestDuckDBPushSyncOptionsPassesThroughProjectFilters(t *testing.T) {
 func TestBrowserSyncRoutesAreSSEOnly(t *testing.T) {
 	s := testServer(t, 30)
 	spec := readOpenAPISpec(t, s.Handler())
-	for _, path := range []string{"/api/v1/import/claude-ai/sync", "/api/v1/import/chatgpt/sync"} {
+	for _, path := range []string{"/api/v1/import/claude-ai/sync", "/api/v1/import/chatgpt/sync", "/api/v1/import/gemini/sync", "/api/v1/import/grok/sync"} {
 		op := requireOpenAPIOperation(t, spec, "post", path)
 		require.Contains(t, op.Responses, "200")
 		assert.Len(t, op.Responses["200"].Content, 1)

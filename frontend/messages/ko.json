@@ -2860,5 +2860,8 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud: 실시간 토큰 확인 필요",
   "status_bar_codex_cloud_oldest_failure": "가장 오래된 실패: {time}",
   "status_bar_codex_cloud_last_success": "마지막 동기화 성공: {time}",
-  "status_bar_codex_cloud_homes": "Codex 홈: {homes}"
+  "status_bar_codex_cloud_homes": "Codex 홈: {homes}",
+  "import_browser_signed_out": "AgentsView 확장 프로그램이 설치된 Chrome 프로필에서 {provider}에 로그인하세요. 확장 프로그램은 한 프로필에서만 사용하세요.",
+  "import_browser_tab_note": "필요하면 백그라운드에서 {provider} 탭을 열고 동기화 후에도 유지합니다.",
+  "import_browser_history_note": "매번 텍스트 기록을 다시 읽습니다. 변경된 대화의 이전 버전은 휴지통에 보관됩니다. 불완전한 대화와 Grok 분기는 기존 기록을 보존하고 재시도합니다. 첨부 파일은 가져오지 않습니다."
 }

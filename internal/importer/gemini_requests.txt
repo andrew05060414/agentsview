@@ -1,0 +1,2 @@
+/agentsview-sync/conversations?pinned={pinned}&cursor={cursor}
+/agentsview-sync/conversation/{geminichat}?limit={limit}

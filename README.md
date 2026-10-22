@@ -83,6 +83,11 @@ For custom directories, additional agent homes, and supported S3 sources, see
 The same guide explains how to choose
 [what content to archive](https://agentsview.io/docs/configuration/#archive-content).
 
+For this development branch's Chrome history import, see
+[browser history sync](docs/internal/browser-history-sync.md). It includes
+Gemini and Grok text reads alongside Claude.ai and ChatGPT, with explicit
+completeness limits and live-account checks still required before rollout.
+
 The desktop app and ordinary session CLI commands share a detached local daemon
 and start one when needed. Dedicated diagnostics such as
 `db adopt-machine --list` and `doctor sync` read the archive without starting

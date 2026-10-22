@@ -3,6 +3,8 @@ const requestShapes = new Map();
 const shapeFiles = {
   "claude-ai": "claude_ai_requests.txt",
   chatgpt: "chatgpt_requests.txt",
+  gemini: "gemini_requests.txt",
+  grok: "grok_requests.txt",
 };
 
 async function shapesFor(platform) {
@@ -29,6 +31,10 @@ const parameters = {
   conversation: uuid,
   offset: "[0-9]+",
   archived: "(?:false|true)",
+  pinned: "[01]",
+  cursor: "(?:[A-Za-z0-9_.~+\\-]|%[0-9A-Fa-f]{2}){0,4096}",
+  geminichat: "c_[a-f0-9]{8,64}",
+  limit: "(?:100|200|400|800|1600|3200|6400|12800)",
 };
 
 function shapePattern(shape) {

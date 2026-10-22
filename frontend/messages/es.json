@@ -2972,5 +2972,8 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud: los tokens en vivo requieren atención",
   "status_bar_codex_cloud_oldest_failure": "Fallo más antiguo: {time}",
   "status_bar_codex_cloud_last_success": "Última sincronización correcta: {time}",
-  "status_bar_codex_cloud_homes": "Carpetas de Codex: {homes}"
+  "status_bar_codex_cloud_homes": "Carpetas de Codex: {homes}",
+  "import_browser_signed_out": "Inicia sesión en {provider} en el perfil de Chrome con la extensión AgentsView. Activa la extensión en un solo perfil.",
+  "import_browser_tab_note": "La sincronización abre una pestaña de {provider} en segundo plano si hace falta y la deja abierta.",
+  "import_browser_history_note": "El texto se vuelve a leer cada vez. Las versiones anteriores se guardan en la papelera. Los chats incompletos y las ramas de Grok conservan su archivo para reintentar; no se importan adjuntos."
 }

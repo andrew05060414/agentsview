@@ -2857,5 +2857,8 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud：即時權杖需要處理",
   "status_bar_codex_cloud_oldest_failure": "最早的失敗：{time}",
   "status_bar_codex_cloud_last_success": "上次成功同步：{time}",
-  "status_bar_codex_cloud_homes": "Codex 主目錄：{homes}"
+  "status_bar_codex_cloud_homes": "Codex 主目錄：{homes}",
+  "import_browser_signed_out": "請在安裝了 AgentsView 擴充功能的 Chrome 個人資料中登入 {provider}。請只在一個個人資料中啟用擴充功能。",
+  "import_browser_tab_note": "同步會視需要在背景開啟 {provider} 分頁，並在同步後保留。",
+  "import_browser_history_note": "每次同步都會重新讀取文字歷史。對話變更時，舊版本會保存在垃圾桶中。不完整的對話和 Grok 分支會保留原存檔以供重試；不匯入附件。"
 }

@@ -51,11 +51,15 @@ func chatGPTFreshness(updatedAt time.Time, session *db.Session) uint64 {
 var chatGPTDetailGap = 3 * time.Second
 
 func waitChatGPTDetailGap(ctx context.Context) error {
-	if chatGPTDetailGap <= 0 {
+	return waitBrowserGap(ctx, chatGPTDetailGap)
+}
+
+func waitBrowserGap(ctx context.Context, gap time.Duration) error {
+	if gap <= 0 {
 		return nil
 	}
 	jitter := time.Duration(rand.Int64N(int64(800*time.Millisecond))) - 400*time.Millisecond
-	timer := time.NewTimer(chatGPTDetailGap + jitter)
+	timer := time.NewTimer(gap + jitter)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

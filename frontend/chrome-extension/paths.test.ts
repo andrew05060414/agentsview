@@ -3,9 +3,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const getURL = vi.fn((file: string) => `chrome-extension://test/${file}`);
 const fetchShapes = vi.fn(async (url: string) => {
-  const file = url.endsWith("chatgpt_requests.txt")
-    ? "chatgpt_requests.txt"
-    : "claude_ai_requests.txt";
+  const file = url.split("/").at(-1)!;
   return new Response(readFileSync(`../internal/importer/${file}`, "utf8"));
 });
 vi.stubGlobal("chrome", { runtime: { getURL } });
@@ -20,6 +18,33 @@ afterAll(() => vi.unstubAllGlobals());
 const base = "/api/organizations/11111111-1111-4111-8111-111111111111";
 const list = `${base}/chat_conversations_v2?limit=50&offset=0`;
 const detail = `${base}/chat_conversations/22222222-2222-4222-8222-222222222222?tree=True&rendering_mode=messages&consistency=strong&render_all_tools=true&include_inline_comparison=true`;
+
+describe("Gemini and Grok read allowlists", () => {
+  it.each([
+    ["gemini", "/agentsview-sync/conversations?pinned=0&cursor="],
+    ["gemini", "/agentsview-sync/conversations?pinned=1&cursor=next%2Bpage%3D"],
+    ["gemini", "/agentsview-sync/conversation/c_12345678?limit=100"],
+    ["grok", "/rest/app-chat/conversations?pageSize=50&pageToken="],
+    [
+      "grok",
+      "/rest/app-chat/conversations/22222222-2222-4222-8222-222222222222/response-node?includeThreads=true",
+    ],
+  ])("accepts %s %s", async (platform, path) =>
+    expect(await allowedPath(platform, path)).toBe(true),
+  );
+  it.each([
+    ["gemini", "/_/BardChatUi/data/batchexecute?rpcids=GzXR5e"],
+    ["gemini", "/agentsview-sync/conversations?pinned=0&cursor=&rpcids=GzXR5e"],
+    ["gemini", "/agentsview-sync/conversation/c_12345678?limit=99999999"],
+    ["gemini", "/agentsview-sync/conversation/c_12345678/../delete?limit=100"],
+    ["grok", "/rest/app-chat/conversations/new"],
+    ["grok", "/rest/app-chat/conversations/22222222-2222-4222-8222-222222222222/responses"],
+    ["grok", "/rest/app-chat/conversations?pageSize=50&pageToken=x&delete=true"],
+    ["grok", "https://grok.com/rest/app-chat/conversations?pageSize=50&pageToken="],
+  ])("refuses %s %s", async (platform, path) =>
+    expect(await allowedPath(platform, path)).toBe(false),
+  );
+});
 
 describe("Claude request allowlist", () => {
   it.each(["network", "HTTP"])("retries after a %s shapes load failure", async (failure) => {

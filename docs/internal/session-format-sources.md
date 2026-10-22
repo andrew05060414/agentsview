@@ -22,6 +22,26 @@ computes later with its pricing catalog. A compatible upstream implementation,
 independent parser, or recorded fixture is useful evidence for a format, but is
 called out when it is not the product's own producer source.
 
+## Gemini and Grok browser history
+
+Checked 2026-10-22. No public producer schema was found for these web history
+endpoints. These are independent client observations, not first-party format
+guarantees:
+
+- Gemini RPC names, list fields, and newest-first history fields were checked
+  against [Gemini-API chat reads](https://github.com/HanaokaYuzu/Gemini-API/blob/1ad0d4a93e505e77c79769d78ef2997641f973c8/src/gemini_webapi/components/chat_mixin.py)
+  and its [RPC constants](https://github.com/HanaokaYuzu/Gemini-API/blob/1ad0d4a93e505e77c79769d78ef2997641f973c8/src/gemini_webapi/constants.py).
+- List cursors and Grok's response-node/load-responses pairing were checked
+  against [agent-tincan read operations](https://github.com/mvanhorn/agent-tincan/blob/0eb8cfd2a20a2bbf94b3c2c4e49e1d829423490e/extension/ops.js).
+
+AgentsView implements fixed read operations without a new dependency. Synthetic
+fixtures exercise the observed field shapes. No authenticated account capture
+has been verified for this change. Gemini browser records stay separate from
+Takeout activity records, and Grok web records stay separate from local Grok
+agent sessions. Neither web importer claims token or cost coverage. See
+[browser history sync](browser-history-sync.md) for current completeness
+limits, retry behavior, and the remaining live-account acceptance steps.
+
 ## Pricing Catalog Evidence
 
 Agentsview uses Pydantic GenAI Prices v2 as its historical and conditional
