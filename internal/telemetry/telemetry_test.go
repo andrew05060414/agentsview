@@ -1,24 +1,22 @@
 package telemetry
 
 import (
+	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	kittelemetry "go.kenn.io/kit/telemetry/posthog"
 )
 
 func TestEnabledFromEnvHonorsAgentsViewAndGenericOptOut(t *testing.T) {
+	clearTelemetryVetoes(t)
+	t.Setenv(GenericEnabledEnv, "1")
+
 	t.Setenv(EnabledEnv, "0")
 	assert.False(t, EnabledFromEnv())
 
 	t.Setenv(EnabledEnv, "1")
-	if kittelemetry.ProcessDisabled() {
-		assert.False(t, EnabledFromEnv())
-		return
-	}
 	assert.True(t, EnabledFromEnv())
 
 	t.Setenv(GenericEnabledEnv, "0")
@@ -27,6 +25,7 @@ func TestEnabledFromEnvHonorsAgentsViewAndGenericOptOut(t *testing.T) {
 
 func TestNewReporterDisabledDuringTestsDespiteEnabledEnv(t *testing.T) {
 	t.Setenv(EnabledEnv, "1")
+	clearTelemetryVetoes(t)
 	t.Setenv(GenericEnabledEnv, "1")
 
 	reporter, err := NewReporter(Options{ScreenClaimsPath: filepath.Join(t.TempDir(), "screens"), InstallationID: "anonymous-install-id"})
@@ -36,6 +35,8 @@ func TestNewReporterDisabledDuringTestsDespiteEnabledEnv(t *testing.T) {
 }
 
 func TestNewReporterOptedOutKeepsAllowlist(t *testing.T) {
+	clearTelemetryVetoes(t)
+	t.Setenv(EnabledEnv, "1")
 	t.Setenv(GenericEnabledEnv, "0")
 
 	reporter, err := NewReporter(Options{ScreenClaimsPath: filepath.Join(t.TempDir(), "screens")})
@@ -50,6 +51,7 @@ func TestNewReporterOptedOutKeepsAllowlist(t *testing.T) {
 
 func TestAllowedEventOptionsConfigureDaemonActiveShape(t *testing.T) {
 	t.Setenv(EnabledEnv, "1")
+	clearTelemetryVetoes(t)
 	t.Setenv(GenericEnabledEnv, "1")
 
 	client, err := newKitReporter(Options{
@@ -62,29 +64,24 @@ func TestAllowedEventOptionsConfigureDaemonActiveShape(t *testing.T) {
 	reporter := &Reporter{client: client}
 
 	props, err := reporter.SanitizeProperties(EventDaemonActive, map[string]any{
-		"$process_person_profile": true,
-		"$geoip_disable":          false,
-		"application":             "other",
-		"version":                 "caller-version",
-		"commit":                  "caller-commit",
-		"goos":                    "caller-os",
-		"goarch":                  "caller-arch",
-		"source":                  "caller-source",
-		"app":                     "legacy-app",
-		"project":                 "private-project",
-		"session":                 "private-session",
+		"app":     "legacy-app",
+		"project": "private-project",
+		"session": "private-session",
 	})
 	require.NoError(t, err)
 
-	assert.False(t, props["$process_person_profile"].(bool))
-	assert.True(t, props["$geoip_disable"].(bool))
 	assert.Equal(t, "agentsview", props["application"])
 	assert.Equal(t, "v1.2.3", props["version"])
 	assert.Equal(t, "abc123", props["commit"])
-	assert.Equal(t, runtime.GOOS, props["goos"])
-	assert.Equal(t, runtime.GOARCH, props["goarch"])
 	assert.Equal(t, "daemon", props["source"])
 	assert.NotContains(t, props, "app")
 	assert.NotContains(t, props, "project")
 	assert.NotContains(t, props, "session")
+}
+
+func clearTelemetryVetoes(t *testing.T) {
+	t.Helper()
+	t.Setenv("DO_NOT_TRACK", "0")
+	t.Setenv("CI", "")
+	require.NoError(t, os.Unsetenv("CI"))
 }

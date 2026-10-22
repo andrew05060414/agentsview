@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -29,7 +30,7 @@ const chromeNativeHost = chromehost.NativeHost
 func newChromeCommand() *cobra.Command {
 	cmd := &cobra.Command{Use: "chrome", Short: "Set up browser Sync in Chrome", GroupID: groupData}
 	cmd.AddCommand(&cobra.Command{Use: "setup", Short: "Install the Chrome native host", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		cfg, err := config.LoadMinimal()
+		cfg, err := config.LoadMinimalFor(config.ScopeLocal)
 		if err != nil {
 			return err
 		}
@@ -49,7 +50,7 @@ func newChromeCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "Open chrome://extensions, enable Developer mode, and Load unpacked:\n%s\n", folder)
+		fmt.Fprintf(cmd.OutOrStdout(), "Open chrome://extensions, enable Developer mode, and Load unpacked:\n%s\n\nIf AgentsView is already running, restart it so Chrome can connect.\n", folder)
 		return nil
 	}})
 	return cmd
@@ -245,4 +246,22 @@ func setupChrome(dataDir, home, executable string, assets fs.FS, register func(s
 		return "", err
 	}
 	return folder, nil
+}
+
+// warnStaleChromeLauncher logs when chrome setup wrote a launcher that relays
+// to a different socket than this server listens on, such as the
+// ~/av-chrome-<hash> fallback that earlier builds used.
+func warnStaleChromeLauncher(dataDir, socket string) {
+	path := chromehost.LauncherPath(dataDir)
+	launcher, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		log.Printf("Chrome host launcher: %v", err)
+		return
+	}
+	if !chromehost.LauncherTargets(string(launcher), socket, runtime.GOOS) {
+		log.Printf("Chrome sync will not connect: %s points to a different socket than %s. Run `agentsview chrome setup`, then reload the extension at chrome://extensions", path, socket)
+	}
 }

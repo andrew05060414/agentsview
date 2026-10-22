@@ -548,8 +548,12 @@ instead of writing directly.
 Set `AGENTSVIEW_NO_DAEMON=1` to disable daemon auto-start. Commands that require
 the daemon refuse while it is disabled. Direct write commands acquire the local
 write-owner lock before opening SQLite. If another process owns that lock, the
-command refuses and asks you to stop the daemon, wait for idle shutdown, or
-retry after the offline operation finishes.
+command refuses. If `agentsview daemon status` shows a daemon, run
+`agentsview daemon stop`; otherwise find the agentsview process holding the
+lock file, then wait for it to finish or stop it. Auto-start (MCP and CLI
+commands that start a server on their own) reports the holder in the same way
+instead of launching a server that could not open the archive. `daemon start`
+and `serve --background` report the child's failure as before.
 
 ______________________________________________________________________
 
@@ -1143,7 +1147,7 @@ agentsview activity report [flags]
 | `--bucket`   | automatic | Bucket size: `5m`, `15m`, `1h`, `1d`, or `1w`         |
 | `--project`  |           | Filter by project                                     |
 | `--agent`    |           | Filter by agent name                                  |
-| `--machine`  |           | Filter by machine name                                |
+| `--machine`  |           | ID, alias, ID/alias list, or unique display name      |
 | `--format`   | `human`   | Output format: `human` or `json`                      |
 | `--json`     | `false`   | Alias for `--format json`                             |
 | `--no-sync`  | `false`   | Skip on-demand sync before querying                   |
@@ -1570,13 +1574,14 @@ ______________________________________________________________________
 
 Install the native host and unpacked extension to sync Claude.ai and ChatGPT
 through Google Chrome. The command prints the extension folder. Open
-`chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and
-select that folder.
-Keep Chrome open during Sync. Registration is per OS user; the last setup wins.
-The first connected Chrome profile is used. Rerun setup and reload the extension
-when the executable path or data directory changes. After an upgrade mismatch,
-restart AgentsView if you upgraded it, rerun setup, reload the extension at
-`chrome://extensions`, then Sync again.
+through Google Chrome. The command prints the extension folder. AgentsView opens
+its Chrome connection only after setup, so restart AgentsView if it is already
+running. Open `chrome://extensions`, enable **Developer mode**, choose **Load
+unpacked**, and select that folder. Keep Chrome open during Sync. Registration is
+per OS user; the last setup wins. The first connected Chrome profile is used.
+Rerun setup and reload the extension when the executable path or data directory
+changes. After an upgrade mismatch, restart AgentsView if you upgraded it, rerun
+setup, reload the extension at `chrome://extensions`, then Sync again.
 
 See
 [Sync Claude.ai chats](https://agentsview.io/docs/chat-import/#sync-claudeai-chats)
@@ -1639,7 +1644,7 @@ agentsview export sessions [flags]
 | `--all`               | `false` | Export every eligible page as one output stream           |
 | `--project`           |         | Filter by exact project name                              |
 | `--exclude-project`   |         | Exclude sessions from the given project                   |
-| `--machine`           |         | Filter by machine name                                    |
+| `--machine`           |         | ID, alias, ID/alias list, or unique display name          |
 | `--git-branch`        |         | Filter by project/branch token                            |
 | `--agent`             |         | Filter by agent name                                      |
 | `--date`              |         | Include sessions active on `YYYY-MM-DD`                   |
@@ -1741,6 +1746,10 @@ document. Refresh saved digests when changing versions.
 ______________________________________________________________________
 
 ### `agentsview session`
+
+Machine filters accept exact IDs, aliases, comma-separated ID/alias lists, or a
+unique whole display label. A valid 32-hex installation ID takes precedence even
+without stored sessions. Unknown or ambiguous names return an error with choices.
 
 Programmatic access to session data for scripts, automation agents, and CI jobs.
 See [Session API](/docs/session-api/) for full documentation, including
@@ -2240,6 +2249,7 @@ agentsview help
 | `AGENTSVIEW_NO_DAEMON`                |                                                      | Set to `1`, `true`, `yes`, or `on` to disable CLI daemon auto-start                                 |
 | `AGENTSVIEW_DAEMON_IDLE_TIMEOUT`      | `20m`                                                | Override idle self-shutdown duration for detached background daemons                                |
 | `AGENTSVIEW_TELEMETRY_ENABLED`        |                                                      | Set to `0` to disable [anonymous daemon telemetry](/docs/configuration/#anonymous-daemon-telemetry) |
+| `DO_NOT_TRACK`                        |                                                      | Set to `1` to disable telemetry                                                                     |
 
 Environment variables override the built-in defaults. Set them in your shell
 profile or pass them inline:

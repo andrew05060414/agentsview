@@ -174,7 +174,7 @@ func (s *Server) syncBrowser(ctx context.Context, chrome bool, config browserSyn
 		return nil, apiError(http.StatusNotImplemented, "sync requires a local archive")
 	}
 	if chrome && !s.chrome.Connected() {
-		return nil, apiErrorWithCode(http.StatusConflict, config.hostRequired, "Run agentsview chrome setup and keep Chrome open, then Sync again")
+		return nil, apiErrorWithCode(http.StatusConflict, config.hostRequired, "Run agentsview chrome setup, restart AgentsView, and keep Chrome open, then Sync again")
 	}
 	if chrome && !s.chrome.syncMu.TryLock() {
 		return nil, apiErrorWithCode(http.StatusConflict, config.running, "Chrome Sync is already running")
@@ -333,6 +333,10 @@ func (s *Server) importClaudeAIFromFileWithCallbacks(
 		stats, importErr = importer.ImportClaudeAIWithOptions(ctx, s.db, reader, cb, opts)
 		return importErr
 	})
+	// Refresh after every import attempt; even a failed import can commit title-only changes counted as skipped.
+	if s.broadcaster != nil {
+		s.broadcaster.Emit("sessions")
+	}
 	if err != nil {
 		if errors.Is(err, db.ErrWriterClosed) {
 			return importer.ImportStats{}, writerClosedError(s.archiveStale())
@@ -473,6 +477,10 @@ func (s *Server) importChatGPTFromFile(
 			filepath.Join(s.cfg.DataDir, "assets"), cb, opts)
 		return importErr
 	})
+	// Refresh after every import attempt; even a failed import can commit title-only changes counted as skipped.
+	if s.broadcaster != nil {
+		s.broadcaster.Emit("sessions")
+	}
 	if err != nil {
 		if errors.Is(err, db.ErrWriterClosed) {
 			return importer.ImportStats{}, writerClosedError(s.archiveStale())

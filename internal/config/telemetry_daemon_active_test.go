@@ -113,3 +113,125 @@ func TestClaimDaemonActiveConcurrent(t *testing.T) {
 	}
 	assert.EqualValues(t, 1, sends.Load())
 }
+
+func TestClaimSetupFinished(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, telemetrySetupFinishedFilename)
+	for _, tc := range []struct {
+		name, id, record string
+		wantSent         bool
+	}{
+		{"first content", "install-one", "install-one\n", true},
+		{"restart", "install-one", "install-one\n", false},
+		{"changed identity retries", "install-two", "install-two\n", true},
+	} {
+		cfg := Config{DataDir: dir, InstallationID: tc.id}
+		sent := false
+		err := cfg.ClaimSetupFinished(func() error {
+			sent = true
+			return nil
+		})
+		require.NoError(t, err, tc.name)
+		assert.Equal(t, tc.wantSent, sent, tc.name)
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, tc.record, string(data))
+	}
+}
+
+func TestTelemetryClaimsDoNotBlockConfigSaves(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		claim         func(Config, func() error) error
+		sendErr       error
+		waitForReader bool
+	}{
+		{"daemon active", func(c Config, send func() error) error { return c.ClaimDaemonActive(time.Now(), send) }, nil, false},
+		{"setup finished", func(c Config, send func() error) error { return c.ClaimSetupFinished(send) }, errors.New("queue full"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			started, release := make(chan struct{}), make(chan struct{})
+			releaseSend := sync.OnceFunc(func() { close(release) })
+			claimDone := make(chan struct{})
+			var claimErr error
+			var savesDone, readDone chan struct{}
+			var claimed bool
+			var readErr error
+			go func() {
+				claimErr = tc.claim(Config{DataDir: dir, InstallationID: "install-one"}, func() error {
+					close(started)
+					<-release
+					return tc.sendErr
+				})
+				close(claimDone)
+			}()
+			defer func() {
+				releaseSend()
+				<-claimDone
+				if readDone != nil {
+					<-readDone
+				}
+				if savesDone != nil {
+					<-savesDone
+				}
+			}()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				require.FailNow(t, "claim callback did not start")
+			}
+			if tc.waitForReader {
+				readStarted := make(chan struct{})
+				readDone = make(chan struct{})
+				go func() {
+					defer close(readDone)
+					close(readStarted)
+					readConfig := Config{DataDir: dir, InstallationID: "install-one"}
+					claimed, readErr = readConfig.SetupFinishedClaimed()
+				}()
+				select {
+				case <-readStarted:
+				case <-time.After(5 * time.Second):
+					require.FailNow(t, "setup read did not start")
+				}
+				select {
+				case <-readDone:
+					require.FailNow(t, "setup read returned while the claim was pending", "claimed=%v err=%v", claimed, readErr)
+				case <-time.After(100 * time.Millisecond): //nolint:kennlint // timer shows the read waits while the claim holds the setup record lock
+				}
+			}
+			saved := make(chan error, 1)
+			savesDone = make(chan struct{})
+			go func() {
+				defer close(savesDone)
+				cfg := Config{DataDir: dir}
+				if err := cfg.SaveSettings(map[string]any{"chart_palette": ChartPaletteMatplotlib}); err != nil {
+					saved <- err
+					return
+				}
+				saved <- cfg.SaveTerminalConfig(TerminalConfig{Mode: "clipboard"})
+			}()
+			select {
+			case err := <-saved:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				require.FailNow(t, "config saves waited for the claim callback")
+			}
+			<-savesDone
+			cfg := readConfigFile(t, dir)
+			assert.Equal(t, ChartPaletteMatplotlib, cfg.ChartPalette)
+			assert.Equal(t, "clipboard", cfg.Terminal.Mode)
+			releaseSend()
+			<-claimDone
+			if tc.waitForReader {
+				<-readDone
+				require.ErrorIs(t, claimErr, tc.sendErr)
+				require.NoError(t, readErr)
+				assert.False(t, claimed, "a failed send rolls back the reservation the read waited on")
+			} else {
+				require.NoError(t, claimErr)
+			}
+		})
+	}
+}

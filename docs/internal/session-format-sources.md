@@ -586,15 +586,15 @@ fixtures retain this field; missing identities remain source-local.
   [persistence policy](https://github.com/openai/codex/blob/c71297b9a9b3f7995445eff8d768837814ac06f8/codex-rs/core/src/rollout/policy.rs#L6-L15).
   Its
   [metadata schema](https://github.com/openai/codex/blob/c71297b9a9b3f7995445eff8d768837814ac06f8/codex-rs/protocol/src/protocol.rs#L971-L980)
-  has no `forked_from_id`. AgentsView keeps the first nonempty metadata ID and
-  ignores later metadata with a different or empty ID. Same-thread metadata can
-  still update the working directory and branch; existing fork replay filtering
-  and revert-page identities remain in effect. This establishes a producer path
-  for the shape reported in
+  has no `forked_from_id`. AgentsView keeps the first nonempty metadata ID
+  and ignores later metadata with a different or empty ID. Same-thread
+  metadata can still update the working directory and branch; existing fork
+  replay filtering and revert-page identities remain in effect. This
+  establishes a producer path for the shape reported in
   [issue #2248](https://github.com/kenn-io/agentsview/issues/2248); the
   particular file's history remains unverified.
-  `TestCodexMisfiledPageUpgradeRetainsTranscriptMetadata` verifies that a proven
-  page correction preserves transcript metadata during upgrade.
+  `TestCodexMisfiledPageUpgradeRetainsTranscriptMetadata` verifies that a
+  proven page correction preserves transcript metadata during upgrade.
 
 - **Compressed rollouts (checked 2026-10-16, source at commit
   `6b991972c5b539198dcea9bac4fc14e57559c3af`):** A background worker started
@@ -1435,6 +1435,12 @@ fixtures retain this field; missing identities remain source-local.
   at `38700b4b38bf387dafded6c97c3f190d084b49e9`. No local Gemini session was
   available to check. Agentsview uses the summary as the session name. The
   first message falls back to it only when there is no user message.
+- **Change detection (checked 2026-10-20):** Gemini reads only chat recordings
+  under `tmp/` and the root `projects.json` and `trustedFolders.json`. Any
+  other change under a Gemini root is non-data for Gemini, so the nested
+  `antigravity`, `antigravity-ide`, and `antigravity-cli` trees never trigger
+  a Gemini rescan. A separately configured Gemini root inside one of those
+  trees still owns its own recordings.
 
 ## Gemini Apps (`gemini-apps`)
 
@@ -3963,6 +3969,13 @@ schemas keep their existing ordering behavior.
   archived session's working-directory filter during sync and rebuilds,
   rechecked with synthetic stores on 2026-10-13.
 
+- **Change detection (checked 2026-10-20):** Parsing opens conversation
+  databases and the title store read-only, which rewrites their `-shm` WAL
+  index. Those `-shm` events, including removals, are non-data, matching the
+  CLI rule below. Without this, an HTTP remote re-imported every session after
+  the collector read its own mirror. Main-database and WAL changes still
+  resolve to their conversation or title refresh.
+
 ## Antigravity CLI (`antigravity-cli`)
 
 - **Format:** Newer per-session SQLite databases or older encrypted protobuf
@@ -4008,6 +4021,14 @@ schemas keep their existing ordering behavior.
   when the value is missing or relative. The exact absolute workspace remains
   the CWD. The project label is derived from the path text without probing the
   recorded folder when filesystem discovery is disabled.
+- **Change detection (checked 2026-10-20):** SQLite's
+  [WAL-index format](https://sqlite.org/walformat.html#the_wal_index_or_shm_file)
+  describes `-shm` as a transient index rather than database content.
+  Conversation `-shm` events, including removals, are non-data, so they never
+  select a session or trigger a provider-wide rescan during remote imports.
+  Main-database and WAL changes still resolve to their conversation. These are
+  import-routing rules; the closed producer format and its evidence
+  classification are unchanged.
 
 ## iFlow CLI (`iflow`)
 
@@ -4175,13 +4196,30 @@ schemas keep their existing ordering behavior.
   records and metadata.
 - **Evidence:** `source`.
 - **Upstream:** Clone `https://github.com/gptme/gptme.git` at
-  `a1d8ca21dd662e04970ff36c8c3e9b342f989605`; see
-  [conversations.py](https://github.com/gptme/gptme/blob/a1d8ca21dd662e04970ff36c8c3e9b342f989605/gptme/logmanager/conversations.py)
+  `8f71713f3d1151b3141927aa014db62b9d756117`; see
+  [conversations.py](https://github.com/gptme/gptme/blob/8f71713f3d1151b3141927aa014db62b9d756117/gptme/logmanager/conversations.py)
   and
-  [message.py](https://github.com/gptme/gptme/blob/a1d8ca21dd662e04970ff36c8c3e9b342f989605/gptme/message.py).
+  [message.py](https://github.com/gptme/gptme/blob/8f71713f3d1151b3141927aa014db62b9d756117/gptme/message.py).
 - **Usage and cost:** Assistant metadata can persist input, output, cache-read,
   and cache-creation tokens with model data. Agentsview catalog-prices the
-  normalized usage and consumes no authoritative persisted USD total.
+  normalized usage unless `metadata.cost_source` is `"provider"` and
+  `metadata.cost` is a valid non-negative USD amount. In that case it imports
+  an exact-cost usage event, retaining message token display fields but not
+  a duplicate billable message token row. Reverified 2026-10-20 against
+  gptme commit `54c3a29fc3d5089f211528e206b50d7ee3f775c8`:
+  [`_record_usage`](https://github.com/gptme/gptme/blob/54c3a29fc3d5089f211528e206b50d7ee3f775c8/gptme/llm/llm_openai.py#L317-L398)
+  writes this marker only for reported direct OpenRouter costs, including
+  zero; estimates, BYOK fees and proxied routes do not receive the marker.
+  Parser data version 141 reparses unchanged gptme sources in place to import
+  these events without changing source or session identities.
+  Reverified 2026-10-20 at the pinned commit: assistant metadata stores the
+  requested model ID, including any `@host` provider pin
+  ([metadata](https://github.com/gptme/gptme/blob/8f71713f3d1151b3141927aa014db62b9d756117/gptme/llm/llm_openai.py#L357)).
+  The suffix is a comma-separated OpenRouter host allowlist
+  ([routing](https://github.com/gptme/gptme/blob/8f71713f3d1151b3141927aa014db62b9d756117/gptme/llm/llm_openai.py#L1579-L1588))
+  that gptme removes before sending the model to the API. Agentsview strips
+  it before pricing. Parser data version 140 reparses unchanged gptme sources
+  in place without changing source or session identities.
 - **Agentsview:** `internal/parser/gptme.go` and
   `internal/parser/gptme_provider.go`.
 

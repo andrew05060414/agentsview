@@ -74,8 +74,11 @@ Setup registers Google Chrome only. Chromium, Edge, and Brave aren't supported.
 Set up Chrome once:
 
 1. Run `agentsview chrome setup`.
-2. Open `chrome://extensions` and turn on **Developer mode**.
-3. Click **Load unpacked** and select the folder printed by the command.
+2. If AgentsView is already running, restart it. AgentsView opens its Chrome
+   connection only after setup, so a server started before setup can't reach
+   Chrome.
+3. Open `chrome://extensions` and turn on **Developer mode**.
+4. Click **Load unpacked** and select the folder printed by the command.
 
 Keep Chrome open during Sync. When the executable path or data directory changes,
 rerun setup and reload the extension at `chrome://extensions`. After an upgrade
@@ -84,12 +87,27 @@ then click **Sync** again. The extension reconnects when AgentsView restarts.
 Registration is per OS user; the last setup wins. The first connected Chrome
 profile is used until it disconnects.
 
+Most installs need nothing more. Chrome reaches AgentsView through a private
+socket at `<dataDir>/chrome/host.sock`, and setup writes that path into the
+launcher. If your data directory path is too long for a socket, AgentsView puts
+the socket in `av-chrome-<hash>/` inside `$XDG_RUNTIME_DIR`, or inside your temp
+directory when `$XDG_RUNTIME_DIR` isn't set. On macOS and Linux that directory
+must belong to you with mode 0700, so a shared `/tmp` doesn't qualify. If no
+directory qualifies, setup fails and the server logs why; use a shorter data
+directory or set `$XDG_RUNTIME_DIR`. If setup and the server see different
+values of `$XDG_RUNTIME_DIR` or `$TMPDIR`, Chrome can't connect; rerun setup
+after changing either. The server removes the socket and its directory when it
+stops.
+
+Earlier development builds put that socket in `~/av-chrome-<hash>/`. If you ran
+setup with one of them, rerun `agentsview chrome setup` and reload the
+extension; until you do, the server logs a warning at startup and Chrome stays
+disconnected. You can delete the old `~/av-chrome-<hash>/` directories.
+
 There's no removal command. Remove the extension at `chrome://extensions`, then
 delete `<dataDir>/chrome/extension/` and the launcher,
 `<dataDir>/chrome/host.cmd` on Windows or `<dataDir>/chrome/host` on macOS and
-Linux. On macOS and Linux, delete `~/av-chrome-<hash>/` too if setup used that
-socket fallback directory. Also delete the native host registration for your
-platform:
+Linux. Also delete the native host registration for your platform:
 
 - Windows: `<dataDir>/chrome/io.kenn.agentsview.json` and the registry key
   `HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts\io.kenn.agentsview`.
@@ -99,9 +117,10 @@ platform:
   uses `$CHROME_CONFIG_HOME/google-chrome` first, then
   `$XDG_CONFIG_HOME/google-chrome`, then `~/.config/google-chrome`.
 
-If Sync reports a disconnected host after setup, open Chrome and enable the
-extension at `chrome://extensions`. If it still fails, check the server startup
-error log for a Chrome host endpoint bind failure.
+If Sync reports a disconnected host after setup, restart AgentsView if it was
+running during setup, then open Chrome and enable the extension at
+`chrome://extensions`. If it still fails, check the server startup error log for
+a Chrome host endpoint bind failure.
 
 Open **Import conversations** and select **Claude.ai**. Local web UIs connected
 to a writable archive show a Chrome card; other connections show file upload

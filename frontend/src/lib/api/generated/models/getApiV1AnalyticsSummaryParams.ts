@@ -17,7 +17,7 @@ export type GetApiV1AnalyticsSummaryParams = {
    */
   timezone?: string;
   /**
-   * Filter by machine
+   * Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
    */
   machine?: string;
   /**
@@ -73,4 +73,8 @@ export type GetApiV1AnalyticsSummaryParams = {
    * Filter by termination reason
    */
   termination?: string;
+  /**
+   * Include model aliases for display grouping
+   */
+  group_models?: boolean;
 };

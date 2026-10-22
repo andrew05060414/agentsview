@@ -65,6 +65,35 @@ func (p *geminiProvider) SourcesForChangedPath(
 	return p.sources.SourcesForChangedPath(ctx, req)
 }
 
+func (p *geminiProvider) ChangedPathRelevance(
+	ctx context.Context,
+	req ChangedPathRequest,
+) (ChangedPathRelevance, error) {
+	if err := ctx.Err(); err != nil {
+		return ChangedPathUnclassified, err
+	}
+	// Gemini reads only chat recordings under tmp/ and two root metadata
+	// files. Everything else under a root, such as the nested Antigravity
+	// trees, belongs to other providers or to nobody.
+	outside := false
+	for _, root := range p.sources.roots {
+		path := filepath.Clean(req.Path)
+		rel, ok := relUnder(root, path)
+		if !ok {
+			continue
+		}
+		if rel == "tmp" || strings.HasPrefix(rel, "tmp"+string(filepath.Separator)) ||
+			geminiProjectMetadataPath(root, path) {
+			return ChangedPathUnclassified, nil
+		}
+		outside = true
+	}
+	if outside {
+		return ChangedPathNonData, nil
+	}
+	return ChangedPathUnclassified, nil
+}
+
 func (p *geminiProvider) SourceForReconciliation(
 	ctx context.Context,
 	path, project string,
@@ -671,6 +700,7 @@ func geminiProviderCapabilities() Capabilities {
 			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
+			ChangedPathRelevance: CapabilitySupported,
 			FindSource:           CapabilitySupported,
 			CompositeFingerprint: CapabilitySupported,
 			IncrementalAppend:    CapabilityNotApplicable,

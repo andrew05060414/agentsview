@@ -33,7 +33,12 @@ func testChromeConnection(t *testing.T, srv *Server) (string, net.Conn) {
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
 	socket := filepath.Join(dir, "chrome", "host.sock")
 	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
+	// Stop the host before removing dir: its cleanup deletes the socket
+	// directory, and Windows denies a second concurrent delete.
+	t.Cleanup(func() {
+		cancel()
+		srv.chrome.shutdown()
+	})
 	require.NoError(t, srv.ServeChromeHost(ctx, socket))
 	conn, err := (&net.Dialer{}).DialContext(t.Context(), "unix", socket)
 	require.NoError(t, err)
@@ -132,7 +137,7 @@ func TestChromeHostAbsent(t *testing.T) {
 	req.RemoteAddr = "127.0.0.1:1234"
 	srv.mux.ServeHTTP(response, req)
 	assert.Equal(t, http.StatusConflict, response.Code)
-	assert.JSONEq(t, `{"code":"claude_ai_chrome_host_required","error":"Run agentsview chrome setup and keep Chrome open, then Sync again"}`, response.Body.String())
+	assert.JSONEq(t, `{"code":"claude_ai_chrome_host_required","error":"Run agentsview chrome setup, restart AgentsView, and keep Chrome open, then Sync again"}`, response.Body.String())
 }
 
 func TestClaudeAIChromeStatus(t *testing.T) {
@@ -425,4 +430,58 @@ func TestChromeHostAcceptRetries(t *testing.T) {
 		assert.Contains(t, output.String(), "temporary accept failure")
 		assert.NotContains(t, output.String(), net.ErrClosed.Error())
 	})
+}
+
+func TestChromeHostCloseRemovesEndpointFiles(t *testing.T) {
+	for _, tt := range []struct {
+		name                   string
+		existing, cancelServer bool
+	}{
+		{"shutdown removes created dir", false, false},
+		{"context cancel removes created dir", false, true},
+		{"shutdown keeps existing dir", true, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := testServer(t, 5*time.Second)
+			root, err := os.MkdirTemp("", "av") //nolint:usetesting // Keep the socket path below macOS's limit.
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, os.RemoveAll(root)) })
+			dir := filepath.Join(root, "chrome")
+			kept := filepath.Join(dir, "extension")
+			if tt.existing {
+				require.NoError(t, os.MkdirAll(kept, 0o700))
+			}
+			socket := filepath.Join(dir, "host.sock")
+			ctx, cancel := context.WithCancel(t.Context())
+			t.Cleanup(cancel)
+			require.NoError(t, srv.ServeChromeHost(ctx, socket))
+			conn, err := (&net.Dialer{}).DialContext(t.Context(), "unix", socket)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			require.FileExists(t, socket+".lock")
+
+			if tt.cancelServer {
+				cancel()
+			} else {
+				require.NoError(t, srv.Shutdown(t.Context()))
+			}
+
+			if tt.cancelServer {
+				// Cleanup removes the lock file, then the created directory.
+				require.Eventually(t, func() bool {
+					_, err := os.Lstat(dir)
+					return errors.Is(err, os.ErrNotExist)
+				}, 5*time.Second, 10*time.Millisecond)
+			}
+			assert.NoFileExists(t, socket+".lock")
+			assert.NoFileExists(t, socket)
+			if tt.existing {
+				assert.DirExists(t, kept)
+			} else {
+				assert.NoDirExists(t, dir)
+			}
+			_, err = (&net.Dialer{}).DialContext(t.Context(), "unix", socket)
+			assert.Error(t, err)
+		})
+	}
 }
