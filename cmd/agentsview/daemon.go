@@ -55,14 +55,18 @@ func defaultDaemonLaunchWaitDeps() daemonLaunchWaitDeps {
 		acquireLaunchLock:  acquireBackgroundLaunchLockWithError,
 		loadReadOnlyConfig: config.LoadReadOnly,
 		writableRecords:    writableDaemonRecords,
-		confirmed:          stopTargetConfirmed,
-		probe:              daemonRecordPingConfirmed,
-		isStarting:         IsDaemonStarting,
-		readStartupState:   readStartupState,
-		now:                time.Now,
-		sleep:              time.Sleep,
-		timeout:            backgroundServeReadyTimeout,
-		tick:               startProbeTick(),
+		// Discovery may reuse a reachable daemon in another PID namespace.
+		// Only signaling requires a confirmed local process identity.
+		confirmed: func(rec daemon.RuntimeRecord, authToken string) bool {
+			return daemonRecordPingConfirmed(rec, authToken) || processIdentityConfirmed(rec)
+		},
+		probe:            daemonRecordPingConfirmed,
+		isStarting:       IsDaemonStarting,
+		readStartupState: readStartupState,
+		now:              time.Now,
+		sleep:            time.Sleep,
+		timeout:          backgroundServeReadyTimeout,
+		tick:             startProbeTick(),
 	}
 }
 
@@ -858,7 +862,7 @@ func daemonStatusRecords(
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
-		if !daemon.ProcessAlive(rec.PID) {
+		if !daemon.RuntimeProcessAlive(rec) {
 			continue
 		}
 		state := runtimeRecordIdentityState(rec)

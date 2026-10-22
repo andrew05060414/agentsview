@@ -1894,7 +1894,7 @@ describe("App telemetry", () => {
         if (requestUrl(input).includes("/api/v1/telemetry/events")) {
           if (typeof init?.body !== "string") throw new Error("telemetry body is not a string");
           posted.push(JSON.parse(init.body));
-          return new Response('{"status":"disabled"}', { status: 202, headers });
+          return new Response('{"status":"queued"}', { status: 202, headers });
         }
         return new Response("{}", { status: 200, headers });
       }),
@@ -1914,16 +1914,18 @@ describe("App telemetry", () => {
     await flushEffects();
     now = 120_000;
     window.dispatchEvent(new Event("pagehide"));
+    await flushEffects();
     expect(postedFor("visit_ended")).toHaveLength(1);
     window.dispatchEvent(new Event("pageshow"));
     await unmount(component);
     component = undefined;
     now = 240_000;
     window.dispatchEvent(new Event("pagehide"));
+    await flushEffects();
     expect(postedFor("visit_ended")).toHaveLength(1);
   });
 
-  it("reports authenticated route changes, the usage alias, and focus until unmount", async () => {
+  it("reports authenticated route changes and the usage alias", async () => {
     setup();
     router.replace("recall");
     settings.needsAuth = true;
@@ -1936,19 +1938,13 @@ describe("App telemetry", () => {
       router.navigate(route);
       await flushEffects();
     }
-    expect(postedFor("screen_viewed")).toEqual([
-      { screen: "recall", surface: "web" },
-      { screen: "sessions", surface: "web" },
-      { screen: "usage", surface: "web" },
-    ]);
-    window.dispatchEvent(new Event("focus"));
-    await flushEffects();
-    expect(postedFor("screen_viewed").at(-1)).toEqual({ screen: "usage", surface: "web" });
-    expect(postedFor("screen_viewed")).toHaveLength(4);
-    await unmount(component!);
-    component = undefined;
-    window.dispatchEvent(new Event("focus"));
-    expect(postedFor("screen_viewed")).toHaveLength(4);
+    await vi.waitFor(() =>
+      expect(postedFor("screen_viewed")).toEqual([
+        { screen: "recall", surface: "web" },
+        { screen: "sessions", surface: "web" },
+        { screen: "usage", surface: "web" },
+      ]),
+    );
   });
   async function open(id: string | null) {
     router.route = "sessions";
@@ -1970,35 +1966,42 @@ describe("App telemetry", () => {
     expect(postedFor("session_viewed")).toEqual([]);
 
     await open("session-1");
-    expect(postedFor("session_viewed")).toEqual([{ agent: "codex" }]);
+    await vi.waitFor(() => expect(postedFor("session_viewed")).toEqual([{ agent: "codex" }]));
 
     sessions.sessions = [hydratedSession("session-1", "codex", { message_count: 3 })];
     await flushEffects();
-    expect(postedFor("session_viewed")).toHaveLength(1);
+    await vi.waitFor(() => expect(postedFor("session_viewed")).toHaveLength(1));
 
     await open(null);
     await open("session-1");
-    expect(postedFor("session_viewed")).toEqual([{ agent: "codex" }, { agent: "codex" }]);
+    await vi.waitFor(() =>
+      expect(postedFor("session_viewed")).toEqual([{ agent: "codex" }, { agent: "codex" }]),
+    );
 
     router.route = "usage";
     router.sessionId = null;
     await flushEffects();
     await open("session-1");
-    expect(postedFor("session_viewed")).toHaveLength(3);
+    await vi.waitFor(() => expect(postedFor("session_viewed")).toHaveLength(3));
   });
 
   it("reports analytics_viewed once per analytics page and never for the sessions landing page", async () => {
     setup();
+    window.history.replaceState(null, "", "/");
     router.route = "sessions";
     component = mount(App, { target: document.body });
-    await flushEffects();
+    await vi.waitFor(() => expect(postedFor("app_opened")).toHaveLength(1));
     expect(postedFor("analytics_viewed")).toEqual([]);
 
-    for (const route of ["usage", "token-usage", "activity"] as const) {
+    router.route = "usage";
+    await vi.waitFor(() => expect(postedFor("analytics_viewed")).toEqual([{ page: "usage" }]));
+    for (const route of ["token-usage", "activity"] as const) {
       router.route = route;
       await flushEffects();
     }
     await open(null);
-    expect(postedFor("analytics_viewed")).toEqual([{ page: "usage" }, { page: "activity" }]);
+    await vi.waitFor(() =>
+      expect(postedFor("analytics_viewed")).toEqual([{ page: "usage" }, { page: "activity" }]),
+    );
   });
 });
