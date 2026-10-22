@@ -1670,6 +1670,7 @@ type ParsedMessage struct {
 	Ordinal       int
 	Role          RoleType
 	Content       string
+	DialogueText  *string
 	ThinkingText  string // concatenated text of all thinking blocks; "" if none
 	Timestamp     time.Time
 	HasThinking   bool

@@ -2240,10 +2240,30 @@ The automatic outbound requests are update checks and anonymous telemetry:
 
 As of 0.33.0, the server sends an anonymous `daemon_active` liveness ping on
 each UTC day it runs. Restarts and other servers sharing the data directory do
-not send another ping that day. The web UI also reports an anonymous
-`app_opened` event to the server when it loads and on the first focus of a later
-UTC day. The server sends it to PostHog with the same fields and opt-out as the
+not send another ping that day. When telemetry is disabled, the server skips
+hourly telemetry wake-ups. The web UI also reports an anonymous
+`app_opened` event on load or focus for each selected server and UTC day;
+reloads and focus don't repeat it that day. These claims live in browser local
+storage. The server sends it to PostHog with the same fields and opt-out as the
 ping. The browser never contacts PostHog.
+Two tabs whose initial checks overlap can each send `app_opened`, such as when
+a browser restores several tabs together.
+After a disabled receipt, the browser stops sending reports and tracking visits.
+It checks again on its first load or focus on a later UTC day. Re-enabling
+telemetry takes effect after that check.
+An unauthorized check (HTTP 401) or exhausted retries also stop visit tracking
+and discard its accumulated duration. Tracking starts fresh when a later check
+enables reporting. Outcomes that occur while reporting is unavailable are
+dropped. A fresh page retries after authentication; otherwise, the next UTC
+day's load or focus starts a new check.
+HTTP 401 makes reporting unavailable immediately. Server errors (HTTP 5xx) and
+network failures retry up to five times with increasing delays before reporting
+becomes unavailable. Other HTTP errors settle without retries and don't grant
+permission to report.
+Each browser telemetry request has a 10-second deadline, including reading its
+receipt.
+The browser retains each daily claim's 35 most recently accepted UTC dates.
+Rolling the clock back to an evicted date can count it again.
 
 The server sends `setup_finished` once per installation when the archive first
 has a session in the default session list. Sessions need messages to count;
@@ -2269,17 +2289,27 @@ of `under_1m`, `1_to_5m`, `5_to_30m`, or `over_30m`. These mean below 1 minute,
 1 to below 5 minutes, 5 to below 30 minutes, and 30 minutes or more. Visible
 time adds up across tab switches and includes idle visible time; hidden time
 adds nothing. Closing or reloading the page, or leaving it hidden for 30
-minutes, ends a visit. Visits that span a server change are discarded in full.
-The next visit uses the selected server after a reload, reopening, or return
-from 30 minutes hidden. Each visit can send one event, with no daily limit.
+minutes, ends a visit. Switching servers discards the old visit and starts a
+new tracker immediately for the selected server in the same tab. Each visit
+can send one event, with no daily limit.
+While permission is pending, the browser holds visit events and other outcomes
+in page memory for the selected server, up to 64 events total. Additional
+events are dropped. An enabled receipt releases the held events; a disabled
+receipt discards them. A visit ending after UTC midnight also waits in page
+memory while that day's check is pending. Closing the page before an enabled
+receipt can lose those events.
 Delivery is best effort: a visit can be lost if the browser crashes, quits, or
 discards the tab before the event is sent. Long-lived tabs are the most exposed
 to this, so `over_30m` can undercount.
 
 The web UI also reports `screen_viewed` with `surface: web`. The server counts
 each screen once per installation per UTC day, across tabs and server restarts.
-It stores versioned JSON claims in `telemetry-screen-views` beside the
-installation identity. When telemetry is enabled, the server checks the file
+The browser also deduplicates screen reports per selected server and local
+storage, so separate browsers can check the same installation independently.
+The server stores versioned JSON claims in `telemetry-screen-views` beside the
+installation identity. For each installation and screen, it retains the 35 most
+recently accepted UTC dates. A clock rollback to an evicted date can count that
+screen again. When telemetry is enabled, the server checks the file
 once in the background after it starts serving; a web UI report that arrives
 first waits for that check. The check moves older plain-text claims, malformed
 claims, or claims from a newer format to a unique
