@@ -1,5 +1,10 @@
 package parser
 
+const (
+	qoderDotDir   = ".qoder"
+	qoderCNDotDir = ".qoder-cn"
+)
+
 // qoderDefaultDirs returns platform-specific default directories that
 // hold Qoder session transcripts. The IDE stores its data under
 // an Electron-style user-data directory per platform:
@@ -21,10 +26,10 @@ package parser
 func qoderDefaultDirs() []string {
 	return []string{
 		// Legacy export paths (kept for users who enable the in-IDE export).
-		".qoder/projects",
+		qoderDotDir + "/projects",
 		".qoderwork/projects",
 		// Qoder CLI CN
-		".qoder-cn/projects",
+		qoderCNDotDir + "/projects",
 		// macOS
 		"Library/Application Support/Qoder/SharedClientCache/cli/projects",
 		// Linux

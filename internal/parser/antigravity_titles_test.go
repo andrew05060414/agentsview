@@ -14,9 +14,9 @@ import (
 
 func TestAntigravityTitleCacheExpiresMatchingMarkers(t *testing.T) {
 	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
-	priorNow := antigravityTitleNow
-	antigravityTitleNow = func() time.Time { return now }
-	t.Cleanup(func() { antigravityTitleNow = priorNow })
+	priorNow := sqliteTitleNow
+	sqliteTitleNow = func() time.Time { return now }
+	t.Cleanup(func() { sqliteTitleNow = priorNow })
 	store := filepath.Join(t.TempDir(), AntigravitySummariesDBName)
 	conn, err := sql.Open("sqlite3", store)
 	require.NoError(t, err)
