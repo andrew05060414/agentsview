@@ -198,3 +198,35 @@ export const postApiV1ImportClaudeAiSyncResultsById = async (
     body: JSON.stringify(claudeAISyncResultInputBody),
   });
 };
+
+export const getPostApiV1ImportGeminiSyncUrl = () => {
+  return `/api/v1/import/gemini/sync`;
+};
+
+/**
+ * @summary Sync Gemini conversations
+ */
+export const postApiV1ImportGeminiSync = async (
+  options?: Parameters<typeof orvalRequest>[1],
+): Promise<Response> => {
+  return orvalRequest<Response>(getPostApiV1ImportGeminiSyncUrl(), {
+    ...options,
+    method: "POST",
+  });
+};
+
+export const getPostApiV1ImportGrokSyncUrl = () => {
+  return `/api/v1/import/grok/sync`;
+};
+
+/**
+ * @summary Sync Grok conversations
+ */
+export const postApiV1ImportGrokSync = async (
+  options?: Parameters<typeof orvalRequest>[1],
+): Promise<Response> => {
+  return orvalRequest<Response>(getPostApiV1ImportGrokSyncUrl(), {
+    ...options,
+    method: "POST",
+  });
+};

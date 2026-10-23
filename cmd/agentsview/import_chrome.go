@@ -18,6 +18,12 @@ func syncChrome(ctx context.Context, importType string) error {
 	if importType == "chatgpt" {
 		label = "ChatGPT"
 	}
+	if importType == "gemini" {
+		label = "Gemini"
+	}
+	if importType == "grok" {
+		label = "Grok"
+	}
 	cfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
 		return err
@@ -37,6 +43,20 @@ func syncChrome(ctx context.Context, importType string) error {
 		return err
 	}
 	streamCall := map[string]func() (int, []byte, *runtime.Stream[[]byte], *http.Response, error){
+		"gemini": func() (int, []byte, *runtime.Stream[[]byte], *http.Response, error) {
+			response, err := api.PostAPIV1ImportGeminiSyncStreamWithResponse(ctx)
+			if response == nil {
+				return 0, nil, nil, nil, err
+			}
+			return response.StatusCode, response.Body, response.Stream200, response.HTTPResponse, err
+		},
+		"grok": func() (int, []byte, *runtime.Stream[[]byte], *http.Response, error) {
+			response, err := api.PostAPIV1ImportGrokSyncStreamWithResponse(ctx)
+			if response == nil {
+				return 0, nil, nil, nil, err
+			}
+			return response.StatusCode, response.Body, response.Stream200, response.HTTPResponse, err
+		},
 		"chatgpt": func() (int, []byte, *runtime.Stream[[]byte], *http.Response, error) {
 			response, err := api.PostAPIV1ImportChatgptSyncStreamWithResponse(ctx)
 			if response == nil {

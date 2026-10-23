@@ -2929,5 +2929,8 @@
   "status_bar_codex_cloud_live_attention": "Codex Cloud: ライブトークンの確認が必要です",
   "status_bar_codex_cloud_oldest_failure": "最も古い失敗: {time}",
   "status_bar_codex_cloud_last_success": "最後に成功した同期: {time}",
-  "status_bar_codex_cloud_homes": "Codex ホーム: {homes}"
+  "status_bar_codex_cloud_homes": "Codex ホーム: {homes}",
+  "import_browser_signed_out": "AgentsView 拡張機能を有効にした Chrome プロファイルで {provider} にログインしてください。拡張機能は1つのプロファイルだけで有効にしてください。",
+  "import_browser_tab_note": "必要に応じて {provider} のタブをバックグラウンドで開き、同期後も残します。",
+  "import_browser_history_note": "毎回テキスト履歴を読み直します。変更前の会話はゴミ箱に保存されます。不完全な会話と Grok の分岐は元の記録を保持して再試行します。添付ファイルは取り込みません。"
 }

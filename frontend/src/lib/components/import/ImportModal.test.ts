@@ -18,6 +18,7 @@ const isRemoteConnection = vi.hoisted(() => vi.fn());
 const chromeStatus = vi.hoisted(() => vi.fn());
 const syncClaudeAI = vi.hoisted(() => vi.fn());
 const syncChatGPTChrome = vi.hoisted(() => vi.fn());
+const syncWebChrome = vi.hoisted(() => vi.fn());
 vi.mock("../../api/browserHost.js", () => ({ getBrowserHost }));
 vi.mock("../../api/runtime.js", async (original) => ({
   ...(await original<typeof import("../../api/runtime.js")>()),
@@ -31,6 +32,7 @@ vi.mock("../../api/client.js", () => ({
   connectClaudeAI: (browser: typeof host) => browser.connect(),
   syncClaudeAI,
   syncChatGPTChrome,
+  syncWebChrome,
   importClaudeAI: vi.fn(),
   importChatGPT: vi.fn(),
 }));
@@ -50,6 +52,7 @@ beforeEach(() => {
   chromeStatus.mockResolvedValue(ready);
   syncClaudeAI.mockResolvedValue(stats);
   syncChatGPTChrome.mockResolvedValue(stats);
+  syncWebChrome.mockResolvedValue(stats);
   void setLocale("en", { reload: false });
 });
 afterEach(() => {
@@ -119,6 +122,35 @@ it("offers Chrome Sync for ChatGPT and opens ChatGPT sign-in after auth failure"
   );
   expect(syncClaudeAI).not.toHaveBeenCalled();
 });
+
+it.each(["gemini", "grok"] as const)(
+  "syncs %s text history and shows the matching sign-in recovery",
+  async (provider) => {
+    syncWebChrome.mockRejectedValueOnce(new ApiError(0, "auth", `${provider}_auth_required`));
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    render(ImportModal, props());
+    const label = provider === "gemini" ? "Gemini" : "Grok";
+    await fireEvent.click(screen.getByRole("button", { name: label }));
+    expect(screen.queryByText(m.import_drop_here())).toBeNull();
+    expect(screen.queryByRole("button", { name: m.import_import() })).toBeNull();
+    await clickSync();
+    await waitFor(() => expect(screen.getByText("Signed out")).toBeTruthy());
+    expect(syncWebChrome).toHaveBeenCalledWith(
+      provider,
+      expect.objectContaining({ onProgress: expect.any(Function) }),
+      expect.any(AbortSignal),
+    );
+    await fireEvent.click(
+      screen.getByRole("button", { name: m.import_browser_signed_out({ provider: label }) }),
+    );
+    expect(open).toHaveBeenCalledExactlyOnceWith(
+      provider === "gemini" ? "https://gemini.google.com/app" : "https://grok.com/",
+      "_blank",
+      "noopener,noreferrer",
+    );
+    expect(syncClaudeAI).not.toHaveBeenCalled();
+  },
+);
 
 it.each(["stop", "cancel"])(
   "shows progress and refreshes completed chats after %s",

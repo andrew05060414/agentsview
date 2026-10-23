@@ -8,7 +8,7 @@
   import {
     importClaudeAI,
     importChatGPT,
-    connectClaudeAI, syncClaudeAI, syncChatGPTChrome,
+    connectClaudeAI, syncClaudeAI, syncChatGPTChrome, syncWebChrome,
   } from "../../api/client.js";
   import { getBrowserHost } from "../../api/browserHost.js";
   import { sync as syncState } from "../../stores/sync.svelte.js";
@@ -35,7 +35,10 @@
 
   let fileInput: HTMLInputElement | undefined = $state();
   let selectedFile = $state<File | null>(null);
-  let provider = $state<"claude-ai" | "chatgpt">("claude-ai");
+  let provider = $state<"claude-ai" | "chatgpt" | "gemini" | "grok">("claude-ai");
+  const webOnly = $derived(provider === "gemini" || provider === "grok");
+  const providerLabel = $derived(provider === "gemini" ? "Gemini" : provider === "grok" ? "Grok" : provider === "chatgpt" ? "ChatGPT" : "Claude.ai");
+  const signInMessage = $derived(webOnly ? m.import_browser_signed_out({ provider: providerLabel }) : provider === "chatgpt" ? m.import_chatgpt_signed_out() : m.import_claude_signed_out());
   let importing = $state(false);
   let dragOver = $state(false);
   let dragCount = $state(0);
@@ -55,8 +58,8 @@
   let syncError = $state<string | null>(null);
   let signInError = $state<string | null>(null);
   const chromeRead = new LatestRead();
-  const updateRequiredCode = $derived(provider === "chatgpt" ? "chrome_host_update_required" : "claude_ai_chrome_host_update_required");
-  const authRequiredCode = $derived(provider === "chatgpt" ? "chatgpt_auth_required" : "claude_ai_auth_required");
+  const updateRequiredCode = $derived(provider === "claude-ai" ? "claude_ai_chrome_host_update_required" : "chrome_host_update_required");
+  const authRequiredCode = $derived(provider === "claude-ai" ? "claude_ai_auth_required" : `${provider}_auth_required`);
   const chromeState = $derived(
     syncController ? "connected" :
     syncFlag === updateRequiredCode ? "extension-update" :
@@ -117,7 +120,7 @@
     signInError = null;
     try {
       if (activeHost) await connectClaudeAI(activeHost);
-      else window.open(provider === "chatgpt" ? "https://chatgpt.com/" : "https://claude.ai/login?return_url=%2Fnew", "_blank", "noopener,noreferrer");
+      else window.open(provider === "gemini" ? "https://gemini.google.com/app" : provider === "grok" ? "https://grok.com/" : provider === "chatgpt" ? "https://chatgpt.com/" : "https://claude.ai/login?return_url=%2Fnew", "_blank", "noopener,noreferrer");
     } catch (e) { signInError = e instanceof Error ? e.message : String(e); }
   }
 
@@ -135,7 +138,9 @@
     syncController = controller;
     try {
       const onProgress = (stats: ImportStats) => { progressStats = stats; };
-      const stats = provider === "chatgpt"
+      const stats = provider === "gemini" || provider === "grok"
+        ? await syncWebChrome(provider, { onProgress }, controller.signal)
+        : provider === "chatgpt"
         ? await syncChatGPTChrome({ onProgress }, controller.signal)
         : await syncClaudeAI(activeHost, { onProgress }, controller.signal);
       if (!controller.signal.aborted) result = stats;
@@ -340,6 +345,7 @@
       disabled={importing && !syncController}
       onclick={handleClose}
     />
+    {#if !webOnly}
     <Button
       label={m.import_import()}
       tone="info"
@@ -347,6 +353,7 @@
       disabled={!selectedFile || importing}
       onclick={handleImport}
     />
+    {/if}
   {/if}
 {/snippet}
 
@@ -424,6 +431,12 @@
           <span class="pdot chatgpt"></span>
           <span>ChatGPT</span>
         </button>
+        {#each ["gemini", "grok"] as site}
+          <button class="provider-pill" class:selected={provider === site}
+            aria-pressed={provider === site} onclick={() => selectProvider(site as "gemini" | "grok")} disabled={importing}>
+            <span>{site === "gemini" ? "Gemini" : "Grok"}</span>
+          </button>
+        {/each}
       </div>
 
       {#if canSync}
@@ -442,7 +455,7 @@
               <Button size="sm" label={m.import_claude_stop()} tone="neutral" surface="outline" onclick={() => syncController?.abort()} />
             {:else}
               {#if activeHost || chromeState === "signed-out"}
-                <Button size="sm" label={m.import_claude_connect()} ariaLabel={activeHost ? undefined : provider === "chatgpt" ? m.import_chatgpt_signed_out() : m.import_claude_signed_out()} tone={chromeState === "signed-out" ? "info" : "neutral"} surface={chromeState === "signed-out" ? "soft" : "outline"} disabled={importing} onclick={connect} />
+                <Button size="sm" label={m.import_claude_connect()} ariaLabel={activeHost ? undefined : signInMessage} tone={chromeState === "signed-out" ? "info" : "neutral"} surface={chromeState === "signed-out" ? "soft" : "outline"} disabled={importing} onclick={connect} />
               {/if}
               <Button size="sm" label={m.import_claude_sync()} tone={chromeState === "signed-out" ? "neutral" : "info"} surface={chromeState === "signed-out" ? "outline" : "soft"} disabled={syncDisabled} onclick={sync} />
             {/if}
@@ -453,9 +466,9 @@
             {:else if chromeState === "disconnected"}
               <p class="hint">{m.import_claude_open_chrome()}</p>
             {:else if chromeState === "connected"}
-              <p class="hint">{provider === "chatgpt" ? m.import_chatgpt_tab_note() : m.import_claude_tab_note()}</p>
+              <p class="hint">{webOnly ? m.import_browser_tab_note({ provider: providerLabel }) : provider === "chatgpt" ? m.import_chatgpt_tab_note() : m.import_claude_tab_note()}</p>
             {:else if chromeState === "signed-out"}
-              <p class="hint">{provider === "chatgpt" ? m.import_chatgpt_signed_out() : m.import_claude_signed_out()}</p>
+              <p class="hint">{signInMessage}</p>
             {:else if chromeState === "extension-update"}
               <p class="hint">{m.import_claude_update_app()}</p>
             {/if}
@@ -478,7 +491,7 @@
         </Card>
       {/if}
 
-      {#if !syncController}
+      {#if !syncController && !webOnly}
         <p class="hint">
           {#if provider === "claude-ai"}
             {m.import_hint_claude({ json: "conversations.json", zip: ".zip" })}
@@ -511,6 +524,8 @@
             </span>
           {/if}
         </div>
+      {:else if webOnly}
+        <p class="hint">{m.import_browser_history_note()}</p>
       {:else if selectedFile}
         <div class="zone zone-file">
           <div class="file-row">

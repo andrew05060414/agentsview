@@ -40,9 +40,7 @@ beforeEach(async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string) => {
-      const file = url.endsWith("chatgpt_requests.txt")
-        ? "chatgpt_requests.txt"
-        : "claude_ai_requests.txt";
+      const file = url.split("/").at(-1)!;
       return new Response(readFileSync(`../internal/importer/${file}`, "utf8"));
     }),
   );
@@ -60,18 +58,34 @@ afterEach(() => {
 });
 
 async function request(path = "/api/organizations", platform = "claude-ai") {
-  message({ id: "a", path, platform, version: 2 });
+  message({ id: "a", path, platform, version: 3 });
   await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledOnce());
   return port.postMessage.mock.calls[0]![0];
 }
 
 describe("Chrome native host worker", () => {
+  it.each([
+    ["gemini", "/agentsview-sync/conversations?pinned=0&cursor=", "https://gemini.google.com"],
+    ["grok", "/rest/app-chat/conversations?pageSize=50&pageToken=", "https://grok.com"],
+  ])("routes %s reads to the matching isolated-world adapter", async (platform, path, origin) => {
+    expect(await request(path, platform)).toMatchObject({ status: 200, version: 3 });
+    expect(chrome.tabs.query).toHaveBeenCalledWith({ url: `${origin}/*`, discarded: false });
+    expect(chrome.scripting.executeScript).toHaveBeenCalledWith({
+      target: { tabId: 7 },
+      files: ["claude_fetch.js", `${platform}_fetch.js`],
+      world: "ISOLATED",
+    });
+    expect(chrome.scripting.executeScript.mock.calls.at(-1)![0].args).toEqual([
+      `${platform}Fetch`,
+      `${origin}${path}`,
+    ]);
+  });
   it("refuses unsupported paths before touching tabs", async () => {
-    message({ id: "a", path: "/api/settings", platform: "claude-ai", version: 2 });
+    message({ id: "a", path: "/api/settings", platform: "claude-ai", version: 3 });
     await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledOnce());
     expect(port.postMessage).toHaveBeenCalledWith({
       id: "a",
-      version: 2,
+      version: 3,
       status: 0,
       error: "Unsupported browser fetch path",
     });
@@ -87,7 +101,7 @@ describe("Chrome native host worker", () => {
       await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledOnce());
       expect(port.postMessage).toHaveBeenCalledWith({
         id: "a",
-        version: 2,
+        version: 3,
         status: 200,
         body: "chats",
       });
@@ -97,7 +111,7 @@ describe("Chrome native host worker", () => {
   it("fetches in an existing Claude tab and replies by id", async () => {
     expect(await request()).toEqual({
       id: "a",
-      version: 2,
+      version: 3,
       status: 200,
       body: "chats",
     });
@@ -127,7 +141,7 @@ describe("Chrome native host worker", () => {
     chrome.tabs.query.mockResolvedValue([]);
     expect(await request()).toEqual({
       id: "a",
-      version: 2,
+      version: 3,
       status: 200,
       body: "chats",
     });
@@ -155,7 +169,7 @@ describe("Chrome native host worker", () => {
     updated(7, { status: "complete" });
     expect(await pending).toEqual({
       id: "a",
-      version: 2,
+      version: 3,
       status: 200,
       body: "chats",
     });
@@ -166,7 +180,7 @@ describe("Chrome native host worker", () => {
     chrome.scripting.executeScript
       .mockResolvedValueOnce([{ result: true }])
       .mockResolvedValueOnce([{ result: { status: 200, body: '"'.repeat(32 * 1024 * 1024) } }]);
-    expect(await request()).toEqual({ id: "a", version: 2, status: 413 });
+    expect(await request()).toEqual({ id: "a", version: 3, status: 413 });
   });
 
   it.each([null, {}, { status: "200" }])(
@@ -177,7 +191,7 @@ describe("Chrome native host worker", () => {
         .mockResolvedValueOnce([{ result }]);
       expect(await request()).toEqual({
         id: "a",
-        version: 2,
+        version: 3,
         status: 0,
         error: "The browser page changed during Sync; try Sync again",
       });
@@ -200,7 +214,7 @@ describe("Chrome native host worker", () => {
       ),
     ).toEqual({
       id: "a",
-      version: 2,
+      version: 3,
       status: 200,
       body: "conversations",
     });

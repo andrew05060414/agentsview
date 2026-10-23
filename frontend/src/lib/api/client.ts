@@ -456,6 +456,18 @@ export async function syncChatGPTChrome(
   return readImportResponse(response, cb);
 }
 
+export async function syncWebChrome(
+  provider: "gemini" | "grok",
+  cb?: ImportCallbacks,
+  signal?: AbortSignal,
+): Promise<ImportStats> {
+  const response =
+    provider === "gemini"
+      ? await ImportService.postApiV1ImportGeminiSync({ signal })
+      : await ImportService.postApiV1ImportGrokSync({ signal });
+  return readImportResponse(response, cb);
+}
+
 export async function importClaudeAI(file: File, cb?: ImportCallbacks): Promise<ImportStats> {
   return readImportResponse(
     await ImportService.postApiV1ImportClaudeAi({ file }, undefined, {
