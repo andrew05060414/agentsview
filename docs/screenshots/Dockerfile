@@ -1,5 +1,5 @@
 # Stage 1: Build agentsview binary
-FROM golang:1.27.2-bookworm AS builder
+FROM golang:1.27.3-bookworm AS builder
 
 ENV GOPROXY="https://proxy.golang.org|direct"
 
@@ -29,7 +29,7 @@ RUN VITE_PROJECT_MAPPING_WORKSPACE=true make build VERSION="$AV_VERSION" COMMIT=
 RUN cp agentsview /bin/agentsview
 
 # Stage 2: Run Playwright screenshots
-FROM node:24-bookworm
+FROM node:24.22.1-bookworm
 
 WORKDIR /work
 

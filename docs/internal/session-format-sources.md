@@ -140,6 +140,13 @@ evidence; they do not establish whether a tool helped the task.
 
 ## Claude Code (`claude`)
 
+- **Dialogue projection:** Reverified 2026-10-17 against the shared block parser
+  and ingest fixtures. Text blocks retain literal thinking and tool markers;
+  separate thinking blocks remain available as reasoning. Cowork, iCodeMate
+  CLI, and Qoder share this parser. Amp and OpenClaude use the same block
+  extraction. Hosted changes to dialogue derivation alone preserve session
+  identity and content revisions. Parser changes to other fields, such as Pi
+  reasoning text, still produce a new revision.
 - **Launch evidence (2026-10-07):** Claude Code 2.1.293's bundled CLI launch
   initializer records `entrypoint=sdk-cli` for print-mode launches and `cli`
   for interactive terminal launches; SDK libraries use `sdk-py` or `sdk-ts`.
@@ -2154,6 +2161,17 @@ schemas keep their existing ordering behavior.
 
 ## OpenHands (`openhands`)
 
+- **Action event shape:** Reverified 2026-10-17 against the SDK's
+  [ActionEvent](https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-sdk/openhands/sdk/event/llm_convertible/action.py).
+  `thought` contains text blocks; `reasoning_content` and `thinking_blocks`
+  carry reasoning, and `action` and `tool_call` carry the tool invocation.
+- **Dialogue projection:** Reverified 2026-10-17 against parser fixtures.
+  Structured text blocks retain literal markers separately from reasoning and
+  tool calls. Unpaired observations retain their stored-content `message`
+  search behavior and add no tool call. The `thinking` source on SQLite,
+  PostgreSQL, DuckDB, and ClickHouse searches reasoning with substring or
+  regex mode; source-less sessions and v4 imports retain their stored-content
+  fallback.
 - **Format:** A CLI conversation directory containing `base_state.json` and one
   JSON file per event under `events/`; Agentsview also fingerprints optional
   legacy `TASKS.json` files.
@@ -2191,6 +2209,9 @@ schemas keep their existing ordering behavior.
 
 ## Cursor (`cursor`)
 
+- **Dialogue projection:** Reverified 2026-10-17 against the JSONL parser and
+  shared block fixtures. Assistant text and thinking blocks remain separate.
+  Cursor IDE uses a different parser.
 - **Format:** Legacy text and newer JSONL transcripts under per-project
   `agent-transcripts` directories in three layouts: flat (`<id>.ext`), nested
   (`<id>/<id>.ext`), and subagent (`<parent>/subagents/<id>.ext`), where a
@@ -2573,6 +2594,10 @@ schemas keep their existing ordering behavior.
 
 ## Pi (`pi`)
 
+- **Dialogue projection:** Reverified 2026-10-17 against Pi block-order and
+  ingest fixtures. Text blocks retain quoted markers, thinking blocks populate
+  `thinking_text`, and tool calls retain their separate inputs and results.
+  OMP, OMO, Prime Agent, and StepCode share this parser.
 - **Format:** A tree-structured JSONL log with a session header and entries
   connected by `id` and `parentId`.
 - **Evidence:** `source`.
@@ -2986,6 +3011,9 @@ schemas keep their existing ordering behavior.
 
 ## OpenClaw (`openclaw`)
 
+- **Dialogue projection:** Reverified 2026-10-17 against parser fixtures.
+  Structured text blocks retain literal markers separately from reasoning and
+  tool calls.
 - **Format:** Per-agent session JSONL managed by the OpenClaw session store.
 - **Evidence:** `source`.
 - **Upstream:** Clone `https://github.com/openclaw/openclaw.git` at
@@ -3052,6 +3080,9 @@ schemas keep their existing ordering behavior.
 
 ## QClaw (`qclaw`)
 
+- **Dialogue projection:** Reverified 2026-10-17 against parser fixtures.
+  Structured text blocks retain literal markers separately from reasoning and
+  tool calls.
 - **Format:** OpenClaw-compatible agent session JSONL with QClaw-specific root
   discovery.
 - **Evidence:** `no-public-source`.
@@ -3200,20 +3231,21 @@ schemas keep their existing ordering behavior.
 - **Freshness:** Sync stores an FNV-64a hash of the list's `updated_at`, visible
   leaf, stored message count, transcript revision, title, and end time in
   `provider_freshness`, keyed by `claude-ai` and session ID. Resync and
-  `ResetAllMtimes` clear it. A zip re-import that changes stored text, count,
-  or title triggers a detail fetch. Title-only repairs count as updates and
-  send session refresh notifications. Reverified 2026-10-11 with reconstructed
-  fixtures in `TestSyncClaudeAIZipTitleFreshness` and
-  `TestClaudeAISyncMutationNotifications`. Only ChatGPT usage-only sync refreshes
-  counts and end time for shorter snapshots with unchanged retained rows before
-  caching freshness. Claude.ai keeps the longer archive, verified by
-  `TestSyncClaudeAIUsageArchiveShorterBranchKeepsLonger`. Sync stores messages
-  in the same
+  `ResetAllMtimes` clear it. The hash includes a selected-branch-counts marker
+  to refresh older cached counts once. A zip re-import that changes stored
+  text, count, or title triggers a detail fetch. Title-only repairs count as
+  updates and send session refresh notifications. Reverified 2026-10-11 with
+  reconstructed fixtures in `TestSyncClaudeAIZipTitleFreshness` and
+  `TestClaudeAISyncMutationNotifications`. Sync stores messages in the same
   shape as zip import, without source UUIDs. Pins match by role, text, and
   occurrence rank. Reverified 2026-10-08 against the reconstructed list and
   detail fixtures and `TestSyncClaudeAIResyncRestoresTranscript`,
   `TestSyncClaudeAIZipFreshness`, `TestSyncClaudeAIZipSameCountFreshness`, and
-  `TestSyncClaudeAIBranchSwitch`. Shorter zip exports remain refused. See
+  `TestSyncClaudeAIBranchSwitch`. Usage-only message and user-turn counts
+  follow the selected branch, including shorter branches. Verified
+  2026-10-22 with the reconstructed fixture in
+  `TestSyncClaudeAIUsageArchiveShorterBranchUpdatesCounts`, rather than a live
+  observation of count behavior. Shorter zip exports remain refused. See
   [Sync Claude.ai chats](https://agentsview.io/docs/chat-import/#sync-claudeai-chats)
   for branch updates and Trash copies.
 - **Limits:** Browser reads and decoded relay responses are capped at 32 MiB.
@@ -3603,6 +3635,9 @@ schemas keep their existing ordering behavior.
 
 ## Devin CLI (`devin`)
 
+- **Dialogue projection:** Reverified 2026-10-17 against parser fixtures.
+  Structured text blocks retain literal markers separately from reasoning and
+  tool calls.
 - **Format:** `cli/sessions.db` for session metadata plus transcript JSON
   artifacts. The `sessions.created_at`, `sessions.last_activity_at`, and
   `message_nodes.created_at` columns are Unix epoch seconds (not
@@ -4011,8 +4046,19 @@ schemas keep their existing ordering behavior.
   when present. Agentsview avoids double counting and catalog-prices usage. No
   provider USD cost is consumed.
 - **Agentsview:** `internal/parser/antigravity_cli.go`,
-  `internal/parser/antigravity_crypto.go`, and
-  `internal/parser/antigravity_cli_provider.go`. The CLI `history.jsonl`
+  `internal/parser/antigravity_crypto.go`,
+  `internal/parser/antigravity_brain_transcript.go`, and
+  `internal/parser/antigravity_cli_provider.go`. Plaintext brain transcripts
+  at `brain/<uuid>/.system_generated/logs/transcript.jsonl` are folded into
+  CLI sessions alongside `.db` `gen_metadata` token usage. A brain transcript
+  replaces the SQLite decode only when every SQLite step has a transcript line
+  at the same `step_index`, and every decoded, user, or planner step's line
+  has content; otherwise it is a fallback, and `history.jsonl` prompts it
+  lacks are added back. Generation metadata moves only onto the model's own
+  transcript entries. Checkpointed WAL databases on read-only mounts without
+  `.db-shm` or framed `-wal` sidecars fall back to `immutable=1`. An
+  unreadable database fails the parse and keeps the archived session unless a
+  trajectory sidecar supplies the transcript. The CLI `history.jsonl`
   `workspace` value and the current CLI's `cache/last_conversations.json`
   workspace-to-conversation mapping are authoritative session CWD sources when
   the workspace is an absolute path. Agentsview prefers the first valid
@@ -4032,6 +4078,9 @@ schemas keep their existing ordering behavior.
 
 ## iFlow CLI (`iflow`)
 
+- **Dialogue projection:** Reverified 2026-10-17 against the observed-format
+  ingest fixture. Assistant thinking blocks populate `thinking_text`; text
+  blocks supply dialogue. This adds no upstream format claim.
 - **Format:** Claude-like JSONL with UUID/parent UUID links and streaming
   message records.
 - **Evidence:** `no-public-source`.
@@ -4204,16 +4253,16 @@ schemas keep their existing ordering behavior.
   and cache-creation tokens with model data. Agentsview catalog-prices the
   normalized usage unless `metadata.cost_source` is `"provider"` and
   `metadata.cost` is a valid non-negative USD amount. In that case it imports
-  an exact-cost usage event, retaining message token display fields but not
-  a duplicate billable message token row. Reverified 2026-10-20 against
-  gptme commit `54c3a29fc3d5089f211528e206b50d7ee3f775c8`:
+  an exact-cost usage event, retaining message token display fields but not a
+  duplicate billable message token row. Reverified 2026-10-20 against gptme
+  commit `54c3a29fc3d5089f211528e206b50d7ee3f775c8`:
   [`_record_usage`](https://github.com/gptme/gptme/blob/54c3a29fc3d5089f211528e206b50d7ee3f775c8/gptme/llm/llm_openai.py#L317-L398)
   writes this marker only for reported direct OpenRouter costs, including
   zero; estimates, BYOK fees and proxied routes do not receive the marker.
   Parser data version 141 reparses unchanged gptme sources in place to import
-  these events without changing source or session identities.
-  Reverified 2026-10-20 at the pinned commit: assistant metadata stores the
-  requested model ID, including any `@host` provider pin
+  these events without changing source or session identities. Reverified
+  2026-10-20 at the pinned commit: assistant metadata stores the requested
+  model ID, including any `@host` provider pin
   ([metadata](https://github.com/gptme/gptme/blob/8f71713f3d1151b3141927aa014db62b9d756117/gptme/llm/llm_openai.py#L357)).
   The suffix is a comma-separated OpenRouter host allowlist
   ([routing](https://github.com/gptme/gptme/blob/8f71713f3d1151b3141927aa014db62b9d756117/gptme/llm/llm_openai.py#L1579-L1588))
@@ -4244,11 +4293,45 @@ schemas keep their existing ordering behavior.
   `<session-id>.jsonl`. This is a user-reported local observation, not
   producer-side evidence, and does not establish storage behavior for all
   Qoder CN releases or platforms.
+- **Title evidence:** Both macOS builds keep session titles in a `chat_sessions`
+  table inside the app's Electron user-data database:
+  `~/Library/Application Support/com.qoder.app.stable/main.sqlite` titles
+  `~/.qoder/projects`, and `…com.qodercn.app.stable/main.sqlite` titles
+  `~/.qoder-cn/projects`. `chat_sessions.session_id` is the transcript file's
+  name without `.jsonl`. The table has more columns than Agentsview reads, and
+  the two builds' column sets differ, so only `session_id` and `title` are
+  selected. The database is read with ordinary read-only locking, like every
+  other live app database. The installed-app schema and paths above are
+  single-machine user-side observations, not producer-side evidence, and do
+  not establish behavior for other Qoder releases. A root is bound to its
+  database only by a canonical absolute home-anchored path. Each title lookup
+  resolves the default-root symlinks to match the configured canonical root.
+  Transcript membership is lexical under either the unresolved or resolved
+  default root. No title store is confirmed for `~/.qoderwork/projects` or the
+  three `SharedClientCache/cli/projects` roots. See the
+  [usage guide](https://agentsview.io/docs/usage/#session-browser) for title
+  precedence and sync behavior.
+- **Title store on Linux and Windows:** The Linux package
+  `https://download.qoder.com/qoder-app/releases/latest/Qoder-linux-amd64.deb`
+  (version 0.4.9, inspected 2026-10-22 without running it) ships
+  `resources/product.json` with `"dataDirectoryName": "com.qoder.app.stable"`.
+  Its Electron bundle names `main.sqlite` and `chat_sessions` and resolves
+  `appData` with `XDG_CONFIG_HOME`, `.config`, and `APPDATA`. A
+  [Qoder forum report](https://forum.qoder.com/t/qoder/12133) for Qoder CN
+  0.1.0 on Windows gives the data path as `%APPDATA%\com.qodercn.app.stable\`.
+  Agentsview therefore resolves the store under Electron's `appData`
+  directory, which `os.UserConfigDir` matches: `$XDG_CONFIG_HOME` or
+  `~/.config` on Linux and `%APPDATA%` on Windows. The Linux path is inferred
+  from the package and the Electron convention, not observed on an installed
+  machine. The bundle also lets a user move the data directory, and Agentsview
+  does not follow a moved directory.
 - **Usage and cost:** The consumed files provide transcript and model/session
   metadata but no authoritative token, cache, reasoning, credit, or USD events
   to Agentsview.
 - **Agentsview:** `internal/parser/qoder.go` and
-  `internal/parser/qoder_provider.go`.
+  `internal/parser/qoder_provider.go`, with titles read through
+  `internal/parser/qoder_titles.go` and applied per sync pass in
+  `internal/sync/native_titles.go`.
 
 ## QwenPaw (`qwenpaw`)
 

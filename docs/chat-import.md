@@ -3,10 +3,11 @@ title: Chat Import
 description: Import Claude.ai, ChatGPT, and Gemini Apps conversations into AgentsView
 ---
 
-AgentsView can import your conversation history from Claude.ai,
-ChatGPT, and Gemini Apps. These services let you export your data as a zip
-file — AgentsView reads these exports and adds the conversations
-to your local database alongside your agent coding sessions.
+Bring Claude.ai, ChatGPT, and Gemini Apps conversations into the same searchable
+archive as your coding sessions. [Sync Claude.ai through Chrome](#sync-claudeai-chats)
+to fetch new and changed chats, or import the services' exported files below.
+ChatGPT dot, Codex web, and Codex cloud task chats use the separate opt-in
+[Codex Cloud source](/docs/configuration/#codex-cloud).
 
 ## Exporting Your Data
 
@@ -129,6 +130,8 @@ until Chrome connects. **Not connected** asks you to open Chrome and shows the
 setup command and extension loading instructions. **Connected** enables **Sync**,
 which uses your existing Claude.ai session, including Google sign-in.
 
+![Claude.ai Sync with Chrome connected](/docs/assets/generated/screenshots/import-claude-sync.png)
+
 **Signed out** appears after Sync needs authentication. Click **Sign in**,
 finish in the Chrome profile with the AgentsView extension, then return and
 click **Sync**. Enable the extension in only one Chrome profile. Sync uses the
@@ -155,11 +158,14 @@ changes count as updates and refresh open session lists. Resync clears
 freshness, so the next Sync fetches each chat once. Search stays available
 during Sync.
 
-Changed chats show Claude.ai's visible branch, even when it has fewer turns. If
-a replacement loses a pin or note, Sync keeps the previous version in Trash with
-its pins and notes. Replacements that preserve every pin and note make no copy.
-Switching back on Claude.ai restores those turns, but dropped pins and notes
-stay in the Trash copy. Trashed and permanently deleted chats stay deleted.
+Changed chats show Claude.ai's visible branch, even when it has fewer turns.
+Usage-only archives also update their message and user-turn counts to follow
+that branch. The first Sync after upgrading refetches cached usage-only chat
+details once to repair their counts. If a replacement loses a pin or note, Sync
+keeps the previous version in Trash with its pins and notes. Replacements that
+preserve every pin and note make no copy. Switching back on Claude.ai restores
+those turns, but dropped pins and notes stay in the Trash copy. Trashed and
+permanently deleted chats stay deleted.
 
 Each chat has a 32 MiB response limit. Larger chats count as failed while Sync
 continues. An expired sign-in or two chat failures in a row ends Sync. Closing

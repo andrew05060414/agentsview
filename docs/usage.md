@@ -239,6 +239,11 @@ the results through their normal pushes.
 
 ![Tool usage](/docs/assets/generated/screenshots/tool-usage.png)
 
+![Sessions and calls behind a selected tool rate](/docs/assets/generated/screenshots/tool-rate-evidence.png)
+
+For a model's assessment of one session, use
+[Analyze tool effectiveness](/docs/recall/#tool-effectiveness-reports).
+
 ### Top Skills
 
 The Top Skills panel ranks skill-backed tool calls by call count, session count,
@@ -425,6 +430,25 @@ Antigravity sessions show the conversation title Antigravity saves in
 `conversation_summaries.db`. Renames appear shortly after that file changes,
 or on the next `agentsview sync`. Names set in AgentsView still win.
 
+Qoder's database title lookup applies to `~/.qoder/projects` and
+`~/.qoder-cn/projects`. The Qoder app stores titles in `main.sqlite` under
+its data directory: `com.qoder.app.stable` (or `com.qodercn.app.stable` for
+Qoder CN) inside `~/Library/Application Support` on macOS,
+`$XDG_CONFIG_HOME` or `~/.config` on Linux, and `%APPDATA%` on Windows. If
+you moved the app's data directory, AgentsView does not find it. Names take
+precedence in this order:
+
+1. A name set in AgentsView.
+2. A non-blank database title.
+3. A file-side name, with a sidecar title ahead of an in-chat rename.
+
+Renames appear at the next sync pass: a watched change in any agent root,
+manual `agentsview sync`, or startup. For these two roots, blank database
+titles or read errors preserve the archived name. A missing database, schema,
+or session row uses non-empty file-side names; an empty file-side name
+preserves the archived title. Other Qoder roots use file-side names, including
+clearing the archived title when empty.
+
 When a session has a native resume target, the sidebar also exposes a direct
 native session link so supported agents can reopen their own session instead of
 only navigating inside AgentsView.
@@ -499,6 +523,13 @@ filter categories that can be combined:
 
 ![Session filter dropdown](/docs/assets/generated/screenshots/session-filters.png)
 
+![Label and pull request filters](/docs/assets/generated/screenshots/session-label-filters.png)
+
+Label and pull-request filters can find child and automated sessions. The
+sidebar shows the containing tree; an explicit single-turn exclusion still
+applies. Use [launcher links](/docs/session-api/#agentsview-session-parent) to
+attach independently launched workers to their manager and roll up their costs.
+
 - **Starred** — toggle to show only starred sessions
 - **Recently Active** — toggle to show only sessions updated within the last 24
   hours
@@ -513,6 +544,11 @@ filter categories that can be combined:
   **Unclean**), tinted to match the indicator colors. The underlying
   `?termination=` URL parameter and API also accept the parser-side values
   `clean` and `awaiting_user`, but those aren't exposed as sidebar pills.
+- **Labels** — enter an exact label such as `ticket=example` and press Enter.
+  Add several labels to require all of them. Create labels through the
+  [CLI or API](/docs/session-api/#agentsview-session-label).
+- **Pull request** — enter `owner/repo#123` and press Enter to find sessions
+  linked to that pull request by Claude Code.
 - **Min Prompts** — filter to sessions with at least 2, 3, 5, or 10 user
   messages
 - **Include single-turn** — toggle to include sessions with one or fewer user
@@ -1026,7 +1062,7 @@ sessions. Results update after a 300ms typing pause.
 
 !!! tip
 
-    For deeper searches across full transcripts — including tool inputs, tool result
+    For deeper searches across full transcripts — including thinking, tool inputs, tool result
     content, and regex patterns — use the
     [`agentsview session search`](/docs/session-api/#agentsview-session-search) CLI
     or the `GET /api/v1/search/content` HTTP endpoint added in 0.30.0. The command

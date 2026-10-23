@@ -91,7 +91,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
-          node-version: "24"
+          node-version: "24.22.1"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -149,7 +149,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
-          node-version: "26"
+          node-version: "26.12.1"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -169,12 +169,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.15"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
 
       - name: Install docs check tools
         run: |
@@ -195,8 +195,10 @@ jobs:
           bash desktop/scripts/test-repair-appimage-diricon.sh
 
   test:
-    name: Go Test (${{ matrix.name }})
+    name: Go ${{ matrix.testSet == 'lint' && 'Lint' || 'Test' }} (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    env:
+      MSYS2_PACKAGES: mingw-w64-x86_64-gcc ${{ matrix.testSet == 'lint' && 'make' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -215,6 +217,9 @@ jobs:
             testSet: evalingest
           - os: windows-latest
             name: windows-latest
+          - os: windows-latest
+            name: windows-latest
+            testSet: lint
           - os: macos-latest
             name: macos-latest
     steps:
@@ -228,6 +233,7 @@ jobs:
         uses: ./.github/actions/windows-go-paths
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        id: setup_go
         with:
           go-version-file: go.mod
           cache: false
@@ -251,7 +257,7 @@ jobs:
         with:
           msystem: MINGW64
           update: false
-          install: mingw-w64-x86_64-gcc
+          install: ${{ env.MSYS2_PACKAGES }}
           path-type: inherit
 
       - name: Setup MinGW (Windows, retry on transient failure)
@@ -260,7 +266,7 @@ jobs:
         with:
           msystem: MINGW64
           update: false
-          install: mingw-w64-x86_64-gcc
+          install: ${{ env.MSYS2_PACKAGES }}
           path-type: inherit
 
       - name: Restore pricing snapshot
@@ -268,20 +274,20 @@ jobs:
 
       - name: Run Go tests (Linux, single package)
         if: runner.os == 'Linux' && matrix.package != ''
-        run: go test -tags "fts5" -coverprofile=coverage.out ${{ matrix.package }} -v -count=1 -timeout=20m
+        run: go test -tags "fts5" ${{ matrix.package }} -v -count=1 -timeout=20m
         env:
           CGO_ENABLED: "1"
 
-      # Keep exclusions aligned with the race job's Other packages shard.
+      # Sync and DuckDB run in separate normal Linux jobs.
       - name: Run other Go tests (Linux)
         if: runner.os == 'Linux' && matrix.testSet == 'other'
         shell: bash
-        run: go list -tags fts5 ./... | grep -vE '/internal/(duckdb|sync)$' | xargs go test -tags "fts5" -coverprofile=coverage.out -v -count=1 -timeout=20m
+        run: go list -tags fts5 ./... | grep -vE '/internal/(duckdb|sync)$' | xargs go test -tags "fts5" -v -count=1 -timeout=20m
         env:
           CGO_ENABLED: "1"
 
       - name: Run Go tests (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.testSet != 'lint'
         shell: pwsh
         run: |
           # Isolated packages run in their own jobs below so they do not
@@ -303,26 +309,61 @@ jobs:
         env:
           CGO_ENABLED: "1"
 
-      - name: Install Go linter (Windows)
-        if: runner.os == 'Windows'
+      - name: Resolve Windows linter version
+        id: windows_linter_version
+        if: runner.os == 'Windows' && matrix.testSet == 'lint'
         shell: bash
         run: |
-          version=$(sed -n 's/^version: *//p' .custom-gcl.yml)
-          bash scripts/retry.sh 3 5 go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$version"
-        env:
-          CGO_ENABLED: "1"
+          version="$(sed -nE "s/^[[:space:]]*GOLANGCI_LINT_VERSION[[:space:]]*[?:]?[[:space:]]*=[[:space:]]*//; T; s/#.*//; s/^[[:space:]\"']+//; s/[[:space:]\"']+$//; p; q" Makefile)"
+          if [ -z "$version" ]; then
+            echo "Makefile GOLANGCI_LINT_VERSION must be nonempty" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Run Go linters (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Restore Windows linter cache
+        if: runner.os == 'Windows' && matrix.testSet == 'lint'
+        uses: ./.github/actions/go-cache-restore
+        with:
+          group: lint-${{ runner.os }}-${{ runner.arch }}-${{ steps.windows_linter_version.outputs.version }}-${{ hashFiles('.custom-gcl.yml') }}-${{ steps.setup_go.outputs.go-version }}
+          include-go-cache: "false"
+          extra-path: ${{ runner.temp }}/golangci-lint
+
+      - name: Prepare Go linters (Windows)
+        id: prepare_windows_linter
+        if: runner.os == 'Windows' && matrix.testSet == 'lint'
+        shell: msys2 {0}
         run: |
-          # Windows-only files never reach the Linux lint job.
-          & "$(go env GOPATH)\bin\golangci-lint.exe" custom --name custom-gcl
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./custom-gcl run ./...
+          set -e
+          export GOBIN="$GOLANGCI_LINT_CACHE/bin"
+          linter_dir="$(cygpath -u "$GOBIN")"
+          export PATH="$linter_dir:$PATH"
+          if [ -f "$linter_dir/custom-gcl.exe" ]; then exit 0; fi
+          mkdir -p "$linter_dir"
+          bash scripts/retry.sh 3 5 make lint-tools
+          make nilaway-golangci-build
+          mv custom-gcl.exe "$linter_dir/custom-gcl.exe"
         env:
           CGO_ENABLED: "1"
           GOLANGCI_LINT_CACHE: ${{ runner.temp }}/golangci-lint
+
+      - name: Run Go linters (Windows)
+        if: runner.os == 'Windows' && matrix.testSet == 'lint'
+        shell: pwsh
+        run: |
+          # Windows-only files never reach the Linux lint job.
+          $linterDir = Join-Path $env:GOLANGCI_LINT_CACHE 'bin'
+          $customLinter = Join-Path $linterDir 'custom-gcl.exe'
+          & $customLinter run ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        env:
+          CGO_ENABLED: "1"
+          GOLANGCI_LINT_CACHE: ${{ runner.temp }}/golangci-lint
+
+      - name: Save Windows linter cache
+        if: ${{ !cancelled() && runner.os == 'Windows' && matrix.testSet == 'lint' && steps.prepare_windows_linter.outcome == 'success' }}
+        continue-on-error: true
+        uses: ./.github/actions/go-cache-save
 
       - name: Run archive, CLI, signing, and volume identity tests (macOS)
         if: runner.os == 'macOS'
@@ -343,20 +384,8 @@ jobs:
         if: matrix.testSet == 'evalingest'
         run: make test-evalingest
 
-      - name: Upload coverage
-        if: runner.os == 'Linux' && matrix.testSet != 'evalingest'
-        id: codecov
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
-        with:
-          files: coverage.out
-        continue-on-error: true
-
-      - name: Warn on coverage upload failure
-        if: runner.os == 'Linux' && steps.codecov.outcome == 'failure'
-        run: echo "::warning::Codecov upload failed"
-
       - name: Save Go caches
-        if: runner.os != 'Linux' || matrix.testSet == 'other'
+        if: matrix.testSet != 'lint' && (runner.os != 'Linux' || matrix.testSet == 'other')
         uses: ./.github/actions/go-cache-save
 
   # Isolated Windows suites share setup; each matrix entry gets its own runner.
@@ -613,12 +642,23 @@ jobs:
         include:
           - name: Sync A-R
             runner: ubuntu-latest
-            testSet: sync
+            package: ./internal/sync
             run: *sync-test-prefix
           - name: Sync remaining
             runner: ubuntu-latest
-            testSet: sync
+            package: ./internal/sync
             skip: *sync-test-prefix
+          - name: CLI A-P
+            runner: ubuntu-latest
+            package: ./cmd/agentsview
+            run: *cli-test-prefix
+          - name: CLI remaining
+            runner: ubuntu-latest
+            package: ./cmd/agentsview
+            skip: *cli-test-prefix
+          - name: Database and Server
+            runner: ubuntu-latest
+            package: ./internal/db ./internal/server
           - name: Other packages
             runner: ubuntu-latest
             testSet: other
@@ -647,19 +687,27 @@ jobs:
       - name: Restore pricing snapshot
         run: go run ./internal/pricing/cmd/litellm-snapshot -restore
 
-      # internal/duckdb is excluded from -race (CGo-heavy, race-insensitive,
-      # and 7+ minutes on its own); it is still covered without -race by the
-      # Linux DuckDB shard. Limit package fan-out because the race
-      # detector makes highly parallel runs slow enough to exhaust deadlines.
+      # Keep exclusions aligned with the explicit race matrix packages.
+      # DuckDB runs without -race in its Linux shard. Limit package fan-out
+      # because highly parallel race runs can exhaust deadlines.
       - name: Run Go tests (race detector)
         if: matrix.testSet == 'other'
-        run: go list ./... | grep -vE '/internal/(duckdb|sync)$' | xargs go test -p 4 -tags "fts5" -race -count=1 -timeout=20m
+        run: go list ./... | grep -vE '/(cmd/agentsview|internal/(db|server|duckdb|sync))$' | xargs go test -p 4 -tags "fts5" -race -count=1 -timeout=20m
         env:
           CGO_ENABLED: "1"
 
-      - name: Run sync tests (race detector)
-        if: matrix.testSet == 'sync'
-        run: go test -tags "fts5" -race ./internal/sync -run '${{ matrix.run || '.' }}' -skip '${{ matrix.skip || '^$' }}' -count=1 -timeout=20m
+      - name: Run ${{ matrix.name }} tests (race detector)
+        if: matrix.package != ''
+        run: go test -tags "fts5" -race ${{ matrix.package }} -run '${{ matrix.run || '.' }}' -skip '${{ matrix.skip || '^$' }}' -count=1 -timeout=20m
+        env:
+          CGO_ENABLED: "1"
+
+      # This job owns the shared cache, including tests run by the other shards.
+      - name: Warm moved race test builds for the next run
+        if: matrix.testSet == 'other' && github.event_name == 'push' && github.ref == 'refs/heads/main' && env.GO_CACHE_HIT != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/race-test-binaries"
+          go test -p 4 -tags "fts5" -race -c -o "$RUNNER_TEMP/race-test-binaries/" ./cmd/agentsview ./internal/db ./internal/server
         env:
           CGO_ENABLED: "1"
 
@@ -677,7 +725,7 @@ jobs:
           persist-credentials: false
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2
         with:
           workspaces: desktop/src-tauri -> target
           # Pull requests restore main's build without saving their own copy.
@@ -786,7 +834,12 @@ jobs:
           TEST_CLICKHOUSE_URL: clickhouse://localhost:19000/default
 
   e2e:
+    name: e2e (${{ matrix.browser }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, webkit]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -811,7 +864,7 @@ jobs:
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
-          node-version: "24"
+          node-version: "24.22.1"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -847,11 +900,11 @@ jobs:
           sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i -E \
             -e 's|https?://(azure\.)?archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
             -e 's|http://security\.ubuntu\.com/ubuntu|https://security.ubuntu.com/ubuntu|g' {} +
-          npx playwright install --with-deps chromium webkit
+          npx playwright install --with-deps ${{ matrix.browser }}
         working-directory: frontend
 
       - name: Run E2E tests
-        run: npx playwright test --reporter=list
+        run: npx playwright test --reporter=list --project=${{ matrix.browser }}
         working-directory: frontend
         env:
           E2E_PREBUILT_FIXTURE: /tmp/testfixture
@@ -859,6 +912,7 @@ jobs:
           PROJECT_MAPPING_WORKSPACE_E2E_ENABLED: "true"
 
       - name: Run DuckDB E2E tests
+        if: matrix.browser == 'chromium'
         run: make e2e-duckdb
         env:
           E2E_PREBUILT_FIXTURE: /tmp/testfixture

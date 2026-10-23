@@ -12,17 +12,22 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 const (
 	selectMessageCols = `id, session_id, ordinal, role, content,
-		thinking_text,
-		COALESCE(timestamp, '') AS timestamp,
+		thinking_text, dialogue_text, ` + selectMessageMetadataCols
+
+	// Bounded transcript loaders don't need the search projection.
+	selectTranscriptMessageCols = `id, session_id, ordinal, role, content,
+		thinking_text, NULL AS dialogue_text, ` + selectMessageMetadataCols
+
+	selectMessageMetadataCols = `COALESCE(timestamp, '') AS timestamp,
 		has_thinking, has_tool_use, content_length,
 		is_system,
 		model, reasoning_effort, token_usage, context_tokens, output_tokens, provider_id,
@@ -32,7 +37,7 @@ const (
 		source_parent_uuid, is_sidechain, is_compact_boundary`
 
 	insertMessageCols = `session_id, ordinal, role, content,
-		thinking_text,
+		thinking_text, dialogue_text,
 		timestamp, has_thinking, has_tool_use, content_length,
 		is_system,
 		model, reasoning_effort, token_usage, context_tokens, output_tokens, provider_id,
@@ -53,7 +58,7 @@ const (
 	// Keep multi-row INSERT statements below SQLite's historic
 	// 999-variable limit so binaries built against older SQLite
 	// versions still work.
-	messageInsertRowsPerStmt         = 35  // 28 params per row
+	messageInsertRowsPerStmt         = 34  // 29 params per row
 	toolCallInsertRowsPerStmt        = 66  // 15 params per row
 	toolResultEventInsertRowsPerStmt = 70  // 14 params per row
 	toolCallAgentStateRowsPerStmt    = 142 // 7 params per row
@@ -515,6 +520,9 @@ type Message struct {
 	Ordinal   int    `json:"ordinal"`
 	Role      string `json:"role"`
 	Content   string `json:"content"`
+	// DialogueText is content without inline thinking and tool renderings,
+	// nil falls back to Content for unclassified rows and v4 imports.
+	DialogueText *string `json:"-"`
 	// ThinkingText holds the concatenated text of all thinking
 	// blocks for this message; "" if none.
 	ThinkingText      string         `json:"thinking_text"`
@@ -788,15 +796,15 @@ func (db *DB) GetAllMessages(
 	ctx context.Context, sessionID string,
 ) ([]Message, error) {
 	db.messagesLoadCount.Add(1)
-	return allMessagesWithQuerier(ctx, db.getReader(), sessionID)
+	return allMessagesWithQuerier(ctx, db.getReader(), sessionID, selectMessageCols)
 }
 
-func allMessagesWithQuerier(ctx context.Context, q messageRowsQuerier, sessionID string) ([]Message, error) {
+func allMessagesWithQuerier(ctx context.Context, q messageRowsQuerier, sessionID, columns string) ([]Message, error) {
 	rows, err := q.QueryContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM messages
 		WHERE session_id = ?
-		ORDER BY ordinal ASC`, selectMessageCols), sessionID)
+		ORDER BY ordinal ASC`, columns), sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("querying all messages: %w", err)
 	}
@@ -1297,7 +1305,7 @@ func insertMessagesTx(
 	for start := 0; start < len(msgs); start += messageInsertRowsPerStmt {
 		end := min(start+messageInsertRowsPerStmt, len(msgs))
 		batch := msgs[start:end]
-		args := make([]any, 0, len(batch)*28)
+		args := make([]any, 0, len(batch)*29)
 		for i, m := range batch {
 			id := nextID + int64(start+i)
 			ids[start+i] = id
@@ -1307,7 +1315,7 @@ func insertMessagesTx(
 		query := fmt.Sprintf(
 			"INSERT INTO messages (id, %s) VALUES %s",
 			insertMessageCols,
-			multiRowPlaceholders(len(batch), 28),
+			multiRowPlaceholders(len(batch), 29),
 		)
 		if _, err := tx.Exec(query, args...); err != nil {
 			first := batch[0].Ordinal
@@ -2391,8 +2399,8 @@ func deleteSessionMessageRowsTx(
 		// Bulk-delete the FTS entries first so the later row delete
 		// does not re-tokenize large message blobs through delete triggers.
 		if _, err := tx.Exec(
-			`INSERT INTO `+table.name+`(`+table.name+`, rowid, content)
-			 SELECT 'delete', id, content FROM messages WHERE session_id = ?`,
+			`INSERT INTO `+table.name+`(`+table.name+`, rowid, rendered, content)
+			 SELECT 'delete', id, rendered, content FROM message_search_content WHERE session_id = ?`,
 			sessionID,
 		); err != nil {
 			return fmt.Errorf("bulk-deleting %s entries: %w", table.name, err)
@@ -3226,7 +3234,7 @@ func scanMessages(rows MessageRows) ([]Message, error) {
 		var tokenUsage string
 		err := rows.Scan(
 			&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
-			&m.Content, &m.ThinkingText, &m.Timestamp,
+			&m.Content, &m.ThinkingText, &m.DialogueText, &m.Timestamp,
 			&m.HasThinking, &m.HasToolUse, &m.ContentLength,
 			&m.IsSystem,
 			&m.Model, &m.ReasoningEffort, &tokenUsage,
@@ -3320,100 +3328,16 @@ func (db *DB) MessageContentFingerprint(ctx context.Context, sessionID string) (
 	return sum, maximum, minimum, err
 }
 
-// SanitizeUTF8 strips NUL bytes, replaces invalid UTF-8 sequences,
-// and removes control runes (other than \n, \t, \r). PostgreSQL
-// enforces strict UTF-8 and rejects NUL in text columns, so the push
-// boundary applies this to every parser-derived string; the local
-// fingerprint builders below apply it too so local fingerprints stay
-// comparable to PG-readback fingerprints when a stored row carries
-// NUL bytes.
-//
-// The control-rune strip runs per rune, not per byte: C1 controls
-// (U+0080..U+009F) are valid two-byte UTF-8 and survive
-// strings.ToValidUTF8, so a terminal escape such as ESC ]0;...BEL
-// embedded in parsed content would otherwise persist intact. This
-// function is the single sanitization seam shared by the write path
+// SanitizeUTF8 applies stringutil.SanitizeUTF8. PostgreSQL enforces
+// strict UTF-8 and rejects NUL in text columns, so the push boundary
+// applies this to every parser-derived string; the local fingerprint
+// builders below apply it too so local fingerprints stay comparable to
+// PG-readback fingerprints when a stored row carries NUL bytes. It is
+// the single sanitization seam shared by the write path
 // (sync.validateAndSanitize), the local fingerprint builders, and the
-// PG push/readback path, so it MUST stay idempotent:
-// SanitizeUTF8(SanitizeUTF8(s)) == SanitizeUTF8(s). The byte-level
-// NUL strip is retained because it is the pg-push breaker fix and a
-// raw NUL must be removed before strings.ToValidUTF8 (which treats it
-// as valid).
+// PG push/readback path.
 func SanitizeUTF8(s string) string {
-	if isCleanText(s) {
-		return s
-	}
-	s = strings.ReplaceAll(s, "\x00", "")
-	s = strings.ToValidUTF8(s, "")
-	// Fast path: skip the rune scan and allocation when the string
-	// carries no control runes to strip.
-	if strings.IndexFunc(s, isStrippableControl) < 0 {
-		return s
-	}
-	return strings.Map(func(r rune) rune {
-		if isStrippableControl(r) {
-			return -1
-		}
-		return r
-	}, s)
-}
-
-// isCleanText reports whether SanitizeUTF8 would return s unchanged:
-// valid UTF-8 with no NUL or strippable control rune. Most transcript
-// text needs no repair, so one pass that skips ASCII decoding avoids
-// the separate NUL, UTF-8 and control scans of the repair path.
-func isCleanText(s string) bool {
-	const (
-		spaces = 0x2020202020202020
-		ones   = 0x0101010101010101
-		highs  = 0x8080808080808080
-	)
-	for i := 0; i < len(s); {
-		if len(s)-i >= 8 {
-			// Skip 8 bytes of printable ASCII (0x20..0x7e) at once.
-			// Subtracting spaces sets the high bit of a byte below 0x20
-			// or at 0xa0 and above; adding ones sets it for DEL and
-			// 0x80..0xfe. A borrow or carry only starts at a byte that
-			// is already flagged, so a clean block always yields zero; a
-			// false positive only sends bytes to the check below. Keep
-			// this inline: the compiler does not inline it as a separate
-			// function, which adds a call for every non-ASCII rune.
-			b := s[i : i+8]
-			word := uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 |
-				uint64(b[3])<<24 | uint64(b[4])<<32 | uint64(b[5])<<40 |
-				uint64(b[6])<<48 | uint64(b[7])<<56
-			if ((word-spaces)|(word+ones))&highs == 0 {
-				i += 8
-				continue
-			}
-		}
-		c := s[i]
-		if c < utf8.RuneSelf {
-			if c == 0x7f || c < 0x20 && c != '\n' && c != '\t' && c != '\r' {
-				return false
-			}
-			i++
-			continue
-		}
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size == 1 || isStrippableControl(r) {
-			return false
-		}
-		i += size
-	}
-	return true
-}
-
-// isStrippableControl reports whether r is a control rune that
-// SanitizeUTF8 removes. Newline, tab, and carriage return are
-// preserved because they are legitimate whitespace in message
-// content; every other control rune (C0 below U+0020, DEL, and the
-// C1 block U+0080..U+009F) is stripped.
-func isStrippableControl(r rune) bool {
-	if r == '\n' || r == '\t' || r == '\r' {
-		return false
-	}
-	return unicode.IsControl(r)
+	return stringutil.SanitizeUTF8(s)
 }
 
 // MessageTokenFingerprint returns an exact ordered fingerprint of
@@ -4190,7 +4114,7 @@ func (db *DB) GetMessageByOrdinal(ctx context.Context,
 	var tokenUsage string
 	err := row.Scan(
 		&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
-		&m.Content, &m.ThinkingText, &m.Timestamp,
+		&m.Content, &m.ThinkingText, &m.DialogueText, &m.Timestamp,
 		&m.HasThinking, &m.HasToolUse, &m.ContentLength,
 		&m.IsSystem,
 		&m.Model, &m.ReasoningEffort, &tokenUsage,

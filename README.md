@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-09
+last_edited: 2026-10-22
 ---
 
 # agentsview
@@ -8,13 +8,23 @@ Browse, search, and track costs across your AI coding agents. Your session
 archive stays on your machine unless you choose a feature that shares it.
 
 This README and the [documentation](https://agentsview.io/docs/) follow `main`.
-The latest release is **v0.45.0**. Check the
+The latest release is **v0.46.1**. Check the
 [changelog](https://agentsview.io/docs/changelog/) for what it includes.
 
-Version 0.45.0 adds Spanish, Junie/OMO/StepCode sessions, message-frequency
-charts, and conversation-memory plugins for Claude Code and Codex. Review tool
-errors and recovery in the transcript, approve extracted Recall entries, and
-compare prompt volume including cache reads and writes.
+Version 0.46.1 fixes Antigravity transcripts and read-only mounts, preserves
+repeated prompts, and restores container builds.
+
+Version 0.46.0 adds
+[Claude.ai Sync through Chrome](https://agentsview.io/docs/chat-import/#sync-claudeai-chats),
+opt-in
+[Codex cloud chats](https://agentsview.io/docs/configuration/#codex-cloud), and
+Muse Code and fx sessions. Preserve a retired machine's history with
+[local archives](https://agentsview.io/docs/commands/#agentsview-archive), or
+sync a remote machine over
+[SSH](https://agentsview.io/docs/remote-access/#ssh-remote-sync) without
+installing a daemon. Find work by label or linked pull request, narrow cost
+charts by project, and inspect tool effectiveness with transcript evidence.
+Connected assistants gain eight read-only MCP tools for the same archive.
 
 <p align="center">
   <img src="https://agentsview.io/assets/generated/screenshots/dashboard.png" alt="Analytics dashboard" width="720">
@@ -805,21 +815,20 @@ Troubleshooting:
 
 agentsview sends limited anonymous telemetry to PostHog: a `daemon_active` ping
 at most once per UTC day while the server runs. The browser checks with
-`app_opened` once a day; reloads and focus don't repeat it that day, and a disabled
-reply stops reports and visit tracking. See the
+`app_opened` once a day; reloads and focus don't repeat it that day, and a
+disabled reply stops reports and visit tracking. See the
 [telemetry configuration](docs/configuration.md#anonymous-daemon-telemetry) for
-scope and delivery limits.
-The server also sends `setup_finished` once per installation when the archive
-first has a session in the default session list, including orphaned sessions and
-excluding automated sessions and trash. Existing installs with such a session
-send it on their first start after upgrading. The web UI sends `visit_ended`
-with `surface: web` and visible visit duration in fixed buckets: `under_1m`,
-`1_to_5m`, `5_to_30m`, or `over_30m`. The web UI also reports searches (search
-mode), session views (the session's agent type), screen views (screen name, once
-per installation per UTC day on the server), exports (format), generated
-insights (insight kind), and analytics page views (page name), each with one
-value from a fixed list in the server that drops anything else. All events use
-a stable random install ID as the event `DistinctId`.
+scope and delivery limits. The server also sends `setup_finished` once per
+installation when the archive first has a session in the default session list,
+including orphaned sessions and excluding automated sessions and trash. Existing
+installs with such a session send it on their first start after upgrading. The
+web UI sends `visit_ended` with `surface: web` and visible visit duration in
+fixed buckets: `under_1m`, `1_to_5m`, `5_to_30m`, or `over_30m`. The web UI also
+reports searches (search mode), session views (the session's agent type), screen
+views (screen name, once per installation per UTC day on the server), exports
+(format), generated insights (insight kind), and analytics page views (page
+name), each with one value from a fixed list in the server that drops anything
+else. All events use a stable random install ID as the event `DistinctId`.
 [Feature outcomes](docs/configuration.md#anonymous-daemon-telemetry) also count
 empty searches, visible errors, and failed sync attempts. The events include
 `application=agentsview`, app version, commit, OS, and CPU architecture, with
@@ -847,7 +856,7 @@ ______________________________________________________________________
 
 ## Development
 
-Requires Go 1.27.2+ (CGO), Node.js 24.11+.
+Requires Go 1.27.3+ (CGO), Node.js 24.22.1+.
 
 ```bash
 make dev            # Go server (dev mode)
@@ -873,8 +882,8 @@ When the Docker CLI uses a non-default socket, export `DOCKER_HOST` for that
 socket before running the benchmark.
 
 Pre-commit and pre-push hooks via [prek](https://github.com/j178/prek): run
-`make lint-tools` and `make install-hooks` after cloning (requires `prek` and
-`uv`).
+`make lint-tools` and `make install-hooks` after cloning (requires `prek` 0.5.7
+or newer and `uv`).
 
 ### Project Layout
 
