@@ -182,13 +182,15 @@ func compareSessionFields(
 	// contrast first_message and started_at, also appended via
 	// appendTextFieldDiff, derive from the session head and are
 	// byte-stable across appends, so they stay strict.
-	before := len(diffs)
-	diffs = appendTextFieldDiff(
-		diffs, FieldSessionName,
-		stored.SessionName, prepared.SessionName,
-	)
-	if len(diffs) > before {
-		markIncrementalHistory(&diffs[len(diffs)-1], prepared.Agent)
+	if !prepared.PreserveSessionName {
+		before := len(diffs)
+		diffs = appendTextFieldDiff(
+			diffs, FieldSessionName,
+			stored.SessionName, prepared.SessionName,
+		)
+		if len(diffs) > before {
+			markIncrementalHistory(&diffs[len(diffs)-1], prepared.Agent)
+		}
 	}
 	diffs = appendTextFieldDiff(
 		diffs, FieldStartedAt,

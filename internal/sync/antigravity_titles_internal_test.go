@@ -14,6 +14,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
 type antigravityTitleQuerySpy struct {
@@ -37,7 +38,7 @@ func TestAntigravityUnrelatedChangedPathSkipsUnchangedStoreQueries(t *testing.T)
 	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
 	spy := &antigravityTitleQuerySpy{Store: archive, reader: archive}
 	engine.archiveStore = spy
-	engine.deferredAntigravityTitles = make(map[string]*string)
+	engine.deferredNativeTitles = make(map[string]*string)
 	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{store}))
 	require.Equal(t, [][]string{{"antigravity:" + dbtest.AntigravityTitleID}}, spy.queries)
 	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{filepath.Join(root, "unrelated")}))
@@ -59,7 +60,7 @@ func TestAntigravityFramelessWALEventsDoNotRereadStore(t *testing.T) {
 	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
 	spy := &antigravityTitleQuerySpy{Store: archive, reader: archive}
 	engine.archiveStore = spy
-	engine.deferredAntigravityTitles = make(map[string]*string)
+	engine.deferredNativeTitles = make(map[string]*string)
 	for _, size := range []int{0, 32} {
 		require.NoError(t, os.WriteFile(store+"-wal", make([]byte, size), 0o600))
 		require.NoError(t, engine.SyncPathsContext(t.Context(), []string{store + "-wal"}))
@@ -73,7 +74,28 @@ func TestAntigravityFramelessWALEventsDoNotRereadStore(t *testing.T) {
 	assert.Empty(t, spy.queries, "reader-created WAL events must not reread titles")
 }
 
-func TestAntigravityTitleFailureDoesNotRetryOtherAgents(t *testing.T) {
+func TestQoderTitleStoreOutsideWatchedRootsDoesNotRetry(t *testing.T) {
+	root, store := testjsonl.QoderTitleRoot(t)
+	transcript := testjsonl.WriteQoderTranscript(t, root, testjsonl.QoderTitleID, "hello")
+	testjsonl.SetQoderTitle(t, store, testjsonl.QoderTitleID, "First")
+	archive := openTestDB(t)
+	engine := NewEngine(t.Context(), archive, EngineConfig{AgentDirs: map[parser.AgentType][]string{parser.AgentQoder: {root}}, Machine: "host-a"})
+	t.Cleanup(engine.Close)
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{transcript}))
+	require.NoError(t, os.WriteFile(store, []byte("not a database"), 0o600))
+	stats, err := engine.SyncWatchBatchThenRun(t.Context(), WatchBatch{Paths: []string{filepath.Join(root, "unrelated")}}, nil, nil)
+	assert.Equal(t, 1, stats.Failed)
+	require.NoError(t, err, "an external Qoder store must not schedule a watch retry")
+	require.NoError(t, os.Remove(store))
+	testjsonl.SetQoderTitle(t, store, testjsonl.QoderTitleID, "Recovered rename")
+	stats = engine.SyncAll(t.Context(), nil)
+	assert.Zero(t, stats.Failed)
+	session, err := archive.GetSessionFull(t.Context(), "qoder:"+testjsonl.QoderTitleID)
+	require.NoError(t, err)
+	assert.Equal(t, new("Recovered rename"), session.SessionName)
+}
+
+func TestNativeTitleFailureDoesNotRetryOtherAgents(t *testing.T) {
 	for _, mode := range []string{"watcher", "watcher-read", "plan", "recovery", "grouped"} {
 		t.Run(mode, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -93,22 +115,24 @@ func TestAntigravityTitleFailureDoesNotRetryOtherAgents(t *testing.T) {
 				}
 				beforeSync, beforeStats := engine.LastSync(), engine.LastSyncStats()
 				dbtest.SetAntigravityTitle(t, root, "Later")
-				failurePath := archive.Path()
-				inject := `CREATE TRIGGER fail_title_write BEFORE UPDATE OF session_name ON sessions BEGIN SELECT RAISE(FAIL, 'injected title write failure'); END`
-				repair := "DROP TRIGGER fail_title_write"
+				var raw *sql.DB
+				var savedStore []byte
 				if mode == "watcher-read" {
-					failurePath = store
-					inject = "ALTER TABLE conversation_summaries RENAME TO unavailable_summaries"
-					repair = "ALTER TABLE unavailable_summaries RENAME TO conversation_summaries"
+					var err error
+					savedStore, err = os.ReadFile(store)
+					require.NoError(t, err)
+					require.NoError(t, os.WriteFile(store, []byte("not a database"), 0o600))
+				} else {
+					var err error
+					raw, err = sql.Open("sqlite3", archive.Path())
+					require.NoError(t, err)
+					t.Cleanup(func() { require.NoError(t, raw.Close()) })
+					_, err = raw.ExecContext(t.Context(), `CREATE TRIGGER fail_title_write BEFORE UPDATE OF session_name ON sessions BEGIN SELECT RAISE(FAIL, 'injected title write failure'); END`)
+					require.NoError(t, err)
 				}
-				raw, err := sql.Open("sqlite3", failurePath)
-				require.NoError(t, err)
-				t.Cleanup(func() { require.NoError(t, raw.Close()) })
-				_, err = raw.ExecContext(t.Context(), inject)
-				require.NoError(t, err)
 				spy := &antigravityTitleQuerySpy{Store: archive, reader: archive}
 				engine.archiveStore = spy
-				engine.deferredAntigravityTitles = make(map[string]*string)
+				engine.deferredNativeTitles = make(map[string]*string)
 				calls := make(chan WatchBatch, 2)
 				switch mode {
 				case "watcher", "watcher-read":
@@ -153,8 +177,12 @@ func TestAntigravityTitleFailureDoesNotRetryOtherAgents(t *testing.T) {
 				var missing sql.NullString
 				require.NoError(t, archive.Reader().QueryRow(t.Context(), "SELECT source_missing_at FROM sessions WHERE id = 'missing'").Scan(&missing))
 				assert.True(t, missing.Valid, "title failures preserve other agents' deletion proof")
-				_, err = raw.ExecContext(t.Context(), repair)
-				require.NoError(t, err)
+				if mode == "watcher-read" {
+					require.NoError(t, os.WriteFile(store, savedStore, 0o600))
+				} else {
+					_, err = raw.ExecContext(t.Context(), "DROP TRIGGER fail_title_write")
+					require.NoError(t, err)
+				}
 				if mode == "watcher" || mode == "watcher-read" {
 					time.Sleep(20 * time.Millisecond)
 					synctest.Wait()

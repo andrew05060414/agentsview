@@ -1,4 +1,4 @@
-package db
+package stringutil
 
 import (
 	"math/rand/v2"

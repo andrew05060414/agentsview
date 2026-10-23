@@ -598,7 +598,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (141: import provider-reported gptme costs as exact usage events. Re-parse
 // unchanged gptme sources in place; source and session identities are unchanged.)
 // (142: reparse classified dialogue in place.)
-const dataVersion = 142
+// (143: keep each repeated antigravity-cli history.jsonl prompt as its own
+// turn when the SQLite decode missed it. Re-parse unchanged antigravity-cli
+// sources in place; source and session identities are unchanged.)
+const dataVersion = 143
 
 const archiveOnlyVersionBase = 1 << 20
 

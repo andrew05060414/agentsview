@@ -30,7 +30,9 @@ func TestCodexLegacyPageVersionRebuildsEveryProvider(t *testing.T) {
 }
 
 func TestDialogueUpgradePreservesCompletedCodexRepositoryUpgrade(t *testing.T) {
-	completedVersion := CurrentDataVersion() - 1
+	// The version just before the dialogue upgrade (142), so later scoped
+	// upgrades still pass through it.
+	const completedVersion = 141
 	path := filepath.Join(t.TempDir(), "archive.db")
 	d := testDBAtPath(t, path, "completed Codex upgrade")
 	for _, agent := range []string{"codex", "pi"} {

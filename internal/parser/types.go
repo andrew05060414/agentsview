@@ -1518,9 +1518,11 @@ type ParsedSession struct {
 	FirstMessage            string
 	SessionName             string
 	// SessionNamePresent distinguishes an explicitly present provider title
-	// (including a blank title) from no title signal. Codex and Antigravity
-	// keep titles outside the transcript, so a missing or unreadable title
-	// source keeps the stored title while an explicit blank clears it.
+	// (including a blank title) from no title signal. Codex, Antigravity,
+	// and Qoder keep titles outside the transcript, so a missing or
+	// unreadable title source keeps the stored title while an explicit
+	// blank clears it. Qoder's app database leaves a blank title unset, so
+	// it keeps the stored title too.
 	SessionNamePresent bool
 	// PRLinks lists the pull or merge requests the source associated with
 	// this session, deduplicated by URL in first-appearance order.

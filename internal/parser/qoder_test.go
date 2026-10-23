@@ -189,7 +189,7 @@ func TestParseQoderSubagentExclusionIDs(t *testing.T) {
 `
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 
-	results, excluded, err := ParseQoderSessionWithExclusions(path, "proj", "local")
+	results, excluded, err := ParseQoderSessionWithExclusions(t.Context(), path, "proj", "local")
 	require.NoError(t, err)
 	assert.Empty(t, results)
 	assert.Equal(t, []string{
