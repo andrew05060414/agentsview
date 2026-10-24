@@ -21,6 +21,19 @@ The latest release is
   and keeps the previous version in Trash when it replaces a chat's history with
   a different branch. Appending turns makes no copy.
 
+**Improvements**
+
+- `pg push` saves download traffic when a session grows by comparing short
+  hashes with PostgreSQL instead of downloading the session's old text.
+  Sessions with rows written before control-character cleanup are rewritten once.
+
+**Bug fixes**
+
+- Claude Code channel questions appear in transcripts, search, and user-message
+  totals. Rewinding after a channel conversation keeps that conversation as a
+  separate fork and preserves the retry's session ID and saved items. Existing
+  Claude-format sources are reprocessed on upgrade.
+
 ## 0.46.1
 
 <small>2026-10-22</small>
