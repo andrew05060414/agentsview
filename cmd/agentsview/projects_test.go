@@ -10,7 +10,25 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 )
+
+func TestProjectsPGUsesReadStore(t *testing.T) {
+	newAgentDataDir(t)
+	t.Setenv("AGENTSVIEW_PG_URL", "postgres://example.test/archive")
+	remote := dbtest.OpenTestDB(t)
+	require.NoError(t, remote.UpsertSession(t.Context(), db.Session{ID: "remote", Project: "shared-project", Agent: "codex", UserMessageCount: 1, MessageCount: 1}))
+	stub := stubPGReadStore(t, remote)
+	out := captureStdout(t, func() {
+		_, err := executeCommand(newRootCommand(), "projects", "--pg", "--json")
+		require.NoError(t, err)
+	})
+	projects := decodeCLIJSON[[]db.ProjectInfo](t, out)
+	require.Len(t, projects, 1)
+	assert.Equal(t, "shared-project", projects[0].Name)
+	assert.True(t, stub.Opened)
+	assert.True(t, stub.CleanupCalled)
+}
 
 func TestFetchHTTPProjects(t *testing.T) {
 	var gotAuth string

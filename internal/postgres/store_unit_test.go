@@ -83,6 +83,25 @@ func TestEscapeLike(t *testing.T) {
 	}
 }
 
+func TestPGMessagesBranchFTSRequiresAllTerms(t *testing.T) {
+	pb := &paramBuilder{}
+	branch, err := pgMessagesBranch(
+		db.ContentSearchFilter{
+			Pattern: "quick fox",
+			Mode:    "fts",
+		},
+		escapeLike("quick fox"),
+		pb,
+	)
+	require.NoError(t, err)
+
+	assert.Contains(t, branch,
+		"COALESCE(m.dialogue_text, m.content) ILIKE '%'||$1||'%' ESCAPE E'\\\\'")
+	assert.Contains(t, branch,
+		"COALESCE(m.dialogue_text, m.content) ILIKE '%'||$2||'%' ESCAPE E'\\\\'")
+	assert.Equal(t, []any{"quick", "fox"}, pb.args)
+}
+
 func TestPGSubstringSnippetFTSModeCentersOnFirstTerm(t *testing.T) {
 	body := strings.Repeat("prefix ", 30) + "the quick brown fox jumps"
 

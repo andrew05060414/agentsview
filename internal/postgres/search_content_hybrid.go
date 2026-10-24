@@ -152,7 +152,10 @@ func (s *Store) fetchHybridKeywordBatchPG(
 
 	kf := f
 	kf.Mode = "fts"
-	contentPred := pgContentSearchPredicate("COALESCE(m.dialogue_text, m.content)", kf, escapeLike(f.Pattern), pb)
+	contentPred, err := pgContentSearchPredicate("COALESCE(m.dialogue_text, m.content)", kf, escapeLike(f.Pattern), pb)
+	if err != nil {
+		return nil, err
+	}
 	limitP := pb.add(k)
 	offsetP := pb.add(offset)
 
