@@ -23,7 +23,6 @@ type pushFrictionComparison struct {
 }
 
 type pushMessageComparison struct {
-	MessageCounts           map[string]int
 	MessageContentHash      map[string]string
 	MessageRoleTime         map[string]string
 	MessageFlags            map[string]string
@@ -309,11 +308,9 @@ func readPushSessionMessageComparisons(
 	ctx context.Context,
 	tx *sql.Tx,
 	sessionIDs []string,
-	localCounts map[string]db.MessageContentAggregate,
 	includeFriction bool,
 ) (*pushMessageComparison, error) {
 	comparisons := &pushMessageComparison{
-		MessageCounts:           make(map[string]int, len(sessionIDs)),
 		MessageContentHash:      make(map[string]string, len(sessionIDs)),
 		MessageRoleTime:         make(map[string]string, len(sessionIDs)),
 		MessageFlags:            make(map[string]string, len(sessionIDs)),
@@ -334,23 +331,23 @@ func readPushSessionMessageComparisons(
 				return nil, err
 			}
 		}
-		if err := loadPushMessageCounts(ctx, tx, chunk, comparisons.MessageCounts); err != nil {
-			return nil, err
-		}
-		eligible := make([]string, 0, len(chunk))
-		for _, id := range chunk {
-			if count := localCounts[id].Count; count > 0 && comparisons.MessageCounts[id] == count {
-				eligible = append(eligible, id)
-			}
-		}
-		chunk = eligible
-		if len(chunk) == 0 {
-			continue
-		}
 		if err := loadPushMessageContentHashFingerprints(
 			ctx, tx, chunk, comparisons.MessageContentHash,
 		); err != nil {
 			return nil, err
+		}
+		eligible := make([]string, 0, len(chunk))
+		for _, id := range chunk {
+			if comparisons.MessageContentHash[id] != "" {
+				eligible = append(eligible, id)
+			}
+		}
+		if err := loadPushUsageEventFingerprints(ctx, tx, chunk, comparisons.UsageEventFingerprint); err != nil {
+			return nil, err
+		}
+		chunk = eligible
+		if len(chunk) == 0 {
+			continue
 		}
 		if err := loadPushMessageRoleTimeFingerprints(
 			ctx, tx, chunk, comparisons.MessageRoleTime,
@@ -377,11 +374,6 @@ func readPushSessionMessageComparisons(
 		}
 		if err := loadPushToolResultEventFingerprints(
 			ctx, tx, chunk, comparisons.ToolResultFingerprint,
-		); err != nil {
-			return nil, err
-		}
-		if err := loadPushUsageEventFingerprints(
-			ctx, tx, chunk, comparisons.UsageEventFingerprint,
 		); err != nil {
 			return nil, err
 		}
@@ -430,36 +422,6 @@ func sessionFrictionUnchanged(
 	return ok && previous == (pushFrictionComparison{
 		Count: sess.FrictionCount, RulesVersion: sess.FrictionRulesVersion, Hash: sess.FrictionHash,
 	}), nil
-}
-
-func loadPushMessageCounts(
-	ctx context.Context,
-	tx *sql.Tx,
-	sessionIDs []string,
-	out map[string]int,
-) error {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT session_id, COUNT(*)
-		FROM messages
-		WHERE session_id = ANY($1)
-		GROUP BY session_id
-	`, sessionIDs)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var sessionID string
-		var count int64
-		if err := rows.Scan(
-			&sessionID, &count,
-		); err != nil {
-			return err
-		}
-		out[sessionID] = int(count)
-	}
-	return rows.Err()
 }
 
 func loadPushMessageContentHashFingerprints(
@@ -985,32 +947,4 @@ func (c *pushMessageComparison) messageFields(id string) db.MessageComparisonFie
 		ContentHash: c.MessageContentHash[id], RoleTime: c.MessageRoleTime[id], Flags: c.MessageFlags[id], Dialogue: c.MessageDialogue[id],
 		Token: c.MessageTokenFingerprint[id], ToolCalls: c.ToolCallFingerprint[id], ToolResults: c.ToolResultFingerprint[id],
 	}
-}
-
-// pushTranscriptMatches consumes the remote streams from one local read view.
-func pushTranscriptMatches(ctx context.Context, snapshot *db.MessageSnapshot, id string, remote *pushMessageComparison) (bool, error) {
-	fields := remote.messageFields(id)
-	streams := []*string{&fields.ContentHash, &fields.RoleTime, &fields.Flags, &fields.Dialogue, &fields.Token, &fields.ToolCalls, &fields.ToolResults}
-	for start := 0; ; {
-		messages, err := snapshot.GetMessages(ctx, id, start, db.MaxMessageLimit, true)
-		if err != nil {
-			return false, err
-		}
-		if len(messages) == 0 {
-			break
-		}
-		for _, message := range messages {
-			row := db.MessageComparisonRow(message, pgPushTimestampFingerprintText)
-			fragments := []string{row.ContentHash, row.RoleTime, row.Flags, row.Dialogue, row.Token, row.ToolCalls, row.ToolResults}
-			for i, fragment := range fragments {
-				rest, ok := strings.CutPrefix(*streams[i], fragment)
-				if !ok {
-					return false, nil
-				}
-				*streams[i] = rest
-			}
-		}
-		start = messages[len(messages)-1].Ordinal + 1
-	}
-	return fields == (db.MessageComparisonFields{}), nil
 }

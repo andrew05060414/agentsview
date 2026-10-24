@@ -573,10 +573,6 @@ func (s *Sync) pushWithOptions(
 	}
 	reportPrepare(0)
 	prepared := 0
-	var localCounts map[string]db.MessageContentAggregate
-	if !full {
-		localCounts = make(map[string]db.MessageContentAggregate, len(sessionByID))
-	}
 	candidateIDs := mapKeys(sessionByID)
 	for start := 0; start < len(candidateIDs); start += pushComparisonBatchSize {
 		end := min(start+pushComparisonBatchSize, len(candidateIDs))
@@ -584,9 +580,6 @@ func (s *Sync) pushWithOptions(
 		depState, err := readLocalPushDependencyState(ctx, s.local, chunk)
 		if err != nil {
 			return result, err
-		}
-		if !full {
-			maps.Copy(localCounts, depState.contentAgg)
 		}
 		for _, id := range chunk {
 			usageFP, usageKnown := usageFingerprints[id]
@@ -726,7 +719,7 @@ func (s *Sync) pushWithOptions(
 
 		batchResult, err := s.pushBatch(
 			ctx, batch, full, markerID, legacyMarkerMachines,
-			usageFingerprints, localCounts, &pushed,
+			usageFingerprints, &pushed,
 		)
 		if err != nil {
 			return result, err
@@ -742,7 +735,7 @@ func (s *Sync) pushWithOptions(
 				sr, retryErr := s.pushBatch(
 					ctx, []db.Session{sess},
 					full, markerID, legacyMarkerMachines,
-					usageFingerprints, localCounts, &pushed,
+					usageFingerprints, &pushed,
 				)
 				if retryErr != nil {
 					return result, retryErr
@@ -1332,13 +1325,12 @@ func (s *Sync) pushBatch(
 	markerID string,
 	legacyMarkerMachines []string,
 	sessionUsageFingerprints map[string]string,
-	localCounts map[string]db.MessageContentAggregate,
 	pushed *[]db.Session,
 ) (batchResult, error) {
 	preloadComparisons := len(batch) > 0 && !full
 	result, err := s.pushBatchAttempt(
 		ctx, batch, full, markerID, legacyMarkerMachines,
-		sessionUsageFingerprints, localCounts, pushed, preloadComparisons,
+		sessionUsageFingerprints, pushed, preloadComparisons,
 	)
 	if err == nil || !errors.Is(err, errPushComparisonPreload) {
 		return result, err
@@ -1350,7 +1342,7 @@ func (s *Sync) pushBatch(
 	)
 	return s.pushBatchAttempt(
 		ctx, batch, full, markerID, legacyMarkerMachines,
-		sessionUsageFingerprints, localCounts, pushed, false,
+		sessionUsageFingerprints, pushed, false,
 	)
 }
 
@@ -1361,7 +1353,6 @@ func (s *Sync) pushBatchAttempt(
 	markerID string,
 	legacyMarkerMachines []string,
 	sessionUsageFingerprints map[string]string,
-	localCounts map[string]db.MessageContentAggregate,
 	pushed *[]db.Session,
 	preloadComparisons bool,
 ) (batchResult, error) {
@@ -1386,7 +1377,7 @@ func (s *Sync) pushBatchAttempt(
 	comparisons := (*pushMessageComparison)(nil)
 	if preloadComparisons && len(sessionIDs) > 0 {
 		comparisonsBatch, err := readPushSessionMessageComparisons(
-			ctx, tx, sessionIDs, localCounts, true,
+			ctx, tx, sessionIDs, true,
 		)
 		if err != nil {
 			_ = tx.Rollback()
@@ -1427,7 +1418,7 @@ func (s *Sync) pushBatchAttempt(
 			return batchResult{}, nil
 		}
 
-		msgCount, err := s.pushMessages(
+		msgCount, messagesChanged, err := s.pushMessages(
 			ctx, tx, sess.ID, full,
 			sessionUsageFingerprints, comparisons,
 		)
@@ -1477,7 +1468,7 @@ func (s *Sync) pushBatchAttempt(
 		// plan usage were rewritten but pushSession was a metadata no-op
 		// (its WHERE clause skips unchanged rows). PG read-mode session
 		// watchers rely on updated_at to surface these changes.
-		if msgCount > 0 || findingsChanged || frictionChanged || planUsageChanged {
+		if messagesChanged || findingsChanged || frictionChanged || planUsageChanged {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE sessions
 				SET updated_at = NOW()
@@ -3050,10 +3041,9 @@ func writePGSession(ctx context.Context, tx *sql.Tx, sess db.Session, markerID s
 	return nil
 }
 
-// pushMessages replaces a session's messages and tool calls
-// in PG. It skips the replacement when the PG message count
-// already matches the local count, avoiding redundant work
-// for metadata-only changes.
+// pushMessages replaces a session's changed transcript suffix in PG. It
+// returns the inserted count and whether transcript or usage changes need
+// a session version refresh.
 func (s *Sync) pushMessages(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -3061,160 +3051,110 @@ func (s *Sync) pushMessages(
 	full bool,
 	sessionUsageFingerprints map[string]string,
 	comparisons *pushMessageComparison,
-) (count int, err error) {
-	localCount, err := s.local.MessageCount(ctx, sessionID)
-	if err != nil {
-		return 0, fmt.Errorf(
-			"counting local messages: %w", err,
-		)
-	}
-	if localCount == 0 {
-		if err := lockPinnedMessagesSession(ctx, tx, sessionID); err != nil {
-			return 0, err
-		}
-		savedPins, err := snapshotPinnedMessages(ctx, tx, sessionID)
-		if err != nil {
-			return 0, err
-		}
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM tool_result_events WHERE session_id = $1`,
-			sessionID,
-		); err != nil {
-			return 0, fmt.Errorf(
-				"deleting stale pg tool_result_events: %w", err,
-			)
-		}
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM tool_calls WHERE session_id = $1`,
-			sessionID,
-		); err != nil {
-			return 0, fmt.Errorf(
-				"deleting stale pg tool_calls: %w", err,
-			)
-		}
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM messages WHERE session_id = $1`,
-			sessionID,
-		); err != nil {
-			return 0, fmt.Errorf(
-				"deleting stale pg messages: %w", err,
-			)
-		}
-		// Usage events are independent of transcript messages: a
-		// session can carry token/cost accounting (e.g. a hermes
-		// state.db-only session) with zero messages. Sync them here
-		// too so their cost reaches PG instead of being dropped with
-		// the rest of the message-replace path below.
-		if err := s.replaceUsageEvents(ctx, tx, sessionID); err != nil {
-			return 0, err
-		}
-		if err := restorePinnedMessages(
-			ctx, tx, sessionID, savedPins,
-		); err != nil {
-			return 0, err
-		}
-		return 0, nil
-	}
-
+) (count int, changed bool, err error) {
 	snapshot, err := s.local.BeginMessageSnapshot(ctx)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer func() { err = errors.Join(err, snapshot.Close()) }()
-
-	if !full && comparisons == nil {
-		comparisons, err = readPushSessionMessageComparisons(ctx, tx, []string{sessionID},
-			map[string]db.MessageContentAggregate{sessionID: {Count: localCount}}, false,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("reading pg message comparison: %w", err)
-		}
-	}
-
-	if !full && comparisons != nil && comparisons.MessageCounts[sessionID] == localCount && localCount > 0 {
-		matches, err := pushTranscriptMatches(ctx, snapshot, sessionID, comparisons)
-		if err != nil {
-			return 0, err
-		}
-		if matches {
-			usageFP, known := sessionUsageFingerprints[sessionID]
-			if !known {
-				usageFP, err = localUsageEventPGFingerprint(ctx, s.local, sessionID)
-				if err != nil {
-					return 0, err
-				}
-			}
-			if usageFP == comparisons.UsageEventFingerprint[sessionID] {
-				return 0, nil
+	boundary := 0
+	usageChanged := true
+	if !full {
+		if comparisons == nil {
+			comparisons, err = readPushSessionMessageComparisons(ctx, tx, []string{sessionID}, false)
+			if err != nil {
+				return 0, false, fmt.Errorf("reading pg message comparison: %w", err)
 			}
 		}
+		var transcriptChanged bool
+		boundary, transcriptChanged, err = pushSuffixBoundary(ctx, snapshot, sessionID, comparisons.messageFields(sessionID))
+		if err != nil {
+			return 0, false, err
+		}
+		usageFP, known := sessionUsageFingerprints[sessionID]
+		if !known {
+			usageFP, err = localUsageEventPGFingerprint(ctx, s.local, sessionID)
+			if err != nil {
+				return 0, false, err
+			}
+		}
+		usageChanged = usageFP != comparisons.UsageEventFingerprint[sessionID]
+		if !transcriptChanged {
+			if usageChanged {
+				usageChanged, err = s.replaceUsageEvents(ctx, tx, sessionID)
+			}
+			return 0, usageChanged, err
+		}
 	}
-
 	if err := lockPinnedMessagesSession(ctx, tx, sessionID); err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	savedPins, err := snapshotPinnedMessages(ctx, tx, sessionID)
+	savedPins, err := snapshotPinnedMessages(ctx, tx, sessionID, boundary)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	if err := s.replaceUsageEvents(ctx, tx, sessionID); err != nil {
-		return 0, err
+	if usageChanged {
+		usageChanged, err = s.replaceUsageEvents(ctx, tx, sessionID)
+		if err != nil {
+			return 0, false, err
+		}
 	}
-	count, err = s.copySessionMessages(ctx, tx, sessionID, snapshot)
+	count, changed, err = s.copySessionMessages(ctx, tx, sessionID, snapshot, boundary)
 	if err != nil {
-		return count, err
+		return count, false, err
 	}
-
-	if err := restorePinnedMessages(
-		ctx, tx, sessionID, savedPins,
-	); err != nil {
-		return count, err
+	if err := restorePinnedMessages(ctx, tx, sessionID, savedPins); err != nil {
+		return count, false, err
 	}
-
-	return count, nil
+	return count, changed || usageChanged, nil
 }
 
-// copySessionMessages replaces a session's PostgreSQL messages, tool calls,
+// copySessionMessages replaces a session's changed suffix of messages, tool calls,
 // and tool result events with the local transcript. It reads every page from
 // one SQLite snapshot. Local sync keeps writing during a push, and a rewrite
 // between two page reads could move a pinned message into a range already
 // copied, so restoring the pins would drop that pin. Messages that arrive
 // after the snapshot go out with the next push.
 func (s *Sync) copySessionMessages(
-	ctx context.Context, tx *sql.Tx, sessionID string, snapshot *db.MessageSnapshot,
-) (count int, err error) {
+	ctx context.Context, tx *sql.Tx, sessionID string, snapshot *db.MessageSnapshot, boundary int,
+) (count int, changed bool, err error) {
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM tool_result_events
-		WHERE session_id = $1
-	`, sessionID); err != nil {
-		return 0, fmt.Errorf(
+		WHERE session_id = $1 AND tool_call_message_ordinal >= $2
+	`, sessionID, boundary); err != nil {
+		return 0, false, fmt.Errorf(
 			"deleting pg tool_result_events: %w", err,
 		)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM tool_calls
-		WHERE session_id = $1
-	`, sessionID); err != nil {
-		return 0, fmt.Errorf(
+		WHERE session_id = $1 AND message_ordinal >= $2
+	`, sessionID, boundary); err != nil {
+		return 0, false, fmt.Errorf(
 			"deleting pg tool_calls: %w", err,
 		)
 	}
-	if _, err := tx.ExecContext(ctx, `
+	deleted, err := tx.ExecContext(ctx, `
 		DELETE FROM messages
-		WHERE session_id = $1
-	`, sessionID); err != nil {
-		return 0, fmt.Errorf(
+		WHERE session_id = $1 AND ordinal >= $2
+	`, sessionID, boundary)
+	if err != nil {
+		return 0, false, fmt.Errorf(
 			"deleting pg messages: %w", err,
 		)
 	}
-	startOrdinal := 0
+	deletedCount, err := deleted.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("counting deleted pg messages: %w", err)
+	}
+	startOrdinal := boundary
 	for {
 		msgs, err := snapshot.GetMessages(
 			ctx, sessionID, startOrdinal,
 			db.MaxMessageLimit, true,
 		)
 		if err != nil {
-			return count, fmt.Errorf(
+			return count, false, fmt.Errorf(
 				"reading local messages: %w", err,
 			)
 		}
@@ -3224,7 +3164,7 @@ func (s *Sync) copySessionMessages(
 
 		nextOrdinal := msgs[len(msgs)-1].Ordinal + 1
 		if nextOrdinal <= startOrdinal {
-			return count, fmt.Errorf(
+			return count, false, fmt.Errorf(
 				"pushMessages %s: ordinal did not "+
 					"advance (start=%d, last=%d)",
 				sessionID, startOrdinal,
@@ -3235,17 +3175,17 @@ func (s *Sync) copySessionMessages(
 		if err := bulkInsertMessages(
 			ctx, tx, sessionID, msgs,
 		); err != nil {
-			return count, err
+			return count, false, err
 		}
 		if err := bulkInsertToolCalls(
 			ctx, tx, sessionID, msgs,
 		); err != nil {
-			return count, err
+			return count, false, err
 		}
 		if err := bulkInsertToolResultEvents(
 			ctx, tx, sessionID, msgs,
 		); err != nil {
-			return count, err
+			return count, false, err
 		}
 		count += len(msgs)
 		startOrdinal = nextOrdinal
@@ -3253,32 +3193,36 @@ func (s *Sync) copySessionMessages(
 			s.afterMessagePage()
 		}
 	}
-	return count, nil
+	return count, count > 0 || deletedCount > 0, nil
 }
 
 // replaceUsageEvents replaces a session's usage_events in PG with the
 // current local set. Usage events are synced independently of transcript
 // messages because a session can have token/cost accounting with no
-// messages at all (e.g. a hermes state.db-only session). Both the
-// zero-message and the normal message-replace paths in pushMessages call
-// this so a session's cost always reaches PG.
+// messages at all (e.g. a hermes state.db-only session).
+// It reports whether any rows were deleted or inserted.
 func (s *Sync) replaceUsageEvents(
 	ctx context.Context, tx *sql.Tx, sessionID string,
-) error {
-	if _, err := tx.ExecContext(ctx, `
+) (bool, error) {
+	result, err := tx.ExecContext(ctx, `
 		DELETE FROM usage_events
 		WHERE session_id = $1
-	`, sessionID); err != nil {
-		return fmt.Errorf("deleting pg usage_events: %w", err)
+	`, sessionID)
+	if err != nil {
+		return false, fmt.Errorf("deleting pg usage_events: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("counting deleted pg usage_events: %w", err)
 	}
 	usageEvents, err := s.local.GetUsageEvents(ctx, sessionID)
 	if err != nil {
-		return fmt.Errorf("reading local usage events: %w", err)
+		return false, fmt.Errorf("reading local usage events: %w", err)
 	}
 	if err := bulkInsertUsageEvents(ctx, tx, usageEvents); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return deleted > 0 || len(usageEvents) > 0, nil
 }
 
 type savedPostgresPin struct {
@@ -3421,14 +3365,18 @@ const snapshotPinnedMessagesQuery = `
 				) = 1
 			)
 		WHERE p.session_id = $1
+			AND (p.message_id >= $2 OR
+				CASE WHEN p.source_uuid <> '' THEN anchored.ordinal
+					ELSE current_message.ordinal
+				END IS DISTINCT FROM p.message_id)
 		ORDER BY p.id
 		FOR UPDATE OF p`
 
 func snapshotPinnedMessages(
-	ctx context.Context, tx *sql.Tx, sessionID string,
+	ctx context.Context, tx *sql.Tx, sessionID string, boundary int,
 ) ([]savedPostgresPin, error) {
 	rows, err := tx.QueryContext(
-		ctx, snapshotPinnedMessagesQuery, sessionID,
+		ctx, snapshotPinnedMessagesQuery, sessionID, boundary,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("snapshotting pg pins: %w", err)
