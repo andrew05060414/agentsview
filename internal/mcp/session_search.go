@@ -78,6 +78,9 @@ func (t *toolset) searchUniqueSessions(ctx context.Context, req service.ContentS
 			out.Matches = append(out.Matches, match)
 			added++
 			if len(out.Matches) == limit {
+				if len(state.IDs) >= 512 {
+					return out, "", nil
+				}
 				b, err := json.Marshal(state)
 				return out, base64.RawURLEncoding.EncodeToString(b), err
 			}

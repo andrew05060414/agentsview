@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -11,6 +12,18 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
 )
+
+func TestSessionSearchStopsAtContinuationBound(t *testing.T) {
+	state := sessionSearchCursor{IDs: []string{}}
+	for i := range 511 {
+		state.IDs = append(state.IDs, fmt.Sprintf("previous-%d", i))
+	}
+	ts := &toolset{svc: &sessionPagingService{}}
+	page, next, err := ts.searchUniqueSessions(t.Context(), service.ContentSearchRequest{Pattern: "archive", Limit: 10}, state)
+	require.NoError(t, err)
+	require.Len(t, page.Matches, 1)
+	assert.Empty(t, next, "the continuation at the hard bound must not be returned")
+}
 
 type sessionPagingService struct {
 	service.SessionService

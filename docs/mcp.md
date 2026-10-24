@@ -32,7 +32,8 @@ Continue distinct-session searches with `next_session_cursor` as
 `session_cursor`, keeping the other search filters unchanged. This reuses the
 backend's session exclusion before limiting results, so a frequently mentioned
 session cannot fill every page. Continuations are bounded to 512 sessions;
-narrow the date or project filters for larger searches. Set
+narrow the date or project filters for larger searches. At this bound,
+`session_limit_reached` is true and no unusable continuation is returned. Set
 `unique_sessions: false` to use the existing integer `next_cursor`/`cursor`
 contract, also preserving `activity_cutoff`. The full profile keeps its existing
 defaults. Set `exclude_one_shot: true` to hide single-question sessions.
