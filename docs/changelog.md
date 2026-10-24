@@ -24,6 +24,27 @@ The latest release is
   `agentsview import --type chatgpt --sync`. Sync pages active and archived chats
   and keeps the previous version in Trash when it replaces a chat's history with
   a different branch. Appending turns makes no copy.
+- When Friction Log review is enabled, AgentsView stores daily digests and
+  catches up on completed days missed while offline, including sessions that
+  arrive late within the configured backfill window. Digests retain findings,
+  usage, and pattern recurrence, and survive full resyncs that retain transcript
+  text. PostgreSQL hubs build their own digests. Read APIs and CLI commands
+  remain planned.
+
+**Improvements**
+
+- `pg push` saves download traffic when a session grows by comparing short
+  hashes with PostgreSQL instead of downloading the session's old text.
+  Sessions with rows written before control-character cleanup are rewritten once.
+- `pg push` reduces writes when a session grows by rewriting only the messages
+  from the first changed message onward instead of the whole session.
+
+**Bug fixes**
+
+- Claude Code channel questions appear in transcripts, search, and user-message
+  totals. Rewinding after a channel conversation keeps that conversation as a
+  separate fork and preserves the retry's session ID and saved items. Existing
+  Claude-format sources are reprocessed on upgrade.
 
 ## 0.46.1
 
