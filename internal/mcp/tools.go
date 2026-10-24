@@ -23,9 +23,10 @@ import (
 // toolset holds the dependencies shared by every tool handler. now is
 // injectable so tests can control the self-reference exclusion window.
 type toolset struct {
-	svc     service.SessionService
-	now     func() time.Time
-	version string
+	svc           service.SessionService
+	now           func() time.Time
+	version       string
+	memoryProfile bool
 }
 
 func (t *toolset) clock() time.Time {
@@ -725,7 +726,7 @@ func (t *toolset) getMessageBodyContinuation(
 
 type searchContentIn struct {
 	Pattern          string `json:"pattern" jsonschema:"Natural-language query for semantic/hybrid, whitespace-separated literals for terms, or exact substring/regex for lexical search across message text and tool inputs/results."`
-	Mode             string `json:"mode,omitempty" jsonschema:"substring (default), regex, terms, semantic, or hybrid. Prefer hybrid or semantic for contextual questions when a vector search index is configured."`
+	Mode             string `json:"mode,omitempty" jsonschema:"fts (memory profile default), substring (full profile default), regex, terms, semantic, or hybrid. fts supports quoted Boolean OR; terms requires all literals in one exchange."`
 	Scope            string `json:"scope,omitempty" jsonschema:"Semantic/hybrid/terms result scope: top, all, or subordinate (default all)."`
 	Project          string `json:"project,omitempty" jsonschema:"Restrict to one project."`
 	Agent            string `json:"agent,omitempty" jsonschema:"Restrict to one agent."`
@@ -738,7 +739,10 @@ type searchContentIn struct {
 	Cursor           int    `json:"cursor,omitempty" jsonschema:"Pagination cursor from a previous next_cursor; also pass activity_cutoff when the recent-activity heuristic applies."`
 	ActivityCutoff   string `json:"activity_cutoff,omitempty" jsonschema:"RFC3339 cutoff returned by the previous page. Required with a positive cursor when the recent-activity heuristic applies."`
 	IncludeActive    bool   `json:"include_active,omitempty" jsonschema:"Include matches from sessions active in the last 10 minutes. Default false: the conversation you are in right now is also recorded, so without this exclusion you would find yourself."`
-	IncludeOneShot   bool   `json:"include_one_shot,omitempty" jsonschema:"Include one-shot sessions. Default false."`
+	IncludeOneShot   bool   `json:"include_one_shot,omitempty" jsonschema:"Include one-shot sessions. Default true in memory profile, false in full profile; exclude_one_shot overrides it."`
+	ExcludeOneShot   bool   `json:"exclude_one_shot,omitempty" jsonschema:"Exclude one-shot sessions even in the memory profile, which includes them by default."`
+	UniqueSessions   *bool  `json:"unique_sessions,omitempty" jsonschema:"Return one hit per session. Default true in memory profile, false in full profile. Continue with session_cursor instead of cursor."`
+	SessionCursor    string `json:"session_cursor,omitempty" jsonschema:"Opaque next_session_cursor from a unique-session search; keep all search arguments unchanged."`
 	IncludeAutomated bool   `json:"include_automated,omitempty" jsonschema:"Include automated sessions. Default false."`
 	Context          int    `json:"context,omitempty" jsonschema:"Messages of context before/after each match (max 10)."`
 }
@@ -790,10 +794,11 @@ type contentMatch struct {
 }
 
 type searchContentOut struct {
-	Matches        []contentMatch `json:"matches"`
-	NextCursor     *int           `json:"next_cursor,omitempty"`
-	ActivityCutoff string         `json:"activity_cutoff,omitempty" jsonschema:"Effective RFC3339 activity cutoff; pass it unchanged with next_cursor as cursor to continue."`
-	ExcludedActive int            `json:"excluded_active,omitempty"`
+	NextSessionCursor string         `json:"next_session_cursor,omitempty"`
+	Matches           []contentMatch `json:"matches"`
+	NextCursor        *int           `json:"next_cursor,omitempty"`
+	ActivityCutoff    string         `json:"activity_cutoff,omitempty" jsonschema:"Effective RFC3339 activity cutoff; pass it unchanged with next_cursor as cursor to continue."`
+	ExcludedActive    int            `json:"excluded_active,omitempty"`
 	// EffectiveMode and EffectiveScope report the defaults the search
 	// resolved, which the caller cannot see in its own request.
 	EffectiveMode  string                  `json:"effective_mode"`
@@ -845,6 +850,9 @@ func validateSearchDates(from, to string) error {
 func (t *toolset) searchContent(
 	ctx context.Context, _ *mcp.CallToolRequest, in searchContentIn,
 ) (*mcp.CallToolResult, searchContentOut, error) {
+	if t.memoryProfile && in.Mode == "" {
+		in.Mode = "fts"
+	}
 	if in.Scope != "" && !db.ContentSearchModeSupportsScope(in.Mode) {
 		return nil, searchContentOut{}, errors.New(db.ContentSearchScopeUnsupportedMsg)
 	}
@@ -860,6 +868,28 @@ func (t *toolset) searchContent(
 		}
 	}
 	currentSession := strings.TrimSpace(in.CurrentSessionID)
+	unique := t.memoryProfile
+	if in.UniqueSessions != nil {
+		unique = *in.UniqueSessions
+	}
+	var sessionState sessionSearchCursor
+	if in.SessionCursor != "" {
+		if !unique || in.Cursor != 0 {
+			return nil, searchContentOut{}, errors.New("session_cursor requires unique_sessions and cannot be combined with cursor")
+		}
+		var err error
+		sessionState, err = decodeSessionSearchCursor(in.SessionCursor)
+		if err != nil {
+			return nil, searchContentOut{}, err
+		}
+		if in.ActivityCutoff == "" {
+			in.ActivityCutoff = sessionState.Cutoff
+			cutoffTime, _ = time.Parse(time.RFC3339, in.ActivityCutoff)
+		}
+	}
+	if unique && in.Cursor != 0 {
+		return nil, searchContentOut{}, errors.New("unique_sessions uses session_cursor instead of cursor")
+	}
 	excludeSessions := db.NormalizeExcludeSessionIDs([]string{currentSession})
 	cutoff := ""
 	if currentSession == "" && !in.IncludeActive {
@@ -887,24 +917,32 @@ func (t *toolset) searchContent(
 		Limit:              clampLimit(in.Limit, defaultSearchLimit, maxContentSearchLimit),
 		Cursor:             in.Cursor,
 		Context:            in.Context,
-		IncludeOneShot:     in.IncludeOneShot,
+		IncludeOneShot:     (in.IncludeOneShot || t.memoryProfile) && !in.ExcludeOneShot,
 		IncludeAutomated:   in.IncludeAutomated,
 		ExcludeSessionIDs:  excludeSessions,
 		ExcludeActiveSince: cutoff,
 	}
-	res, err := t.svc.SearchContent(ctx, req)
+	var res *service.ContentSearchResult
+	var nextSessionCursor string
+	var err error
+	if unique {
+		res, nextSessionCursor, err = t.searchUniqueSessions(ctx, req, sessionState)
+	} else {
+		res, err = t.svc.SearchContent(ctx, req)
+	}
 	if err != nil {
 		return nil, searchContentOut{}, err
 	}
 	legacy := cutoff != "" && !res.ActiveFilterApplied
 	out := searchContentOut{
-		Matches:        make([]contentMatch, 0, len(res.Matches)),
-		ActivityCutoff: cutoff,
-		EffectiveMode:  cmp.Or(in.Mode, "substring"),
+		NextSessionCursor: nextSessionCursor,
+		Matches:           make([]contentMatch, 0, len(res.Matches)),
+		ActivityCutoff:    cutoff,
+		EffectiveMode:     cmp.Or(in.Mode, "substring"),
 		Exclusions: searchContentExclusions{
 			CurrentSessionID: currentSession,
 			RecentActive:     currentSession == "" && !in.IncludeActive,
-			OneShot:          !in.IncludeOneShot, Automated: !in.IncludeAutomated,
+			OneShot:          !req.IncludeOneShot, Automated: !in.IncludeAutomated,
 		},
 		RevisionBound: res.RevisionBound,
 		Coverage:      service.NormalizeMemoryCoverage(res.Coverage),

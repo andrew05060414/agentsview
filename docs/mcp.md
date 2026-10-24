@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-09
+last_edited: 2026-10-24
 title: MCP Server
 description: Connect assistant clients to your AgentsView session history with MCP
 ---
@@ -13,6 +13,35 @@ summarize and compare token usage, and search the AgentsView guides without
 leaving the assistant.
 
 MCP tool results warn when the archive is stale during a full parser rebuild.
+
+The `memory` profile advertises only `get_memory_status`, `search_content`, and
+`get_messages`. Run `agentsview mcp --pg --profile memory` to read a configured
+PostgreSQL archive without starting or restarting the local daemon. Supply
+connection credentials through the existing private configuration or process
+environment, never command arguments or checked-in MCP configuration.
+
+In this profile, `search_content` defaults to message-only `fts`, includes
+one-shot sessions, and returns one match per session. PostgreSQL `fts` preserves
+implicit AND and quoted expressions such as `"reader" OR "压缩"`; plain
+`reader OR archive` treats OR as a literal word. PostgreSQL uses literal
+case-insensitive matching and recency ordering, rather than SQLite BM25 ranking.
+Use `semantic` for natural-language queries and `terms` when every literal must
+occur within one user/assistant exchange.
+
+Continue distinct-session searches with `next_session_cursor` as
+`session_cursor`, keeping the other search filters unchanged. This reuses the
+backend's session exclusion before limiting results, so a frequently mentioned
+session cannot fill every page. Continuations are bounded to 512 sessions;
+narrow the date or project filters for larger searches. Set
+`unique_sessions: false` to use the existing integer `next_cursor`/`cursor`
+contract, also preserving `activity_cutoff`. The full profile keeps its existing
+defaults. Set `exclude_one_shot: true` to hide single-question sessions.
+
+Open a returned full `session_id` with `get_messages`, optionally passing its
+`transcript_revision` as `expected_revision`. The default response contains
+user/assistant dialogue, each message capped at 2000 characters, without raw
+tool-call payloads. Source, timestamps, message ordinals, and revisions provide
+the evidence needed to verify a result before quoting it.
 
 ## When To Use It
 

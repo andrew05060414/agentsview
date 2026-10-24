@@ -116,7 +116,7 @@ func newServer(opts ServeOptions) *mcp.Server {
 		}
 	})
 
-	t := &toolset{svc: opts.Service, now: opts.Now, version: version}
+	t := &toolset{svc: opts.Service, now: opts.Now, version: version, memoryProfile: opts.Profile == ProfileMemory}
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
 	memoryOnly := opts.Profile == ProfileMemory
 
@@ -194,7 +194,9 @@ func newServer(opts ServeOptions) *mcp.Server {
 			"prior work and answering contextual questions, especially when the exact wording is unknown. " +
 			"If these modes report not available, use terms when every literal term must occur within one " +
 			"user/assistant exchange, or substring/regex for exact error messages, identifiers, and code fragments. " +
-			"The default mode remains substring. Set context to include N messages of " +
+			"The full profile defaults to substring; the memory profile defaults to fts, includes one-shot sessions, " +
+			"and returns one match per session. Use unique_sessions=false for message-level cursor pagination, " +
+			"or pass next_session_cursor as session_cursor for distinct sessions across pages. Set context to include N messages of " +
 			"surrounding conversation with each match. Matches from the last 10 minutes (including the " +
 			"current conversation) are excluded unless include_active is set; current_session_id replaces " +
 			"that heuristic with one exact exclusion. One-shot and automated " +
