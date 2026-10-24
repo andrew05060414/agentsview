@@ -114,7 +114,7 @@ func TestEscapeLike(t *testing.T) {
 
 func TestPGMessagesBranchFTSRequiresAllTerms(t *testing.T) {
 	pb := &paramBuilder{}
-	branch := pgMessagesBranch(
+	branch, err := pgMessagesBranch(
 		db.ContentSearchFilter{
 			Pattern: "quick fox",
 			Mode:    "fts",
@@ -122,6 +122,7 @@ func TestPGMessagesBranchFTSRequiresAllTerms(t *testing.T) {
 		escapeLike("quick fox"),
 		pb,
 	)
+	require.NoError(t, err)
 
 	assert.Contains(t, branch,
 		"m.content ILIKE '%'||$1||'%' ESCAPE E'\\\\'")

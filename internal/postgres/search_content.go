@@ -8,13 +8,14 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
 )
 
 // SearchContent implements content search for the PostgreSQL read-only store.
 // The "fts" mode falls back to ILIKE over message content, with one predicate
-// per prepared FTS term to preserve SQLite's implicit-AND semantics.
+// per quoted term, preserving implicit AND and explicit Boolean operators.
 func (s *Store) SearchContent(
 	ctx context.Context, f db.ContentSearchFilter,
 ) (db.ContentSearchPage, error) {
@@ -134,6 +135,9 @@ func (s *Store) searchContentSubstringPG(
 	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
 		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 	escapedPat := escapeLike(f.Pattern)
+	if f.Mode == "fts" && pgFTSNeedsSessionScan(f.Pattern) {
+		return s.searchContentFTSBySession(ctx, f, scopeWhere, scopeArgs)
+	}
 
 	pb := &paramBuilder{
 		n:    len(scopeArgs),
@@ -142,7 +146,11 @@ func (s *Store) searchContentSubstringPG(
 
 	var branches []string
 	if pgHasSource(f, "messages") {
-		branches = append(branches, pgMessagesBranch(f, escapedPat, pb))
+		branch, err := pgMessagesBranch(f, escapedPat, pb)
+		if err != nil {
+			return db.ContentSearchPage{}, err
+		}
+		branches = append(branches, branch)
 	}
 	if pgHasSource(f, "tool_input") {
 		branches = append(branches, pgToolInputBranch(f, escapedPat, pb))
@@ -168,14 +176,55 @@ func (s *Store) searchContentSubstringPG(
 		func(body string) string { return pgSubstringSnippet(f, body) })
 }
 
+// Trigram indexes have no selective key for one- and two-character literals.
+// Scan recent sessions first, bounding each indexed session read before LIMIT,
+// rather than decompressing every message matching a common companion term.
+func pgFTSNeedsSessionScan(pattern string) bool {
+	prepared := db.PrepareFTSQuery(pattern)
+	if strings.Contains(prepared, " OR ") {
+		return false
+	}
+	for _, term := range db.FTSTerms(prepared) {
+		if utf8.RuneCountInString(term) < 3 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) searchContentFTSBySession(ctx context.Context, f db.ContentSearchFilter, where string, scopeArgs []any) (db.ContentSearchPage, error) {
+	pb := &paramBuilder{n: len(scopeArgs), args: append([]any{}, scopeArgs...)}
+	predicate, err := pgFTSExpression(f.Pattern, pb)
+	if err != nil {
+		return db.ContentSearchPage{}, err
+	}
+	// The expression keeps the per-session index usable while avoiding a
+	// repeated global trigram bitmap build for each session.
+	predicate = strings.ReplaceAll(predicate, "m.content ILIKE", "(m.content || '') ILIKE")
+	system := "TRUE"
+	if f.ExcludeSystem {
+		system = "m.is_system = FALSE AND " + db.PostgresSystemPrefixSQL("m.content", "m.role")
+	}
+	cap := pb.add(f.Cursor + f.Limit + 1)
+	limit, offset := pb.add(f.Limit+1), pb.add(f.Cursor)
+	query := `SELECT s.id,s.project,s.agent,COALESCE(s.transcript_revision,''),'message',m.role,'',m.ordinal,m.timestamp,m.content
+	FROM (SELECT *,COALESCE(ended_at,started_at,created_at) AS sort_ts FROM sessions WHERE ` + where + ` ORDER BY sort_ts DESC NULLS LAST,id OFFSET 0) s
+	CROSS JOIN LATERAL (SELECT m.role,m.ordinal,m.timestamp,m.content FROM messages m WHERE m.session_id=s.id AND ` + predicate + ` AND ` + system + ` ORDER BY m.ordinal LIMIT ` + cap + `) m
+	ORDER BY s.sort_ts DESC NULLS LAST,s.id,m.ordinal LIMIT ` + limit + ` OFFSET ` + offset
+	return s.scanPGContentMatches(ctx, query, pb.args, f.Limit, f.Cursor, func(body string) string { return pgSubstringSnippet(f, body) })
+}
+
 // pgMessagesBranch builds the messages source branch SQL.
 // Placeholders continue from pb's current position.
 func pgMessagesBranch(
 	f db.ContentSearchFilter, escapedPat string, pb *paramBuilder,
-) string {
-	contentPred := pgContentSearchPredicate(
+) (string, error) {
+	contentPred, err := pgContentSearchPredicate(
 		"m.content", f, escapedPat, pb,
 	)
+	if err != nil {
+		return "", err
+	}
 
 	sysPred := "TRUE"
 	if f.ExcludeSystem {
@@ -197,38 +246,22 @@ func pgMessagesBranch(
 		JOIN scoped sc ON sc.id = m.session_id
 		WHERE %s
 		  AND %s`,
-		contentPred, sysPred)
+		contentPred, sysPred), nil
 }
 
 func pgContentSearchPredicate(
 	column string, f db.ContentSearchFilter, escapedPat string,
 	pb *paramBuilder,
-) string {
+) (string, error) {
 	if f.Mode != "fts" {
 		ilikePat := "%" + escapedPat + "%"
 		ilikeParam := pb.add(ilikePat)
 		return fmt.Sprintf(
 			"%s ILIKE '%%'||%s||'%%' ESCAPE E'\\\\'",
 			column, ilikeParam,
-		)
+		), nil
 	}
-
-	terms := db.FTSTerms(db.PrepareFTSQuery(f.Pattern))
-	clauses := make([]string, 0, len(terms))
-	for _, term := range terms {
-		if term == "" {
-			continue
-		}
-		termParam := pb.add(escapeLike(term))
-		clauses = append(clauses, fmt.Sprintf(
-			"%s ILIKE '%%'||%s||'%%' ESCAPE E'\\\\'",
-			column, termParam,
-		))
-	}
-	if len(clauses) == 0 {
-		return "FALSE"
-	}
-	return strings.Join(clauses, " AND ")
+	return pgFTSExpression(f.Pattern, pb)
 }
 
 // pgToolInputBranch builds the tool_input source branch SQL.
