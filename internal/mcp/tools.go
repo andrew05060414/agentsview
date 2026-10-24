@@ -794,11 +794,12 @@ type contentMatch struct {
 }
 
 type searchContentOut struct {
-	NextSessionCursor string         `json:"next_session_cursor,omitempty"`
-	Matches           []contentMatch `json:"matches"`
-	NextCursor        *int           `json:"next_cursor,omitempty"`
-	ActivityCutoff    string         `json:"activity_cutoff,omitempty" jsonschema:"Effective RFC3339 activity cutoff; pass it unchanged with next_cursor as cursor to continue."`
-	ExcludedActive    int            `json:"excluded_active,omitempty"`
+	SessionLimitReached bool           `json:"session_limit_reached,omitempty" jsonschema:"Distinct-session continuation reached its 512-session bound. Narrow the date or project filters."`
+	NextSessionCursor   string         `json:"next_session_cursor,omitempty"`
+	Matches             []contentMatch `json:"matches"`
+	NextCursor          *int           `json:"next_cursor,omitempty"`
+	ActivityCutoff      string         `json:"activity_cutoff,omitempty" jsonschema:"Effective RFC3339 activity cutoff; pass it unchanged with next_cursor as cursor to continue."`
+	ExcludedActive      int            `json:"excluded_active,omitempty"`
 	// EffectiveMode and EffectiveScope report the defaults the search
 	// resolved, which the caller cannot see in its own request.
 	EffectiveMode  string                  `json:"effective_mode"`
@@ -935,10 +936,11 @@ func (t *toolset) searchContent(
 	}
 	legacy := cutoff != "" && !res.ActiveFilterApplied
 	out := searchContentOut{
-		NextSessionCursor: nextSessionCursor,
-		Matches:           make([]contentMatch, 0, len(res.Matches)),
-		ActivityCutoff:    cutoff,
-		EffectiveMode:     cmp.Or(in.Mode, "substring"),
+		NextSessionCursor:   nextSessionCursor,
+		SessionLimitReached: unique && nextSessionCursor == "" && len(sessionState.IDs)+len(res.Matches) >= 512,
+		Matches:             make([]contentMatch, 0, len(res.Matches)),
+		ActivityCutoff:      cutoff,
+		EffectiveMode:       cmp.Or(in.Mode, "substring"),
 		Exclusions: searchContentExclusions{
 			CurrentSessionID: currentSession,
 			RecentActive:     currentSession == "" && !in.IncludeActive,
