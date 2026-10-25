@@ -1420,6 +1420,9 @@ func (b *directBackend) enrichContentContext(
 // never reaches a transport response.
 func RedactMessageSecrets(m db.Message) db.Message {
 	m.Content = secrets.Redact(m.Content)
+	if m.DialogueText != nil {
+		m.DialogueText = new(secrets.Redact(*m.DialogueText))
+	}
 	m.ThinkingText = secrets.Redact(m.ThinkingText)
 	if len(m.ToolCalls) == 0 {
 		return m

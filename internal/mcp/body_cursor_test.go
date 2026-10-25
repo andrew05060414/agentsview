@@ -27,7 +27,7 @@ func TestGetMessages_BodyCursorRejectsSystemRow(t *testing.T) {
 			Content: "secret system prompt", IsSystem: true,
 			ContentLength: len("secret system prompt"),
 		},
-		dbtest.UserMsg("sysrow", 1, "abcdefghij"),
+		dialogueUserMsg("sysrow", 1, "abcdefghij"),
 	}, dbtest.WithMessageCounts(2, 1))
 
 	_, first, err := ts.getMessages(t.Context(), nil, getMessagesIn{
@@ -60,7 +60,7 @@ func TestGetMessages_TruncatedWithoutRevisionBindingsKeepsPagination(t *testing.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"messages":[{"session_id":"legacy","ordinal":0,` +
-			`"role":"user","content":"abcdefghij","content_length":10}],` +
+			`"role":"user","content":"abcdefghij","dialogue_text":"abcdefghij","content_length":10}],` +
 			`"count":1,"first_ordinal":0,"last_ordinal":0}`))
 	}))
 	t.Cleanup(srv.Close)
@@ -89,7 +89,7 @@ func TestGetMessages_TruncatedWithoutRevisionBindingsKeepsPagination(t *testing.
 func TestGetMessages_BodyCursorContinuesUnderIssuingRoles(t *testing.T) {
 	ts, d := newTestToolset(t)
 	dbtest.SeedSessionWithMessages(t, d, "toolroles", "proj", []db.Message{
-		dbtest.UserMsg("toolroles", 0, "abcdefghij"),
+		dialogueUserMsg("toolroles", 0, "abcdefghij"),
 		{
 			SessionID: "toolroles", Ordinal: 1, Role: "tool",
 			Content:       "remainder text",
