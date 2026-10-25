@@ -6,6 +6,7 @@ package mcp
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json/v2"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/service"
 )
 
@@ -435,8 +437,8 @@ type getMessagesIn struct {
 	Around             *int     `json:"around,omitempty" jsonschema:"Center a symmetric window on this ordinal (e.g. match_ordinal from search_content or search_sessions), instead of linear pagination. Mutually exclusive with from and direction."`
 	Before             *int     `json:"before,omitempty" jsonschema:"Messages of context before the around anchor, default 5. Requires around; replaces limit on that path."`
 	After              *int     `json:"after,omitempty" jsonschema:"Messages of context after the around anchor, default 5. Requires around; replaces limit on that path."`
-	Roles              []string `json:"roles,omitempty" jsonschema:"Roles to include, e.g. tool. Default: user and assistant only. System messages are always excluded. Ignored when raw is set."`
-	Raw                bool     `json:"raw,omitempty" jsonschema:"Return the stored records, including tool-only rows. Default false returns dialogue only: tool-only rows are omitted and counted in filtered."`
+	Roles              []string `json:"roles,omitempty" jsonschema:"Roles to include, e.g. tool. Explicit roles retain stored content. Default: user and assistant only. System messages are always excluded."`
+	Raw                bool     `json:"raw,omitempty" jsonschema:"Return stored content, including tool-only rows. Default false returns persisted dialogue projections; unclassified rows are withheld and counted in uncertain and filtered."`
 	MaxCharsPerMessage int      `json:"max_chars_per_message,omitempty" jsonschema:"Truncate each message to this many characters, default 2000, max 20000."`
 	ExpectedRevision   string   `json:"expected_revision,omitempty" jsonschema:"Transcript revision cited by search or an earlier read. Returns source_changed when it no longer matches."`
 	BodyCursor         string   `json:"body_cursor,omitempty" jsonschema:"Opaque continuation for the remainder of one oversized message. Use before advancing next_from."`
@@ -452,12 +454,13 @@ type messageOut struct {
 	FullLength int    `json:"full_length,omitempty"`
 	Truncated  bool   `json:"truncated,omitempty"`
 	BodyCursor string `json:"body_cursor,omitempty"`
+	bodyDigest string
 }
 
 type getMessagesOut struct {
 	Messages  []messageOut `json:"messages"`
 	Filtered  int          `json:"filtered,omitempty" jsonschema:"How many of this page's scanned messages were excluded, by the role/system filter or, unless raw is set, because they carry no dialogue (omitted when zero). Summed across a full pagination sweep, filtered plus the returned messages adds up to the session's message_count."`
-	Uncertain int          `json:"uncertain,omitempty" jsonschema:"How many returned messages carry a tool call whose rendering could not be matched, so they were kept whole rather than dropped."`
+	Uncertain int          `json:"uncertain,omitempty" jsonschema:"How many scanned messages were withheld because their dialogue projection is unclassified (a coverage gap). Included in filtered."`
 	// NextFrom is set off the last scanned ordinal (not the last visible
 	// one), so paging stays reliable even though filtering can make a page
 	// return fewer than the limit.
@@ -475,6 +478,11 @@ type messageBodyCursor struct {
 	NextFrom       *int     `json:"n,omitempty"`
 	Roles          []string `json:"l,omitempty"`
 	Raw            bool     `json:"w,omitempty"`
+	ContentDigest  string   `json:"h"`
+}
+
+func messageBodyDigest(content string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(content)))
 }
 
 func encodeMessageBodyCursor(cursor messageBodyCursor) string {
@@ -488,47 +496,36 @@ func decodeMessageBodyCursor(raw string) (messageBodyCursor, error) {
 		return messageBodyCursor{}, errors.New("invalid body_cursor")
 	}
 	var cursor messageBodyCursor
-	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.Version != 2 ||
+	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.Version != 3 ||
 		cursor.EvidenceSource == "" || cursor.SessionID == "" || cursor.Revision == "" ||
+		cursor.ContentDigest == "" ||
 		cursor.Ordinal < 0 || cursor.Offset <= 0 {
 		return messageBodyCursor{}, errors.New("invalid body_cursor")
 	}
 	return cursor, nil
 }
 
-// filterAndMapMessage applies the get_messages visibility contract to one
-// message and shapes a survivor into a messageOut truncated to maxChars. ok
-// is false when the message was filtered, so the caller can count it.
-// uncertain is true when a kept message carries a tool call whose rendering
-// could not be matched, so it was kept whole rather than dropped.
-//
-// raw keeps the stored records: only the role filter applies, and an empty
-// roles falls back to user and assistant. Otherwise a message must also be
-// dialogue (db.DialogueVisible): a tool-only row is excluded even though its
-// role is assistant. System content (IsSystem or a legacy system content
-// prefix) is always dropped.
 // projectedMessageContent selects dialogue without rewriting the archived record.
-// Legacy rows with uncertain tool/thinking content are withheld by default.
+// A nil projection is a coverage gap, even when legacy flags claim no tools.
 func projectedMessageContent(m db.Message, raw bool) (string, bool, bool) {
 	if raw {
 		return m.Content, true, false
 	}
-	verdict := db.DialogueVisible(m)
-	if !verdict.Visible {
-		return "", false, verdict.Uncertain
+	if !roleAllowed(m.Role, nil) || m.SourceSubtype == "tool_result" {
+		return "", false, false
 	}
-	if m.DialogueText != nil {
-		if strings.TrimSpace(*m.DialogueText) == "" {
-			return "", false, false
-		}
-		return *m.DialogueText, true, false
-	}
-	if m.HasToolUse || len(m.ToolCalls) > 0 || m.HasThinking || verdict.Uncertain {
+	if m.DialogueText == nil {
 		return "", false, true
 	}
-	return m.Content, true, false
+	if strings.TrimSpace(*m.DialogueText) == "" {
+		return "", false, false
+	}
+	return *m.DialogueText, true, false
 }
 
+// filterAndMapMessage always excludes system content, then selects either the
+// persisted dialogue or explicitly requested raw content. Unclassified dialogue
+// is withheld and counted as uncertain; no rendering heuristics recover it.
 func filterAndMapMessage(m db.Message, roles []string, maxChars int, raw bool) (messageOut, bool, bool) {
 	if isSystemMessage(m) || !roleAllowed(m.Role, roles) {
 		return messageOut{}, false, false
@@ -545,6 +542,7 @@ func filterAndMapMessage(m db.Message, roles []string, maxChars int, raw bool) (
 	}
 	if cut {
 		mo.FullLength = utf8.RuneCountInString(content)
+		mo.bodyDigest = messageBodyDigest(content)
 	}
 	return mo, true, uncertain
 }
@@ -635,7 +633,7 @@ const dialogueAroundFetchCap = 200
 func (t *toolset) getMessagesAround(
 	ctx context.Context, in getMessagesIn,
 ) (*mcp.CallToolResult, getMessagesOut, error) {
-	if in.Raw {
+	if in.Raw || len(in.Roles) > 0 {
 		return t.getMessagesAroundRaw(ctx, in)
 	}
 	return t.getMessagesAroundDialogue(ctx, in)
@@ -662,7 +660,7 @@ func (t *toolset) getMessagesAroundRaw(
 	if err != nil {
 		return nil, getMessagesOut{}, err
 	}
-	return nil, t.shapeAround(res, in, roles, in.Raw), nil
+	return nil, t.shapeAround(res, in, roles, true), nil
 }
 
 // getMessagesAroundDialogue counts before/after over dialogue rows. It reads
@@ -765,7 +763,7 @@ func (t *toolset) shapeAround(
 	if anchorIdx >= 0 {
 		beforeFrom = anchorIdx
 		seen := 0
-		for i := anchorIdx - 1; i >= 0; i-- {
+		for i := anchorIdx - 1; before > 0 && i >= 0; i-- {
 			if kept[i] {
 				seen++
 			}
@@ -778,8 +776,9 @@ func (t *toolset) shapeAround(
 	// afterTo is one past the last row of the page, found the same way.
 	afterTo := len(res.Messages)
 	if anchorIdx >= 0 {
+		afterTo = anchorIdx + 1
 		seen := 0
-		for i := anchorIdx + 1; i < len(res.Messages); i++ {
+		for i := anchorIdx + 1; after > 0 && i < len(res.Messages); i++ {
 			afterTo = i + 1
 			if kept[i] {
 				seen++
@@ -791,12 +790,12 @@ func (t *toolset) shapeAround(
 	}
 
 	for i := beforeFrom; i < afterTo; i++ {
+		if uncertain[i] {
+			out.Uncertain++
+		}
 		if !kept[i] {
 			out.Filtered++
 			continue
-		}
-		if uncertain[i] {
-			out.Uncertain++
 		}
 		out.Messages = append(out.Messages, mapped[i])
 	}
@@ -831,10 +830,10 @@ func attachBodyCursors(
 		}
 		hasBodyCursor = true
 		out.Messages[i].BodyCursor = encodeMessageBodyCursor(messageBodyCursor{
-			Version: 2, EvidenceSource: evidenceSource, SessionID: sessionID,
+			Version: 3, EvidenceSource: evidenceSource, SessionID: sessionID,
 			Revision: out.TranscriptRevision, Ordinal: out.Messages[i].Ordinal,
 			Offset: utf8.RuneCountInString(out.Messages[i].Content), NextFrom: nextFrom,
-			Roles: roles, Raw: raw,
+			Roles: roles, Raw: raw, ContentDigest: out.Messages[i].bodyDigest,
 		})
 	}
 	if hasBodyCursor {
@@ -888,6 +887,9 @@ func (t *toolset) getMessageBodyContinuation(
 	content, visible, _ := projectedMessageContent(message, cursor.Raw || len(cursor.Roles) > 0)
 	if !visible {
 		return nil, getMessagesOut{}, fmt.Errorf("%w: cited message projection unavailable", service.ErrSourceChanged)
+	}
+	if messageBodyDigest(content) != cursor.ContentDigest {
+		return nil, getMessagesOut{}, fmt.Errorf("%w: cited message projection changed", service.ErrSourceChanged)
 	}
 	runes := []rune(content)
 	if cursor.Offset >= len(runes) {
@@ -946,30 +948,34 @@ func toContextMessages(msgs []db.Message) []contextMessage {
 	}
 	out := make([]contextMessage, 0, len(msgs))
 	for _, m := range msgs {
-		content, _ := truncate(m.Content, contextMessageMaxChars)
+		message, ok, _ := filterAndMapMessage(m, nil, contextMessageMaxChars, false)
+		if !ok {
+			continue
+		}
 		out = append(out, contextMessage{
-			Ordinal: m.Ordinal, Role: m.Role, Content: content,
+			Ordinal: m.Ordinal, Role: m.Role, Content: message.Content,
 		})
 	}
 	return out
 }
 
 type contentMatch struct {
-	WebURL          string   `json:"web_url,omitempty" jsonschema:"Browser URL for this session; use this URL when linking to it."`
-	SessionID       string   `json:"session_id"`
-	Project         string   `json:"project,omitempty"`
-	Agent           string   `json:"agent"`
-	Location        string   `json:"location" jsonschema:"Where the match occurred: one of message, thinking, tool_input, or tool_result."`
-	Role            string   `json:"role,omitempty"`
-	Ordinal         int      `json:"ordinal"`
-	Timestamp       string   `json:"timestamp"`
-	Snippet         string   `json:"snippet"`
-	Score           *float64 `json:"score,omitempty" jsonschema:"Relevance score for semantic/hybrid modes; omitted for substring/regex/fts."`
-	OrdinalRange    [2]int   `json:"ordinal_range" jsonschema:"[start, end] ordinals of the conversation unit containing this match; equal to the match ordinal for single-message units."`
-	Subordinate     bool     `json:"subordinate,omitzero" jsonschema:"True when this match belongs to a subordinate unit: a sidechain run, or a subagent/fork session."`
-	Relationship    string   `json:"relationship,omitempty" jsonschema:"The matched session's relationship to its parent (for example subagent or fork), when it has one."`
-	ParentSessionID string   `json:"parent_session_id,omitempty" jsonschema:"The parent session ID, when the matched session has one."`
-	Sidechain       bool     `json:"is_sidechain,omitzero" jsonschema:"True when the matched message itself is flagged as a sidechain message."`
+	WebURL              string   `json:"web_url,omitempty" jsonschema:"Browser URL for this session; use this URL when linking to it."`
+	SessionID           string   `json:"session_id"`
+	Project             string   `json:"project,omitempty"`
+	Agent               string   `json:"agent"`
+	Location            string   `json:"location" jsonschema:"Where the match occurred: one of message, thinking, tool_input, or tool_result."`
+	Role                string   `json:"role,omitempty"`
+	Ordinal             int      `json:"ordinal"`
+	Timestamp           string   `json:"timestamp"`
+	Snippet             string   `json:"snippet"`
+	DialogueUnavailable bool     `json:"dialogue_unavailable,omitempty" jsonschema:"The hit has no reliable dialogue projection. Its snippet is withheld; session/ordinal metadata remains available for explicit raw inspection."`
+	Score               *float64 `json:"score,omitempty" jsonschema:"Relevance score for semantic/hybrid modes; omitted for substring/regex/fts."`
+	OrdinalRange        [2]int   `json:"ordinal_range" jsonschema:"[start, end] ordinals of the conversation unit containing this match; equal to the match ordinal for single-message units."`
+	Subordinate         bool     `json:"subordinate,omitzero" jsonschema:"True when this match belongs to a subordinate unit: a sidechain run, or a subagent/fork session."`
+	Relationship        string   `json:"relationship,omitempty" jsonschema:"The matched session's relationship to its parent (for example subagent or fork), when it has one."`
+	ParentSessionID     string   `json:"parent_session_id,omitempty" jsonschema:"The parent session ID, when the matched session has one."`
+	Sidechain           bool     `json:"is_sidechain,omitzero" jsonschema:"True when the matched message itself is flagged as a sidechain message."`
 	// ContextBefore/ContextAfter are populated when Context > 0: the N
 	// messages immediately before/after this match, content truncated to
 	// 500 characters.
@@ -1129,11 +1135,42 @@ func (t *toolset) searchContent(
 				continue
 			}
 		}
+		// Storage search deliberately falls back to raw text for legacy rows.
+		// The memory surface must not advertise that fallback as dialogue. Keep
+		// hit coordinates and pagination, but withhold unclassified snippets.
+		unavailable := false
+		if len(in.Sources) == 0 && m.Location != "message" {
+			m.Snippet = ""
+			unavailable = true
+		}
+		if len(in.Sources) == 0 && m.Location == "message" {
+			page, err := t.svc.Messages(ctx, m.SessionID, service.MessageFilter{
+				Around: &m.Ordinal, Before: new(0), After: new(0),
+				ExpectedRevision: m.TranscriptRevision,
+			})
+			if err != nil {
+				return nil, searchContentOut{}, err
+			}
+			m.Snippet = ""
+			unavailable = true
+			if len(page.Messages) == 1 && page.Messages[0].Ordinal == m.Ordinal {
+				stored := page.Messages[0]
+				if stored.DialogueText != nil {
+					stored.DialogueText = new(secrets.Redact(*stored.DialogueText))
+				}
+				message, ok, _ := filterAndMapMessage(stored, nil, contextMessageMaxChars, false)
+				if ok {
+					m.Snippet = message.Content
+					unavailable = false
+				}
+			}
+		}
 		out.Matches = append(out.Matches, contentMatch{
 			WebURL: m.WebURL, SessionID: m.SessionID, Project: m.Project, Agent: m.Agent,
 			Location: m.Location, Role: m.Role, Ordinal: m.Ordinal,
 			Timestamp: m.Timestamp, Snippet: m.Snippet, Score: m.Score,
-			OrdinalRange: m.OrdinalRange, Subordinate: m.Subordinate,
+			DialogueUnavailable: unavailable,
+			OrdinalRange:        m.OrdinalRange, Subordinate: m.Subordinate,
 			Relationship: m.Relationship, ParentSessionID: m.ParentSessionID,
 			Sidechain:          m.Sidechain,
 			ContextBefore:      toContextMessages(m.ContextBefore),
