@@ -26,7 +26,7 @@ func dialogueText(content string) *string { return &content }
 
 // TestGetMessages_OmitsToolOnlyRows pins the default read to dialogue: a row
 // whose content is only a tool rendering is counted in Filtered, while a row
-// that still has prose is returned whole.
+// with prose and tools returns only the dialogue projection.
 func TestGetMessages_OmitsToolOnlyRows(t *testing.T) {
 	ts, d := newTestToolset(t)
 	dbtest.SeedSession(t, d, "s1", "proj", func(s *db.Session) {
@@ -52,7 +52,7 @@ func TestGetMessages_OmitsToolOnlyRows(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, out.Messages, 3)
 	assert.Equal(t, []int{0, 2, 3}, ordinals(out))
-	assert.Equal(t, prose, out.Messages[1].Content, "prose plus a tool call is returned whole")
+	assert.Equal(t, "running it", out.Messages[1].Content, "mixed tool rendering must not leak")
 	assert.Equal(t, 1, out.Filtered)
 	assert.Equal(t, 0, out.Uncertain)
 }
@@ -75,10 +75,9 @@ func TestGetMessages_RawKeepsToolOnlyRows(t *testing.T) {
 	assert.Equal(t, 0, out.Filtered)
 }
 
-// TestGetMessages_KeepsUnmatchedRendering pins the safe side of the rule: a
-// tool row whose rendering cannot be rebuilt from its stored input is kept
-// and counted as uncertain, never deleted on a guess.
-func TestGetMessages_KeepsUnmatchedRendering(t *testing.T) {
+// TestGetMessages_ExcludesUnmatchedRendering ensures uncertain legacy tool text
+// is withheld rather than being advertised as dialogue.
+func TestGetMessages_ExcludesUnmatchedRendering(t *testing.T) {
 	ts, d := newTestToolset(t)
 	dbtest.SeedSession(t, d, "s1", "proj", func(s *db.Session) {
 		s.MessageCount = 1
@@ -91,10 +90,34 @@ func TestGetMessages_KeepsUnmatchedRendering(t *testing.T) {
 
 	_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "s1"})
 	require.NoError(t, err)
-	require.Len(t, out.Messages, 1)
-	assert.Equal(t, 0, out.Messages[0].Ordinal)
+	require.Empty(t, out.Messages)
 	assert.Equal(t, 1, out.Uncertain)
-	assert.Equal(t, 0, out.Filtered)
+	assert.Equal(t, 1, out.Filtered)
+}
+
+// A mixed legacy row without a persisted dialogue projection cannot be
+// safely decontaminated. Default is fail-closed, raw remains available.
+func TestGetMessages_WithholdsUnclassifiedMixedRow(t *testing.T) {
+	ts, d := newTestToolset(t)
+	dbtest.SeedSession(t, d, "mixed", "proj", func(s *db.Session) {
+		s.MessageCount = 2
+	})
+	raw := "starting\\n[Bash]\\n$ cat token"
+	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
+		{SessionID: "mixed", Ordinal: 0, Role: "assistant", Content: raw,
+			ContentLength: len(raw), HasToolUse: true,
+			ToolCalls: []db.ToolCall{{ToolName: "shell", Category: "Bash", InputJSON: `{"command":"cat token"}`}}},
+		dbtest.AsstMsg("mixed", 1, "finished"),
+	}))
+	_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "mixed"})
+	require.NoError(t, err)
+	assert.Equal(t, []int{1}, ordinals(out))
+	assert.Equal(t, 1, out.Filtered)
+	assert.Equal(t, 1, out.Uncertain)
+	_, full, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "mixed", Raw: true})
+	require.NoError(t, err)
+	require.Len(t, full.Messages, 2)
+	assert.Equal(t, raw, full.Messages[0].Content)
 }
 
 // TestGetMessages_AroundCountsVisibleRows pins the window to dialogue rows:
