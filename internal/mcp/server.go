@@ -217,7 +217,8 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolSearchContent,
-		Description: "Search raw session text, including thinking, tool inputs, and results. " +
+		Description: "Search session text. Substring and regex search dialogue messages only by default; " +
+			"pass sources to include thinking, tool inputs, or tool results. " +
 			"Prefer mode hybrid (semantic similarity plus keywords) for finding " +
 			"prior work and answering contextual questions, especially when the exact wording is unknown. " +
 			"Hybrid returns keyword matches with effective_mode hybrid_keyword and a note when search by meaning is unavailable. " +

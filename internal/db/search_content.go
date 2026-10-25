@@ -346,6 +346,21 @@ func hasSource(f ContentSearchFilter, name string) bool {
 	return slices.Contains(f.Sources, name)
 }
 
+// dialogueMessagePredicate keeps a lexical message search on dialogue rows:
+// user or assistant, not a tool result, and not a row whose stored dialogue
+// projection is empty. A NULL projection is an unclassified legacy row and is
+// kept. The system exclusion is added only when the caller asks for it, so
+// the CLI and HTTP default of including system rows is unchanged.
+func dialogueMessagePredicate(f ContentSearchFilter) string {
+	pred := "m.role IN ('user','assistant')" +
+		" AND COALESCE(m.source_subtype,'') <> 'tool_result'" +
+		" AND (m.dialogue_text IS NULL OR TRIM(m.dialogue_text) <> '')"
+	if f.ExcludeSystem {
+		pred += " AND m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
+	}
+	return pred
+}
+
 // searchContentSubstring builds a UNION ALL across the selected sources
 // with a case-insensitive LIKE, scoped to qualifying sessions, ordered by
 // recency then ordinal, fetching Limit+1 rows for cursor detection. A query
@@ -428,11 +443,7 @@ func substringUnion(f ContentSearchFilter, candidates substringCandidateFilters)
 	// the Limit+1 returned rows ship a full body.
 	snippetExpr := func(col string) string { return col }
 
-	sysPred := "1=1"
-	if f.ExcludeSystem {
-		sysPred = "m.is_system = 0 AND " +
-			SystemPrefixSQL("m.content", "m.role")
-	}
+	sysPred := dialogueMessagePredicate(f)
 	if hasSource(f, "messages") {
 		branches = append(branches, fmt.Sprintf(`
 			SELECT m.session_id, s.project, s.agent,
@@ -817,11 +828,7 @@ func (db *DB) regexCandidateRows(
 		return col + " LIKE ? ESCAPE '\\'"
 	}
 
-	sysPred := "1=1"
-	if f.ExcludeSystem {
-		sysPred = "m.is_system = 0 AND " +
-			SystemPrefixSQL("m.content", "m.role")
-	}
+	sysPred := dialogueMessagePredicate(f)
 	if hasSource(f, "messages") {
 		w := prefilterClause("COALESCE(m.dialogue_text, m.content)") + candidates.message.sql
 		args = append(args, candidates.message.args...)
@@ -1088,10 +1095,7 @@ func (db *DB) searchContentFTS(
 		return ContentSearchPage{}, err
 	}
 	scope, scopeArgs := sessionScopeSubquery(f)
-	sysPred := "1=1"
-	if f.ExcludeSystem {
-		sysPred = "m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
-	}
+	sysPred := dialogueMessagePredicate(f)
 	// A row can match OR and NOT queries without every operand, so ask SQLite
 	// which operands this row matched. Snippets then follow a branch the row
 	// actually satisfied. Unquoted input never carries these operators. Syntax
