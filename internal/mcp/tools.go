@@ -474,6 +474,7 @@ type messageBodyCursor struct {
 	Offset         int      `json:"p"`
 	NextFrom       *int     `json:"n,omitempty"`
 	Roles          []string `json:"l,omitempty"`
+	Raw            bool     `json:"w,omitempty"`
 }
 
 func encodeMessageBodyCursor(cursor messageBodyCursor) string {
@@ -506,30 +507,44 @@ func decodeMessageBodyCursor(raw string) (messageBodyCursor, error) {
 // dialogue (db.DialogueVisible): a tool-only row is excluded even though its
 // role is assistant. System content (IsSystem or a legacy system content
 // prefix) is always dropped.
+// projectedMessageContent selects dialogue without rewriting the archived record.
+// Legacy rows with uncertain tool/thinking content are withheld by default.
+func projectedMessageContent(m db.Message, raw bool) (string, bool, bool) {
+	if raw {
+		return m.Content, true, false
+	}
+	verdict := db.DialogueVisible(m)
+	if !verdict.Visible {
+		return "", false, verdict.Uncertain
+	}
+	if m.DialogueText != nil {
+		if strings.TrimSpace(*m.DialogueText) == "" {
+			return "", false, false
+		}
+		return *m.DialogueText, true, false
+	}
+	if m.HasToolUse || len(m.ToolCalls) > 0 || m.HasThinking || verdict.Uncertain {
+		return "", false, true
+	}
+	return m.Content, true, false
+}
+
 func filterAndMapMessage(m db.Message, roles []string, maxChars int, raw bool) (messageOut, bool, bool) {
 	if isSystemMessage(m) || !roleAllowed(m.Role, roles) {
 		return messageOut{}, false, false
 	}
-	uncertain := false
-	if !raw {
-		verdict := db.DialogueVisible(m)
-		if !verdict.Visible {
-			return messageOut{}, false, false
-		}
-		uncertain = verdict.Uncertain
+	content, ok, uncertain := projectedMessageContent(m, raw)
+	if !ok {
+		return messageOut{}, false, uncertain
 	}
-	content, cut := truncate(m.Content, maxChars)
+	text, cut := truncate(content, maxChars)
 	mo := messageOut{
-		Ordinal:    m.Ordinal,
-		Role:       m.Role,
-		Content:    content,
-		Timestamp:  m.Timestamp,
-		Model:      m.Model,
-		HasToolUse: m.HasToolUse,
-		Truncated:  cut,
+		Ordinal: m.Ordinal, Role: m.Role, Content: text,
+		Timestamp: m.Timestamp, Model: m.Model, HasToolUse: m.HasToolUse,
+		Truncated: cut,
 	}
 	if cut {
-		mo.FullLength = utf8.RuneCountInString(m.Content)
+		mo.FullLength = utf8.RuneCountInString(content)
 	}
 	return mo, true, uncertain
 }
@@ -569,12 +584,12 @@ func (t *toolset) getMessages(
 	}
 	for _, m := range res.Messages {
 		mo, ok, uncertain := filterAndMapMessage(m, in.Roles, maxChars, in.Raw || len(in.Roles) > 0)
+		if uncertain {
+			out.Uncertain++
+		}
 		if !ok {
 			out.Filtered++
 			continue
-		}
-		if uncertain {
-			out.Uncertain++
 		}
 		out.Messages = append(out.Messages, mo)
 	}
@@ -592,7 +607,7 @@ func (t *toolset) getMessages(
 			out.NextFrom = &next
 		}
 	}
-	attachBodyCursors(&out, res.EvidenceSource, in.SessionID, in.Roles)
+	attachBodyCursors(&out, res.EvidenceSource, in.SessionID, in.Roles, in.Raw || len(in.Roles) > 0)
 	return nil, out, nil
 }
 
@@ -792,12 +807,12 @@ func (t *toolset) shapeAround(
 		next := res.Messages[afterTo-1].Ordinal + 1
 		out.NextFrom = &next
 	}
-	attachBodyCursors(&out, res.EvidenceSource, in.SessionID, in.Roles)
+	attachBodyCursors(&out, res.EvidenceSource, in.SessionID, in.Roles, raw)
 	return out
 }
 
 func attachBodyCursors(
-	out *getMessagesOut, evidenceSource, sessionID string, roles []string,
+	out *getMessagesOut, evidenceSource, sessionID string, roles []string, raw bool,
 ) {
 	nextFrom := out.NextFrom
 	hasBodyCursor := false
@@ -819,7 +834,7 @@ func attachBodyCursors(
 			Version: 2, EvidenceSource: evidenceSource, SessionID: sessionID,
 			Revision: out.TranscriptRevision, Ordinal: out.Messages[i].Ordinal,
 			Offset: utf8.RuneCountInString(out.Messages[i].Content), NextFrom: nextFrom,
-			Roles: roles,
+			Roles: roles, Raw: raw,
 		})
 	}
 	if hasBodyCursor {
@@ -870,7 +885,11 @@ func (t *toolset) getMessageBodyContinuation(
 	if isSystemMessage(message) || !roleAllowed(message.Role, cursor.Roles) {
 		return nil, getMessagesOut{}, fmt.Errorf("%w: cited message is not available", service.ErrSourceChanged)
 	}
-	runes := []rune(message.Content)
+	content, visible, _ := projectedMessageContent(message, cursor.Raw || len(cursor.Roles) > 0)
+	if !visible {
+		return nil, getMessagesOut{}, fmt.Errorf("%w: cited message projection unavailable", service.ErrSourceChanged)
+	}
+	runes := []rune(content)
 	if cursor.Offset >= len(runes) {
 		return nil, getMessagesOut{}, errors.New("invalid body_cursor offset")
 	}
