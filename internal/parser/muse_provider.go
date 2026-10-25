@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -12,11 +13,76 @@ import (
 // into that shape, which keeps tool output spills, approval-review logs, and
 // the derived .msp-view-v1 cache out of the scan.
 func newMuseProviderFactory(def AgentDef) ProviderFactory {
-	return NewSourceSetFactory(
+	return museProviderFactory{NewSourceSetFactory(
 		def,
 		museProviderCapabilities(),
 		func(cfg ProviderConfig) SourceSet { return newMuseSourceSet(cfg.Roots) },
-	)
+	)}
+}
+
+// museProviderFactory adds raw capture of session.jsonl to the source set
+// provider. The source set already decides which files are sessions, so the
+// plan reuses that discovery instead of walking the tree again.
+type museProviderFactory struct{ ProviderFactory }
+
+func (f museProviderFactory) NewProvider(cfg ProviderConfig) Provider {
+	return &museProvider{f.ProviderFactory.NewProvider(cfg).(*SourceSetProvider)}
+}
+
+type museProvider struct{ *SourceSetProvider }
+
+var _ StreamingRawCaptureSourceProvider = (*museProvider)(nil)
+
+func (p *museProvider) Definition() AgentDef {
+	return p.SourceSetProvider.Definition()
+}
+
+func (p *museProvider) Capabilities() Capabilities {
+	return p.SourceSetProvider.Capabilities()
+}
+
+func (p *museProvider) DiscoverRawCaptureSourcesEach(
+	ctx context.Context, yield func(SourceRef) error,
+) (bool, error) {
+	err := p.DiscoverEach(withRawCaptureStreamingTraversal(ctx), yield)
+	return err == nil, err
+}
+
+// PlanRawCapture captures one session.jsonl. Tool output spills,
+// approval-review logs, and the derived .msp-view-v1 cache never reach this
+// plan because discovery does not yield them.
+func (p *museProvider) PlanRawCapture(
+	ctx context.Context, source SourceRef,
+) (RawCapturePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return RawCapturePlan{}, err
+	}
+	src, ok := source.Opaque.(JSONLSource)
+	if !ok || src.Root == "" || src.Path == "" || isS3URI(src.Root) ||
+		!isMuseSourcePath(src.Root, src.Path) {
+		return RawCapturePlan{}, invalidRawCapturePlan("muse source is not a local session log")
+	}
+	info, err := os.Lstat(src.Path)
+	if err != nil {
+		return RawCapturePlan{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return RawCapturePlan{}, invalidRawCapturePlan("muse session log is not a regular file")
+	}
+	rel, err := filepath.Rel(src.Root, src.Path)
+	if err != nil {
+		return RawCapturePlan{}, invalidRawCapturePlan(
+			"resolve muse session log path: %s", rawCaptureFilesystemError(err),
+		)
+	}
+	return RawCapturePlan{
+		ConfiguredRoot: src.Root,
+		CaptureRoot:    src.Root,
+		SourceKey:      source.Key,
+		Entries: []RawCaptureEntry{{
+			Path: filepath.ToSlash(rel), LocalPath: src.Path, Appendable: true,
+		}},
+	}, nil
 }
 
 func newMuseSourceSet(roots []string) JSONLSourceSet {
@@ -117,6 +183,12 @@ func museDigits(s string, n int) bool {
 
 func museProviderCapabilities() Capabilities {
 	caps := Capabilities{
+		RawCapture: RawCaptureCapabilities{
+			Support:  CapabilitySupported,
+			Shape:    RawCaptureShapeFiles,
+			Append:   RawCaptureAppendOne,
+			Snapshot: RawCaptureSnapshotNone,
+		},
 		Source: jsonlFileProviderSourceCapabilities(),
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,

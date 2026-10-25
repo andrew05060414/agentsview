@@ -1808,3 +1808,60 @@ func TestProviderParserHostedCodexSkillNameStaysLexical(t *testing.T) {
 	require.Len(t, out.Outcome.Results[0].Result.Messages[0].ToolCalls, 1)
 	assert.Empty(t, out.Outcome.Results[0].Result.Messages[0].ToolCalls[0].SkillName)
 }
+
+// TestProviderParserAcceptsMuseSessionManifest round-trips one synthetic Muse
+// session.jsonl through the provider plan into a canonical manifest and back
+// through the hosted parser. The record names only its stream, so the parse
+// accepts the source without carrying any conversation content.
+func TestProviderParserAcceptsMuseSessionManifest(t *testing.T) {
+	t.Parallel()
+	const sessionID = "0199a1b2-6c3d-7e4f-8a5b-000000000101"
+	clientRoot := t.TempDir()
+	rel := "2026/10/24/" + sessionID + "/session.jsonl"
+	sessionLog := filepath.Join(clientRoot, filepath.FromSlash(rel))
+	require.NoError(t, os.MkdirAll(filepath.Dir(sessionLog), 0o755))
+	contents := []byte(
+		`{"schema_version":1,"stream":{"kind":"session","id":"` + sessionID +
+			`"},"sequence":1,"recorded_at":1789000000000000,` +
+			`"payload_type":"runtime.session","payload":{"kind":"run","event":{"kind":"started"}}}` + "\n",
+	)
+	require.NoError(t, os.WriteFile(sessionLog, contents, 0o600))
+	excluded := filepath.Join(clientRoot, ".msp-view-v1", sessionID, "session.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(excluded), 0o755))
+	require.NoError(t, os.WriteFile(excluded, []byte("{}\n"), 0o600))
+
+	provider, ok := parser.NewProvider(parser.AgentMuse, parser.ProviderConfig{
+		Roots: []string{clientRoot},
+	})
+	require.True(t, ok)
+	discovery, err := parser.DiscoverRawCaptureSources(t.Context(), provider)
+	require.NoError(t, err)
+	require.True(t, discovery.Complete)
+	require.Len(t, discovery.Sources, 1, "only the session log is a raw-capture source")
+
+	manifest, objects := manifestFromCapturePlan(t, parser.AgentMuse, provider, discovery.Sources[0])
+	require.Len(t, manifest.Manifest.Entries, 1)
+	assert.Equal(t, rel, manifest.Manifest.Entries[0].Path)
+	assert.Equal(t, sessionLog, manifest.Manifest.SourceKey)
+
+	materialized, err := (Materializer{
+		Store: &materializerStore{objects: objects}, BaseDir: t.TempDir(), MaxTotalBytes: 1 << 20,
+	}).Materialize(t.Context(), manifest)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, materialized.Cleanup()) })
+	rebuilt, err := materialized.EntryPath(rel)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(materialized.Root(), filepath.FromSlash(rel)), rebuilt)
+
+	dispatch, err := NewProviderParser(parser.ProviderFactories(), "hosted-worker")
+	require.NoError(t, err)
+	parsed, err := dispatch.Parse(t.Context(), manifest, materialized)
+	require.NoError(t, err)
+	assert.False(t, parsed.Tombstone)
+	require.Len(t, parsed.Outcome.Results, 1)
+	session := parsed.Outcome.Results[0].Result.Session
+	assert.Equal(t, parser.AgentMuse, session.Agent)
+	assert.Equal(t, "muse:"+sessionID, session.ID)
+	assert.Equal(t, sessionLog, session.File.Path)
+	assert.NotContains(t, session.File.Path, materialized.Root())
+}
