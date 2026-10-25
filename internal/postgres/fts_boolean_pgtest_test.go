@@ -47,3 +47,20 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 		})
 	}
 }
+
+func TestPGFTSUsesDialogueProjection(t *testing.T) {
+	store := setupContentSearch(t)
+	insertCSSession(t, store, "projected", "fixture", "codex", "2024-06-15T10:00:00Z", "2024-06-15T11:00:00Z")
+	insertCSMessage(t, store, "projected", 0, "assistant", "visible answer; hidden 库", "2024-06-15T10:00:00Z", false)
+	_, err := store.DB().Exec("UPDATE messages SET dialogue_text=$1, thinking_text=$2 WHERE session_id=$3", "visible answer", "hidden 库", "projected")
+	require.NoError(t, err)
+	for _, pattern := range []string{"库", `"hidden" OR "absent"`} {
+		page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: pattern, Mode: "fts", Limit: 5})
+		require.NoError(t, err)
+		assert.Empty(t, page.Matches, "FTS must preserve the upstream dialogue/thinking boundary")
+	}
+	page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: "visible", Mode: "fts", Limit: 5})
+	require.NoError(t, err)
+	require.Len(t, page.Matches, 1)
+	assert.NotContains(t, page.Matches[0].Snippet, "hidden")
+}
