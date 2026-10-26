@@ -196,14 +196,15 @@ func (s *Store) fetchHybridKeywordBatchPG(
 }
 
 // pgKeywordApproxSnippet windows content around the pattern's term-aware span
-// (pgFTSSnippetRange, the same helper the fts snippet path uses via
+// (db.FTSSnippetRange, the same helper the fts snippet path uses via
 // pgSubstringSnippet), rune-snapped via db.SnippetBounds. Centering on the raw
 // pattern would fall back to the message start for quoted phrases or multi-term
-// queries whose pattern is not a literal substring. The result is the raw,
-// unredacted centering text SemanticSnippet later locates in
+// queries whose pattern is not a literal substring; FTSSnippetRange instead
+// locates the de-quoted phrase, then the first matched term, then the start. The
+// result is the raw, unredacted centering text SemanticSnippet later locates in
 // the full content; redaction always runs on the full content, not this window.
 func pgKeywordApproxSnippet(content, pattern string) string {
-	start, end := pgFTSSnippetRange(pattern, content)
+	start, end := db.FTSSnippetRange(pattern, content)
 	lo, hi := db.SnippetBounds(content, start, end, db.ContentSnippetRadius)
 	return content[lo:hi]
 }

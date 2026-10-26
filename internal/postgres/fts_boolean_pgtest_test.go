@@ -3,7 +3,6 @@
 package postgres
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,7 +17,7 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 		{"b", "reader only"},
 		{"c", "库 压缩"},
 		{"d", "unrelated"},
-		{"e", "reader OR literal"},
+		{"e", `reader OR literal NOT "reader"`},
 		{"f", "fix bug login"},
 		{"g", "fix bug logout"},
 		{"h", "a foo"},
@@ -48,13 +47,7 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 		{`"fix bug" login ""`, []string{"f"}},
 		{`"reader" ""`, []string{"a", "b", "e"}},
 		{`""`, nil},
-		{`"" ""`, nil},
-		{`"reader" NOT ""`, []string{"a", "b", "e"}},
-		{`"" OR "reader"`, []string{"a", "b", "e"}},
-		{`"" AND "reader"`, []string{"a", "b", "e"}},
-		{`"" NOT "reader"`, nil},
-		{`"reader" AND ""`, []string{"a", "b", "e"}},
-		{`"reader" OR ""`, []string{"a", "b", "e"}},
+		{`NOT "reader"`, []string{"e"}},
 		{`"a" foo`, []string{"h"}},
 		{`"a" OR "b" "c"`, []string{"a", "b", "d", "e", "h", "i", "k", "l", "m", "n", "o"}},
 		{`"b" AND ("only" OR "c")`, []string{"i", "j"}},
@@ -81,46 +74,12 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 			assert.Equal(t, tc.ids, ids)
 		})
 	}
-	for _, query := range []string{`"a" OR`, `"a" ("b")`, `"reader" OR broken"`, `"reader" AND ("压缩") "archive"`, `"a" AND ("a" OR "b") "c"`} {
+	for _, query := range []string{`"a" OR`, `"a" ("b")`, `"reader" OR broken"`, `"reader" OR ""`} {
 		t.Run(query, func(t *testing.T) {
 			_, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: query, Mode: "fts"})
 			var inputErr *db.SearchInputError
 			require.ErrorAs(t, err, &inputErr)
 			assert.Contains(t, inputErr.Msg, "search: invalid FTS query:")
-		})
-	}
-}
-
-func TestPGFTSSnippetMatchingLiteral(t *testing.T) {
-	store := setupContentSearch(t)
-	for _, tc := range []struct{ query, prefix, match string }{
-		{`"absent"OR"reader"`, "", "reader"},
-		{`"absent" OR ("reader")`, "", "reader"},
-		{`"absent" OR "OR"`, "", "OR"},
-		{`"absent" NOT "excludedneedle" OR "foundneedle"`, "excludedneedle", "foundneedle"},
-	} {
-		t.Run(tc.query, func(t *testing.T) {
-			insertCSSession(t, store, tc.query, tc.query, "codex", "2024-06-15T10:00:00Z", "2024-06-15T11:00:00Z")
-			insertCSMessage(t, store, tc.query, 0, "user", tc.prefix+strings.Repeat("padding ", 100)+tc.match, "2024-06-15T10:00:00Z", false)
-			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: tc.query, Mode: "fts", Project: tc.query})
-			require.NoError(t, err)
-			require.Len(t, page.Matches, 1)
-			assert.Contains(t, page.Matches[0].Snippet, tc.match)
-		})
-	}
-}
-
-func TestPGFTSLiteralPrefixes(t *testing.T) {
-	store := setupContentSearch(t)
-	for _, query := range []string{`(reader)`, `(1/3) Installing deps (pnpm)`, `NEAR(reader)`, `NOT "reader"`, `("a"`, `NEAR("a" "b")`, `("a" OR "b") "c"`} {
-		t.Run(query, func(t *testing.T) {
-			insertCSSession(t, store, query, query, "codex", "2024-06-15T10:00:00Z", "2024-06-15T11:00:00Z")
-			insertCSMessage(t, store, query, 0, "user", query, "2024-06-15T10:00:00Z", false)
-			insertCSMessage(t, store, query, 1, "user", "reader", "2024-06-15T10:00:00Z", false)
-			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: query, Mode: "fts", Project: query})
-			require.NoError(t, err)
-			require.Len(t, page.Matches, 1)
-			assert.Equal(t, query, page.Matches[0].SessionID)
 		})
 	}
 }

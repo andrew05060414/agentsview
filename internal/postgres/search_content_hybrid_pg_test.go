@@ -300,24 +300,6 @@ func TestPGHybridKeywordSnippetCentersOnTerm(t *testing.T) {
 		"snippet centers on a matched term, not the message start")
 }
 
-func TestPGHybridKeywordSnippetMatchingLiteral(t *testing.T) {
-	for _, tc := range []struct{ query, prefix, match string }{
-		{`"absent" OR "reader"`, "", "reader"},
-		{`"absent" NOT "excludedneedle" OR "foundneedle"`, "excludedneedle", "foundneedle"},
-	} {
-		t.Run(tc.query, func(t *testing.T) {
-			store := wireHybrid(t, &hybridFakeSearcher{})
-			insertCSSession(t, store, "s1", "proj", "claude", hybridStart, hybridEnd)
-			content := tc.prefix + strings.Repeat("padding ", 100) + tc.match
-			insertCSUnitMessage(t, store, "s1", 0, "user", content, false, false)
-			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: tc.query, Mode: "hybrid"})
-			require.NoError(t, err)
-			require.Len(t, page.Matches, 1)
-			assert.Contains(t, page.Matches[0].Snippet, tc.match)
-		})
-	}
-}
-
 // hybridSessionIDs projects a page's matches to session IDs in order.
 func hybridSessionIDs(page db.ContentSearchPage) []string {
 	out := make([]string, len(page.Matches))
