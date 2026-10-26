@@ -572,21 +572,26 @@ func pgToolResultEventsCandidateBranch(
 // offsets index body directly even when lowercasing would change byte length.
 func pgSubstringSnippet(f db.ContentSearchFilter, body string) string {
 	if f.Mode == "fts" {
-		if tokens, err := pgFTSTokens(f.Pattern); err == nil {
-			for _, tok := range tokens {
-				if tok.kind != "term" || tok.text == "" {
-					continue
-				}
-				if start, end, ok := db.CaseInsensitiveSpan(body, tok.text); ok {
-					return f.BuildSnippet(body, start, end)
-				}
-			}
-		}
-		start, end := db.FTSSnippetRange(f.Pattern, body)
+		start, end := pgFTSSnippetRange(f.Pattern, body)
 		return f.BuildSnippet(body, start, end)
 	}
 	start, end, _ := db.CaseInsensitiveSpan(body, f.Pattern)
 	return f.BuildSnippet(body, start, end)
+}
+
+// pgFTSSnippetRange centers on the first matching literal outside a NOT operand.
+func pgFTSSnippetRange(pattern, body string) (int, int) {
+	if tokens, err := pgFTSTokens(pattern); err == nil {
+		for i, tok := range tokens {
+			if tok.kind != "term" || tok.text == "" || (i > 0 && tokens[i-1].kind == "NOT") {
+				continue
+			}
+			if start, end, ok := db.CaseInsensitiveSpan(body, tok.text); ok {
+				return start, end
+			}
+		}
+	}
+	return db.FTSSnippetRange(pattern, body)
 }
 
 // pgThinkingBranch suppresses a legacy thinking hit when its rendered message

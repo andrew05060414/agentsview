@@ -14,12 +14,21 @@ import (
 func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 	store := setupContentSearch(t)
 	for _, row := range []struct{ id, body string }{
-		{"a", "reader 压缩 archive"}, {"b", "reader only"}, {"c", "库 压缩"},
-		{"d", "unrelated"}, {"e", "reader OR literal"},
-		{"f", "fix bug login"}, {"g", "fix bug logout"},
-		{"h", "a foo"}, {"i", "b c"}, {"j", "b only"},
-		{"k", "read*"}, {"l", "read plain *"},
-		{"m", "a content:y"}, {"n", "a or b"}, {"o", "a NEAR b"},
+		{"a", "reader 压缩 archive"},
+		{"b", "reader only"},
+		{"c", "库 压缩"},
+		{"d", "unrelated"},
+		{"e", "reader OR literal"},
+		{"f", "fix bug login"},
+		{"g", "fix bug logout"},
+		{"h", "a foo"},
+		{"i", "b c"},
+		{"j", "b only"},
+		{"k", "read*"},
+		{"l", "read plain *"},
+		{"m", "a content:y"},
+		{"n", "a or b"},
+		{"o", "a NEAR b"},
 	} {
 		insertCSSession(t, store, row.id, "fixture", "codex", "2024-06-15T10:00:00Z", "2024-06-15T11:00:00Z")
 		insertCSMessage(t, store, row.id, 0, "user", row.body, "2024-06-15T10:00:00Z", false)
@@ -38,7 +47,14 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 		{`"fix bug" login`, []string{"f"}},
 		{`"fix bug" login ""`, []string{"f"}},
 		{`"reader" ""`, []string{"a", "b", "e"}},
-		{`"" OR "reader"`, []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o"}},
+		{`""`, nil},
+		{`"" ""`, nil},
+		{`"reader" NOT ""`, []string{"a", "b", "e"}},
+		{`"" OR "reader"`, []string{"a", "b", "e"}},
+		{`"" AND "reader"`, []string{"a", "b", "e"}},
+		{`"" NOT "reader"`, nil},
+		{`"reader" AND ""`, []string{"a", "b", "e"}},
+		{`"reader" OR ""`, []string{"a", "b", "e"}},
 		{`"a" foo`, []string{"h"}},
 		{`"a" OR "b" "c"`, []string{"a", "b", "d", "e", "h", "i", "k", "l", "m", "n", "o"}},
 		{`"b" AND ("only" OR "c")`, []string{"i", "j"}},
@@ -77,14 +93,15 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 
 func TestPGFTSSnippetMatchingLiteral(t *testing.T) {
 	store := setupContentSearch(t)
-	for _, tc := range []struct{ query, match string }{
-		{`"absent"OR"reader"`, "reader"},
-		{`"absent" OR ("reader")`, "reader"},
-		{`"absent" OR "OR"`, "OR"},
+	for _, tc := range []struct{ query, prefix, match string }{
+		{`"absent"OR"reader"`, "", "reader"},
+		{`"absent" OR ("reader")`, "", "reader"},
+		{`"absent" OR "OR"`, "", "OR"},
+		{`"absent" NOT "excludedneedle" OR "foundneedle"`, "excludedneedle", "foundneedle"},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			insertCSSession(t, store, tc.query, tc.query, "codex", "2024-06-15T10:00:00Z", "2024-06-15T11:00:00Z")
-			insertCSMessage(t, store, tc.query, 0, "user", strings.Repeat("padding ", 100)+tc.match, "2024-06-15T10:00:00Z", false)
+			insertCSMessage(t, store, tc.query, 0, "user", tc.prefix+strings.Repeat("padding ", 100)+tc.match, "2024-06-15T10:00:00Z", false)
 			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: tc.query, Mode: "fts", Project: tc.query})
 			require.NoError(t, err)
 			require.Len(t, page.Matches, 1)

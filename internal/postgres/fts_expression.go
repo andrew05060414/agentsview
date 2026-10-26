@@ -23,6 +23,9 @@ func pgFTSExpression(pattern, column string, pb *paramBuilder) (string, error) {
 	if err != nil || p.pos != len(tokens) {
 		return "", &db.SearchInputError{Msg: "search: invalid FTS query: invalid Boolean expression"}
 	}
+	if expr == "" {
+		return "FALSE", nil
+	}
 	return expr, nil
 }
 
@@ -99,6 +102,9 @@ func (p *ftsParser) atom() (string, error) {
 	p.pos++
 	switch tok.kind {
 	case "term":
+		if tok.text == "" {
+			return "", nil // An empty operand imposes no constraint.
+		}
 		return p.column + " ILIKE '%'||" + p.pb.add(escapeLike(tok.text)) + "||'%' ESCAPE E'\\\\'", nil
 	case "(":
 		expr, err := p.expression(1)
@@ -106,6 +112,9 @@ func (p *ftsParser) atom() (string, error) {
 			return "", errors.New("unclosed group")
 		}
 		p.pos++
+		if expr == "" {
+			return "", nil
+		}
 		return "(" + expr + ")", nil
 	default:
 		return "", errors.New("expected term")
@@ -144,6 +153,16 @@ func (p *ftsParser) expression(minPrec int) (string, error) {
 		right, err := p.expression(prec + 1)
 		if err != nil {
 			return "", err
+		}
+		if right == "" {
+			continue
+		}
+		if left == "" {
+			if op != "NOT" {
+				left = right
+				continue
+			}
+			left = "FALSE"
 		}
 		if op == "NOT" {
 			left = "(" + left + " AND NOT (" + right + "))"
