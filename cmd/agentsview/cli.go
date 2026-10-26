@@ -553,34 +553,11 @@ func newProjectsCommand() *cobra.Command {
 		GroupID:      groupCore,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if pgReadRequested(cmd) {
-				cfg, err := config.LoadPFlags(cmd.Flags())
-				if err != nil {
-					return err
-				}
-				pgCfg, _, err := resolvePGReadConfig(cmd, cfg)
-				if err != nil {
-					return err
-				}
-				store, cleanup, err := openPGReadStore(cfg, pgCfg)
-				if err != nil {
-					return err
-				}
-				defer cleanup()
-				projects, err := store.GetProjects(cmd.Context(), false, false)
-				if err != nil {
-					return err
-				}
-				writeProjects(projects, outputFormat(cmd) == "json")
-				return nil
-			}
+		Run: func(cmd *cobra.Command, args []string) {
 			runProjects(cmd.Context(), outputFormat(cmd) == "json")
-			return nil
 		},
 	}
 	registerFormatFlags(cmd.Flags())
-	cmd.Flags().Bool("pg", false, "Read projects from configured PostgreSQL")
 	return cmd
 }
 

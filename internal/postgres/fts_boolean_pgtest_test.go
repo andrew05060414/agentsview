@@ -15,6 +15,10 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 	for _, row := range []struct{ id, body string }{
 		{"a", "reader 压缩 archive"}, {"b", "reader only"}, {"c", "库 压缩"},
 		{"d", "unrelated"}, {"e", "reader OR literal"},
+		{"f", "fix bug login"}, {"g", "fix bug logout"},
+		{"h", "a foo"}, {"i", "b c"}, {"j", "b only"},
+		{"k", "read*"}, {"l", "read plain *"},
+		{"m", "a content:y"}, {"n", "a or b"}, {"o", "a NEAR b"},
 	} {
 		insertCSSession(t, store, row.id, "fixture", "codex", "2024-06-15T10:00:00Z", "2024-06-15T11:00:00Z")
 		insertCSMessage(t, store, row.id, 0, "user", row.body, "2024-06-15T10:00:00Z", false)
@@ -28,6 +32,15 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 		{`"reader" OR "definitely_absent"`, []string{"a", "b", "e"}},
 		{"库", []string{"c"}},
 		{`"reader" NOT "压缩"`, []string{"b", "e"}},
+		{`"fix bug" login`, []string{"f"}},
+		{`"a" foo`, []string{"h"}},
+		{`"a" OR "b" "c"`, []string{"a", "b", "d", "e", "h", "i", "k", "l", "m", "n", "o"}},
+		{`"b" AND ("only" OR "c")`, []string{"i", "j"}},
+		{`"a" or "b"`, []string{"n"}},
+		{`"a" NEAR "b"`, []string{"o"}},
+		{`"read"*`, []string{"k"}},
+		{`read*`, []string{"k"}},
+		{`"a" content:y`, []string{"m"}},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			f := db.ContentSearchFilter{Pattern: tc.query, Mode: "fts", Limit: 1}
@@ -44,6 +57,14 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 				f.Cursor = page.NextCursor
 			}
 			assert.Equal(t, tc.ids, ids)
+		})
+	}
+	for _, query := range []string{`"a" OR`, `NOT "a"`, `("a"`, `"a" ("b")`, `NEAR("a" "b")`} {
+		t.Run(query, func(t *testing.T) {
+			_, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: query, Mode: "fts"})
+			var inputErr *db.SearchInputError
+			require.ErrorAs(t, err, &inputErr)
+			assert.Contains(t, inputErr.Msg, "search: invalid FTS query:")
 		})
 	}
 }

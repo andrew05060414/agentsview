@@ -97,6 +97,7 @@ The latest release is
 - Command Code v3 sessions appear with their titles, tool calls, and token
   costs. Forks count only new usage, and existing sessions are reprocessed
   on upgrade.
+- PostgreSQL content searches in `fts` mode honor `AND`, `OR`, `NOT`, and parentheses in quoted queries and report malformed expressions as input errors.
 - Foreground `agentsview serve` now exits with status 1 when a server is already
   running so service managers retry. `serve --background` and `daemon start`
   still exit with status 0.

@@ -1,7 +1,7 @@
 package postgres
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 	"unicode"
 
@@ -11,10 +11,11 @@ import (
 // pgFTSExpression preserves the Boolean structure of prepared FTS queries.
 // PostgreSQL uses literal ILIKE terms instead of SQLite's token index, so short
 // CJK terms remain searchable without changing the archive or its indexes.
-func pgFTSExpression(pattern string, pb *paramBuilder) (string, error) {
-	input := db.PrepareFTSQuery(pattern)
-	if len(input) > 16384 {
-		return "", &db.SearchInputError{Msg: "search: fts expression too large"}
+func pgFTSExpression(pattern, column string, pb *paramBuilder) (string, error) {
+	input := strings.TrimSpace(pattern)
+	// Keep group syntax and unsupported expression prefixes visible to the parser.
+	if !strings.HasPrefix(input, "(") && !strings.HasPrefix(input, "NEAR(") && !strings.HasPrefix(input, `NOT "`) {
+		input = db.PrepareFTSQuery(input)
 	}
 	var tokens []ftsToken
 	for i := 0; i < len(input); {
@@ -34,9 +35,10 @@ func pgFTSExpression(pattern string, pb *paramBuilder) (string, error) {
 			}
 			word := input[start:i]
 			if word != "AND" && word != "OR" && word != "NOT" {
-				return "", &db.SearchInputError{Msg: "search: PostgreSQL fts supports quoted literals, AND, OR, NOT and parentheses"}
+				tokens = append(tokens, ftsToken{kind: "term", text: word})
+			} else {
+				tokens = append(tokens, ftsToken{kind: word})
 			}
-			tokens = append(tokens, ftsToken{kind: word})
 			continue
 		}
 		i++
@@ -57,53 +59,57 @@ func pgFTSExpression(pattern string, pb *paramBuilder) (string, error) {
 			i++
 		}
 		if !closed || strings.TrimFunc(term.String(), unicode.IsSpace) == "" {
-			return "", &db.SearchInputError{Msg: "search: invalid quoted fts term"}
+			return "", &db.SearchInputError{Msg: "search: invalid FTS query: invalid quoted term"}
+		}
+		// Text attached to a closing quote belongs to the same literal term.
+		for i < len(input) && !strings.ContainsRune(" \t\n\r()", rune(input[i])) {
+			term.WriteByte(input[i])
+			i++
 		}
 		tokens = append(tokens, ftsToken{kind: "term", text: term.String()})
 	}
 	if len(tokens) == 0 {
 		return "FALSE", nil
 	}
-	if len(tokens) > 256 {
-		return "", &db.SearchInputError{Msg: "search: too many fts terms"}
-	}
-	p := ftsParser{tokens: tokens, pb: pb}
+	p := ftsParser{tokens: tokens, column: column, pb: pb}
 	expr, err := p.expression(1)
 	if err != nil || p.pos != len(tokens) {
-		return "", &db.SearchInputError{Msg: "search: invalid Boolean fts expression"}
+		return "", &db.SearchInputError{Msg: "search: invalid FTS query: invalid Boolean expression"}
 	}
 	return expr, nil
 }
 
 type ftsToken struct{ kind, text string }
+
 type ftsParser struct {
 	tokens []ftsToken
+	column string
 	pos    int
 	pb     *paramBuilder
 }
 
 func (p *ftsParser) atom() (string, error) {
 	if p.pos >= len(p.tokens) {
-		return "", fmt.Errorf("missing term")
+		return "", errors.New("missing term")
 	}
 	tok := p.tokens[p.pos]
 	p.pos++
 	switch tok.kind {
 	case "term":
-		return "m.content ILIKE '%'||" + p.pb.add(escapeLike(tok.text)) + "||'%' ESCAPE E'\\\\'", nil
+		return p.column + " ILIKE '%'||" + p.pb.add(escapeLike(tok.text)) + "||'%' ESCAPE E'\\\\'", nil
 	case "(":
 		expr, err := p.expression(1)
 		if err != nil || p.pos >= len(p.tokens) || p.tokens[p.pos].kind != ")" {
-			return "", fmt.Errorf("unclosed group")
+			return "", errors.New("unclosed group")
 		}
 		p.pos++
 		return "(" + expr + ")", nil
 	default:
-		return "", fmt.Errorf("expected term")
+		return "", errors.New("expected term")
 	}
 }
 
-func (p *ftsParser) expression(min int) (string, error) {
+func (p *ftsParser) expression(minPrec int) (string, error) {
 	left, err := p.atom()
 	if err != nil {
 		return "", err
@@ -118,12 +124,12 @@ func (p *ftsParser) expression(min int) (string, error) {
 			prec = 2
 		case "NOT":
 			prec = 3
-		case "term", "(":
+		case "term":
 			prec = 4
 			implicit = true
 			op = "AND"
 		}
-		if prec < min {
+		if prec < minPrec {
 			break
 		}
 		if !implicit {
