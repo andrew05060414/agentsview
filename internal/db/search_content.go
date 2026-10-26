@@ -929,8 +929,8 @@ func (db *DB) searchContentFTS(
 
 // ftsSnippet builds the snippet for an FTS match. FTS matching is tokenized, so
 // there is no exact byte offset; it centers on the first case-insensitive
-// occurrence of the de-quoted query phrase, falling back to a matching query
-// term, then a segmented term if supplied, then to the start. Trying the whole
+// occurrence of the de-quoted query phrase, falling back to the query's first
+// token, then a segmented term if supplied, then to the start. Trying the whole
 // phrase first keeps a phrase query ("foo bar") centered on the phrase rather
 // than on a stray earlier "foo". The approximation only affects snippet
 // centering, not redaction, which scans the full body.
@@ -944,15 +944,15 @@ func (f ContentSearchFilter) ftsSnippet(body, segmentedTerm string) string {
 
 // FTSSnippetRange returns the byte range around which FTS-like snippets should
 // be centered. It first tries the de-quoted raw phrase, then falls back to the
-// first matching prepared-FTS term, and finally to the start of the body.
+// first parsed prepared-FTS term, and finally to the start of the body.
 func FTSSnippetRange(pattern, body string) (int, int) {
 	if phrase := strings.Trim(pattern, "\""); phrase != "" {
 		if start, end, ok := CaseInsensitiveSpan(body, phrase); ok {
 			return start, end
 		}
 	}
-	for i, term := range FTSTerms(PrepareFTSQuery(pattern)) {
-		if term == "" || (i > 0 && (term == "AND" || term == "OR" || term == "NOT")) {
+	for _, term := range FTSTerms(PrepareFTSQuery(pattern)) {
+		if term == "" {
 			continue
 		}
 		if start, end, ok := CaseInsensitiveSpan(body, term); ok {
@@ -963,6 +963,7 @@ func FTSSnippetRange(pattern, body string) (int, int) {
 				return start, end
 			}
 		}
+		break
 	}
 	return 0, 0
 }

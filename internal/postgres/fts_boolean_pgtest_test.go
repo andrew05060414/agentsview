@@ -3,6 +3,7 @@
 package postgres
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,6 +36,9 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 		{"库", []string{"c"}},
 		{`"reader" NOT "压缩"`, []string{"b", "e"}},
 		{`"fix bug" login`, []string{"f"}},
+		{`"fix bug" login ""`, []string{"f"}},
+		{`"reader" ""`, []string{"a", "b", "e"}},
+		{`"" OR "reader"`, []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o"}},
 		{`"a" foo`, []string{"h"}},
 		{`"a" OR "b" "c"`, []string{"a", "b", "d", "e", "h", "i", "k", "l", "m", "n", "o"}},
 		{`"b" AND ("only" OR "c")`, []string{"i", "j"}},
@@ -67,6 +71,24 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 			var inputErr *db.SearchInputError
 			require.ErrorAs(t, err, &inputErr)
 			assert.Contains(t, inputErr.Msg, "search: invalid FTS query:")
+		})
+	}
+}
+
+func TestPGFTSSnippetMatchingLiteral(t *testing.T) {
+	store := setupContentSearch(t)
+	for _, tc := range []struct{ query, match string }{
+		{`"absent"OR"reader"`, "reader"},
+		{`"absent" OR ("reader")`, "reader"},
+		{`"absent" OR "OR"`, "OR"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			insertCSSession(t, store, tc.query, tc.query, "codex", "2024-06-15T10:00:00Z", "2024-06-15T11:00:00Z")
+			insertCSMessage(t, store, tc.query, 0, "user", strings.Repeat("padding ", 100)+tc.match, "2024-06-15T10:00:00Z", false)
+			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: tc.query, Mode: "fts", Project: tc.query})
+			require.NoError(t, err)
+			require.Len(t, page.Matches, 1)
+			assert.Contains(t, page.Matches[0].Snippet, tc.match)
 		})
 	}
 }

@@ -3,7 +3,6 @@ package postgres
 import (
 	"errors"
 	"strings"
-	"unicode"
 
 	"go.kenn.io/agentsview/internal/db"
 )
@@ -12,6 +11,22 @@ import (
 // PostgreSQL uses literal ILIKE terms instead of SQLite's token index, so short
 // CJK terms remain searchable without changing the archive or its indexes.
 func pgFTSExpression(pattern, column string, pb *paramBuilder) (string, error) {
+	tokens, err := pgFTSTokens(pattern)
+	if err != nil {
+		return "", err
+	}
+	if len(tokens) == 0 {
+		return "FALSE", nil
+	}
+	p := ftsParser{tokens: tokens, column: column, pb: pb}
+	expr, err := p.expression(1)
+	if err != nil || p.pos != len(tokens) {
+		return "", &db.SearchInputError{Msg: "search: invalid FTS query: invalid Boolean expression"}
+	}
+	return expr, nil
+}
+
+func pgFTSTokens(pattern string) ([]ftsToken, error) {
 	input := db.PrepareFTSQuery(pattern)
 	var tokens []ftsToken
 	for i := 0; i < len(input); {
@@ -54,8 +69,8 @@ func pgFTSExpression(pattern, column string, pb *paramBuilder) (string, error) {
 			term.WriteByte(input[i])
 			i++
 		}
-		if !closed || strings.TrimFunc(term.String(), unicode.IsSpace) == "" {
-			return "", &db.SearchInputError{Msg: "search: invalid FTS query: invalid quoted term"}
+		if !closed {
+			return nil, &db.SearchInputError{Msg: "search: invalid FTS query: invalid quoted term"}
 		}
 		// Keep prefix markers literal, as in the other substring search paths.
 		for i < len(input) && input[i] == '*' {
@@ -64,15 +79,7 @@ func pgFTSExpression(pattern, column string, pb *paramBuilder) (string, error) {
 		}
 		tokens = append(tokens, ftsToken{kind: "term", text: term.String()})
 	}
-	if len(tokens) == 0 {
-		return "FALSE", nil
-	}
-	p := ftsParser{tokens: tokens, column: column, pb: pb}
-	expr, err := p.expression(1)
-	if err != nil || p.pos != len(tokens) {
-		return "", &db.SearchInputError{Msg: "search: invalid FTS query: invalid Boolean expression"}
-	}
-	return expr, nil
+	return tokens, nil
 }
 
 type ftsToken struct{ kind, text string }

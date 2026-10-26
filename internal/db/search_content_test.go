@@ -198,26 +198,6 @@ func TestFTSSnippetRangeRuneAligned(t *testing.T) {
 		"FTS snippet range end %d splits a rune in %q", end, body)
 }
 
-func TestFTSSnippetRangeFirstMatchingTerm(t *testing.T) {
-	for _, tc := range []struct {
-		pattern string
-		body    string
-		match   string
-	}{
-		{`"absent" OR "reader"`, strings.Repeat("prefix ", 100) + "reader", "reader"},
-		{`"absent" OR "reader"`, "OR " + strings.Repeat("prefix ", 100) + "reader", "reader"},
-		{`"absent" AND "reader"`, "AND reader", "reader"},
-		{`"absent" NOT "reader"`, "NOT reader", "reader"},
-		{`"reader" OR "archive"`, "archive reader", "reader"},
-		{`"OR" "reader"`, "OR reader", "OR"},
-	} {
-		t.Run(tc.pattern, func(t *testing.T) {
-			start, end := FTSSnippetRange(tc.pattern, tc.body)
-			assert.Equal(t, tc.match, tc.body[start:end])
-		})
-	}
-}
-
 // TestSubstringSnippetUnicodeOffset guards against the snippet panic and
 // mis-centering when lowercasing changes byte length. U+023A lowercases to the
 // 3-byte U+2C65, so a ToLower-derived offset runs past the original bounds and

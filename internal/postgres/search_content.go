@@ -572,6 +572,16 @@ func pgToolResultEventsCandidateBranch(
 // offsets index body directly even when lowercasing would change byte length.
 func pgSubstringSnippet(f db.ContentSearchFilter, body string) string {
 	if f.Mode == "fts" {
+		if tokens, err := pgFTSTokens(f.Pattern); err == nil {
+			for _, tok := range tokens {
+				if tok.kind != "term" || tok.text == "" {
+					continue
+				}
+				if start, end, ok := db.CaseInsensitiveSpan(body, tok.text); ok {
+					return f.BuildSnippet(body, start, end)
+				}
+			}
+		}
 		start, end := db.FTSSnippetRange(f.Pattern, body)
 		return f.BuildSnippet(body, start, end)
 	}
