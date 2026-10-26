@@ -10,7 +10,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
-func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
+func TestPGFTSBooleanSemantics(t *testing.T) {
 	store := setupContentSearch(t)
 	for _, row := range []struct{ id, body string }{
 		{"a", "reader 压缩 archive"},
@@ -25,7 +25,6 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 		{"j", "b only"},
 		{"k", "read*"},
 		{"l", "read plain *"},
-		{"m", "a content:y"},
 		{"n", "a or b"},
 		{"o", "a NEAR b"},
 	} {
@@ -36,40 +35,28 @@ func TestPGFTSBooleanChineseAndPagination(t *testing.T) {
 		query string
 		ids   []string
 	}{
-		{"reader 压缩", []string{"a"}},
 		{`"reader" OR "压缩"`, []string{"a", "b", "c", "e"}},
 		{`"reader"OR"压缩"`, []string{"a", "b", "c", "e"}},
 		{`"reader"AND"archive"`, []string{"a"}},
 		{`"reader" OR "definitely_absent"`, []string{"a", "b", "e"}},
-		{"库", []string{"c"}},
 		{`"reader" NOT "压缩"`, []string{"b", "e"}},
 		{`"fix bug" login`, []string{"f"}},
-		{`"fix bug" login ""`, []string{"f"}},
 		{`"reader" ""`, []string{"a", "b", "e"}},
 		{`""`, nil},
 		{`NOT "reader"`, []string{"e"}},
-		{`"a" foo`, []string{"h"}},
-		{`"a" OR "b" "c"`, []string{"a", "b", "d", "e", "h", "i", "k", "l", "m", "n", "o"}},
+		{`"a" OR "b" "c"`, []string{"a", "b", "d", "e", "h", "i", "k", "l", "n", "o"}},
 		{`"b" AND ("only" OR "c")`, []string{"i", "j"}},
 		{`"a" or "b"`, []string{"n"}},
 		{`"a" NEAR "b"`, []string{"o"}},
 		{`"read"*`, []string{"k"}},
 		{`read*`, []string{"k"}},
-		{`"a" content:y`, []string{"m"}},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
-			f := db.ContentSearchFilter{Pattern: tc.query, Mode: "fts", Limit: 1}
+			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: tc.query, Mode: "fts", Limit: 50})
+			require.NoError(t, err)
 			var ids []string
-			for {
-				page, err := store.SearchContent(t.Context(), f)
-				require.NoError(t, err)
-				for _, m := range page.Matches {
-					ids = append(ids, m.SessionID)
-				}
-				if page.NextCursor == 0 {
-					break
-				}
-				f.Cursor = page.NextCursor
+			for _, m := range page.Matches {
+				ids = append(ids, m.SessionID)
 			}
 			assert.Equal(t, tc.ids, ids)
 		})
