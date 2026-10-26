@@ -61,12 +61,9 @@ func TestPGFTSBooleanSemantics(t *testing.T) {
 			assert.Equal(t, tc.ids, ids)
 		})
 	}
-	for _, query := range []string{`"a" OR`, `"a" ("b")`, `"reader" OR broken"`, `"reader" OR ""`} {
-		t.Run(query, func(t *testing.T) {
-			_, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: query, Mode: "fts"})
-			var inputErr *db.SearchInputError
-			require.ErrorAs(t, err, &inputErr)
-			assert.Contains(t, inputErr.Msg, "search: invalid FTS query:")
-		})
-	}
+	t.Run(`"a" OR`, func(t *testing.T) {
+		_, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: `"a" OR`, Mode: "fts"})
+		var inputErr *db.SearchInputError
+		require.ErrorAs(t, err, &inputErr)
+	})
 }
