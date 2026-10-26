@@ -12,11 +12,7 @@ import (
 // PostgreSQL uses literal ILIKE terms instead of SQLite's token index, so short
 // CJK terms remain searchable without changing the archive or its indexes.
 func pgFTSExpression(pattern, column string, pb *paramBuilder) (string, error) {
-	input := strings.TrimSpace(pattern)
-	// Keep group syntax and unsupported expression prefixes visible to the parser.
-	if !strings.HasPrefix(input, "(") && !strings.HasPrefix(input, "NEAR(") && !strings.HasPrefix(input, `NOT "`) {
-		input = db.PrepareFTSQuery(input)
-	}
+	input := db.PrepareFTSQuery(pattern)
 	var tokens []ftsToken
 	for i := 0; i < len(input); {
 		if strings.ContainsRune(" \t\n\r", rune(input[i])) {
@@ -30,7 +26,7 @@ func pgFTSExpression(pattern, column string, pb *paramBuilder) (string, error) {
 		}
 		if input[i] != '"' {
 			start := i
-			for i < len(input) && !strings.ContainsRune(" \t\n\r()", rune(input[i])) {
+			for i < len(input) && !strings.ContainsRune(" \t\n\r()\"", rune(input[i])) {
 				i++
 			}
 			word := input[start:i]
@@ -61,8 +57,8 @@ func pgFTSExpression(pattern, column string, pb *paramBuilder) (string, error) {
 		if !closed || strings.TrimFunc(term.String(), unicode.IsSpace) == "" {
 			return "", &db.SearchInputError{Msg: "search: invalid FTS query: invalid quoted term"}
 		}
-		// Text attached to a closing quote belongs to the same literal term.
-		for i < len(input) && !strings.ContainsRune(" \t\n\r()", rune(input[i])) {
+		// Keep prefix markers literal, as in the other substring search paths.
+		for i < len(input) && input[i] == '*' {
 			term.WriteByte(input[i])
 			i++
 		}
@@ -125,6 +121,9 @@ func (p *ftsParser) expression(minPrec int) (string, error) {
 		case "NOT":
 			prec = 3
 		case "term":
+			if p.tokens[p.pos-1].kind != "term" {
+				return "", errors.New("expected operator after group")
+			}
 			prec = 4
 			implicit = true
 			op = "AND"

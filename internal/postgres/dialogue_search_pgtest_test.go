@@ -21,7 +21,7 @@ func TestPGDialogueSearchParity(t *testing.T) {
 	defer store.Close()
 	dbtest.AssertDialogueSearchParity(t, local, store, "substring", "regex", "fts")
 	t.Run("fts ignores sources", func(t *testing.T) {
-		for _, pattern := range []string{"answerneedle", "reasoningneedle"} {
+		for _, pattern := range []string{"answerneedle", "reasoningneedle", `"reasoningneedle" OR "absent"`} {
 			f := db.ContentSearchFilter{Pattern: pattern, Mode: "fts", Project: "dialogue-search", Sources: []string{"thinking"}, Limit: 50}
 			want, err := local.SearchContent(t.Context(), f)
 			require.NoError(t, err)
