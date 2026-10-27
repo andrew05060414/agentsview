@@ -171,8 +171,9 @@ func newServer(opts ServeOptions) *mcp.Server {
 		Name: ToolGetMessages,
 		Description: "Read a slice of one session's transcript, either by linear pagination (from/direction/" +
 			"limit) or a symmetric window centered on an ordinal (around, with before/after sizing each " +
-			"side, default 5; mutually exclusive with from/direction). Defaults return only user and " +
-			"assistant messages, each truncated to 2000 characters; truncated messages are flagged so you " +
+			"side, default 5; mutually exclusive with from/direction). Defaults return persisted user and " +
+			"assistant dialogue projections without inline thinking or tools; unclassified rows are withheld " +
+			"and counted in uncertain and filtered. Messages are truncated to 2000 characters; truncated messages are flagged so you " +
 			"can re-fetch with a higher max_chars_per_message. Each page reports how many scanned messages " +
 			"the role/system filter dropped as filtered, so across a full pagination sweep, returned plus " +
 			"filtered messages add up to the session's message_count (which counts all stored messages, " +
@@ -189,7 +190,8 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolSearchContent,
-		Description: "Search raw session text, including thinking, tool inputs, and results. When a vector search index is " +
+		Description: "Search session text. Substring and regex search dialogue messages only by default; " +
+			"pass sources to include thinking, tool inputs, or tool results. When a vector search index is " +
 			"configured, prefer mode hybrid (semantic similarity plus keywords) or semantic for finding " +
 			"prior work and answering contextual questions, especially when the exact wording is unknown. " +
 			"If these modes report not available, use terms when every literal term must occur within one " +
