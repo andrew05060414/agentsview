@@ -424,6 +424,21 @@ func TestParseClaudeAIDetail_SelectedPath(t *testing.T) {
 	}
 }
 
+func TestParseClaudeAIDetail_LoneMessageWithoutParent(t *testing.T) {
+	// A conversation whose only message has a null/absent parent still imports;
+	// the same shape with another message left out of the chain stays an error.
+	for _, parent := range []string{`,"parent_message_uuid":null`, ``} {
+		input := `{"uuid":"tree","created_at":"2026-03-01T10:00:00Z","updated_at":"2026-03-01T10:05:00Z","current_leaf_message_uuid":"q","chat_messages":[{"uuid":"q","sender":"human","text":"Question"` + parent + `}]}`
+		result, err := ParseClaudeAIDetail([]byte(input))
+		require.NoError(t, err)
+		require.Len(t, result.Messages, 1)
+		assert.Equal(t, "Question", result.Messages[0].Content)
+	}
+	input := `{"uuid":"tree","created_at":"2026-03-01T10:00:00Z","updated_at":"2026-03-01T10:05:00Z","current_leaf_message_uuid":"q","chat_messages":[{"uuid":"q","sender":"human","text":"Question","parent_message_uuid":null},{"uuid":"other","parent_message_uuid":"q","sender":"assistant"}]}`
+	_, err := ParseClaudeAIDetail([]byte(input))
+	require.ErrorContains(t, err, "parent must be a string")
+}
+
 func TestParseClaudeAIDetail_InvalidTree(t *testing.T) {
 	const question = `{"uuid":"q","parent_message_uuid":"00000000-0000-4000-8000-000000000000","sender":"human"}`
 	const answer = `{"uuid":"a","parent_message_uuid":"q","sender":"assistant"}`

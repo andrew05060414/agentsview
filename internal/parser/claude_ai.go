@@ -217,6 +217,15 @@ func selectedClaudeAIPath(conv claudeAIConversation) ([]claudeAIMessage, error) 
 		seen[id] = true
 		var parent string
 		if m.Parent.Kind() != jsontext.KindString || json.Unmarshal(m.Parent, &parent) != nil {
+			// Claude.ai sends a null or absent parent for some conversations that
+			// never got a reply (a lone prompt). That is the chain's end, not
+			// corruption, only when the chain already holds every message the
+			// conversation lists: nothing is left out, so nothing is guessed.
+			if k := m.Parent.Kind(); (k == jsontext.KindNull || len(m.Parent) == 0) &&
+				len(path)+1 == len(conv.Messages) {
+				path = append(path, m)
+				break
+			}
 			return nil, fmt.Errorf("message %s's parent must be a string", m.UUID)
 		}
 		path = append(path, m)
