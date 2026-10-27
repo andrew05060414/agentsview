@@ -3,6 +3,7 @@
 package postgres
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -66,4 +67,32 @@ func TestPGFTSBooleanSemantics(t *testing.T) {
 		var inputErr *db.SearchInputError
 		require.ErrorAs(t, err, &inputErr)
 	})
+}
+
+// TestPGFTSBooleanSnippetCentersOnMatchedOperand checks the fts snippet and the
+// hybrid keyword window. Each matching operand sits past the opening window,
+// after text that holds a non-matching operand, a negated operand, or an
+// operator word.
+func TestPGFTSBooleanSnippetCentersOnMatchedOperand(t *testing.T) {
+	filler := strings.Repeat("filler ", 40)
+	for _, tc := range []struct {
+		name, query, body, want string
+	}{
+		{"later OR operand", `"alpha" OR "beta"`, "Order notes " + filler + "beta closes", "beta closes"},
+		{"OR phrase", `"absent" OR "fix bug"`, filler + "fix bug closes", "fix bug closes"},
+		{"negated operand", `"alpha" NOT "beta" OR "gamma"`, "beta opens " + filler + "gamma closes", "gamma closes"},
+		{"unsatisfied AND", `"alpha" AND "beta" OR "gamma"`, "alpha opens " + filler + "gamma closes", "gamma closes"},
+	} {
+		for _, mode := range []string{"fts", "hybrid"} {
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				store := wireHybrid(t, &hybridFakeSearcher{})
+				insertCSSession(t, store, "s1", "proj", "claude", hybridStart, hybridEnd)
+				insertCSUnitMessage(t, store, "s1", 0, "user", tc.body, false, false)
+				page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{Pattern: tc.query, Mode: mode, Limit: 50})
+				require.NoError(t, err)
+				require.Len(t, page.Matches, 1)
+				assert.Contains(t, page.Matches[0].Snippet, tc.want)
+			})
+		}
+	}
 }

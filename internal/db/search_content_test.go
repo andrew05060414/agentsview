@@ -722,6 +722,37 @@ func TestSearchContentFTSPhraseSnippetFallsBackToFirstToken(t *testing.T) {
 	assert.Contains(t, got.Matches[0].Snippet, "foo-bar")
 }
 
+// TestSearchContentFTSBooleanSnippetCentersOnMatchedOperand places each
+// matching operand past the opening snippet window, after text that holds a
+// non-matching operand, a negated operand, or an operator word.
+func TestSearchContentFTSBooleanSnippetCentersOnMatchedOperand(t *testing.T) {
+	d := testDB(t)
+	if !d.HasFTS(t.Context()) {
+		t.Skip("fts5 not available")
+	}
+	filler := strings.Repeat("filler ", 40)
+	for _, tc := range []struct {
+		name, query, body, want string
+	}{
+		{"later OR operand", `"alpha" OR "beta"`, "Order notes " + filler + "beta closes", "beta closes"},
+		{"OR phrase", `"absent" OR "fix bug"`, filler + "fix bug closes", "fix bug closes"},
+		{"negated operand", `"alpha" NOT "beta" OR "gamma"`, "beta opens " + filler + "gamma closes", "gamma closes"},
+		{"unsatisfied AND", `"alpha" AND "beta" OR "gamma"`, "alpha opens " + filler + "gamma closes", "gamma closes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := strings.ReplaceAll(tc.name, " ", "-")
+			seedSearchSession(t, d, id, "proj", [][2]string{{"user", tc.body}})
+			got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+				Pattern: tc.query, Mode: "fts", SessionID: id,
+				Sources: []string{"messages"}, Limit: 50,
+			})
+			require.NoError(t, err)
+			require.Len(t, got.Matches, 1)
+			assert.Contains(t, got.Matches[0].Snippet, tc.want)
+		})
+	}
+}
+
 func TestSearchContentFTSInvalidQuery(t *testing.T) {
 	d := testDB(t)
 	if !d.HasFTS(t.Context()) {

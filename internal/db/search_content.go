@@ -943,29 +943,52 @@ func (f ContentSearchFilter) ftsSnippet(body, segmentedTerm string) string {
 }
 
 // FTSSnippetRange returns the byte range around which FTS-like snippets should
-// be centered. It first tries the de-quoted raw phrase, then falls back to the
-// first parsed prepared-FTS term, and finally to the start of the body.
+// be centered. It first tries the de-quoted raw phrase, then the first positive
+// operand that satisfies the parsed Boolean query, so `"alpha" OR "beta"`
+// centers on beta when only beta is present. Operator words and NOT operands
+// never count as matches. When the engine's tokenized match disagrees with
+// this substring evaluation, it falls back to the first positive operand, or
+// its first word, found in body. A query that does not parse falls back to its
+// first term. Failing all of these, it returns the start of the body.
 func FTSSnippetRange(pattern, body string) (int, int) {
 	if phrase := strings.Trim(pattern, "\""); phrase != "" {
 		if start, end, ok := CaseInsensitiveSpan(body, phrase); ok {
 			return start, end
 		}
 	}
-	for _, term := range FTSTerms(PrepareFTSQuery(pattern)) {
-		if term == "" {
-			continue
-		}
-		if start, end, ok := CaseInsensitiveSpan(body, term); ok {
-			return start, end
-		}
-		if fields := strings.Fields(term); len(fields) > 0 && fields[0] != term {
-			if start, end, ok := CaseInsensitiveSpan(body, fields[0]); ok {
+	expr, err := ParseFTSExpression(pattern)
+	if err != nil {
+		if terms := FTSTerms(PrepareFTSQuery(pattern)); len(terms) > 0 {
+			if start, end, ok := ftsTermSpan(body, terms[0]); ok {
 				return start, end
 			}
 		}
-		break
+		return 0, 0
+	}
+	if expr == nil {
+		return 0, 0
+	}
+	if start, end, ok := expr.matchSpan(body); ok {
+		return start, end
+	}
+	for _, term := range expr.positiveTerms() {
+		if start, end, ok := ftsTermSpan(body, term); ok {
+			return start, end
+		}
 	}
 	return 0, 0
+}
+
+// ftsTermSpan locates term in body, falling back to its first word so a phrase
+// the engine matched across punctuation still centers near the match.
+func ftsTermSpan(body, term string) (int, int, bool) {
+	if start, end, ok := CaseInsensitiveSpan(body, term); ok {
+		return start, end, true
+	}
+	if fields := strings.Fields(term); len(fields) > 0 && fields[0] != term {
+		return CaseInsensitiveSpan(body, fields[0])
+	}
+	return 0, 0, false
 }
 
 // classifyFTSError maps a malformed FTS query into a SearchInputError so HTTP
