@@ -573,7 +573,7 @@ func canonicalChatGPTMessages(
 		)
 	}
 	_, out = db.ProjectSessionForStoragePolicy(sess, out, policy)
-	return out
+	return db.MaskMessagesForStorage(out)
 }
 
 func writeChatGPTSession(
@@ -668,7 +668,7 @@ func storedFormMessages(store db.Store, msgs []db.Message) []db.Message {
 	_, out = db.ProjectSessionForStoragePolicy(
 		db.Session{}, out, storeArchiveContent(store),
 	)
-	return out
+	return db.MaskMessagesForStorage(out)
 }
 
 // sameTurn reports whether two stored rows hold the same turn of the conversation.

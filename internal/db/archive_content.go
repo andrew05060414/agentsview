@@ -79,15 +79,22 @@ func (db *DB) requireDerivedTextStorage(kind string) error {
 }
 
 func (db *DB) sessionForStorage(session Session) Session {
-	return sessionForStoragePolicy(session, db.ArchiveContent())
+	return maskSessionForStorage(
+		sessionForStoragePolicy(session, db.ArchiveContent()),
+	)
 }
 
+// sessionAndMessagesForStorage is the write-boundary projection: the policy
+// projection followed by secret masking. ProjectSessionForStoragePolicy, which
+// callers use before they compute signals and secret findings, deliberately
+// stays unmasked so a session that leaked a secret is still flagged.
 func (db *DB) sessionAndMessagesForStorage(
 	session Session, messages []Message,
 ) (Session, []Message) {
-	return ProjectSessionForStoragePolicy(
+	session, messages = ProjectSessionForStoragePolicy(
 		session, messages, db.ArchiveContent(),
 	)
+	return maskSessionForStorage(session), maskMessagesForStorage(messages)
 }
 
 // ProjectSessionForStoragePolicy applies an explicit storage policy without a
@@ -148,9 +155,9 @@ func (db *DB) messagesForStorage(messages []Message) []Message {
 	case config.ArchiveContentUsage:
 		return usageOnlyMessages(messages)
 	case config.ArchiveContentTranscripts:
-		return transcriptMessages(messages)
+		return maskMessagesForStorage(transcriptMessages(messages))
 	default:
-		return messages
+		return maskMessagesForStorage(messages)
 	}
 }
 
@@ -882,7 +889,7 @@ func (db *DB) toolCallResultUpdatesForStorage(updates []ToolCallResultUpdate) []
 		return nil
 	}
 	if !db.ArchiveContent().OmitsToolContent() {
-		return updates
+		return maskToolCallResultUpdates(updates)
 	}
 	stored := slices.Clone(updates)
 	for i := range stored {

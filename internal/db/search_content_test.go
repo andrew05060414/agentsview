@@ -113,6 +113,7 @@ func TestSearchContentSubstringMessages(t *testing.T) {
 // the snippet window must not leak. A snippet-only redaction would cut the PEM
 // block short and ship raw key bytes.
 func TestSearchContentRedactsStraddlingSecret(t *testing.T) {
+	disableIngestMasking(t) // the test stores a plaintext secret on purpose
 	d := testDB(t)
 	pem := "-----BEGIN RSA PRIVATE KEY-----\n" +
 		strings.Repeat("MIIBSECRETKEYMATERIAL0123456789ABCDEF\n", 5) +
@@ -211,6 +212,7 @@ func TestSubstringSnippetUnicodeOffset(t *testing.T) {
 }
 
 func TestSearchContentToolIO(t *testing.T) {
+	disableIngestMasking(t) // the test stores a plaintext secret on purpose
 	d := testDB(t)
 	insertSession(t, d, "s2", "proj", func(s *Session) {
 		s.Agent = "claude"
@@ -368,6 +370,7 @@ func TestSearchContentPaginationStableAcrossTies(t *testing.T) {
 }
 
 func TestSearchContentRegex(t *testing.T) {
+	disableIngestMasking(t) // the test stores a plaintext secret on purpose
 	d := testDB(t)
 	seedSearchSession(t, d, "r1", "proj", [][2]string{
 		{"user", "key AKIA" + "7QHWN2DKR4FYPLJM here"},

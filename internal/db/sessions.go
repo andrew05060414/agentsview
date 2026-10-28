@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/lockctx"
+	"go.kenn.io/agentsview/internal/mask"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -2719,6 +2720,7 @@ func (db *DB) refreshSessionName(ctx context.Context, id string, sessionName *st
 		clean := *sessionName
 		var stats ValidationStats
 		sanitizeStringField(&clean, &stats)
+		clean = MaskText(clean)
 		sessionName = &clean
 	}
 
@@ -6410,6 +6412,7 @@ func (db *DB) RenameSession(ctx context.Context, id string, displayName *string)
 	if db.usageOnlyStorage() {
 		displayName = nil
 	}
+	displayName, _ = maskStoredPtr(mask.Default(), displayName)
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	tx, err := db.getWriter().Begin(ctx)

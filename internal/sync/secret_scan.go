@@ -126,7 +126,9 @@ func (e *Engine) computeSignalsAndSecretsForStorage(
 	s db.Session, msgs []db.Message,
 ) (db.SessionSignalUpdate, []db.SecretFinding) {
 	if e.db.ArchiveContent().OmitsToolContent() {
-		s, msgs = e.db.ProjectSessionForStorage(s, msgs)
+		// Findings are computed from the unmasked text: a session that leaked a
+		// secret stays flagged even though the stored copy is masked.
+		s, msgs = db.ProjectSessionForStoragePolicy(s, msgs, e.db.ArchiveContent())
 	} else {
 		msgs, _ = e.db.ProjectToolResultImagesWithPolicy(
 			msgs, e.toolResultImages,
@@ -141,7 +143,9 @@ func (e *Engine) computeFullSignalsAndSecretsForStorage(
 	s db.Session, msgs []db.Message, failures map[string]db.StagedToolVerdict,
 ) (db.SessionSignalUpdate, []db.SecretFinding, error) {
 	if e.db.ArchiveContent().OmitsToolContent() {
-		s, msgs = e.db.ProjectSessionForStorage(s, msgs)
+		// Findings are computed from the unmasked text: a session that leaked a
+		// secret stays flagged even though the stored copy is masked.
+		s, msgs = db.ProjectSessionForStoragePolicy(s, msgs, e.db.ArchiveContent())
 		failures = nil
 	} else {
 		msgs, _ = e.db.ProjectToolResultImagesWithPolicy(

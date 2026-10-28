@@ -26,6 +26,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/mask"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
@@ -98,7 +99,7 @@ func TestIncrementalClaudeLateResultLinkScansDefiniteSecret(t *testing.T) {
 	found := false
 	for _, finding := range findings {
 		if finding.LocationKind == "tool_result_event" &&
-			strings.Contains(finding.RedactedMatch, "AKIA") {
+			finding.RedactedMatch == mask.Placeholder(secret) {
 			found = true
 			break
 		}

@@ -365,6 +365,7 @@ func TestSecretScanCandidates(t *testing.T) {
 }
 
 func TestSecretFindingSource(t *testing.T) {
+	disableIngestMasking(t) // the test stores a plaintext secret on purpose
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj", func(s *Session) { s.Agent = "claude" })
 	msgs := []Message{{
@@ -448,6 +449,7 @@ func TestSecretFindingSource(t *testing.T) {
 // tool_call INSERT, SQLite may assign new ids in an arbitrary order, causing
 // call_index=1 to resolve to the wrong tool call.
 func TestOrphanCopyPreservesToolCallIndex(t *testing.T) {
+	disableIngestMasking(t) // the test stores a plaintext secret on purpose
 	dir := t.TempDir()
 	ctx := t.Context()
 

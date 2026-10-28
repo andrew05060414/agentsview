@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/ingest"
+	"go.kenn.io/agentsview/internal/mask"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/rawderive"
 	"go.kenn.io/agentsview/internal/server"
@@ -81,6 +82,8 @@ func TestMain(m *testing.M) {
 	}
 	// Match the default daemon fixtures; replacement tests set their own versions.
 	version = "test"
+	// Fixtures here store plaintext secrets on purpose to exercise scanning.
+	_ = os.Setenv(mask.EnvMask, "off")
 	os.Exit(runWithTestRuntimeRoot(m))
 }
 

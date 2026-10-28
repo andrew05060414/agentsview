@@ -420,6 +420,7 @@ func TestStripToolImagesCopiedSessionsOnly(t *testing.T) {
 }
 
 func TestStripToolImagesRefreshesSecretFindings(t *testing.T) {
+	disableIngestMasking(t) // the test stores a plaintext secret on purpose
 	d := testDB(t)
 	insertSession(t, d, "secrets", "project")
 	key := "AKIA" + "7QHWN2DKR4FYPLJA"
@@ -465,6 +466,7 @@ func TestStripToolImagesRefreshesSecretFindings(t *testing.T) {
 }
 
 func TestStripToolImagesRescansStoredEventCoordinates(t *testing.T) {
+	disableIngestMasking(t) // the test stores a plaintext secret on purpose
 	for _, orphan := range []bool{false, true} {
 		name := "attached"
 		if orphan {

@@ -626,6 +626,7 @@ func insertRecallEntryTx(ctx context.Context, tx *sql.Tx, m RecallEntry) error {
 	if err := validateRecallEvidenceOwnership(m); err != nil {
 		return err
 	}
+	m = maskRecallEntryForStorage(m)
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO recall_entries (
 			id, type, scope, status, review_state, title, body, trigger,

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/mask"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/signals"
@@ -267,7 +268,7 @@ func ScanSecretsFromMessages(
 				MessageOrdinal: ordinal, CallIndex: callIndex,
 				EventIndex: eventIndex, MatchStart: match.Start,
 				MatchEnd: match.End, MatchIndex: match.Index,
-				RedactedMatch: match.Redacted,
+				RedactedMatch: mask.Placeholder(content[match.Start:match.End]),
 				RulesVersion:  secrets.DefiniteRulesVersion(),
 			})
 			if match.Confidence == secrets.ConfidenceDefinite {
