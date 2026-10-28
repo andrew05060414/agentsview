@@ -3,6 +3,7 @@ package mask
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -10,7 +11,8 @@ import (
 // Environment switches for the ingestion-time masker (M1).
 //
 //	AGENTSVIEW_MASK=off            disable masking of newly stored text
-//	AGENTSVIEW_MASK_REGISTRY=path  hashed known-secret registry (JSONL, see Registry)
+//	AGENTSVIEW_MASK_REGISTRY=path  hashed known-secret registry (JSONL, see Registry); default
+//	                               <data dir>/mask-registry.jsonl when present
 //	AGENTSVIEW_MASK_SECRETS_DIR=d  directory of plaintext secret files; strict values
 //	                               are held in memory only and replaced wherever they appear
 const (
@@ -18,6 +20,15 @@ const (
 	EnvRegistry   = "AGENTSVIEW_MASK_REGISTRY"
 	EnvSecretsDir = "AGENTSVIEW_MASK_SECRETS_DIR"
 )
+
+// DefaultRegistryFile is the registry file name looked up in the data directory
+// when AGENTSVIEW_MASK_REGISTRY is not set.
+const DefaultRegistryFile = "mask-registry.jsonl"
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.Mode().IsRegular()
+}
 
 var (
 	defaultOnce   sync.Once
@@ -33,8 +44,25 @@ func Default() *Masker {
 			return
 		}
 		var opts Options
-		if p := os.Getenv(EnvRegistry); p != "" {
-			reg, err := LoadRegistry(p)
+		regPath := os.Getenv(EnvRegistry)
+		if regPath == "" {
+			// No variable: use <data dir>/mask-registry.jsonl when it exists,
+			// so a registry dropped next to the archive needs no service
+			// environment change.
+			dir := os.Getenv("AGENTSVIEW_DATA_DIR")
+			if dir == "" {
+				if home, err := os.UserHomeDir(); err == nil {
+					dir = filepath.Join(home, ".agentsview")
+				}
+			}
+			if dir != "" {
+				if p := filepath.Join(dir, DefaultRegistryFile); fileExists(p) {
+					regPath = p
+				}
+			}
+		}
+		if regPath != "" {
+			reg, err := LoadRegistry(regPath)
 			if err != nil {
 				log.Printf("mask: ignoring registry: %v", err)
 			} else {

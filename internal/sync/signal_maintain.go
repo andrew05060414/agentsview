@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/mask"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/signals"
@@ -194,7 +195,7 @@ func (m *incrementalSignalMaintainer) MaintainTx(
 					MatchStart:     match.Start,
 					MatchEnd:       match.End,
 					MatchIndex:     match.Index,
-					RedactedMatch:  match.Redacted,
+					RedactedMatch:  mask.Placeholder(ev.Content[match.Start:match.End]),
 					RulesVersion:   secrets.DefiniteRulesVersion(),
 				})
 			}
