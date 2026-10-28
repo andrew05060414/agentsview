@@ -156,37 +156,62 @@ func (p *ftsParser) expression(minPrec int) (*FTSExpr, error) {
 	return left, nil
 }
 
-// matchSpan evaluates e against body with case-insensitive substring
-// semantics. When e holds, it returns the span of the first positive operand
-// that satisfies it, preferring the left side of an OR whose sides both hold.
-func (e *FTSExpr) matchSpan(body string) (int, int, bool) {
+// matchedTerms returns the positive terms through which e holds, in query
+// order, given whether each term holds on its own. It returns nil when e does
+// not hold. Every term of an OR side that holds is included, so the caller can
+// skip a term it cannot locate in the text.
+func (e *FTSExpr) matchedTerms(holds func(*FTSExpr) bool) []*FTSExpr {
 	switch e.Op {
 	case "term":
-		return CaseInsensitiveSpan(body, e.Term)
-	case "OR":
-		if start, end, ok := e.Left.matchSpan(body); ok {
-			return start, end, true
+		if holds(e) {
+			return []*FTSExpr{e}
 		}
-		return e.Right.matchSpan(body)
+		return nil
+	case "OR":
+		return append(e.Left.matchedTerms(holds), e.Right.matchedTerms(holds)...)
 	}
-	start, end, ok := e.Left.matchSpan(body)
-	if !ok {
-		return 0, 0, false
+	left := e.Left.matchedTerms(holds)
+	if left == nil {
+		return nil
 	}
-	if _, _, rightOK := e.Right.matchSpan(body); rightOK != (e.Op == "AND") {
-		return 0, 0, false
+	right := e.Right.matchedTerms(holds)
+	if e.Op == "NOT" {
+		if right != nil {
+			return nil
+		}
+		return left
 	}
-	return start, end, true
+	if right == nil {
+		return nil
+	}
+	return append(left, right...)
 }
 
-// positiveTerms returns e's operands in query order, omitting the negated side
+// positiveTerms returns e's terms in query order, omitting the negated side
 // of every NOT.
-func (e *FTSExpr) positiveTerms() []string {
+func (e *FTSExpr) positiveTerms() []*FTSExpr {
 	switch e.Op {
 	case "term":
-		return []string{e.Term}
+		return []*FTSExpr{e}
 	case "NOT":
 		return e.Left.positiveTerms()
 	}
 	return append(e.Left.positiveTerms(), e.Right.positiveTerms()...)
+}
+
+// terms returns every term of e in query order, including negated ones.
+func (e *FTSExpr) terms() []*FTSExpr {
+	if e.Op == "term" {
+		return []*FTSExpr{e}
+	}
+	return append(e.Left.terms(), e.Right.terms()...)
+}
+
+// hasOrNot reports whether e uses OR or NOT, the operators that let a row
+// match without every term.
+func (e *FTSExpr) hasOrNot() bool {
+	if e.Op == "term" {
+		return false
+	}
+	return e.Op == "OR" || e.Op == "NOT" || e.Left.hasOrNot() || e.Right.hasOrNot()
 }

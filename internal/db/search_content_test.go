@@ -738,6 +738,11 @@ func TestSearchContentFTSBooleanSnippetCentersOnMatchedOperand(t *testing.T) {
 		{"OR phrase", `"absent" OR "fix bug"`, filler + "fix bug closes", "fix bug closes"},
 		{"negated operand", `"alpha" NOT "beta" OR "gamma"`, "beta opens " + filler + "gamma closes", "gamma closes"},
 		{"unsatisfied AND", `"alpha" AND "beta" OR "gamma"`, "alpha opens " + filler + "gamma closes", "gamma closes"},
+		// SQLite matches tokens, not substrings: the phrase matches across
+		// punctuation and a stemmed word matches its inflections.
+		{"negated phrase across punctuation", `"alpha" NOT "foo bar" OR "gamma"`, "alpha opens foo-bar " + filler + "gamma closes", "gamma closes"},
+		{"negated stem", `"alpha" NOT "runs" OR "gamma"`, "alpha opens running " + filler + "gamma closes", "gamma closes"},
+		{"OR phrase across punctuation", `"absent" OR "foo bar"`, filler + "foo-bar closes", "foo-bar closes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			id := strings.ReplaceAll(tc.name, " ", "-")
