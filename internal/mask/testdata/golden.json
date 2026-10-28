@@ -1,0 +1,1631 @@
+{
+ "version": 1,
+ "cases": [
+  {
+   "id": "aws-key-plain",
+   "tier": "parity",
+   "in": [
+    "aws id: ",
+    {
+     "j": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " (do not share)"
+   ],
+   "out": [
+    "aws id: ",
+    {
+     "ph": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " (do not share)"
+   ]
+  },
+  {
+   "id": "aws-key-line-start",
+   "tier": "parity",
+   "in": [
+    "",
+    {
+     "j": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    "\nnext line"
+   ],
+   "out": [
+    "",
+    {
+     "ph": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    "\nnext line"
+   ]
+  },
+  {
+   "id": "aws-key-inside-word",
+   "tier": "parity",
+   "in": [
+    "x",
+    {
+     "j": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    }
+   ],
+   "out": [
+    "x",
+    {
+     "j": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "aws-key-too-short",
+   "tier": "parity",
+   "in": [
+    {
+     "j": [
+      "AKIA",
+      "SHORT123"
+     ]
+    }
+   ],
+   "out": [
+    {
+     "j": [
+      "AKIA",
+      "SHORT123"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "google-key-query",
+   "tier": "parity",
+   "in": [
+    "https://x.example/api?key=",
+    {
+     "j": [
+      "AIza",
+      "SyD3mo",
+      "-abcdefghijklmnopqrstuvwxyz01"
+     ]
+    },
+    "&alt=json"
+   ],
+   "out": [
+    "https://x.example/api?key=",
+    {
+     "ph": [
+      "AIza",
+      "SyD3mo",
+      "-abcdefghijklmnopqrstuvwxyz01"
+     ]
+    },
+    "&alt=json"
+   ]
+  },
+  {
+   "id": "google-key-json",
+   "tier": "parity",
+   "in": [
+    "{\"k\":\"",
+    {
+     "j": [
+      "AIza",
+      "SyD3mo",
+      "-abcdefghijklmnopqrstuvwxyz01"
+     ]
+    },
+    "\"}"
+   ],
+   "out": [
+    "{\"k\":\"",
+    {
+     "ph": [
+      "AIza",
+      "SyD3mo",
+      "-abcdefghijklmnopqrstuvwxyz01"
+     ]
+    },
+    "\"}"
+   ]
+  },
+  {
+   "id": "sk-proj",
+   "tier": "parity",
+   "in": [
+    "OPENAI=",
+    {
+     "j": [
+      "sk-",
+      "proj-",
+      "AbCdEf0123456789",
+      "GhIjKlMn"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "OPENAI=",
+    {
+     "ph": [
+      "sk-",
+      "proj-",
+      "AbCdEf0123456789",
+      "GhIjKlMn"
+     ]
+    },
+    "\n"
+   ]
+  },
+  {
+   "id": "sk-ant",
+   "tier": "parity",
+   "in": [
+    "export K=",
+    {
+     "j": [
+      "sk-",
+      "ant-",
+      "api03-",
+      "Zx9Qw8Er7",
+      "Ty6Ui5Op4",
+      "As3Df2Gh1Jk0"
+     ]
+    },
+    " && run"
+   ],
+   "out": [
+    "export K=",
+    {
+     "ph": [
+      "sk-",
+      "ant-",
+      "api03-",
+      "Zx9Qw8Er7",
+      "Ty6Ui5Op4",
+      "As3Df2Gh1Jk0"
+     ]
+    },
+    " && run"
+   ]
+  },
+  {
+   "id": "sk-legacy",
+   "tier": "parity",
+   "in": [
+    "key is ",
+    {
+     "j": [
+      "sk-",
+      "T3BlbkFJ",
+      "0123456789abcdefghijklmn"
+     ]
+    },
+    "."
+   ],
+   "out": [
+    "key is ",
+    {
+     "ph": [
+      "sk-",
+      "T3BlbkFJ",
+      "0123456789abcdefghijklmn"
+     ]
+    },
+    "."
+   ]
+  },
+  {
+   "id": "sk-too-short",
+   "tier": "parity",
+   "in": [
+    "sk-",
+    "tooshort12345"
+   ],
+   "out": [
+    "sk-",
+    "tooshort12345"
+   ]
+  },
+  {
+   "id": "sk-inside-word",
+   "tier": "parity",
+   "in": [
+    "task-",
+    "abcdefghijklmnopqrstuvwxyz"
+   ],
+   "out": [
+    "task-",
+    "abcdefghijklmnopqrstuvwxyz"
+   ]
+  },
+  {
+   "id": "github-ghp",
+   "tier": "parity",
+   "in": [
+    "token ",
+    {
+     "j": [
+      "ghp_",
+      "ABCDEFGHIJKLMNOP",
+      "QRSTUVWXYZ0123456789"
+     ]
+    },
+    " ok"
+   ],
+   "out": [
+    "token ",
+    {
+     "ph": [
+      "ghp_",
+      "ABCDEFGHIJKLMNOP",
+      "QRSTUVWXYZ0123456789"
+     ]
+    },
+    " ok"
+   ]
+  },
+  {
+   "id": "github-fine-grained",
+   "tier": "parity",
+   "in": [
+    "GH=",
+    {
+     "j": [
+      "github_pat_",
+      "11ABCDEFG0",
+      "abcdefghijklmnopqrstuvwxyz"
+     ]
+    },
+    ";"
+   ],
+   "out": [
+    "GH=",
+    {
+     "ph": [
+      "github_pat_",
+      "11ABCDEFG0",
+      "abcdefghijklmnopqrstuvwxyz"
+     ]
+    },
+    ";"
+   ]
+  },
+  {
+   "id": "github-oauth",
+   "tier": "parity",
+   "in": [
+    "oauth: ",
+    {
+     "j": [
+      "gho_",
+      "0123456789ABCDEF",
+      "abcdef"
+     ]
+    },
+    ""
+   ],
+   "out": [
+    "oauth: ",
+    {
+     "ph": [
+      "gho_",
+      "0123456789ABCDEF",
+      "abcdef"
+     ]
+    },
+    ""
+   ]
+  },
+  {
+   "id": "jwt-plain",
+   "tier": "parity",
+   "in": [
+    "cookie jwt=",
+    {
+     "j": [
+      "eyJ",
+      "hbGciOiJIUzI1NiJ9",
+      ".",
+      "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+      ".",
+      "dBjftJeZ4CVPmB92K27uhbUJU1p1r"
+     ]
+    },
+    "; path=/"
+   ],
+   "out": [
+    "cookie jwt=",
+    {
+     "ph": [
+      "eyJ",
+      "hbGciOiJIUzI1NiJ9",
+      ".",
+      "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+      ".",
+      "dBjftJeZ4CVPmB92K27uhbUJU1p1r"
+     ]
+    },
+    "; path=/"
+   ]
+  },
+  {
+   "id": "jwt-in-json",
+   "tier": "parity",
+   "in": [
+    "{\"id_token\":\"",
+    {
+     "j": [
+      "eyJ",
+      "hbGciOiJIUzI1NiJ9",
+      ".",
+      "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+      ".",
+      "dBjftJeZ4CVPmB92K27uhbUJU1p1r"
+     ]
+    },
+    "\"}"
+   ],
+   "out": [
+    "{\"id_token\":\"",
+    {
+     "ph": [
+      "eyJ",
+      "hbGciOiJIUzI1NiJ9",
+      ".",
+      "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+      ".",
+      "dBjftJeZ4CVPmB92K27uhbUJU1p1r"
+     ]
+    },
+    "\"}"
+   ]
+  },
+  {
+   "id": "jwt-empty-signature-unmatched",
+   "tier": "parity",
+   "in": [
+    "x ",
+    {
+     "j": [
+      "eyJ",
+      "hbGciOiJub25lIn0",
+      ".",
+      "eyJzdWIiOiJ4eHh4In0",
+      "."
+     ]
+    },
+    " y"
+   ],
+   "out": [
+    "x ",
+    {
+     "j": [
+      "eyJ",
+      "hbGciOiJub25lIn0",
+      ".",
+      "eyJzdWIiOiJ4eHh4In0",
+      "."
+     ]
+    },
+    " y"
+   ]
+  },
+  {
+   "id": "bearer-header",
+   "tier": "parity",
+   "in": [
+    "Authorization: Bearer ",
+    {
+     "j": [
+      "tok_",
+      "Zq81Lm40Xv73Bn55Pw"
+     ]
+    },
+    "\r\nHost: x"
+   ],
+   "out": [
+    "Authorization: Bearer ",
+    {
+     "ph": [
+      "tok_",
+      "Zq81Lm40Xv73Bn55Pw"
+     ]
+    },
+    "\r\nHost: x"
+   ]
+  },
+  {
+   "id": "bearer-lowercase",
+   "tier": "parity",
+   "in": [
+    "authorization: bearer ",
+    {
+     "j": [
+      "tok_",
+      "Zq81Lm40Xv73Bn55Pw"
+     ]
+    },
+    ""
+   ],
+   "out": [
+    "authorization: bearer ",
+    {
+     "ph": [
+      "tok_",
+      "Zq81Lm40Xv73Bn55Pw"
+     ]
+    },
+    ""
+   ]
+  },
+  {
+   "id": "bearer-in-curl",
+   "tier": "parity",
+   "in": [
+    "curl -H 'Authorization: Bearer ",
+    {
+     "j": [
+      "tok_",
+      "Zq81Lm40Xv73Bn55Pw"
+     ]
+    },
+    "' https://x"
+   ],
+   "out": [
+    "curl -H 'Authorization: Bearer ",
+    {
+     "ph": [
+      "tok_",
+      "Zq81Lm40Xv73Bn55Pw"
+     ]
+    },
+    "' https://x"
+   ]
+  },
+  {
+   "id": "bearer-trailing-dot",
+   "tier": "parity",
+   "in": [
+    "Bearer ",
+    {
+     "j": [
+      "tok_",
+      "Zq81Lm40Xv73Bn55Pw"
+     ]
+    },
+    "."
+   ],
+   "out": [
+    "Bearer ",
+    {
+     "ph": [
+      "tok_",
+      "Zq81Lm40Xv73Bn55Pw"
+     ]
+    },
+    "."
+   ]
+  },
+  {
+   "id": "bearer-short-value",
+   "tier": "parity",
+   "in": [
+    "Bearer ",
+    {
+     "j": [
+      "shorttok"
+     ]
+    }
+   ],
+   "out": [
+    "Bearer ",
+    {
+     "j": [
+      "shorttok"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "conn-postgres",
+   "tier": "parity",
+   "in": [
+    "postgres://app:",
+    {
+     "j": [
+      "S3cr3t",
+      "Pass99"
+     ]
+    },
+    "@db.internal:5432/main"
+   ],
+   "out": [
+    "postgres://app:",
+    {
+     "ph": [
+      "S3cr3t",
+      "Pass99"
+     ]
+    },
+    "@db.internal:5432/main"
+   ]
+  },
+  {
+   "id": "conn-https-basic",
+   "tier": "parity",
+   "in": [
+    "https://bot:",
+    {
+     "j": [
+      "hunter",
+      "2hunter2"
+     ]
+    },
+    "@example.org/path"
+   ],
+   "out": [
+    "https://bot:",
+    {
+     "ph": [
+      "hunter",
+      "2hunter2"
+     ]
+    },
+    "@example.org/path"
+   ]
+  },
+  {
+   "id": "conn-redis",
+   "tier": "parity",
+   "in": [
+    "redis://default:",
+    {
+     "j": [
+      "r3d1s",
+      "Pw0rd"
+     ]
+    },
+    "@10.0.0.5:6379"
+   ],
+   "out": [
+    "redis://default:",
+    {
+     "ph": [
+      "r3d1s",
+      "Pw0rd"
+     ]
+    },
+    "@10.0.0.5:6379"
+   ]
+  },
+  {
+   "id": "conn-no-password",
+   "tier": "parity",
+   "in": [
+    "https://user@host/path ",
+    "http://host:8080/x"
+   ],
+   "out": [
+    "https://user@host/path ",
+    "http://host:8080/x"
+   ]
+  },
+  {
+   "id": "conn-twice-same",
+   "tier": "parity",
+   "in": [
+    "a=postgres://u:",
+    {
+     "j": [
+      "sharedpw",
+      "9"
+     ]
+    },
+    "@h1/d b=postgres://v:",
+    {
+     "j": [
+      "sharedpw",
+      "9"
+     ]
+    },
+    "@h2/d"
+   ],
+   "out": [
+    "a=postgres://u:",
+    {
+     "ph": [
+      "sharedpw",
+      "9"
+     ]
+    },
+    "@h1/d b=postgres://v:",
+    {
+     "ph": [
+      "sharedpw",
+      "9"
+     ]
+    },
+    "@h2/d"
+   ]
+  },
+  {
+   "id": "private-key-rsa",
+   "tier": "parity",
+   "in": [
+    "key:\n",
+    {
+     "j": [
+      "-----BEGIN RSA PRIV",
+      "ATE KEY-----\nQUJDREVGR0hJSktMTU5PUA==\nUVJTVFVWV1hZWjAxMjM0NQ==\n-----END RSA PRIV",
+      "ATE KEY-----"
+     ]
+    },
+    "\ndone"
+   ],
+   "out": [
+    "key:\n",
+    {
+     "ph": [
+      "-----BEGIN RSA PRIV",
+      "ATE KEY-----\nQUJDREVGR0hJSktMTU5PUA==\nUVJTVFVWV1hZWjAxMjM0NQ==\n-----END RSA PRIV",
+      "ATE KEY-----"
+     ]
+    },
+    "\ndone"
+   ]
+  },
+  {
+   "id": "private-key-pkcs8",
+   "tier": "parity",
+   "in": [
+    "",
+    {
+     "j": [
+      "-----BEGIN PRIV",
+      "ATE KEY-----\nQUJDREVGR0hJSg==\n-----END PRIV",
+      "ATE KEY-----"
+     ]
+    },
+    ""
+   ],
+   "out": [
+    "",
+    {
+     "ph": [
+      "-----BEGIN PRIV",
+      "ATE KEY-----\nQUJDREVGR0hJSg==\n-----END PRIV",
+      "ATE KEY-----"
+     ]
+    },
+    ""
+   ]
+  },
+  {
+   "id": "private-key-escaped-newlines",
+   "tier": "parity",
+   "in": [
+    "{\"pem\":\"",
+    {
+     "j": [
+      "-----BEGIN OPENSSH PRIV",
+      "ATE KEY-----\\nQUJDREVGR0g=\\n-----END OPENSSH PRIV",
+      "ATE KEY-----"
+     ]
+    },
+    "\"}"
+   ],
+   "out": [
+    "{\"pem\":\"",
+    {
+     "ph": [
+      "-----BEGIN OPENSSH PRIV",
+      "ATE KEY-----\\nQUJDREVGR0g=\\n-----END OPENSSH PRIV",
+      "ATE KEY-----"
+     ]
+    },
+    "\"}"
+   ]
+  },
+  {
+   "id": "named-env",
+   "tier": "parity",
+   "in": [
+    "API_KEY=",
+    {
+     "j": [
+      "Xk3mP9qL",
+      "2vN8wR5t"
+     ]
+    },
+    "\nNEXT=1"
+   ],
+   "out": [
+    "API_KEY=",
+    {
+     "ph": [
+      "Xk3mP9qL",
+      "2vN8wR5t"
+     ]
+    },
+    "\nNEXT=1"
+   ]
+  },
+  {
+   "id": "named-json-dq",
+   "tier": "parity",
+   "in": [
+    "{\"db_password\": \"",
+    {
+     "j": [
+      "Tr0ub4dor",
+      "3xYz"
+     ]
+    },
+    "\"}"
+   ],
+   "out": [
+    "{\"db_password\": \"",
+    {
+     "ph": [
+      "Tr0ub4dor",
+      "3xYz"
+     ]
+    },
+    "\"}"
+   ]
+  },
+  {
+   "id": "named-json-sq",
+   "tier": "parity",
+   "in": [
+    "{'client_secret': '",
+    {
+     "j": [
+      "aB3dE6gH",
+      "9jK2mN5p"
+     ]
+    },
+    "'}"
+   ],
+   "out": [
+    "{'client_secret': '",
+    {
+     "ph": [
+      "aB3dE6gH",
+      "9jK2mN5p"
+     ]
+    },
+    "'}"
+   ]
+  },
+  {
+   "id": "named-underscore-token",
+   "tier": "parity",
+   "in": [
+    "export GITHUB_TOKEN=",
+    {
+     "j": [
+      "v1.8f3a",
+      "C9d2E7b1"
+     ]
+    },
+    " "
+   ],
+   "out": [
+    "export GITHUB_TOKEN=",
+    {
+     "ph": [
+      "v1.8f3a",
+      "C9d2E7b1"
+     ]
+    },
+    " "
+   ]
+  },
+  {
+   "id": "named-colon-space",
+   "tier": "parity",
+   "in": [
+    "client_secret: ",
+    {
+     "j": [
+      "QwErTy12",
+      "34AsDf56"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "client_secret: ",
+    {
+     "ph": [
+      "QwErTy12",
+      "34AsDf56"
+     ]
+    },
+    "\n"
+   ]
+  },
+  {
+   "id": "named-in-url",
+   "tier": "parity",
+   "in": [
+    "https://x/y?access_token=",
+    {
+     "j": [
+      "Mn8Bv5Cx",
+      "4Zq1Lk9J"
+     ]
+    },
+    "&b=2"
+   ],
+   "out": [
+    "https://x/y?access_token=",
+    {
+     "ph": [
+      "Mn8Bv5Cx",
+      "4Zq1Lk9J"
+     ]
+    },
+    "&b=2"
+   ]
+  },
+  {
+   "id": "named-camel",
+   "tier": "parity",
+   "in": [
+    "{authToken:'",
+    {
+     "j": [
+      "Gh7Jk4Lm",
+      "2Np8Qr5S"
+     ]
+    },
+    "'}"
+   ],
+   "out": [
+    "{authToken:'",
+    {
+     "ph": [
+      "Gh7Jk4Lm",
+      "2Np8Qr5S"
+     ]
+    },
+    "'}"
+   ]
+  },
+  {
+   "id": "named-value-too-short",
+   "tier": "parity",
+   "in": [
+    "api_key=",
+    {
+     "j": [
+      "short12"
+     ]
+    }
+   ],
+   "out": [
+    "api_key=",
+    {
+     "j": [
+      "short12"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "named-no-credential-name",
+   "tier": "parity",
+   "in": [
+    "user_id=",
+    {
+     "j": [
+      "Ab3dEf6hIj9kLm"
+     ]
+    }
+   ],
+   "out": [
+    "user_id=",
+    {
+     "j": [
+      "Ab3dEf6hIj9kLm"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "named-already-masked",
+   "tier": "parity",
+   "in": [
+    "api_key=",
+    {
+     "ph": [
+      "Xk3mP9qL",
+      "2vN8wR5t"
+     ]
+    }
+   ],
+   "out": [
+    "api_key=",
+    {
+     "ph": [
+      "Xk3mP9qL",
+      "2vN8wR5t"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "same-secret-three-times",
+   "tier": "parity",
+   "in": [
+    {
+     "j": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " and ",
+    {
+     "j": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " and ",
+    {
+     "j": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    }
+   ],
+   "out": [
+    {
+     "ph": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " and ",
+    {
+     "ph": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " and ",
+    {
+     "ph": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "two-different-secrets",
+   "tier": "parity",
+   "in": [
+    "a ",
+    {
+     "j": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " b ",
+    {
+     "j": [
+      "ghp_",
+      "ABCDEFGHIJKLMNOP",
+      "QRSTUVWXYZ0123456789"
+     ]
+    }
+   ],
+   "out": [
+    "a ",
+    {
+     "ph": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " b ",
+    {
+     "ph": [
+      "ghp_",
+      "ABCDEFGHIJKLMNOP",
+      "QRSTUVWXYZ0123456789"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "placeholder-untouched",
+   "tier": "parity",
+   "in": [
+    "see ",
+    {
+     "ph": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " ok"
+   ],
+   "out": [
+    "see ",
+    {
+     "ph": [
+      "AKIA",
+      "IOSFODNN7",
+      "EXAMPLE"
+     ]
+    },
+    " ok"
+   ]
+  },
+  {
+   "id": "cjk-context",
+   "tier": "parity",
+   "in": [
+    "密钥是 ",
+    {
+     "j": [
+      "sk-",
+      "proj-",
+      "AbCdEf0123456789",
+      "GhIjKlMn"
+     ]
+    },
+    " 请勿外传"
+   ],
+   "out": [
+    "密钥是 ",
+    {
+     "ph": [
+      "sk-",
+      "proj-",
+      "AbCdEf0123456789",
+      "GhIjKlMn"
+     ]
+    },
+    " 请勿外传"
+   ]
+  },
+  {
+   "id": "secret-then-newline-crlf",
+   "tier": "parity",
+   "in": [
+    "x=",
+    {
+     "j": [
+      "AIza",
+      "SyD3mo",
+      "-abcdefghijklmnopqrstuvwxyz01"
+     ]
+    },
+    "\r\n"
+   ],
+   "out": [
+    "x=",
+    {
+     "ph": [
+      "AIza",
+      "SyD3mo",
+      "-abcdefghijklmnopqrstuvwxyz01"
+     ]
+    },
+    "\r\n"
+   ]
+  },
+  {
+   "id": "plain-text-unchanged",
+   "tier": "parity",
+   "in": [
+    "hello world, nothing secret here: 2026-10-27 12:00:00 id=42"
+   ],
+   "out": [
+    "hello world, nothing secret here: 2026-10-27 12:00:00 id=42"
+   ]
+  },
+  {
+   "id": "empty",
+   "tier": "parity",
+   "in": [
+    ""
+   ],
+   "out": [
+    ""
+   ]
+  },
+  {
+   "id": "gate-ident-value",
+   "tier": "go",
+   "in": [
+    "access_token=",
+    {
+     "j": [
+      "my_secret",
+      "_value_ok"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "access_token=",
+    {
+     "j": [
+      "my_secret",
+      "_value_ok"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "differs"
+  },
+  {
+   "id": "gate-path-value",
+   "tier": "go",
+   "in": [
+    "my_secret_file=",
+    {
+     "j": [
+      "keys/prod",
+      "/id_rsa_prod"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "my_secret_file=",
+    {
+     "j": [
+      "keys/prod",
+      "/id_rsa_prod"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "differs"
+  },
+  {
+   "id": "gate-uuid-value",
+   "tier": "go",
+   "in": [
+    "idempotency_key=",
+    {
+     "j": [
+      "3f2b8c1e-",
+      "9a4d-4e7b-",
+      "b1c2-0d5e6f7a8b9c"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "idempotency_key=",
+    {
+     "j": [
+      "3f2b8c1e-",
+      "9a4d-4e7b-",
+      "b1c2-0d5e6f7a8b9c"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "differs"
+  },
+  {
+   "id": "gate-digits-value",
+   "tier": "go",
+   "in": [
+    "session_key=",
+    {
+     "j": [
+      "1234567890",
+      "12"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "session_key=",
+    {
+     "j": [
+      "1234567890",
+      "12"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "differs"
+  },
+  {
+   "id": "gate-hex-hash-value",
+   "tier": "go",
+   "in": [
+    "api_key_hash=",
+    {
+     "j": [
+      "0123456789abcdef",
+      "0123456789abcdef"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "api_key_hash=",
+    {
+     "j": [
+      "0123456789abcdef",
+      "0123456789abcdef"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "differs"
+  },
+  {
+   "id": "gate-public-key-name",
+   "tier": "go",
+   "in": [
+    "public_key=",
+    {
+     "j": [
+      "Qw3Rt6Yu",
+      "9Io1Pa4S"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "public_key=",
+    {
+     "j": [
+      "Qw3Rt6Yu",
+      "9Io1Pa4S"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "differs"
+  },
+  {
+   "id": "gate-name-contains-key-only",
+   "tier": "go",
+   "in": [
+    "monkey_id=",
+    {
+     "j": [
+      "Qw3Rt6Yu",
+      "9Io1Pa4S"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "monkey_id=",
+    {
+     "j": [
+      "Qw3Rt6Yu",
+      "9Io1Pa4S"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "differs"
+  },
+  {
+   "id": "go-cookie-name",
+   "tier": "go",
+   "in": [
+    "session_cookie=",
+    {
+     "j": [
+      "Zx3Cv6Bn",
+      "9Mq2Wd5E"
+     ]
+    },
+    "; HttpOnly"
+   ],
+   "out": [
+    "session_cookie=",
+    {
+     "ph": [
+      "Zx3Cv6Bn",
+      "9Mq2Wd5E"
+     ]
+    },
+    "; HttpOnly"
+   ],
+   "oc": "unchanged"
+  },
+  {
+   "id": "go-bare-password",
+   "tier": "go",
+   "in": [
+    "password=",
+    {
+     "j": [
+      "Tr0ub4dor",
+      "3xYz9"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "password=",
+    {
+     "ph": [
+      "Tr0ub4dor",
+      "3xYz9"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "unchanged"
+  },
+  {
+   "id": "go-bare-token-json",
+   "tier": "go",
+   "in": [
+    "{\"token\": \"",
+    {
+     "j": [
+      "Ab3dEf6h",
+      "Ij9kLm2N"
+     ]
+    },
+    "\"}"
+   ],
+   "out": [
+    "{\"token\": \"",
+    {
+     "ph": [
+      "Ab3dEf6h",
+      "Ij9kLm2N"
+     ]
+    },
+    "\"}"
+   ],
+   "oc": "unchanged"
+  },
+  {
+   "id": "go-bare-secret-colon",
+   "tier": "go",
+   "in": [
+    "secret: ",
+    {
+     "j": [
+      "QwErTy12",
+      "34AsDf56"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "secret: ",
+    {
+     "ph": [
+      "QwErTy12",
+      "34AsDf56"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "unchanged"
+  },
+  {
+   "id": "go-gitlab-pat",
+   "tier": "go",
+   "in": [
+    "tok ",
+    {
+     "j": [
+      "glpat-",
+      "AbCdEfGhIjKlMnOpQrSt"
+     ]
+    },
+    " end"
+   ],
+   "out": [
+    "tok ",
+    {
+     "ph": [
+      "glpat-",
+      "AbCdEfGhIjKlMnOpQrSt"
+     ]
+    },
+    " end"
+   ],
+   "oc": "unchanged"
+  },
+  {
+   "id": "go-npm-token",
+   "tier": "go",
+   "in": [
+    "//registry:_authToken=",
+    {
+     "j": [
+      "npm_",
+      "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+     ]
+    },
+    "\n"
+   ],
+   "out": [
+    "//registry:_authToken=",
+    {
+     "ph": [
+      "npm_",
+      "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+     ]
+    },
+    "\n"
+   ],
+   "oc": "differs"
+  },
+  {
+   "id": "go-hf-token",
+   "tier": "go",
+   "in": [
+    "HF ",
+    {
+     "j": [
+      "hf_",
+      "AbCdEfGhIjKlMnOpQrStUvWxYz0123"
+     ]
+    }
+   ],
+   "out": [
+    "HF ",
+    {
+     "ph": [
+      "hf_",
+      "AbCdEfGhIjKlMnOpQrStUvWxYz0123"
+     ]
+    }
+   ],
+   "oc": "unchanged"
+  },
+  {
+   "id": "go-slack-token",
+   "tier": "go",
+   "in": [
+    "slack ",
+    {
+     "j": [
+      "xoxb-",
+      "123456789012-",
+      "AbCdEfGhIj"
+     ]
+    },
+    " end"
+   ],
+   "out": [
+    "slack ",
+    {
+     "ph": [
+      "xoxb-",
+      "123456789012-",
+      "AbCdEfGhIj"
+     ]
+    },
+    " end"
+   ],
+   "oc": "unchanged"
+  },
+  {
+   "id": "go-stripe-secret",
+   "tier": "go",
+   "in": [
+    "stripe ",
+    {
+     "j": [
+      "sk_live_",
+      "AbCdEfGhIjKlMnOp12"
+     ]
+    },
+    "!"
+   ],
+   "out": [
+    "stripe ",
+    {
+     "ph": [
+      "sk_live_",
+      "AbCdEfGhIjKlMnOp12"
+     ]
+    },
+    "!"
+   ],
+   "oc": "unchanged"
+  },
+  {
+   "id": "go-aws-sts",
+   "tier": "go",
+   "in": [
+    "sts ",
+    {
+     "j": [
+      "ASIA",
+      "ABCDEFGHIJKLMNOP"
+     ]
+    },
+    " end"
+   ],
+   "out": [
+    "sts ",
+    {
+     "ph": [
+      "ASIA",
+      "ABCDEFGHIJKLMNOP"
+     ]
+    },
+    " end"
+   ],
+   "oc": "unchanged"
+  },
+  {
+   "id": "go-sendgrid",
+   "tier": "go",
+   "in": [
+    "mail ",
+    {
+     "j": [
+      "SG.",
+      "AbCdEfGhIjKlMnOpQrStUv",
+      ".",
+      "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG"
+     ]
+    },
+    " end"
+   ],
+   "out": [
+    "mail ",
+    {
+     "ph": [
+      "SG.",
+      "AbCdEfGhIjKlMnOpQrStUv",
+      ".",
+      "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfG"
+     ]
+    },
+    " end"
+   ],
+   "oc": "unchanged"
+  }
+ ]
+}

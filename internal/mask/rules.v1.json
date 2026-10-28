@@ -1,0 +1,171 @@
+{
+  "id": "history-masking-rules/1",
+  "tier": "L1",
+  "comment": "L1 = vendor-format keys + JWT + connection-string passwords + private-key blocks + credential-named random values. Rules marked origin=opencodex are the same patterns as src/privacy/redact.ts RULES (same order); the placeholder is {{SECRET_<first 8 hex of sha256(value)>}}. Everything outside the secret group of a match is kept; the secret group is replaced; every occurrence of the full matched text is replaced (JS split/join semantics).",
+  "placeholder": { "prefix": "{{SECRET_", "suffix": "}}", "hexChars": 8 },
+  "closure": { "minLen": 12 },
+  "rules": [
+    {
+      "id": "private-key-block",
+      "kind": "private_key",
+      "origin": "opencodex",
+      "pattern": "-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----[\\s\\S]+?-----END(?: [A-Z0-9]+)? PRIVATE KEY-----",
+      "secretGroup": 0,
+      "prefilter": ["PRIVATE KEY"]
+    },
+    {
+      "id": "connection-string-password",
+      "kind": "connection_string",
+      "origin": "opencodex",
+      "pattern": "([a-zA-Z][a-zA-Z0-9+.-]*:\\/\\/[^\\s:@/]+:)([^\\s:@/]+)(@[^\\s/]+)",
+      "secretGroup": 2,
+      "prefilter": ["://"],
+      "closure": "random"
+    },
+    {
+      "id": "google-api-key",
+      "kind": "api_key",
+      "origin": "opencodex",
+      "pattern": "\\bAIza[0-9A-Za-z_-]{35}\\b",
+      "secretGroup": 0,
+      "prefilter": ["AIza"],
+      "closure": "any"
+    },
+    {
+      "id": "sk-key",
+      "kind": "api_key",
+      "origin": "opencodex",
+      "pattern": "\\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\\b",
+      "secretGroup": 0,
+      "prefilter": ["sk-"],
+      "closure": "any"
+    },
+    {
+      "id": "aws-access-key",
+      "kind": "api_key",
+      "origin": "opencodex",
+      "pattern": "\\bAKIA[0-9A-Z]{16}\\b",
+      "secretGroup": 0,
+      "prefilter": ["AKIA"],
+      "closure": "any"
+    },
+    {
+      "id": "github-token",
+      "kind": "api_key",
+      "origin": "opencodex",
+      "pattern": "\\b(?:gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{20,})\\b",
+      "secretGroup": 0,
+      "prefilter": ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"],
+      "closure": "any"
+    },
+    {
+      "id": "jwt",
+      "kind": "token",
+      "origin": "opencodex",
+      "pattern": "\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*\\b",
+      "secretGroup": 0,
+      "prefilter": ["eyJ"],
+      "closure": "any"
+    },
+    {
+      "id": "bearer-token",
+      "kind": "token",
+      "origin": "opencodex",
+      "pattern": "\\b(Bearer\\s+)([A-Za-z0-9._~+/=-]{16,})\\b",
+      "flags": "i",
+      "secretGroup": 2,
+      "prefilter": ["bearer"],
+      "prefilterFold": true,
+      "closure": "random"
+    },
+    {
+      "id": "aws-sts-key",
+      "kind": "api_key",
+      "origin": "agentsview",
+      "pattern": "\\bASIA[0-9A-Z]{16}\\b",
+      "secretGroup": 0,
+      "prefilter": ["ASIA"],
+      "closure": "any"
+    },
+    {
+      "id": "gitlab-pat",
+      "kind": "api_key",
+      "origin": "agentsview",
+      "pattern": "\\b(glpat-[0-9A-Za-z_\\-]{20,})(?:[^0-9A-Za-z_\\-]|$)",
+      "secretGroup": 1,
+      "prefilter": ["glpat-"],
+      "closure": "any"
+    },
+    {
+      "id": "npm-token",
+      "kind": "api_key",
+      "origin": "agentsview",
+      "pattern": "\\bnpm_[0-9A-Za-z]{36}\\b",
+      "secretGroup": 0,
+      "prefilter": ["npm_"],
+      "closure": "any"
+    },
+    {
+      "id": "pypi-token",
+      "kind": "api_key",
+      "origin": "agentsview",
+      "pattern": "\\b(pypi-AgEIcHlwaS5vcmcC[0-9A-Za-z_\\-]{69,})(?:[^0-9A-Za-z_\\-]|$)",
+      "secretGroup": 1,
+      "prefilter": ["pypi-"],
+      "closure": "any"
+    },
+    {
+      "id": "huggingface-token",
+      "kind": "api_key",
+      "origin": "agentsview",
+      "pattern": "\\bhf_[0-9A-Za-z]{30,}\\b",
+      "secretGroup": 0,
+      "prefilter": ["hf_"],
+      "closure": "any"
+    },
+    {
+      "id": "sendgrid-key",
+      "kind": "api_key",
+      "origin": "agentsview",
+      "pattern": "\\b(SG\\.[0-9A-Za-z_\\-]{22}\\.[0-9A-Za-z_\\-]{43})(?:[^0-9A-Za-z_\\-]|$)",
+      "secretGroup": 1,
+      "prefilter": ["SG."],
+      "closure": "any"
+    },
+    {
+      "id": "slack-token",
+      "kind": "api_key",
+      "origin": "agentsview",
+      "pattern": "\\bxox[baprs]-[0-9A-Za-z]{10,}(?:-[0-9A-Za-z]+)*",
+      "secretGroup": 0,
+      "prefilter": ["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"],
+      "closure": "any"
+    },
+    {
+      "id": "stripe-secret",
+      "kind": "api_key",
+      "origin": "agentsview",
+      "pattern": "\\b[sr]k_live_[0-9A-Za-z]{16,}\\b",
+      "secretGroup": 0,
+      "prefilter": ["sk_live_", "rk_live_"],
+      "closure": "any"
+    },
+    {
+      "id": "named-assignment",
+      "kind": "other",
+      "origin": "opencodex",
+      "comment": "OpenCodex masks every value of length >= 8 after a credential-looking name (backreference form (['\"]?)(value)\\2). L1 (this file) masks it only when the NAME is credential-like and the VALUE looks random (gate). The alternation below is the RE2 equivalent of the backreference form; quoted/unquoted behaviour is identical.",
+      "pattern": "([\"']?[A-Za-z0-9_-]*?(?:key|secret|token|password|passwd|pwd|cookie|credential|bearer)[A-Za-z0-9_-]*[\"']?\\s*[:=]\\s*)(?:\"([A-Za-z0-9+/_.~-]{8,})\"|'([A-Za-z0-9+/_.~-]{8,})'|([A-Za-z0-9+/_.~-]{8,}))",
+      "flags": "i",
+      "secretGroups": [2, 3, 4],
+      "prefilter": ["key", "secret", "token", "pass", "pwd", "cookie", "credential", "bearer"],
+      "prefilterFold": true,
+      "gate": {
+        "keyGroup": 1,
+        "keyName": "credential",
+        "valueShape": "random"
+      },
+      "closure": "random"
+    }
+  ]
+}
