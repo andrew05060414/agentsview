@@ -22,6 +22,15 @@ type Registry struct {
 	byLen map[int]map[[32]byte]string // length -> hash -> label
 }
 
+// lenRange returns the shortest and longest registered length.
+func (r *Registry) lenRange() (lo, hi int) {
+	lo = 1 << 30
+	for l := range r.byLen {
+		lo, hi = min(lo, l), max(hi, l)
+	}
+	return lo, hi
+}
+
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry { return &Registry{byLen: map[int]map[[32]byte]string{}} }
 
@@ -181,6 +190,38 @@ func (r *Registry) mask(text string, hits []Hit) (string, []Hit) {
 		hits = append(hits, Hit{Rule: "registry:" + label, FP: FP8(cand), Len: e - s})
 		return true
 	}
+	lo, hi := r.lenRange()
+	// checkTrim tests the span, then the span with up to three non-alphanumeric
+	// characters (sentence punctuation, markdown, brackets) trimmed from each end.
+	checkTrim := func(s, e int) bool {
+		if e-s < lo || e-s > hi+6 {
+			return false
+		}
+		if check(s, e) {
+			return true
+		}
+		for lt := 0; lt <= 3; lt++ {
+			if lt > 0 {
+				if s+lt > e || isAlnum(text[s+lt-1]) {
+					break
+				}
+			}
+			for rt := 0; rt <= 3; rt++ {
+				if rt > 0 {
+					if e-rt < s+lt || isAlnum(text[e-rt]) {
+						break
+					}
+				}
+				if lt == 0 && rt == 0 {
+					continue
+				}
+				if e-rt-(s+lt) >= lo && check(s+lt, e-rt) {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	i := 0
 	for i < len(text) {
 		for i < len(text) && isTokenDelim(text[i]) {
@@ -193,7 +234,7 @@ func (r *Registry) mask(text string, hits []Hit) (string, []Hit) {
 		if i == start {
 			continue
 		}
-		if check(start, i) {
+		if checkTrim(start, i) {
 			continue
 		}
 		// Try the pieces between sub-delimiters.
@@ -201,7 +242,7 @@ func (r *Registry) mask(text string, hits []Hit) (string, []Hit) {
 		for j := start; j <= i; j++ {
 			if j == i || isSubDelim(text[j]) {
 				if j > ps {
-					check(ps, j)
+					checkTrim(ps, j)
 				}
 				ps = j + 1
 			}
@@ -223,4 +264,8 @@ func (r *Registry) mask(text string, hits []Hit) (string, []Hit) {
 	}
 	b.WriteString(text[last:])
 	return b.String(), hits
+}
+
+func isAlnum(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
