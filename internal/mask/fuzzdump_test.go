@@ -66,7 +66,9 @@ func TestDumpDifferential(t *testing.T) {
 			}
 			parts = append(parts, s)
 		}
-		in := strings.Join(parts, []string{" ", "\n", ", ", ""}[rng.Intn(4)])
+		// Parts are always separated: gluing a value to the next part would let a
+		// base64 '=' pad (accepted here, not by OpenCodex) swallow the next '='.
+		in := strings.Join(parts, []string{" ", "\n", ", ", "\t"}[rng.Intn(4)])
 		if err := enc.Encode(map[string]string{"in": in, "out": m.Text(in)}); err != nil {
 			t.Fatal(err)
 		}

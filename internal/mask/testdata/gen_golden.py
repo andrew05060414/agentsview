@@ -119,11 +119,16 @@ for cid, name, val in [
     ("gate-path-value", "my_secret_file=", ("keys/prod", "/id_rsa_prod")),
     ("gate-uuid-value", "idempotency_key=", ("3f2b8c1e-", "9a4d-4e7b-", "b1c2-0d5e6f7a8b9c")),
     ("gate-digits-value", "session_key=", ("1234567890", "12")),
-    ("gate-hex-hash-value", "api_key_hash=", ("0123456789abcdef", "0123456789abcdef")),
     ("gate-public-key-name", "public_key=", ("Qw3Rt6Yu", "9Io1Pa4S")),
     ("gate-name-contains-key-only", "monkey_id=", ("Qw3Rt6Yu", "9Io1Pa4S")),
 ]:
     case(cid, "go", [name, J(*val), "\n"], [name, J(*val), "\n"], oc="differs")
+# a hex digest under a credential-like name is masked (both sides agree)
+both("hex-digest-under-credential-name", "api_key_hash=", ("0123456789abcdef", "0123456789abcdef"), "\n")
+# base64 values: '=' padding is part of the value, '/' does not make it a path
+B64 = ("Z7QiLOOQ", "LDfhmmX8pP12BMur", "/jLfBMDn4JzrGF", "/vkMI", "=")
+case("go-base64-padded-quoted", "go", ["cursor_secret = \"", J(*B64), "\"\n"], ["cursor_secret = \"", P(*B64), "\"\n"], oc="unchanged")
+case("go-base64-padded-env", "go", ["MY_API_KEY=", J(*B64), "\n"], ["MY_API_KEY=", P(*B64), "\n"], oc="differs")
 # credential-looking names that OpenCodex does not match but L1 does
 case("go-cookie-name", "go", ["session_cookie=", J("Zx3Cv6Bn", "9Mq2Wd5E"), "; HttpOnly"],
      ["session_cookie=", P("Zx3Cv6Bn", "9Mq2Wd5E"), "; HttpOnly"], oc="unchanged")

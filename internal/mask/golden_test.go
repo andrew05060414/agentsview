@@ -3,6 +3,7 @@ package mask
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
 	"testing"
@@ -178,6 +179,10 @@ func TestRegistryTokens(t *testing.T) {
 		`"k":"` + val + `",`,
 		"https://h/p/" + val + "?a=1",
 		"a:" + val,
+		"the key is " + val + ".",
+		"**" + val + "**",
+		"(see " + val + ").",
+		"--token=" + val + "!",
 	} {
 		got := m.Text(text)
 		if strings.Contains(got, val) || !strings.Contains(got, Placeholder(val)) {
@@ -224,5 +229,47 @@ func TestMaskedTextIsStable(t *testing.T) {
 	a, b := m.Text(in), m.Text(in)
 	if a != b || a == in {
 		t.Fatal("masking is not deterministic")
+	}
+}
+
+func TestExactValueInsideJSONString(t *testing.T) {
+	val := "Pa" + `ss"wo\rd` + "9Zq" + "Xv"
+	m := newTestMasker(t, Options{Exact: []ExactValue{{Label: "unit", Value: val, Strict: true}}})
+	escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(val)
+	in := `{"cmd":"login ` + escaped + ` now"}`
+	got := m.Text(in)
+	want := `{"cmd":"login ` + Placeholder(val) + ` now"}`
+	if got != want {
+		t.Fatalf("escaped exact value not masked as the original: %q", got)
+	}
+	if got := m.Text("plain " + val); got != "plain "+Placeholder(val) {
+		t.Fatalf("plain form lost: %q", got)
+	}
+}
+
+// The keyword-anchored search must find exactly what scanning the whole text finds.
+func TestAnchoredSearchEqualsFullScan(t *testing.T) {
+	m := newTestMasker(t, Options{})
+	frags := []string{
+		"api_key", "API_KEY", "token", "Token", "my-secret", "password", "passwd", "pwd", "cookie", "credential", "bearer",
+		"key", "x", "_", "-", "=", ":", " = ", ": ", "\"", "'", " ", "\n", ",", ".", "/", "{", "}", "[", "]", "&", "?",
+		"Xk3mP9qL2vN8wR5t", "short", "aB3dE6gH9jK2mN5p==", "0123456789abcdef0123456789abcdef", "my_value_here", "https://h/p",
+		"AKIA" + "IOSFODNN7EXAMPLE", "Bearer ", "monkey", "public_key", "session_cookie",
+	}
+	rng := rand.New(rand.NewSource(7))
+	for i := 0; i < 20000; i++ {
+		var b strings.Builder
+		for n := 1 + rng.Intn(12); n > 0; n-- {
+			b.WriteString(frags[rng.Intn(len(frags))])
+		}
+		in := b.String()
+		disableAnchoredForTest = false
+		fast := m.Text(in)
+		disableAnchoredForTest = true
+		full := m.Text(in)
+		disableAnchoredForTest = false
+		if fast != full {
+			t.Fatalf("anchored and full scans differ for input #%d (len %d)", i, len(in))
+		}
 	}
 }

@@ -4,11 +4,17 @@ package db
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/csv"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +32,15 @@ type MaskBackfillOptions struct {
 	// RegistryOut, when set, receives the sha256 registry of the exact and
 	// closure values (hashes only).
 	RegistryOut string
+	// ScanFile, when set, is scanned for the run's literal values (exact and
+	// admitted closure) once they are known, so a dry-run against the original
+	// archive can measure the residue in an already-masked copy.
+	ScanFile string
+	// LocationsOut, when set, receives a CSV of every location that has a
+	// masked span (session, table, ordinal, call index, pass). Locations are
+	// ids and coordinates, not values; it lets a dry-run be reconciled with an
+	// earlier scan.
+	LocationsOut string
 }
 
 // MaskBackfillReport holds counts only. Nothing in it can reveal a value: values
@@ -37,13 +52,22 @@ type MaskBackfillReport struct {
 	RulesID       string                 `json:"rules_id"`
 	ExactLoaded   int                    `json:"exact_values_loaded"`
 	ClosureValues int                    `json:"closure_values"`
+	ClosureCand   int                    `json:"closure_candidates"`
+	ClosureFPs    map[string]string      `json:"closure_fp8_origin,omitempty"`
+	ClosureDrop   []MaskClosureValue     `json:"closure_dropped_too_common,omitempty"`
 	Rows          map[string]int         `json:"rows_scanned"`
 	RulesOnly     MaskStats              `json:"pass1_rules_and_exact"`
 	Final         MaskStats              `json:"pass2_with_closure"`
 	Updates       map[string]int         `json:"rows_updated,omitempty"`
 	Findings      MaskFindingsReport     `json:"secret_findings,omitempty"`
 	Checks        map[string]interface{} `json:"checks,omitempty"`
+
+	literals []string // exact + admitted closure values; memory only, never serialized
 }
+
+// LiteralValues returns the plaintext exact and closure values used by the run,
+// for a raw-file residue check. They must never be logged or written.
+func (r *MaskBackfillReport) LiteralValues() []string { return r.literals }
 
 // MaskFindingsReport describes the secret_findings rewrite.
 type MaskFindingsReport struct {
@@ -65,7 +89,40 @@ type MaskStats struct {
 	Excluded       map[string]int            `json:"gate_excluded_spans"`
 	ExactByLabel   map[string]MaskRuleStat   `json:"exact_by_label"`
 	ExactValues    map[string]MaskExactValue `json:"exact_values,omitempty"`
+	ClosureTop     []MaskClosureValue        `json:"closure_top,omitempty"`
+	// ClosureProfile groups the admitted closure values by character classes,
+	// entropy and length: "class|entropy bucket|length bucket" -> counts.
+	ClosureProfile map[string]MaskProfileCell `json:"closure_profile,omitempty"`
 }
+
+// MaskProfileCell is one cell of the closure profile.
+type MaskProfileCell struct {
+	Values int `json:"values"`
+	Spans  int `json:"spans"`
+}
+
+// MaskClosureValue is one value of the closure with its occurrence counts
+// (fingerprint, length and the rule that first confirmed it; never the value).
+type MaskClosureValue struct {
+	FP       string `json:"fp8"`
+	Len      int    `json:"len"`
+	Origin   string `json:"origin_rule"`
+	Class    string `json:"class,omitempty"`
+	Entropy  string `json:"entropy,omitempty"`
+	Spans    int    `json:"spans"`
+	Sessions int    `json:"sessions"`
+}
+
+// Closure admission limits. A value that a rule confirmed in a credential
+// context is promoted to "replace everywhere" only if it is rare enough to be a
+// secret rather than a common identifier that happened to follow a key-like
+// name. Values above the limits are kept out of the closure (they are still
+// masked inside the credential context that confirmed them) and listed in the
+// report.
+const (
+	closureMaxSessions = 150
+	closureMaxSpans    = 3000
+)
 
 // MaskFieldStat counts per table.field.
 type MaskFieldStat struct {
@@ -95,13 +152,16 @@ type maskLocKey struct {
 
 type maskAccum struct {
 	sessions map[string]struct{}
-	locs     map[maskLocKey]struct{}
+	locs     map[maskLocKey]string // location -> first rule that fired there
 	spans    int
 	values   map[string]struct{}
 	byField  map[string]*MaskFieldStat
 	rule     map[string]*maskRuleAcc
 	label    map[string]*maskRuleAcc
 	exactFP  map[string]*maskExactAcc
+	closureF map[string]*maskExactAcc // pass 2: occurrences per closure value (by fingerprint)
+	origin   map[string]string        // pass 1: fingerprint -> rule that confirmed the closure value
+	oinfo    map[string][2]string     // pass 1: fingerprint -> class, entropy
 	excluded map[string]int
 	closure  map[string]struct{}
 	rows     int
@@ -122,9 +182,10 @@ type maskExactAcc struct {
 
 func newMaskAccum(collectClosure bool) *maskAccum {
 	a := &maskAccum{
-		sessions: map[string]struct{}{}, locs: map[maskLocKey]struct{}{}, values: map[string]struct{}{},
+		sessions: map[string]struct{}{}, locs: map[maskLocKey]string{}, values: map[string]struct{}{},
 		byField: map[string]*MaskFieldStat{}, rule: map[string]*maskRuleAcc{}, label: map[string]*maskRuleAcc{},
-		exactFP: map[string]*maskExactAcc{}, excluded: map[string]int{},
+		exactFP: map[string]*maskExactAcc{}, closureF: map[string]*maskExactAcc{},
+		origin: map[string]string{}, oinfo: map[string][2]string{}, excluded: map[string]int{},
 	}
 	if collectClosure {
 		a.closure = map[string]struct{}{}
@@ -146,6 +207,7 @@ func (a *maskAccum) observe(table, field string, session string, ord, idx int64,
 	if len(hits) == 0 {
 		return
 	}
+	derived := table == "pg_sync_state" || table == "session_signal_state"
 	any := false
 	for _, h := range hits {
 		if h.Excluded != "" {
@@ -175,12 +237,35 @@ func (a *maskAccum) observe(table, field string, session string, ord, idx int64,
 		if a.closure != nil {
 			if v, ok := h.ClosureValue(); ok {
 				a.closure[v] = struct{}{}
+				a.origin[h.FP] = h.Rule
+				cl, en := mask.ValueClass(v)
+				a.oinfo[h.FP] = [2]string{cl, fmt.Sprintf("%.1f", en)}
 			}
+		}
+		if h.Rule == "closure" {
+			e := a.closureF[h.FP]
+			if e == nil {
+				e = &maskExactAcc{n: h.Len, sessions: map[string]struct{}{}}
+				a.closureF[h.FP] = e
+			}
+			e.spans++
+			e.sessions[session] = struct{}{}
 		}
 	}
 	if any {
-		a.sessions[session] = struct{}{}
-		a.locs[maskLocKey{session, table, ord, idx}] = struct{}{}
+		if !derived {
+			a.sessions[session] = struct{}{}
+		}
+		firstRule := ""
+		for _, h := range hits {
+			if h.Excluded == "" {
+				firstRule = h.Rule
+				break
+			}
+		}
+		if _, seen := a.locs[maskLocKey{session, table, ord, idx}]; !seen {
+			a.locs[maskLocKey{session, table, ord, idx}] = firstRule
+		}
 		f := a.byField[table+"."+field]
 		if f == nil {
 			f = &MaskFieldStat{}
@@ -201,8 +286,10 @@ func (a *maskAccum) merge(o *maskAccum) {
 	for k := range o.sessions {
 		a.sessions[k] = struct{}{}
 	}
-	for k := range o.locs {
-		a.locs[k] = struct{}{}
+	for k, v := range o.locs {
+		if _, seen := a.locs[k]; !seen {
+			a.locs[k] = v
+		}
 	}
 	for k := range o.values {
 		a.values[k] = struct{}{}
@@ -243,6 +330,23 @@ func (a *maskAccum) merge(o *maskAccum) {
 			e.sessions[s] = struct{}{}
 		}
 	}
+	for k, v := range o.closureF {
+		e := a.closureF[k]
+		if e == nil {
+			e = &maskExactAcc{n: v.n, sessions: map[string]struct{}{}}
+			a.closureF[k] = e
+		}
+		e.spans += v.spans
+		for s := range v.sessions {
+			e.sessions[s] = struct{}{}
+		}
+	}
+	for k, v := range o.origin {
+		a.origin[k] = v
+	}
+	for k, v := range o.oinfo {
+		a.oinfo[k] = v
+	}
 	for k, v := range o.excluded {
 		a.excluded[k] += v
 	}
@@ -272,6 +376,42 @@ func (a *maskAccum) stats() MaskStats {
 	for fp, e := range a.exactFP {
 		st.ExactValues[fp] = MaskExactValue{Label: e.label, Len: e.n, Spans: e.spans, Sessions: len(e.sessions)}
 	}
+	for fp, e := range a.closureF {
+		st.ClosureTop = append(st.ClosureTop, MaskClosureValue{FP: fp, Len: e.n, Origin: a.origin[fp], Class: a.oinfo[fp][0], Entropy: a.oinfo[fp][1], Spans: e.spans, Sessions: len(e.sessions)})
+	}
+	st.ClosureProfile = map[string]MaskProfileCell{}
+	for fp, e := range a.closureF {
+		info := a.oinfo[fp]
+		en := 0.0
+		fmt.Sscanf(info[1], "%f", &en)
+		eb := "<3.0"
+		switch {
+		case en >= 4.0:
+			eb = ">=4.0"
+		case en >= 3.5:
+			eb = "3.5-4.0"
+		case en >= 3.0:
+			eb = "3.0-3.5"
+		}
+		lb := "<16"
+		switch {
+		case e.n >= 32:
+			lb = ">=32"
+		case e.n >= 20:
+			lb = "20-31"
+		case e.n >= 16:
+			lb = "16-19"
+		}
+		k := info[0] + "|" + eb + "|" + lb
+		c := st.ClosureProfile[k]
+		c.Values++
+		c.Spans += e.spans
+		st.ClosureProfile[k] = c
+	}
+	sort.Slice(st.ClosureTop, func(i, j int) bool { return st.ClosureTop[i].Spans > st.ClosureTop[j].Spans })
+	if len(st.ClosureTop) > 40 {
+		st.ClosureTop = st.ClosureTop[:40]
+	}
 	return st
 }
 
@@ -296,6 +436,11 @@ type maskTable struct {
 	// derived from the text by construction); otherwise only when the old
 	// length equalled len(old text).
 	lenAlways bool
+	// blob: the column holds a BLOB that is UTF-8 JSON; it is written back as a BLOB.
+	blob bool
+	// derived: bookkeeping that copies session text (the session column of the
+	// select holds a label, not a session id, and is left out of session counts).
+	derived bool
 }
 
 var maskTables = []maskTable{
@@ -327,6 +472,18 @@ var maskTables = []maskTable{
 		name: "recall_entries", fields: []string{"title", "body", "trigger"}, keyCol: "rowid",
 		selectQ: `SELECT rowid, COALESCE(source_session_id, ''), -1, -1, title, body, trigger, NULL
 		          FROM recall_entries WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+	},
+	{
+		// PostgreSQL push bookkeeping: per-session fingerprints embed session text.
+		name: "pg_sync_state", fields: []string{"value"}, keyCol: "rowid", derived: true,
+		selectQ: `SELECT rowid, '~pg_sync_state', -1, -1, value, NULL, NULL, NULL
+		          FROM pg_sync_state WHERE rowid > ? ORDER BY rowid LIMIT ?`,
+	},
+	{
+		// Incremental signal seeds copy tool input text (for example the last retried input).
+		name: "session_signal_state", fields: []string{"state"}, keyCol: "rowid", derived: true, blob: true,
+		selectQ: `SELECT rowid, session_id, -1, -1, CAST(state AS TEXT), NULL, NULL, NULL
+		          FROM session_signal_state WHERE rowid > ? ORDER BY rowid LIMIT ?`,
 	},
 	{
 		name: "recall_evidence", fields: []string{"snippet"}, keyCol: "id",
@@ -462,12 +619,90 @@ func (db *DB) MaskBackfill(ctx context.Context, opts MaskBackfillOptions) (*Mask
 		logf("pass1 %s: %d rows (%.0fs)", t.name, n, time.Since(start).Seconds())
 	}
 	rep.RulesOnly = p1.stats()
-	closure := make([]string, 0, len(p1.closure))
+	candidates := make([]string, 0, len(p1.closure))
 	for v := range p1.closure {
-		closure = append(closure, v)
+		candidates = append(candidates, v)
 	}
-	sort.Strings(closure)
+	sort.Strings(candidates)
+	rep.ClosureCand = len(candidates)
+
+	// Pass 1.5: how common is each candidate? Drop the ones that are too common.
+	closure := candidates
+	if len(candidates) > 0 {
+		lit, err := mask.NewLiteralMasker(opts.Rules, candidates)
+		if err != nil {
+			return rep, err
+		}
+		pc := newMaskAccum(false)
+		pc.origin, pc.oinfo = p1.origin, p1.oinfo
+		for _, t := range maskTables {
+			t := t
+			_, err := scanMaskTable(ctx, rd, t, func(rows []maskRow) error {
+				parallelFor(len(rows), workers, func(lo, hi int) {
+					local := newMaskAccum(false)
+					for i := lo; i < hi; i++ {
+						r := &rows[i]
+						for fi, f := range t.fields {
+							if !r.text[fi].Valid || r.text[fi].String == "" {
+								continue
+							}
+							out, hits := lit.Mask(r.text[fi].String)
+							local.observe(t.name, f, r.session, r.ord, r.idx, hits, out != r.text[fi].String)
+						}
+					}
+					mu.Lock()
+					pc.merge(local)
+					mu.Unlock()
+				})
+				return nil
+			})
+			if err != nil {
+				return rep, err
+			}
+		}
+		common := map[string]bool{}
+		for fp, e := range pc.closureF {
+			if len(e.sessions) > closureMaxSessions || e.spans > closureMaxSpans {
+				common[fp] = true
+				rep.ClosureDrop = append(rep.ClosureDrop, MaskClosureValue{FP: fp, Len: e.n, Origin: p1.origin[fp],
+					Class: p1.oinfo[fp][0], Entropy: p1.oinfo[fp][1], Spans: e.spans, Sessions: len(e.sessions)})
+			}
+		}
+		sort.Slice(rep.ClosureDrop, func(i, j int) bool { return rep.ClosureDrop[i].Spans > rep.ClosureDrop[j].Spans })
+		closure = closure[:0:0]
+		for _, v := range candidates {
+			if !common[mask.FP8(v)] {
+				closure = append(closure, v)
+			}
+		}
+		logf("closure: %d candidates, %d dropped as too common, %d admitted (%.0fs)",
+			len(candidates), len(common), len(closure), time.Since(start).Seconds())
+	}
 	rep.ClosureValues = len(closure)
+	rep.ClosureFPs = make(map[string]string, len(closure))
+	for _, v := range closure {
+		rep.ClosureFPs[mask.FP8(v)] = p1.origin[mask.FP8(v)]
+	}
+	for _, e := range opts.Exact {
+		rep.literals = append(rep.literals, e.Value)
+	}
+	rep.literals = append(rep.literals, closure...)
+	if opts.ScanFile != "" {
+		res, err := mask.ScanFile(opts.ScanFile, rep.literals, nil)
+		if err != nil {
+			return rep, err
+		}
+		if rep.Checks == nil {
+			rep.Checks = map[string]interface{}{}
+		}
+		rep.Checks["raw_scan_of:"+filepath.Base(opts.ScanFile)] = map[string]any{
+			"bytes": res.Bytes, "full_value_hits": sumCounts(res.Full), "fragment_hits": sumCounts(res.Frag),
+			"full_by_fp8": res.Full, "fragment_by_fp8": res.Frag,
+			"full_pages": res.FullPages, "fragment_pages": res.FragPages,
+		}
+		logf("raw scan of %s: %d bytes, full-value hits %d, fragment hits %d", filepath.Base(opts.ScanFile),
+			res.Bytes, sumCounts(res.Full), sumCounts(res.Frag))
+	}
 
 	final, err := mask.New(opts.Rules, mask.Options{Exact: opts.Exact, Closure: closure})
 	if err != nil {
@@ -498,6 +733,7 @@ func (db *DB) MaskBackfill(ctx context.Context, opts MaskBackfillOptions) (*Mask
 
 	// Pass 2: final masker; write when applying.
 	p2 := newMaskAccum(false)
+	p2.origin, p2.oinfo = p1.origin, p1.oinfo
 	for _, t := range maskTables {
 		t := t
 		_, err := scanMaskTable(ctx, rd, t, func(rows []maskRow) error {
@@ -534,6 +770,11 @@ func (db *DB) MaskBackfill(ctx context.Context, opts MaskBackfillOptions) (*Mask
 		logf("pass2 %s done (%.0fs)", t.name, time.Since(start).Seconds())
 	}
 	rep.Final = p2.stats()
+	if opts.LocationsOut != "" {
+		if err := writeMaskLocations(opts.LocationsOut, p1, p2); err != nil {
+			return rep, err
+		}
+	}
 
 	if opts.Apply {
 		if err := db.applyFindingRewrite(ctx, findingUpdates); err != nil {
@@ -564,7 +805,11 @@ func (db *DB) applyMaskBatch(ctx context.Context, t maskTable, rows []maskedRow,
 					continue
 				}
 				sets = append(sets, `"`+f+`" = ?`)
-				args = append(args, r.out[fi])
+				if t.blob {
+					args = append(args, []byte(r.out[fi]))
+				} else {
+					args = append(args, r.out[fi])
+				}
 			}
 			if t.lenCol != "" && r.changed[t.lenFrom] {
 				newLen := len(r.out[t.lenFrom])
@@ -578,6 +823,34 @@ func (db *DB) applyMaskBatch(ctx context.Context, t maskTable, rows []maskedRow,
 			q := "UPDATE " + t.name + " SET " + strings.Join(sets, ", ") + " WHERE " + t.keyCol + " = ?"
 			if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 				return fmt.Errorf("masking %s row %d: %w", t.name, r.row.key, err)
+			}
+			if t.name == "tool_result_events" && r.changed[0] {
+				// A call whose summary is deduplicated into its only non-empty result
+				// event has an empty result_content and keeps the summary length (the
+				// event text length) in result_content_length; follow the masked event.
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE tool_calls SET result_content_length = ?
+					 WHERE session_id = ? AND call_index = ?
+					   AND message_id = (SELECT id FROM messages WHERE session_id = ? AND ordinal = ?)
+					   AND COALESCE(result_content, '') = '' AND COALESCE(result_content_length, 0) = ?
+					   AND (SELECT COUNT(*) FROM tool_result_events
+					        WHERE session_id = ? AND tool_call_message_ordinal = ? AND call_index = ?
+					          AND TRIM(content) <> '') = 1`,
+					len(r.out[0]), r.row.session, r.row.idx, r.row.session, r.row.ord, len(r.row.text[0].String),
+					r.row.session, r.row.ord, r.row.idx); err != nil {
+					return fmt.Errorf("masking tool call summary length %s/%d: %w", r.row.session, r.row.ord, err)
+				}
+			}
+			if t.name == "messages" && r.changed[0] {
+				// The conversation export projection keeps sha256 and byte
+				// length of the message text; keep it in step with the row.
+				sum := sha256.Sum256([]byte(r.out[0]))
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE conversation_messages SET digest = ?, text_bytes = ?
+					 WHERE session_id = ? AND ordinal = ? AND removed = 0 AND digest <> ''`,
+					hex.EncodeToString(sum[:]), len(r.out[0]), r.row.session, r.row.ord); err != nil {
+					return fmt.Errorf("masking conversation digest %s/%d: %w", r.row.session, r.row.ord, err)
+				}
 			}
 		}
 		return nil
@@ -730,4 +1003,112 @@ func (db *DB) MaskVerify(ctx context.Context, full bool) (map[string]string, err
 		}
 	}
 	return res, nil
+}
+
+func sumCounts(m map[string]int) int {
+	n := 0
+	for _, v := range m {
+		n += v
+	}
+	return n
+}
+
+// MaskResidueHit locates a remaining secret value (or a 12+ character run of
+// it) in a text field. Positions and fingerprints only.
+type MaskResidueHit struct {
+	Table   string `json:"table"`
+	Field   string `json:"field"`
+	Session string `json:"session"`
+	Ordinal int64  `json:"ordinal"`
+	Index   int64  `json:"call_index"`
+	FP      string `json:"fp8"`
+	Full    bool   `json:"full_value"`
+	Offset  int    `json:"offset"`
+	FieldLn int    `json:"field_len"`
+	HitLen  int    `json:"hit_len"`
+	Class   string `json:"hit_class"`
+	Entropy string `json:"hit_entropy"`
+	Before  string `json:"char_class_before"`
+	After   string `json:"char_class_after"`
+}
+
+// charClass names the kind of one byte for reports: a=letter d=digit s=space/newline p=punctuation.
+func charClass(c byte) string {
+	switch {
+	case c >= '0' && c <= '9':
+		return "d"
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		return "a"
+	case c == ' ' || c == 10 || c == 13 || c == 9:
+		return "s"
+	}
+	return "p" + string(rune(c))
+}
+
+// MaskResidue scans every masked text field for the given plaintext values and
+// returns where any of them (or fragments) remain.
+func (db *DB) MaskResidue(ctx context.Context, values []string, workers int, limit int) ([]MaskResidueHit, error) {
+	if workers <= 0 {
+		workers = max(2, runtime.NumCPU()-2)
+	}
+	fs := mask.NewFragmentScanner(values)
+	var mu sync.Mutex
+	var out []MaskResidueHit
+	for _, t := range maskTables {
+		t := t
+		_, err := scanMaskTable(ctx, db.Reader(), t, func(rows []maskRow) error {
+			parallelFor(len(rows), workers, func(lo, hi int) {
+				for i := lo; i < hi; i++ {
+					r := &rows[i]
+					for fi, f := range t.fields {
+						if !r.text[fi].Valid || r.text[fi].String == "" {
+							continue
+						}
+						for _, h := range fs.Find(r.text[fi].String) {
+							mu.Lock()
+							if len(out) < limit {
+								s := r.text[fi].String
+								cl, en := mask.ValueClass(s[h.Start:h.End])
+								before, after := "^", "$"
+								if h.Start > 0 {
+									before = charClass(s[h.Start-1])
+								}
+								if h.End < len(s) {
+									after = charClass(s[h.End])
+								}
+								out = append(out, MaskResidueHit{Table: t.name, Field: f, Session: r.session, Ordinal: r.ord,
+									Index: r.idx, FP: h.FP, Full: h.Full, Offset: h.Start, FieldLn: len(s),
+									HitLen: h.End - h.Start, Class: cl, Entropy: fmt.Sprintf("%.1f", en), Before: before, After: after})
+							}
+							mu.Unlock()
+						}
+					}
+				}
+			})
+			return nil
+		})
+		if err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+func writeMaskLocations(path string, p1, p2 *maskAccum) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	_ = w.Write([]string{"session", "table", "ord", "idx", "pass", "rule"})
+	emit := func(a *maskAccum, tag string) {
+		for k, rule := range a.locs {
+			_ = w.Write([]string{k.session, k.table, strconv.FormatInt(k.ord, 10), strconv.FormatInt(k.idx, 10), tag, rule})
+		}
+	}
+	emit(p1, "p1")
+	emit(p2, "p2")
+	w.Flush()
+	return w.Error()
 }

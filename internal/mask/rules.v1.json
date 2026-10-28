@@ -3,7 +3,11 @@
   "tier": "L1",
   "comment": "L1 = vendor-format keys + JWT + connection-string passwords + private-key blocks + credential-named random values. Rules marked origin=opencodex are the same patterns as src/privacy/redact.ts RULES (same order); the placeholder is {{SECRET_<first 8 hex of sha256(value)>}}. Everything outside the secret group of a match is kept; the secret group is replaced; every occurrence of the full matched text is replaced (JS split/join semantics).",
   "placeholder": { "prefix": "{{SECRET_", "suffix": "}}", "hexChars": 8 },
-  "closure": { "minLen": 12 },
+  "closure": {
+    "comment": "A value confirmed by a rule is replaced everywhere (the value closure). Vendor-format values qualify at any length >= 8. Values that only a credential context confirmed (random shape under a credential-like name, bearer tokens, connection-string passwords) qualify only if long and high-entropy enough not to be a common identifier.",
+    "randomMinLen": 16,
+    "randomMinEntropy": 3.6
+  },
   "rules": [
     {
       "id": "private-key-block",
@@ -155,15 +159,16 @@
       "kind": "other",
       "origin": "opencodex",
       "comment": "OpenCodex masks every value of length >= 8 after a credential-looking name (backreference form (['\"]?)(value)\\2). L1 (this file) masks it only when the NAME is credential-like and the VALUE looks random (gate). The alternation below is the RE2 equivalent of the backreference form; quoted/unquoted behaviour is identical.",
-      "pattern": "([\"']?[A-Za-z0-9_-]*?(?:key|secret|token|password|passwd|pwd|cookie|credential|bearer)[A-Za-z0-9_-]*[\"']?\\s*[:=]\\s*)(?:\"([A-Za-z0-9+/_.~-]{8,})\"|'([A-Za-z0-9+/_.~-]{8,})'|([A-Za-z0-9+/_.~-]{8,}))",
+      "pattern": "([\"']?[A-Za-z0-9_-]*?(?:key|secret|token|password|passwd|pwd|cookie|credential|bearer)[A-Za-z0-9_-]*[\"']?\\s*[:=]\\s*)(?:\"([A-Za-z0-9+/_.~-]{8,}={0,2})\"|'([A-Za-z0-9+/_.~-]{8,}={0,2})'|([A-Za-z0-9+/_.~-]{8,}={0,2}))",
       "flags": "i",
       "secretGroups": [2, 3, 4],
       "prefilter": ["key", "secret", "token", "pass", "pwd", "cookie", "credential", "bearer"],
       "prefilterFold": true,
+      "anchorAtKeywords": true,
       "gate": {
         "keyGroup": 1,
         "keyName": "credential",
-        "valueShape": "random"
+        "valueShapes": ["random", "hexhash"]
       },
       "closure": "random"
     }
