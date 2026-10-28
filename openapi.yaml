@@ -1668,6 +1668,10 @@ components:
         context_tokens:
           format: int64
           type: integer
+        dialogue_text:
+          type:
+            - string
+            - "null"
         has_context_tokens:
           type: boolean
         has_output_tokens:

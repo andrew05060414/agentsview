@@ -523,7 +523,7 @@ type Message struct {
 	// DialogueText is content without inline thinking and tool renderings,
 	// nil means unclassified, including v4 imports. Search falls back to
 	// Content; dialogue-only exports report a coverage gap instead.
-	DialogueText *string `json:"-"`
+	DialogueText *string `json:"dialogue_text,omitzero"`
 	// ThinkingText holds the concatenated text of all thinking
 	// blocks for this message; "" if none.
 	ThinkingText      string         `json:"thinking_text"`
