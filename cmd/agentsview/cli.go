@@ -143,6 +143,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newParseDiffCommand())
 	root.AddCommand(newClassifierCommand())
 	root.AddCommand(newSecretsCommand())
+	root.AddCommand(newMaskCommand())
 	root.AddCommand(newSkillsCommand())
 	root.AddCommand(newAgentCommand())
 	root.AddCommand(newMemoryCommand())
