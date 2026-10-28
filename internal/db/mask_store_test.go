@@ -145,3 +145,26 @@ func disableIngestMasking(t *testing.T) {
 	t.Helper()
 	t.Cleanup(mask.SetDefaultForTest(nil))
 }
+
+func TestStorageProjectionMasksDialogueText(t *testing.T) {
+	useTestMasker(t, mask.Options{})
+	d := testDB(t)
+	ctx := t.Context()
+	insertSession(t, d, "dlg", "p", func(s *Session) { s.MessageCount = 1 })
+
+	text := "my key is " + fakeAnthropicKey() + " please check"
+	msg := userMsg("dlg", 0, text)
+	msg.DialogueText = &text
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "dlg", []Message{msg}))
+
+	var content, dialogue string
+	require.NoError(t, d.getReader().QueryRowContext(ctx,
+		`SELECT content, dialogue_text FROM messages WHERE session_id = 'dlg'`,
+	).Scan(&content, &dialogue))
+	ph := mask.Placeholder(fakeAnthropicKey())
+	assert.Contains(t, content, ph)
+	assert.Contains(t, dialogue, ph)
+	assert.NotContains(t, content, fakeAnthropicKey())
+	assert.NotContains(t, dialogue, fakeAnthropicKey())
+	assert.Equal(t, content, dialogue)
+}
