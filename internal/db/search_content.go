@@ -1040,34 +1040,78 @@ func ftsPhraseSpan(pattern, body string) (int, int, bool) {
 }
 
 // firstFTSTermSpan returns the span of the first of terms that ftsTermSpan
-// locates in body.
+// locates in body. Only when none is found does it try each term without
+// trailing '*' markers, which SQLite reads as a prefix marker, or as
+// punctuation inside quotes.
 func firstFTSTermSpan(body string, terms []*FTSExpr) (int, int, bool) {
 	for _, t := range terms {
 		if start, end, ok := ftsTermSpan(body, t.Term); ok {
 			return start, end, true
 		}
 	}
+	for _, t := range terms {
+		stem := strings.TrimRight(t.Term, "*")
+		if stem == t.Term {
+			continue
+		}
+		for _, word := range []string{stem, firstField(stem)} {
+			if start, end, ok := ftsTokenStartSpan(body, word); ok {
+				return start, end, true
+			}
+		}
+	}
 	return 0, 0, false
 }
 
 // ftsTermSpan locates term in body, falling back to its first word so a phrase
-// the engine matched across punctuation still centers near the match, then to
-// the term without trailing '*' markers.
+// the engine matched across punctuation still centers near the match.
 func ftsTermSpan(body, term string) (int, int, bool) {
 	if start, end, ok := CaseInsensitiveSpan(body, term); ok {
 		return start, end, true
 	}
-	if fields := strings.Fields(term); len(fields) > 0 && fields[0] != term {
-		if start, end, ok := CaseInsensitiveSpan(body, fields[0]); ok {
-			return start, end, true
-		}
-	}
-	// A trailing '*' is a prefix marker in SQLite, or punctuation its tokenizer
-	// drops inside quotes.
-	if stem := strings.TrimRight(term, "*"); stem != term && strings.TrimSpace(stem) != "" {
-		return ftsTermSpan(body, stem)
+	if word := firstField(term); word != "" && word != term {
+		return CaseInsensitiveSpan(body, word)
 	}
 	return 0, 0, false
+}
+
+// ftsTokenStartSpan locates word where it starts a token in body, preferring
+// an occurrence that is a whole token. SQLite matches tokens, so an occurrence
+// inside a longer word is never the match.
+func ftsTokenStartSpan(body, word string) (int, int, bool) {
+	if strings.TrimSpace(word) == "" {
+		return 0, 0, false
+	}
+	isWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+	found, foundStart, foundEnd := false, 0, 0
+	for off := 0; off < len(body); {
+		start, end, ok := CaseInsensitiveSpan(body[off:], word)
+		if !ok {
+			break
+		}
+		start, end = start+off, end+off
+		before, _ := utf8.DecodeLastRuneInString(body[:start])
+		after, _ := utf8.DecodeRuneInString(body[end:])
+		if start == 0 || !isWord(before) {
+			if end == len(body) || !isWord(after) {
+				return start, end, true
+			}
+			if !found {
+				found, foundStart, foundEnd = true, start, end
+			}
+		}
+		_, size := utf8.DecodeRuneInString(body[start:])
+		off = start + size
+	}
+	return foundStart, foundEnd, found
+}
+
+// firstField returns the first whitespace-separated word of s, or "".
+func firstField(s string) string {
+	if fields := strings.Fields(s); len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
 }
 
 // classifyFTSError maps a malformed FTS query into a SearchInputError so HTTP

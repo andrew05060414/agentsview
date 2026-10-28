@@ -745,6 +745,8 @@ func TestSearchContentFTSBooleanSnippetCentersOnMatchedOperand(t *testing.T) {
 		{"OR phrase across punctuation", `"absent" OR "foo bar"`, filler + "foo-bar closes", "foo-bar closes"},
 		// A star inside quotes is punctuation, not a prefix marker.
 		{"negated quoted star", `"alpha" NOT "beta*"`, "betamax opens " + filler + "alpha closes", "alpha closes"},
+		{"quoted star OR", `"beta*" OR "gamma"`, "betamax opens " + filler + "gamma beta closes", "gamma beta closes"},
+		{"quoted star alone", `"beta*" OR "absent"`, "betamax opens " + filler + "beta closes", "beta closes"},
 		// Phrase joins and column filters fall back to substring centering.
 		{"phrase join", `"foo" + "bar" OR "baz"`, filler + "foo bar closes", "foo bar closes"},
 		{"column filter", `"needle" AND content:needle OR "absent"`, filler + "needle closes", "needle closes"},
