@@ -87,6 +87,11 @@ func maskMessage(m *mask.Masker, msg Message) (Message, bool) {
 	if c, ok := maskStored(m, msg.ThinkingText); ok {
 		msg.ThinkingText, changed = c, true
 	}
+	// DialogueText (upstream v0.46.1) is a second stored copy of the message text;
+	// the full-text indexes read COALESCE(dialogue_text, content).
+	if d, ok := maskStoredPtr(m, msg.DialogueText); ok {
+		msg.DialogueText, changed = d, true
+	}
 	var calls []ToolCall
 	for j := range msg.ToolCalls {
 		tc, ok := maskToolCall(m, msg.ToolCalls[j])

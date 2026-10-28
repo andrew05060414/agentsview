@@ -445,8 +445,8 @@ type maskTable struct {
 
 var maskTables = []maskTable{
 	{
-		name: "messages", fields: []string{"content", "thinking_text"}, keyCol: "id",
-		selectQ: `SELECT id, session_id, ordinal, -1, content, thinking_text, NULL, content_length
+		name: "messages", fields: []string{"content", "thinking_text", "dialogue_text"}, keyCol: "id",
+		selectQ: `SELECT id, session_id, ordinal, -1, content, thinking_text, dialogue_text, content_length
 		          FROM messages WHERE id > ? ORDER BY id LIMIT ?`,
 		lenCol: "content_length", lenFrom: 0,
 	},
