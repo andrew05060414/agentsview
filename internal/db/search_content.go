@@ -908,10 +908,11 @@ func (db *DB) searchContentFTS(
 	}
 	// A row can match OR and NOT queries without every operand, so ask SQLite
 	// which operands this row matched. Snippets then follow a branch the row
-	// actually satisfied. Unquoted input never carries these operators.
+	// actually satisfied. Unquoted input never carries these operators. Syntax
+	// the parser does not model keeps the substring-based centering.
 	termHits, args := "''", []any{}
 	expr, _ := ParseFTSExpression(f.Pattern)
-	if expr != nil && expr.hasOrNot() {
+	if expr != nil && expr.hasOrNot() && expr.sqliteProbeable() {
 		termHits, args = sqliteFTSTermHitsSQL(expr)
 	} else {
 		expr = nil
@@ -1017,27 +1018,17 @@ func sqliteFTSSnippetRange(pattern, body string, expr *FTSExpr, hits string) (in
 
 // sqliteFTSTermHitsSQL returns a SQL expression that yields one '1' or '0'
 // per term of expr, in query order, reporting whether the indexed content of
-// the row m.id matches that term alone. It is meant for the messages_fts
-// query, whose table name the caller substitutes.
+// the row m.id matches that term's source text alone. It is meant for the
+// messages_fts query, whose table name the caller substitutes.
 func sqliteFTSTermHitsSQL(expr *FTSExpr) (string, []any) {
 	var parts []string
 	var args []any
 	for _, t := range expr.terms() {
 		parts = append(parts, "EXISTS (SELECT 1 FROM messages_fts AS term_fts "+
 			"WHERE term_fts.content MATCH ? AND term_fts.rowid = m.id)")
-		args = append(args, sqliteFTSTermMatch(t.Term))
+		args = append(args, t.Raw)
 	}
 	return strings.Join(parts, " || "), args
-}
-
-// sqliteFTSTermMatch quotes term as one FTS5 phrase. A trailing '*' stays a
-// prefix marker, as it is in the full query.
-func sqliteFTSTermMatch(term string) string {
-	stem := strings.TrimRight(term, "*")
-	if stem == term || strings.TrimSpace(stem) == "" {
-		return `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
-	}
-	return `"` + strings.ReplaceAll(stem, `"`, `""`) + `"*`
 }
 
 // ftsPhraseSpan locates the de-quoted raw pattern in body.
@@ -1060,13 +1051,21 @@ func firstFTSTermSpan(body string, terms []*FTSExpr) (int, int, bool) {
 }
 
 // ftsTermSpan locates term in body, falling back to its first word so a phrase
-// the engine matched across punctuation still centers near the match.
+// the engine matched across punctuation still centers near the match, then to
+// the term without trailing '*' markers.
 func ftsTermSpan(body, term string) (int, int, bool) {
 	if start, end, ok := CaseInsensitiveSpan(body, term); ok {
 		return start, end, true
 	}
 	if fields := strings.Fields(term); len(fields) > 0 && fields[0] != term {
-		return CaseInsensitiveSpan(body, fields[0])
+		if start, end, ok := CaseInsensitiveSpan(body, fields[0]); ok {
+			return start, end, true
+		}
+	}
+	// A trailing '*' is a prefix marker in SQLite, or punctuation its tokenizer
+	// drops inside quotes.
+	if stem := strings.TrimRight(term, "*"); stem != term && strings.TrimSpace(stem) != "" {
+		return ftsTermSpan(body, stem)
 	}
 	return 0, 0, false
 }

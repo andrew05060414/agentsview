@@ -5,13 +5,14 @@ import (
 	"strings"
 )
 
-// FTSExpr is a parsed FTS query. A term node holds a literal word or phrase;
-// an AND, OR, or NOT node combines Left and Right, where NOT means Left and not
-// Right. Implicit AND between adjacent operands binds tighter than NOT, which
-// binds tighter than AND, which binds tighter than OR.
+// FTSExpr is a parsed FTS query. A term node holds a literal word or phrase in
+// Term and its source text, quotes and prefix marker included, in Raw; an AND,
+// OR, or NOT node combines Left and Right, where NOT means Left and not Right.
+// Implicit AND between adjacent operands binds tighter than NOT, which binds
+// tighter than AND, which binds tighter than OR.
 type FTSExpr struct {
 	Op          string
-	Term        string
+	Term, Raw   string
 	Left, Right *FTSExpr
 }
 
@@ -55,12 +56,13 @@ func ftsTokens(pattern string) ([]ftsToken, error) {
 			}
 			word := input[start:i]
 			if word != "AND" && word != "OR" && word != "NOT" {
-				tokens = append(tokens, ftsToken{kind: "term", text: word})
+				tokens = append(tokens, ftsToken{kind: "term", text: word, raw: word})
 			} else {
 				tokens = append(tokens, ftsToken{kind: word})
 			}
 			continue
 		}
+		start := i
 		i++
 		var term strings.Builder
 		closed := false
@@ -87,13 +89,13 @@ func ftsTokens(pattern string) ([]ftsToken, error) {
 			i++
 		}
 		if strings.TrimSpace(term.String()) != "" {
-			tokens = append(tokens, ftsToken{kind: "term", text: term.String()})
+			tokens = append(tokens, ftsToken{kind: "term", text: term.String(), raw: input[start:i]})
 		}
 	}
 	return tokens, nil
 }
 
-type ftsToken struct{ kind, text string }
+type ftsToken struct{ kind, text, raw string }
 
 type ftsParser struct {
 	tokens []ftsToken
@@ -108,7 +110,7 @@ func (p *ftsParser) atom() (*FTSExpr, error) {
 	p.pos++
 	switch tok.kind {
 	case "term":
-		return &FTSExpr{Op: "term", Term: tok.text}, nil
+		return &FTSExpr{Op: "term", Term: tok.text, Raw: tok.raw}, nil
 	case "(":
 		expr, err := p.expression(1)
 		if err != nil || p.pos >= len(p.tokens) || p.tokens[p.pos].kind != ")" {
@@ -214,4 +216,24 @@ func (e *FTSExpr) hasOrNot() bool {
 		return false
 	}
 	return e.Op == "OR" || e.Op == "NOT" || e.Left.hasOrNot() || e.Right.hasOrNot()
+}
+
+// sqliteProbeable reports whether SQLite can match each term of e on its own
+// by its source text. That holds for quoted phrases and plain FTS5 barewords,
+// each with an optional prefix marker. Other syntax, such as column filters,
+// '+' phrase joins, and '^' anchors, is not modeled by this parser.
+func (e *FTSExpr) sqliteProbeable() bool {
+	for _, t := range e.terms() {
+		if strings.HasPrefix(t.Raw, `"`) {
+			continue
+		}
+		word := strings.TrimSuffix(t.Raw, "*")
+		if word == "" || strings.ContainsFunc(word, func(r rune) bool {
+			return r < 0x80 && r != '_' && r != 0x1A &&
+				(r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z')
+		}) {
+			return false
+		}
+	}
+	return true
 }

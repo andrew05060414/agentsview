@@ -743,6 +743,11 @@ func TestSearchContentFTSBooleanSnippetCentersOnMatchedOperand(t *testing.T) {
 		{"negated phrase across punctuation", `"alpha" NOT "foo bar" OR "gamma"`, "alpha opens foo-bar " + filler + "gamma closes", "gamma closes"},
 		{"negated stem", `"alpha" NOT "runs" OR "gamma"`, "alpha opens running " + filler + "gamma closes", "gamma closes"},
 		{"OR phrase across punctuation", `"absent" OR "foo bar"`, filler + "foo-bar closes", "foo-bar closes"},
+		// A star inside quotes is punctuation, not a prefix marker.
+		{"negated quoted star", `"alpha" NOT "beta*"`, "betamax opens " + filler + "alpha closes", "alpha closes"},
+		// Phrase joins and column filters fall back to substring centering.
+		{"phrase join", `"foo" + "bar" OR "baz"`, filler + "foo bar closes", "foo bar closes"},
+		{"column filter", `"needle" AND content:needle OR "absent"`, filler + "needle closes", "needle closes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			id := strings.ReplaceAll(tc.name, " ", "-")
