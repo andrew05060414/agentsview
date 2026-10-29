@@ -106,6 +106,19 @@ describe("collectSearchBlocks", () => {
     expect(new Set(blocks.map((block) => block.key)).size).toBe(blocks.length);
   });
 
+  it("indexes each tool field value ahead of the tool input", () => {
+    const tool = {
+      ...call("shell_command", { command: "make test", cwd: "/workspace/app", timeout: 600000 }),
+      category: "Bash",
+    };
+    const blocks = collectSearchBlocks(message("", { has_tool_use: true, tool_calls: [tool] }));
+    expect(blocks.map((block) => [block.key, block.text])).toEqual([
+      ["7:tool-meta:0.0", "/workspace/app"],
+      ["7:tool-meta:0.1", "600000"],
+      ["7:tool-input:0", "make test"],
+    ]);
+  });
+
   it("uses structured solo input instead of the parsed tool segment", () => {
     const tool = {
       ...call("Bash", { command: "echo actual" }),
@@ -120,7 +133,7 @@ describe("collectSearchBlocks", () => {
         .filter((block) => block.kind.startsWith("tool-"))
         .map((block) => [block.key, block.text]),
     ).toEqual([
-      ["7:tool-input:0", "command: echo actual"],
+      ["7:tool-input:0", "echo actual"],
       ["7:tool-output:0", "output"],
     ]);
   });
@@ -170,10 +183,12 @@ describe("collectSearchBlocks", () => {
     ];
     const blocks = collectSearchBlocks(message("", { has_tool_use: true, tool_calls: tools }));
     expect(blocks.map((block) => block.key)).toEqual([
+      "7:tool-meta:0.0",
       "7:tool-input:0",
       "7:tool-output:0",
       "7:tool-history:0.0",
       "7:tool-history:0.1",
+      "7:tool-meta:1.0",
       "7:tool-input:1",
     ]);
     expect(blocks.map((block) => block.text)).toContain("earlier");
@@ -274,7 +289,7 @@ describe("resolveToolInputText", () => {
         { ...call("exec_command", { cmd: "echo hello" }), category: "Bash" },
         "",
       ),
-    ).toBe("command: echo hello");
+    ).toBe("echo hello");
     expect(resolveToolInputText(call("custom_tool", { value: "hello" }), "")).toBe("value: hello");
     expect(resolveToolInputText(call("Bash", { command: "ignored" }), "legacy")).toBe("legacy");
     expect(resolveToolInputText(undefined, "legacy")).toBe("legacy");

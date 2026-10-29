@@ -313,6 +313,19 @@ describe("ToolBlock output and controls", () => {
     expect(text(".tool-meta")).toContain(path);
     expect(document.querySelector(`.meta-value[title="${path}"]`)).not.toBeNull();
   });
+  it("reveals a field match and shows the field in full while find runs", async () => {
+    const cwd = "/workspace/" + "nested-directory/".repeat(5) + "service-under-test";
+    searchState.active = true;
+    searchState.current = "7:tool-meta:0.0";
+    searchState.query = "nested-directory";
+    await render({
+      toolCall: call("shell_command", { command: "make test", cwd }, { category: "Bash" }),
+      searchScope: { ordinal: 7, callIdx: 0 },
+    });
+    expect(document.querySelector(".tool-header")?.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelector(".tool-meta .meta-value")).toBeNull();
+    expect(text(".tool-meta")).toBe(`cwd: ${cwd}`);
+  });
   it("keeps canonical path metadata accessible without labelling ordinary metadata", async () => {
     const path =
       "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
@@ -516,7 +529,7 @@ describe("ToolBlock input source and copy", () => {
     await click(".tool-header");
     expect(text(".tool-content")).not.toContain("hidden-line-229");
     await click('button[aria-label="Copy input"]');
-    expect(copyToClipboardMock).toHaveBeenCalledWith(`command: ${command}`);
+    expect(copyToClipboardMock).toHaveBeenCalledWith(command);
     expect(text(".tool-content")).not.toContain("hidden-line-229");
   });
   it.each([
@@ -566,6 +579,42 @@ describe("ToolBlock input source and copy", () => {
     const body = text(".diff-view") || text(".tool-content");
     expect(body).toContain(first);
     if (second) expect(body).toContain(second);
+  });
+  it("shows a Bash command as code with its working directory as a field", async () => {
+    const command = "/bin/bash -lc \"python - <<'PY'\nprint('hi')\nPY\"";
+    await render({
+      toolCall: call("shell_command", { command, cwd: "/workspace/app" }, { category: "Bash" }),
+    });
+    await click(".tool-header");
+    expect(document.querySelector(".tool-content.tool-command code")?.textContent).toBe(command);
+    expect(text(".tool-meta")).toContain("cwd:");
+    expect(text(".tool-meta")).toContain("/workspace/app");
+    expect(text(".tool-meta")).not.toContain("cmd:");
+    await click('button[aria-label="Copy input"]');
+    expect(copyToClipboardMock).toHaveBeenCalledExactlyOnceWith(command);
+  });
+  it("copies the command when the block shows legacy segment text", async () => {
+    await render({
+      content: "$ make build",
+      toolCall: call("Bash", { command: "make build" }, { category: "Bash" }),
+    });
+    await click('button[aria-label="Copy input"]');
+    expect(copyToClipboardMock).toHaveBeenCalledExactlyOnceWith("make build");
+  });
+  it("names the file in the header and copies the diff of a per-file change", async () => {
+    const diff = "@@ -1 +1 @@\n-old\n+new\n";
+    await render({
+      toolCall: call(
+        "apply_patch",
+        { path: "src/app.go", kind: { type: "update" }, diff },
+        { category: "Edit" },
+      ),
+    });
+    expect(text(".tool-header .tool-preview")).toBe("src/app.go");
+    await click(".tool-header");
+    expect(text(".diff-view")).toContain("+new");
+    await click('button[aria-label="Copy input"]');
+    expect(copyToClipboardMock).toHaveBeenCalledExactlyOnceWith(diff);
   });
   it("prefers supplied content over synthesized input", async () => {
     await render({ content: "explicit source", toolCall: call("Bash", { command: "fallback" }) });
