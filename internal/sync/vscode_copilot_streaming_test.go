@@ -23,29 +23,21 @@ const growingCopilotStart = `{"kind":0,"v":{"version":3,"sessionId":"aaaaaaaa-bb
 const growingCopilotFinish = `{"kind":2,"k":["requests",0,"response"],"v":[{"kind":"toolInvocationSerialized","presentation":"hidden","toolId":"copilot_fetchWebPage","toolCallId":"toolu_0000000000000000000000001","isComplete":true},{"kind":"toolInvocationSerialized","toolId":"vscode_fetchWebPage_internal","toolCallId":"toolu_0000000000000000000000001","pastTenseMessage":{"value":"Fetched https://example.com/releases"},"isComplete":true},{"value":"The newest release is **v0.46.1**."}]}
 `
 
-func assertGrowingCopilotResponse(t *testing.T, database *db.DB, sessionID string) {
-	t.Helper()
-	messages, err := database.GetAllMessages(t.Context(), sessionID)
-	require.NoError(t, err)
-	require.Len(t, messages, 2)
-	assert.Contains(t, messages[1].Content, "The newest release is **v0.46.1**.")
-	require.Len(t, messages[1].ToolCalls, 2)
-}
-
 func TestVSCodeCopilotGrowingResponsePins(t *testing.T) {
 	initial, todo, _ := strings.Cut(growingCopilotStart, "\n")
 	textStart := initial + "\n" + `{"kind":2,"k":["requests",0,"response"],"v":[{"value":"Let me check."}]}` + "\n"
 	for _, agent := range []parser.AgentType{parser.AgentVSCodeCopilot, parser.AgentPositron} {
 		for _, tc := range []struct {
-			name            string
-			mode            syncWriteMode
-			watcher, legacy bool
+			name                        string
+			mode                        syncWriteMode
+			watcher, legacy, fullResync bool
 		}{
 			{name: "ordinary"},
 			{name: "bulk", mode: syncWriteBulk},
 			{name: "watcher", watcher: true},
 			{name: "legacy/ordinary", legacy: true},
 			{name: "legacy/bulk", mode: syncWriteBulk, legacy: true},
+			{name: "legacy/full-resync", legacy: true, fullResync: true},
 		} {
 			t.Run(string(agent)+"/"+tc.name, func(t *testing.T) {
 				start, finish := textStart, textStart+todo+growingCopilotFinish
@@ -71,7 +63,7 @@ func TestVSCodeCopilotGrowingResponsePins(t *testing.T) {
 				messages, err := database.GetAllMessages(t.Context(), sessionID)
 				require.NoError(t, err)
 				require.Len(t, messages, 2)
-				_, err = database.PinMessage(t.Context(), sessionID, messages[1].ID, nil)
+				_, err = database.PinMessage(t.Context(), sessionID, messages[1].ID, new("Keep this answer"))
 				require.NoError(t, err)
 				dbtest.WriteTestFile(t, path, []byte(finish))
 				if tc.legacy {
@@ -100,8 +92,18 @@ func TestVSCodeCopilotGrowingResponsePins(t *testing.T) {
 					engine = NewEngine(t.Context(), database, EngineConfig{AgentDirs: agentDirs, Machine: "local"})
 					t.Cleanup(engine.Close)
 				}
-				sync()
-				assertGrowingCopilotResponse(t, database, sessionID)
+				if tc.fullResync {
+					stats := engine.ResyncAll(t.Context(), nil)
+					require.False(t, stats.Aborted, "warnings: %v", stats.Warnings)
+					require.Zero(t, stats.Failed)
+				} else {
+					sync()
+				}
+				messages, err = database.GetAllMessages(t.Context(), sessionID)
+				require.NoError(t, err)
+				require.Len(t, messages, 2)
+				assert.Contains(t, messages[1].Content, "The newest release is **v0.46.1**.")
+				require.Len(t, messages[1].ToolCalls, 2)
 				assert.Equal(t, path, database.GetSessionFilePath(t.Context(), sessionID))
 				assert.Equal(t, db.CurrentDataVersion(), database.GetSessionDataVersion(t.Context(), sessionID))
 				pins, err := database.ListPinnedMessages(t.Context(), sessionID, "")
