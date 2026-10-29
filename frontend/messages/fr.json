@@ -2997,5 +2997,170 @@
   "appearance_message_colors_swatch_gray": "Gris",
   "appearance_message_colors_preview": "Aperçu",
   "appearance_message_colors_preview_user": "Pourquoi le test de date échoue-t-il ?",
-  "appearance_message_colors_preview_assistant": "Le jeu de test attend l’UTC. Je l’ai corrigé."
+  "appearance_message_colors_preview_assistant": "Le jeu de test attend l’UTC. Je l’ai corrigé.",
+  "nav_friction": "Journal des frictions",
+  "friction_page_help_docs": "Fonctionnement du journal des frictions",
+  "friction_page_refresh": "Actualiser le journal des frictions",
+  "friction_date_label": "Date du résumé",
+  "friction_date_previous": "Résumé précédent",
+  "friction_date_next": "Résumé suivant",
+  "friction_date_no_match": "Aucune date correspondante",
+  "friction_build_now": "Générer maintenant",
+  "friction_build_title": "Génère un résumé pour chaque journée complète qui n'en a pas encore",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} résumé généré",
+        "countPlural=other": "{countNumber} résumés générés"
+      }
+    }
+  ],
+  "friction_build_nothing": "Chaque journée complète a déjà un résumé.",
+  "friction_build_failed": "Échec de la génération : {error}",
+  "friction_empty_title": "Aucun résumé de frictions pour l'instant",
+  "friction_empty_hint": "Un résumé est généré automatiquement une fois chaque journée locale terminée, et la tâche horaire rattrape toute journée manquée. Utilisez Générer maintenant pour générer tout de suite les journées manquantes.",
+  "friction_empty_hint_remote": "Un résumé est généré automatiquement une fois chaque journée locale terminée, et la tâche horaire rattrape toute journée manquée. Pour générer tout de suite les journées manquantes, ouvrez cette page sur la machine qui exécute AgentsView, ou activez require_auth sur le serveur.",
+  "friction_load_error": "Impossible de charger le journal des frictions",
+  "friction_retry": "Réessayer",
+  "friction_digest_heading": "Journal des frictions — {date}",
+  "friction_digest_built": "Généré le {when} ({timezone})",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "a échoué dans {countNumber} session",
+        "countPlural=other": "a échoué dans {countNumber} sessions"
+      }
+    }
+  ],
+  "friction_clean_title": "Aucune friction trouvée",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Rien n’a été signalé dans la {countNumber} session analysée.",
+        "countPlural=other": "Rien n’a été signalé dans les {countNumber} sessions analysées."
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "Aucune session n’a été active ce jour-là.",
+  "friction_deferral_said": "Travail reporté : « {phrase} »",
+  "friction_pattern_retry_loop": "Boucle de nouvelles tentatives",
+  "friction_pattern_runaway_loop": "Boucle d’outils incontrôlée",
+  "friction_pattern_edit_churn": "Modifications répétées",
+  "friction_pattern_mid_task_compaction": "Compaction en cours de tâche",
+  "friction_pattern_context_pressure": "Pression sur le contexte",
+  "friction_pattern_iteration_runaway": "Longue exécution sans message de l’utilisateur",
+  "friction_digest_missing": "Aucun résumé n'existe pour le {date}.",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} session analysée",
+        "countPlural=other": "{countNumber} sessions analysées"
+      }
+    }
+  ],
+  "friction_headline_title": "À examiner",
+  "friction_p0_title": "Outils en échec dans plusieurs sessions",
+  "friction_patterns_new": "Nouveaux motifs",
+  "friction_patterns_recurring": "Motifs récurrents",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} occurrence",
+        "countPlural=other": "{countNumber} occurrences"
+      }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} session",
+        "countPlural=other": "{countNumber} sessions"
+      }
+    }
+  ],
+  "friction_pattern_first_seen": "Vu pour la première fois le {date}",
+  "friction_section_corrections": "Corrections",
+  "friction_section_errors": "Erreurs",
+  "friction_section_workarounds": "Contournements",
+  "friction_section_deferrals": "Reports",
+  "friction_section_patterns": "Motifs",
+  "friction_section_frustration": "Frustration",
+  "friction_section_interruptions": "Interruptions",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} interruption",
+        "countPlural=other": "{countNumber} interruptions"
+      }
+    }
+  ],
+  "friction_kind_correction": "Correction",
+  "friction_kind_error": "Erreur",
+  "friction_kind_workaround": "Contournement",
+  "friction_kind_deferral": "Report",
+  "friction_kind_pattern": "Motif",
+  "friction_kind_frustration": "Frustration",
+  "friction_kind_interruption": "Interruption",
+  "friction_disabled_title": "Le journal des frictions est désactivé sur ce serveur",
+  "friction_disabled_hint": "Ce serveur ne génère pas de résumés. Définissez [friction] enabled = true dans config.toml, puis redémarrez le démon. Une archive en lecture seule ne peut pas générer de résumés.",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "Afficher le Markdown",
+  "friction_markdown_copy": "Copier le Markdown",
+  "friction_markdown_copied": "Markdown copié",
+  "friction_markdown_download": "Télécharger le Markdown",
+  "friction_markdown_loading": "Chargement du Markdown…",
+  "friction_markdown_error": "Impossible de charger le résumé Markdown.",
+  "friction_open_session": "Ouvrir {session} au message {ordinal}",
+  "friction_open_session_start": "Ouvrir {session}",
+  "friction_quality_card_title": "Journal des frictions",
+  "friction_quality_card_body": "Résumés quotidiens des corrections, erreurs d'outils, contournements, reports et motifs récurrents trouvés dans vos sessions.",
+  "friction_quality_card_open": "Ouvrir le journal des frictions",
+  "friction_session_title": "Constats de friction",
+  "friction_session_loading": "Chargement des constats de friction…",
+  "friction_session_error": "Les constats de friction ne sont pas disponibles.",
+  "friction_session_empty": "Aucun constat de friction dans cette session.",
+  "friction_session_jump": "Message {ordinal}",
+  "friction_session_jump_title": "Aller au message {ordinal}"
 }

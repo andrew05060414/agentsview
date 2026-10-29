@@ -2886,5 +2886,153 @@
   "appearance_message_colors_swatch_gray": "회색",
   "appearance_message_colors_preview": "미리 보기",
   "appearance_message_colors_preview_user": "날짜 테스트가 왜 실패하나요?",
-  "appearance_message_colors_preview_assistant": "픽스처가 UTC를 기대해서 수정했습니다."
+  "appearance_message_colors_preview_assistant": "픽스처가 UTC를 기대해서 수정했습니다.",
+  "nav_friction": "마찰 로그",
+  "friction_page_help_docs": "마찰 로그 작동 방식",
+  "friction_page_refresh": "마찰 로그 새로 고침",
+  "friction_date_label": "다이제스트 날짜",
+  "friction_date_previous": "이전 다이제스트",
+  "friction_date_next": "다음 다이제스트",
+  "friction_date_no_match": "일치하는 날짜가 없습니다",
+  "friction_build_now": "지금 생성",
+  "friction_build_title": "아직 다이제스트가 없는 완료된 모든 날의 다이제스트를 생성합니다",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "다이제스트 {countNumber}개를 생성했습니다" }
+    }
+  ],
+  "friction_build_nothing": "완료된 모든 날에 이미 다이제스트가 있습니다.",
+  "friction_build_failed": "생성 실패: {error}",
+  "friction_empty_title": "아직 마찰 다이제스트가 없습니다",
+  "friction_empty_hint": "다이제스트는 각 로컬 날짜가 끝나면 자동으로 생성되며, 누락된 날은 매시간 작업이 채웁니다. 누락된 날을 바로 만들려면 지금 생성을 사용하세요.",
+  "friction_empty_hint_remote": "다이제스트는 각 로컬 날짜가 끝나면 자동으로 생성되며, 누락된 날은 매시간 작업이 채웁니다. 누락된 날을 바로 만들려면 AgentsView를 실행하는 컴퓨터에서 이 페이지를 열거나 서버에서 require_auth를 켜세요.",
+  "friction_load_error": "마찰 로그를 불러오지 못했습니다",
+  "friction_retry": "다시 시도",
+  "friction_digest_heading": "마찰 로그 — {date}",
+  "friction_digest_built": "{when}에 생성됨 ({timezone})",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countNumber}개 세션에서 실패"
+      }
+    }
+  ],
+  "friction_clean_title": "마찰이 없습니다",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "스캔한 {countNumber}개 세션에서 표시된 항목이 없습니다."
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "이날 활성 세션이 없었습니다.",
+  "friction_deferral_said": "작업을 미룸: “{phrase}”",
+  "friction_pattern_retry_loop": "재시도 루프",
+  "friction_pattern_runaway_loop": "폭주한 도구 루프",
+  "friction_pattern_edit_churn": "반복 편집",
+  "friction_pattern_mid_task_compaction": "작업 중 컨텍스트 압축",
+  "friction_pattern_context_pressure": "컨텍스트 압박",
+  "friction_pattern_iteration_runaway": "사용자 입력 없는 장시간 실행",
+  "friction_digest_missing": "{date} 다이제스트가 없습니다.",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "세션 {countNumber}개 검사" }
+    }
+  ],
+  "friction_headline_title": "확인 필요",
+  "friction_p0_title": "여러 세션에서 실패한 도구",
+  "friction_patterns_new": "새 패턴",
+  "friction_patterns_recurring": "반복 패턴",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber}회 발생" }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "세션 {countNumber}개" }
+    }
+  ],
+  "friction_pattern_first_seen": "처음 발견 {date}",
+  "friction_section_corrections": "수정 지시",
+  "friction_section_errors": "오류",
+  "friction_section_workarounds": "임시 해결책",
+  "friction_section_deferrals": "미룬 작업",
+  "friction_section_patterns": "패턴",
+  "friction_section_frustration": "좌절",
+  "friction_section_interruptions": "중단",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "중단 {countNumber}회" }
+    }
+  ],
+  "friction_kind_correction": "수정 지시",
+  "friction_kind_error": "오류",
+  "friction_kind_workaround": "임시 해결책",
+  "friction_kind_deferral": "미룬 작업",
+  "friction_kind_pattern": "패턴",
+  "friction_kind_frustration": "좌절",
+  "friction_kind_interruption": "중단",
+  "friction_disabled_title": "이 서버에서는 마찰 로그가 꺼져 있습니다",
+  "friction_disabled_hint": "이 서버는 다이제스트를 만들지 않습니다. config.toml에서 [friction] enabled = true로 설정하고 데몬을 다시 시작하세요. 읽기 전용 아카이브에서는 다이제스트를 만들 수 없습니다.",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "Markdown 표시",
+  "friction_markdown_copy": "Markdown 복사",
+  "friction_markdown_copied": "Markdown을 복사했습니다",
+  "friction_markdown_download": "Markdown 다운로드",
+  "friction_markdown_loading": "Markdown 불러오는 중…",
+  "friction_markdown_error": "Markdown 다이제스트를 불러오지 못했습니다.",
+  "friction_open_session": "메시지 {ordinal}에서 {session} 열기",
+  "friction_open_session_start": "{session} 열기",
+  "friction_quality_card_title": "마찰 로그",
+  "friction_quality_card_body": "세션에서 발견된 수정 지시, 도구 오류, 임시 해결책, 미룬 작업, 반복 패턴의 일일 다이제스트입니다.",
+  "friction_quality_card_open": "마찰 로그 열기",
+  "friction_session_title": "마찰 발견 항목",
+  "friction_session_loading": "마찰 발견 항목 불러오는 중…",
+  "friction_session_error": "마찰 발견 항목을 사용할 수 없습니다.",
+  "friction_session_empty": "이 세션에는 마찰 발견 항목이 없습니다.",
+  "friction_session_jump": "메시지 {ordinal}",
+  "friction_session_jump_title": "메시지 {ordinal}(으)로 이동"
 }

@@ -5019,6 +5019,10 @@ components:
           type: integer
         rules_version:
           type: string
+        sessions:
+          additionalProperties:
+            $ref: "#/components/schemas/FrictionSession"
+          type: object
         sessions_scanned:
           format: int64
           type: integer
@@ -5029,6 +5033,9 @@ components:
         summary:
           $ref: "#/components/schemas/FrictionSummary"
         timezone:
+          type: string
+        web_url:
+          description: Friction Log page for this digest when public_url is set
           type: string
       required:
         - date
@@ -5042,6 +5049,7 @@ components:
         - signals
         - p0_alerts
         - patterns
+        - sessions
       type: object
     FrictionDigestsResponse:
       additionalProperties: false
@@ -5222,6 +5230,21 @@ components:
           type: array
       required:
         - reports
+      type: object
+    FrictionSession:
+      additionalProperties: false
+      properties:
+        agent:
+          type: string
+        display_name:
+          type: string
+        first_message:
+          type: string
+        project:
+          type: string
+      required:
+        - agent
+        - project
       type: object
     FrictionSignal:
       additionalProperties: false
@@ -8538,6 +8561,8 @@ components:
           type: integer
         friction_available:
           type: boolean
+        friction_build_allowed:
+          type: boolean
         friction_readable:
           type: boolean
         insight_generation_available:
@@ -8555,6 +8580,7 @@ components:
         - insight_generation_available
         - session_stats_available
         - friction_available
+        - friction_build_allowed
         - api_version
         - data_version
       type: object

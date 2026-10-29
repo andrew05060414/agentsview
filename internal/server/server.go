@@ -55,8 +55,11 @@ type VersionInfo struct {
 	// FrictionReadable reports that this store serves the Friction Log
 	// read routes; mirrors without friction tables omit it.
 	FrictionReadable bool `json:"friction_readable,omitempty"`
-	APIVersion       int  `json:"api_version"`
-	DataVersion      int  `json:"data_version"`
+	// FrictionBuildAllowed reports that this request may start a build:
+	// the server has a friction runner and accepts runs from this caller.
+	FrictionBuildAllowed bool `json:"friction_build_allowed"`
+	APIVersion           int  `json:"api_version"`
+	DataVersion          int  `json:"data_version"`
 }
 
 // APIVersion is shared by HTTP version reporting and local daemon discovery.

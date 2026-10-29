@@ -2973,5 +2973,170 @@
   "appearance_message_colors_swatch_gray": "Gray",
   "appearance_message_colors_preview": "Preview",
   "appearance_message_colors_preview_user": "Why does the date test fail?",
-  "appearance_message_colors_preview_assistant": "The fixture expects UTC. I updated it."
+  "appearance_message_colors_preview_assistant": "The fixture expects UTC. I updated it.",
+  "nav_friction": "Friction Log",
+  "friction_page_help_docs": "How the Friction Log works",
+  "friction_page_refresh": "Refresh Friction Log",
+  "friction_date_label": "Digest date",
+  "friction_date_previous": "Previous digest",
+  "friction_date_next": "Next digest",
+  "friction_date_no_match": "No matching dates",
+  "friction_build_now": "Build now",
+  "friction_build_title": "Build a digest for every complete day that does not have one yet",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Built {countNumber} digest",
+        "countPlural=other": "Built {countNumber} digests"
+      }
+    }
+  ],
+  "friction_build_nothing": "Every complete day already has a digest.",
+  "friction_build_failed": "Build failed: {error}",
+  "friction_empty_title": "No friction digests yet",
+  "friction_empty_hint": "A digest is built automatically once each local day is complete, and the hourly job catches up on any day that was missed. Use Build now to build missing days right away.",
+  "friction_empty_hint_remote": "A digest is built automatically once each local day is complete, and the hourly job catches up on any day that was missed. To build missing days right away, open this page on the machine that runs AgentsView, or turn on require_auth on the server.",
+  "friction_load_error": "Could not load the Friction Log",
+  "friction_retry": "Retry",
+  "friction_digest_heading": "Friction Log — {date}",
+  "friction_digest_built": "Built {when} ({timezone})",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "failed in {countNumber} session",
+        "countPlural=other": "failed in {countNumber} sessions"
+      }
+    }
+  ],
+  "friction_clean_title": "No friction found",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Nothing was flagged in the {countNumber} session scanned.",
+        "countPlural=other": "Nothing was flagged in the {countNumber} sessions scanned."
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "No sessions were active on this day.",
+  "friction_deferral_said": "Put off work: “{phrase}”",
+  "friction_pattern_retry_loop": "Retry loop",
+  "friction_pattern_runaway_loop": "Runaway tool loop",
+  "friction_pattern_edit_churn": "Edit churn",
+  "friction_pattern_mid_task_compaction": "Compaction mid-task",
+  "friction_pattern_context_pressure": "Context pressure",
+  "friction_pattern_iteration_runaway": "Long run without user input",
+  "friction_digest_missing": "No digest exists for {date}.",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} session scanned",
+        "countPlural=other": "{countNumber} sessions scanned"
+      }
+    }
+  ],
+  "friction_headline_title": "Needs attention",
+  "friction_p0_title": "Tools failing across sessions",
+  "friction_patterns_new": "New patterns",
+  "friction_patterns_recurring": "Recurring patterns",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} occurrence",
+        "countPlural=other": "{countNumber} occurrences"
+      }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} session",
+        "countPlural=other": "{countNumber} sessions"
+      }
+    }
+  ],
+  "friction_pattern_first_seen": "First seen {date}",
+  "friction_section_corrections": "Corrections",
+  "friction_section_errors": "Errors",
+  "friction_section_workarounds": "Workarounds",
+  "friction_section_deferrals": "Deferrals",
+  "friction_section_patterns": "Patterns",
+  "friction_section_frustration": "Frustration",
+  "friction_section_interruptions": "Interruptions",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} interruption",
+        "countPlural=other": "{countNumber} interruptions"
+      }
+    }
+  ],
+  "friction_kind_correction": "Correction",
+  "friction_kind_error": "Error",
+  "friction_kind_workaround": "Workaround",
+  "friction_kind_deferral": "Deferral",
+  "friction_kind_pattern": "Pattern",
+  "friction_kind_frustration": "Frustration",
+  "friction_kind_interruption": "Interruption",
+  "friction_disabled_title": "Friction Log is off on this server",
+  "friction_disabled_hint": "This server does not build digests. Set [friction] enabled = true in config.toml and restart the daemon. A read-only archive cannot build digests.",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "Show Markdown",
+  "friction_markdown_copy": "Copy Markdown",
+  "friction_markdown_copied": "Copied Markdown",
+  "friction_markdown_download": "Download Markdown",
+  "friction_markdown_loading": "Loading Markdown…",
+  "friction_markdown_error": "Could not load the Markdown digest.",
+  "friction_open_session": "Open {session} at message {ordinal}",
+  "friction_open_session_start": "Open {session}",
+  "friction_quality_card_title": "Friction Log",
+  "friction_quality_card_body": "Daily digests of corrections, tool errors, workarounds, deferrals and recurring patterns found in your sessions.",
+  "friction_quality_card_open": "Open the Friction Log",
+  "friction_session_title": "Friction findings",
+  "friction_session_loading": "Loading friction findings…",
+  "friction_session_error": "Friction findings are unavailable.",
+  "friction_session_empty": "No friction findings in this session.",
+  "friction_session_jump": "Message {ordinal}",
+  "friction_session_jump_title": "Jump to message {ordinal}"
 }

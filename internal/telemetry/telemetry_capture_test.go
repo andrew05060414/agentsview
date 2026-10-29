@@ -50,6 +50,7 @@ func TestCoreActionAllowlist(t *testing.T) {
 		{EventScreenViewed, "screen", "pinned", true},
 		{EventScreenViewed, "screen", "trash", true},
 		{EventScreenViewed, "screen", "recent-edits", true},
+		{EventScreenViewed, "screen", "friction", true},
 		{EventScreenViewed, "screen", "data", true},
 		{EventScreenViewed, "screen", "settings", true},
 		{EventScreenViewed, "screen", "unknown", false},

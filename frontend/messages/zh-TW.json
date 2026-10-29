@@ -2883,5 +2883,153 @@
   "appearance_message_colors_swatch_gray": "灰色",
   "appearance_message_colors_preview": "預覽",
   "appearance_message_colors_preview_user": "日期測試為什麼會失敗？",
-  "appearance_message_colors_preview_assistant": "測試夾具要求 UTC，我已更新。"
+  "appearance_message_colors_preview_assistant": "測試夾具要求 UTC，我已更新。",
+  "nav_friction": "摩擦日誌",
+  "friction_page_help_docs": "摩擦日誌的運作方式",
+  "friction_page_refresh": "重新整理摩擦日誌",
+  "friction_date_label": "摘要日期",
+  "friction_date_previous": "上一份摘要",
+  "friction_date_next": "下一份摘要",
+  "friction_date_no_match": "沒有相符的日期",
+  "friction_build_now": "立即產生",
+  "friction_build_title": "為每個尚無摘要的完整日期產生摘要",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已產生 {countNumber} 份摘要" }
+    }
+  ],
+  "friction_build_nothing": "每個完整日期都已有摘要。",
+  "friction_build_failed": "產生失敗：{error}",
+  "friction_empty_title": "尚無摩擦摘要",
+  "friction_empty_hint": "每個本地日期結束後會自動產生摘要，每小時執行的工作會補上遺漏的日期。使用「立即產生」可馬上產生缺少的日期。",
+  "friction_empty_hint_remote": "每個本地日期結束後會自動產生摘要，每小時執行的工作會補上遺漏的日期。若要馬上產生缺少的日期，請在執行 AgentsView 的電腦上開啟此頁面，或在伺服器上啟用 require_auth。",
+  "friction_load_error": "無法載入摩擦日誌",
+  "friction_retry": "重試",
+  "friction_digest_heading": "摩擦日誌 — {date}",
+  "friction_digest_built": "產生於 {when}（{timezone}）",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "在 {countNumber} 個工作階段中失敗"
+      }
+    }
+  ],
+  "friction_clean_title": "未發現摩擦",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "掃描的 {countNumber} 個工作階段中沒有標記任何問題。"
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "這一天沒有活躍的工作階段。",
+  "friction_deferral_said": "推遲了工作：「{phrase}」",
+  "friction_pattern_retry_loop": "重試迴圈",
+  "friction_pattern_runaway_loop": "失控的工具迴圈",
+  "friction_pattern_edit_churn": "反覆編輯",
+  "friction_pattern_mid_task_compaction": "任務中途壓縮上下文",
+  "friction_pattern_context_pressure": "上下文壓力",
+  "friction_pattern_iteration_runaway": "長時間執行且無使用者輸入",
+  "friction_digest_missing": "{date} 沒有摘要。",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已掃描 {countNumber} 個對話" }
+    }
+  ],
+  "friction_headline_title": "需要關注",
+  "friction_p0_title": "在多個工作階段中失敗的工具",
+  "friction_patterns_new": "新模式",
+  "friction_patterns_recurring": "反覆出現的模式",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "出現 {countNumber} 次" }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 個對話" }
+    }
+  ],
+  "friction_pattern_first_seen": "首次出現於 {date}",
+  "friction_section_corrections": "糾正",
+  "friction_section_errors": "錯誤",
+  "friction_section_workarounds": "暫時解法",
+  "friction_section_deferrals": "延後事項",
+  "friction_section_patterns": "模式",
+  "friction_section_frustration": "挫折",
+  "friction_section_interruptions": "中斷",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "中斷 {countNumber} 次" }
+    }
+  ],
+  "friction_kind_correction": "糾正",
+  "friction_kind_error": "錯誤",
+  "friction_kind_workaround": "暫時解法",
+  "friction_kind_deferral": "延後事項",
+  "friction_kind_pattern": "模式",
+  "friction_kind_frustration": "挫折",
+  "friction_kind_interruption": "中斷",
+  "friction_disabled_title": "此伺服器已關閉摩擦日誌",
+  "friction_disabled_hint": "此伺服器不產生摘要。請在 config.toml 中設定 [friction] enabled = true 並重新啟動常駐程式。唯讀封存無法產生摘要。",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "顯示 Markdown",
+  "friction_markdown_copy": "複製 Markdown",
+  "friction_markdown_copied": "已複製 Markdown",
+  "friction_markdown_download": "下載 Markdown",
+  "friction_markdown_loading": "正在載入 Markdown…",
+  "friction_markdown_error": "無法載入 Markdown 摘要。",
+  "friction_open_session": "在第 {ordinal} 則訊息開啟 {session}",
+  "friction_open_session_start": "開啟 {session}",
+  "friction_quality_card_title": "摩擦日誌",
+  "friction_quality_card_body": "在你的對話中發現的糾正、工具錯誤、暫時解法、延後事項和反覆出現模式的每日摘要。",
+  "friction_quality_card_open": "開啟摩擦日誌",
+  "friction_session_title": "摩擦發現",
+  "friction_session_loading": "正在載入摩擦發現…",
+  "friction_session_error": "摩擦發現無法使用。",
+  "friction_session_empty": "此對話中沒有摩擦發現。",
+  "friction_session_jump": "訊息 {ordinal}",
+  "friction_session_jump_title": "跳至訊息 {ordinal}"
 }

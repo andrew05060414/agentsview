@@ -26392,17 +26392,21 @@ func (f FrictionDigestItem) Validate() error {
 }
 
 type FrictionDigestResponse struct {
-	BuiltAt         time.Time             `json:"built_at" validate:"required"`
-	Date            string                `json:"date" validate:"required"`
-	MarkdownSha256  string                `json:"markdown_sha256" validate:"required"`
-	P0Alerts        []FrictionP0Alert     `json:"p0_alerts" validate:"required"`
-	Patterns        []FrictionPatternItem `json:"patterns" validate:"required"`
-	Revision        int64                 `json:"revision"`
-	RulesVersion    string                `json:"rules_version" validate:"required"`
-	SessionsScanned int64                 `json:"sessions_scanned"`
-	Signals         []FrictionSignal      `json:"signals" validate:"required"`
-	Summary         FrictionSummary       `json:"summary"`
-	Timezone        string                `json:"timezone" validate:"required"`
+	BuiltAt         time.Time                  `json:"built_at" validate:"required"`
+	Date            string                     `json:"date" validate:"required"`
+	MarkdownSha256  string                     `json:"markdown_sha256" validate:"required"`
+	P0Alerts        []FrictionP0Alert          `json:"p0_alerts" validate:"required"`
+	Patterns        []FrictionPatternItem      `json:"patterns" validate:"required"`
+	Revision        int64                      `json:"revision"`
+	RulesVersion    string                     `json:"rules_version" validate:"required"`
+	Sessions        map[string]FrictionSession `json:"sessions"`
+	SessionsScanned int64                      `json:"sessions_scanned"`
+	Signals         []FrictionSignal           `json:"signals" validate:"required"`
+	Summary         FrictionSummary            `json:"summary"`
+	Timezone        string                     `json:"timezone" validate:"required"`
+
+	// WebURL Friction Log page for this digest when public_url is set
+	WebURL *string `json:"web_url,omitempty"`
 }
 
 func (f FrictionDigestResponse) Validate() error {
@@ -26432,6 +26436,13 @@ func (f FrictionDigestResponse) Validate() error {
 	}
 	if err := typesValidator.Var(f.RulesVersion, "required"); err != nil {
 		errors = errors.Append("RulesVersion", err)
+	}
+	for k, v := range f.Sessions {
+		if validator, ok := any(v).(runtime.Validator); ok {
+			if err := validator.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Sessions[%s]", k), err)
+			}
+		}
 	}
 	for i, item := range f.Signals {
 		if v, ok := any(item).(runtime.Validator); ok {
@@ -26615,6 +26626,17 @@ func (f FrictionRunResponse) Validate() error {
 		return nil
 	}
 	return errors
+}
+
+type FrictionSession struct {
+	Agent        string  `json:"agent" validate:"required"`
+	DisplayName  *string `json:"display_name,omitempty"`
+	FirstMessage *string `json:"first_message,omitempty"`
+	Project      string  `json:"project" validate:"required"`
+}
+
+func (f FrictionSession) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(f))
 }
 
 type FrictionSignal struct {
@@ -28001,6 +28023,7 @@ type VersionInfo struct {
 	Commit                     string `json:"commit" validate:"required"`
 	DataVersion                int64  `json:"data_version"`
 	FrictionAvailable          bool   `json:"friction_available"`
+	FrictionBuildAllowed       bool   `json:"friction_build_allowed"`
 	FrictionReadable           *bool  `json:"friction_readable,omitempty"`
 	InsightGenerationAvailable bool   `json:"insight_generation_available"`
 	ReadOnly                   *bool  `json:"read_only,omitempty"`

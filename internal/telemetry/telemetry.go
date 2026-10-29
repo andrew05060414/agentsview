@@ -180,11 +180,11 @@ func allowedEventOptions(opts Options) []kittelemetry.Option {
 			kittelemetry.AllowProperty("duration_bucket", kittelemetry.AllowStringValues("under_1m", "1_to_5m", "5_to_30m", "over_30m"))),
 		kittelemetry.WithDailyEvent(EventScreenViewed, "screen", kittelemetry.NewDailyClaims(opts.ScreenClaimsPath)),
 		kittelemetry.WithAllowedEvent(EventScreenViewed,
-			kittelemetry.AllowProperty("screen", kittelemetry.AllowStringValues("sessions", "usage", "activity", "trends", "recall", "quality", "pinned", "trash", "recent-edits", "data", "settings")),
+			kittelemetry.AllowProperty("screen", kittelemetry.AllowStringValues("sessions", "usage", "activity", "trends", "recall", "quality", "pinned", "trash", "recent-edits", "friction", "data", "settings")),
 			kittelemetry.AllowProperty("surface", kittelemetry.AllowStringValues("web"))),
 		oneOf(EventSearchRun, "query_type", "text", "semantic", "hybrid"),
 		oneOf(EventSessionViewed, "agent", opts.AgentTypes...),
-		oneOf(EventExportRun, "format", "html", "insight_html", "csv", "markdown_link", "gist", "insight_gist"),
+		oneOf(EventExportRun, "format", "html", "insight_html", "friction_markdown", "csv", "markdown_link", "gist", "insight_gist"),
 		oneOf(EventInsightGenerated, "kind", opts.InsightKinds...),
 		oneOf(EventAnalyticsViewed, "page", "usage", "activity", "trends", "quality"),
 	}

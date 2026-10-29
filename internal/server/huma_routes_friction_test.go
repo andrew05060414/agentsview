@@ -15,6 +15,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/friction"
 	"go.kenn.io/agentsview/internal/friction/review"
@@ -36,6 +37,7 @@ type testFrictionSignal struct {
 type testFrictionDigest struct {
 	Date     string `json:"date"`
 	Revision int    `json:"revision"`
+	WebURL   string `json:"web_url"`
 	Summary  struct {
 		SchemaVersion int                 `json:"schema_version"`
 		Corrections   int                 `json:"corrections"`
@@ -49,6 +51,12 @@ type testFrictionDigest struct {
 	Patterns []struct {
 		Fingerprint string `json:"fingerprint"`
 	} `json:"patterns"`
+	Sessions map[string]struct {
+		Agent        string `json:"agent"`
+		Project      string `json:"project"`
+		DisplayName  string `json:"display_name"`
+		FirstMessage string `json:"first_message"`
+	} `json:"sessions"`
 }
 
 func frictionTestSnapshot(date string) review.Snapshot {
@@ -120,6 +128,7 @@ func TestFrictionDigestRoutes(t *testing.T) {
 		w := te.get(t, "/base/api/v1/friction/digests/2026-09-14")
 		assertStatus(t, w, http.StatusOK)
 		got := decode[testFrictionDigest](t, w)
+		assert.Equal(t, "https://av.example.test/base/friction?date=2026-09-14", got.WebURL)
 		assert.Equal(t, friction.SummarySchemaVersion, got.Summary.SchemaVersion)
 		assert.Equal(t, 1, got.Summary.Corrections)
 		require.Len(t, got.Signals, 2)
@@ -138,6 +147,22 @@ func TestFrictionDigestRoutes(t *testing.T) {
 		}
 		assert.ElementsMatch(t, []string{got.Signals[0].Fingerprint, got.Signals[1].Fingerprint}, fingerprints,
 			"only this digest's patterns")
+	})
+	t.Run("names_archived_sessions", func(t *testing.T) {
+		dbtest.SeedSession(t, te.db, "claude:s1", "project-a", func(s *db.Session) {
+			s.Agent = "claude"
+			s.FirstMessage = dbtest.Ptr("Fix the flaky login test " + strings.Repeat("x", 400))
+		})
+		dbtest.SeedSession(t, te.db, "claude:s2", "project-b", func(s *db.Session) { s.Agent = "claude" })
+		require.NoError(t, te.db.RenameSession(t.Context(), "claude:s2", dbtest.Ptr("Renamed session")))
+		got := decode[testFrictionDigest](t, te.get(t, "/base/api/v1/friction/digests/2026-09-14"))
+		require.Contains(t, got.Sessions, "claude:s1")
+		assert.Equal(t, "project-a", got.Sessions["claude:s1"].Project)
+		assert.True(t, strings.HasPrefix(got.Sessions["claude:s1"].FirstMessage, "Fix the flaky login test"))
+		assert.LessOrEqual(t, len(got.Sessions["claude:s1"].FirstMessage), 300)
+		assert.Equal(t, "Renamed session", got.Sessions["claude:s2"].DisplayName, "P0 alert subjects are named too")
+		assert.NotContains(t, got.Sessions, "claude:s3", "a session missing from the archive is left out")
+		assert.NotContains(t, got.Sessions, "run-7:ci_check", "diagnostic identities are not sessions")
 	})
 	t.Run("markdown", func(t *testing.T) {
 		w := te.get(t, "/base/api/v1/friction/digests/2026-09-14/md")
@@ -271,6 +296,47 @@ func TestFrictionRunRoute(t *testing.T) {
 		assert.Equal(t, friction.SummarySchemaVersion, got.Reports[0].Summary.SchemaVersion)
 		assertStatus(t, te.get(t, "/api/v1/friction/digests/2026-09-14"), http.StatusOK)
 	})
+}
+
+// The page offers Build now from friction_build_allowed, so the flag must
+// match what the run route does with the same caller.
+func TestVersionFrictionBuildAllowedMatchesRunRoute(t *testing.T) {
+	fixed := time.Date(2026, 9, 16, 2, 30, 0, 0, time.UTC)
+	runner := &review.Runner{Loc: time.UTC, Now: func() time.Time { return fixed }, BackfillDays: 7}
+	te := setupWithServerOpts(t, []server.Option{server.WithFriction(runner, nil)})
+	runner.Store = te.db
+
+	tests := []struct {
+		name      string
+		remote    string
+		forwarded bool
+		want      bool
+	}{
+		{name: "direct_localhost", remote: "127.0.0.1:5000", want: true},
+		{name: "proxied_through_localhost", remote: "127.0.0.1:5000", forwarded: true, want: false},
+		{name: "remote_without_auth", remote: "203.0.113.9:4000", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			send := func(method, path, body string) *httptest.ResponseRecorder {
+				req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				req.RemoteAddr = tt.remote
+				if tt.forwarded {
+					req.Header.Set("X-Forwarded-For", "198.51.100.7")
+				}
+				w := httptest.NewRecorder()
+				te.handler.ServeHTTP(w, req)
+				return w
+			}
+			w := send(http.MethodGet, "/api/v1/version", "")
+			assertStatus(t, w, http.StatusOK)
+			assert.Equal(t, tt.want, decode[map[string]any](t, w)["friction_build_allowed"])
+
+			run := send(http.MethodPost, "/api/v1/friction/run", `{"date":"2026-09-14","dry_run":true}`)
+			assert.Equal(t, tt.want, run.Code != http.StatusForbidden, "run status %d: %s", run.Code, run.Body.String())
+		})
+	}
 }
 
 func TestFrictionRunRouteDisabled(t *testing.T) {

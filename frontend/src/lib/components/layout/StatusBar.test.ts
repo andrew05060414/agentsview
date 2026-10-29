@@ -105,6 +105,7 @@ describe("StatusBar", () => {
       data_version: 1,
       insight_generation_available: false,
       friction_available: false,
+      friction_build_allowed: false,
       session_stats_available: false,
       read_only: true,
     };

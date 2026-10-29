@@ -158,6 +158,7 @@ describe("AnalyticsPage outcome window", () => {
             data_version: 1,
             insight_generation_available: false,
             friction_available: false,
+            friction_build_allowed: false,
             session_stats_available: backendAvailable,
           };
     router.route = "sessions";
@@ -194,6 +195,7 @@ describe("AnalyticsPage outcome window", () => {
         data_version: 1,
         insight_generation_available: false,
         friction_available: false,
+        friction_build_allowed: false,
         session_stats_available: true,
         read_only: true,
       };
@@ -945,6 +947,7 @@ describe("AnalyticsPage refresh behavior", () => {
       data_version: 1,
       insight_generation_available: false,
       friction_available: false,
+      friction_build_allowed: false,
       session_stats_available: true,
     };
     router.params = { date_from: "2026-03-01", date_to: "2026-03-31" };

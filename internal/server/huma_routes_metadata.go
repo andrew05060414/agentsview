@@ -204,6 +204,7 @@ func (s *Server) humaGetVersion(
 	_, version.SessionStatsAvailable = s.db.(*db.DB)
 	version.FrictionAvailable = s.frictionRunner != nil
 	_, version.FrictionReadable = s.db.(db.FrictionReader)
+	version.FrictionBuildAllowed = version.FrictionAvailable && s.frictionRunAllowed(ctx)
 	if restrictedIngress(ctx) {
 		// The restricted allowlist has no friction routes.
 		version.ReadOnly = true
@@ -211,6 +212,7 @@ func (s *Server) humaGetVersion(
 		version.SessionStatsAvailable = false
 		version.FrictionAvailable = false
 		version.FrictionReadable = false
+		version.FrictionBuildAllowed = false
 	}
 	return &jsonOutput[VersionInfo]{Body: version}, nil
 }
