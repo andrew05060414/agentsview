@@ -722,6 +722,49 @@ func TestSearchContentFTSPhraseSnippetFallsBackToFirstToken(t *testing.T) {
 	assert.Contains(t, got.Matches[0].Snippet, "foo-bar")
 }
 
+// TestSearchContentFTSBooleanSnippetCentersOnMatchedOperand places each
+// matching operand past the opening snippet window, after text that holds a
+// non-matching operand, a negated operand, or an operator word.
+func TestSearchContentFTSBooleanSnippetCentersOnMatchedOperand(t *testing.T) {
+	d := testDB(t)
+	if !d.HasFTS(t.Context()) {
+		t.Skip("fts5 not available")
+	}
+	filler := strings.Repeat("filler ", 40)
+	for _, tc := range []struct {
+		name, query, body, want string
+	}{
+		{"later OR operand", `"alpha" OR "beta"`, "Order notes " + filler + "beta closes", "beta closes"},
+		{"OR phrase", `"absent" OR "fix bug"`, filler + "fix bug closes", "fix bug closes"},
+		{"negated operand", `"alpha" NOT "beta" OR "gamma"`, "beta opens " + filler + "gamma closes", "gamma closes"},
+		{"unsatisfied AND", `"alpha" AND "beta" OR "gamma"`, "alpha opens " + filler + "gamma closes", "gamma closes"},
+		// SQLite matches tokens, not substrings: the phrase matches across
+		// punctuation and a stemmed word matches its inflections.
+		{"negated phrase across punctuation", `"alpha" NOT "foo bar" OR "gamma"`, "alpha opens foo-bar " + filler + "gamma closes", "gamma closes"},
+		{"negated stem", `"alpha" NOT "runs" OR "gamma"`, "alpha opens running " + filler + "gamma closes", "gamma closes"},
+		{"OR phrase across punctuation", `"absent" OR "foo bar"`, filler + "foo-bar closes", "foo-bar closes"},
+		// A star inside quotes is punctuation, not a prefix marker.
+		{"negated quoted star", `"alpha" NOT "beta*"`, "betamax opens " + filler + "alpha closes", "alpha closes"},
+		{"quoted star OR", `"beta*" OR "gamma"`, "betamax opens " + filler + "gamma beta closes", "gamma beta closes"},
+		{"quoted star alone", `"beta*" OR "absent"`, "betamax opens " + filler + "beta closes", "beta closes"},
+		// Phrase joins and column filters fall back to substring centering.
+		{"phrase join", `"foo" + "bar" OR "baz"`, filler + "foo bar closes", "foo bar closes"},
+		{"column filter", `"needle" AND content:needle OR "absent"`, filler + "needle closes", "needle closes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := strings.ReplaceAll(tc.name, " ", "-")
+			seedSearchSession(t, d, id, "proj", [][2]string{{"user", tc.body}})
+			got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+				Pattern: tc.query, Mode: "fts", SessionID: id,
+				Sources: []string{"messages"}, Limit: 50,
+			})
+			require.NoError(t, err)
+			require.Len(t, got.Matches, 1)
+			assert.Contains(t, got.Matches[0].Snippet, tc.want)
+		})
+	}
+}
+
 func TestSearchContentFTSInvalidQuery(t *testing.T) {
 	d := testDB(t)
 	if !d.HasFTS(t.Context()) {

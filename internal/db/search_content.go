@@ -433,24 +433,28 @@ func (db *DB) searchContentSubstring(
 	}
 
 	query := "SELECT session_id, project, agent, transcript_revision, location, role, tool_name, " +
-		"ordinal, ts, snippet FROM (" +
+		"ordinal, ts, snippet, '' FROM (" +
 		strings.Join(branches, " UNION ALL ") +
 		") ORDER BY julianday(sort_ts) DESC, session_id ASC, ordinal ASC, src ASC, row_id ASC " +
 		"LIMIT ? OFFSET ?"
 	args = append(args, f.Limit+1, f.Cursor)
 
-	return db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, f.substringSnippet)
+	return db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, func(body, _ string) string {
+		return f.substringSnippet(body)
+	})
 }
 
 // scanContentMatches runs query and assembles a ContentSearchPage, treating
 // the (Limit+1)-th row as the cursor sentinel. The body column is the full
 // source field; makeSnippet derives the (windowed, redacted) snippet from it
-// so redaction sees whole secrets rather than a pre-truncated window. The
-// returned page then gets its derived unit ranges and lineage assigned by
-// the shared deriveLexicalUnits pass (post-truncation, O(page)).
+// so redaction sees whole secrets rather than a pre-truncated window. A final
+// text column passes FTS per-term hits to makeSnippet; other queries select an
+// empty string for it. The returned page then gets its derived unit ranges and
+// lineage assigned by the shared deriveLexicalUnits pass (post-truncation,
+// O(page)).
 func (db *DB) scanContentMatches(
 	ctx context.Context, query string, args []any, limit, cursor int,
-	makeSnippet func(body string) string,
+	makeSnippet func(body, termHits string) string,
 ) (ContentSearchPage, error) {
 	rows, err := db.getReader().QueryContext(ctx, query, args...)
 	if err != nil {
@@ -460,14 +464,14 @@ func (db *DB) scanContentMatches(
 	out := make([]ContentMatch, 0)
 	for rows.Next() {
 		var m ContentMatch
-		var body string
+		var body, termHits string
 		if err := rows.Scan(&m.SessionID, &m.Project, &m.Agent,
 			&m.TranscriptRevision,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
-			&m.Timestamp, &body); err != nil {
+			&m.Timestamp, &body, &termHits); err != nil {
 			return ContentSearchPage{}, fmt.Errorf("scan match: %w", err)
 		}
-		m.Snippet = makeSnippet(body)
+		m.Snippet = makeSnippet(body, termHits)
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -902,23 +906,39 @@ func (db *DB) searchContentFTS(
 	if f.ExcludeSystem {
 		sysPred = "m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
 	}
+	// A row can match OR and NOT queries without every operand, so ask SQLite
+	// which operands this row matched. Snippets then follow a branch the row
+	// actually satisfied. Unquoted input never carries these operators. Syntax
+	// the parser does not model keeps the substring-based centering.
+	termHits, args := "''", []any{}
+	expr, _ := ParseFTSExpression(f.Pattern)
+	if expr != nil && expr.hasOrNot() && expr.sqliteProbeable() {
+		termHits, args = sqliteFTSTermHitsSQL(expr)
+	} else {
+		expr = nil
+	}
 	// Select the full content (not FTS snippet()) so the snippet is built in Go
 	// and secret redaction sees whole secrets rather than a pre-truncated window.
 	query := fmt.Sprintf(`
 		SELECT m.session_id, s.project, s.agent,
 			COALESCE(s.transcript_revision,''), 'message', m.role, '',
-			m.ordinal, COALESCE(m.timestamp,'') AS ts, COALESCE(m.dialogue_text, m.content) AS snippet
+			m.ordinal, COALESCE(m.timestamp,'') AS ts, COALESCE(m.dialogue_text, m.content) AS snippet,
+			%s AS term_hits
 		FROM messages_fts
 		JOIN messages m ON m.id = messages_fts.rowid
 		JOIN sessions s ON s.id = m.session_id
 		WHERE messages_fts.content MATCH ? AND %s AND m.%s
 		ORDER BY rank ASC, m.ordinal ASC, m.id ASC
-		LIMIT ? OFFSET ?`, sysPred, scope)
+		LIMIT ? OFFSET ?`, termHits, sysPred, scope)
 	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
-	args := []any{ftsQuery.match}
+	args = append(args, ftsQuery.match)
 	args = append(args, scopeArgs...)
 	args = append(args, f.Limit+1, f.Cursor)
-	page, err := db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, func(body string) string {
+	page, err := db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, func(body, hits string) string {
+		if expr != nil {
+			start, end := sqliteFTSSnippetRange(f.Pattern, body, expr, hits)
+			return f.BuildSnippet(body, start, end)
+		}
 		return f.ftsSnippet(body, ftsQuery.snippetTerm)
 	})
 	if err != nil {
@@ -943,29 +963,155 @@ func (f ContentSearchFilter) ftsSnippet(body, segmentedTerm string) string {
 }
 
 // FTSSnippetRange returns the byte range around which FTS-like snippets should
-// be centered. It first tries the de-quoted raw phrase, then falls back to the
-// first parsed prepared-FTS term, and finally to the start of the body.
+// be centered. It first tries the de-quoted raw phrase, then a positive operand
+// through which the parsed Boolean query holds when each operand is matched as
+// a case-insensitive substring, so `"alpha" OR "beta"` centers on beta when
+// only beta is present. Operator words and NOT operands never count as matches.
+// When the engine's match disagrees with this substring evaluation, it falls
+// back to the first positive operand, or its first word, found in body. A query
+// that does not parse falls back to its first term. Failing all of these, it
+// returns the start of the body.
 func FTSSnippetRange(pattern, body string) (int, int) {
-	if phrase := strings.Trim(pattern, "\""); phrase != "" {
-		if start, end, ok := CaseInsensitiveSpan(body, phrase); ok {
-			return start, end
-		}
+	if start, end, ok := ftsPhraseSpan(pattern, body); ok {
+		return start, end
 	}
-	for _, term := range FTSTerms(PrepareFTSQuery(pattern)) {
-		if term == "" {
-			continue
-		}
-		if start, end, ok := CaseInsensitiveSpan(body, term); ok {
-			return start, end
-		}
-		if fields := strings.Fields(term); len(fields) > 0 && fields[0] != term {
-			if start, end, ok := CaseInsensitiveSpan(body, fields[0]); ok {
+	expr, err := ParseFTSExpression(pattern)
+	if err != nil {
+		if terms := FTSTerms(PrepareFTSQuery(pattern)); len(terms) > 0 {
+			if start, end, ok := ftsTermSpan(body, terms[0]); ok {
 				return start, end
 			}
 		}
-		break
+		return 0, 0
 	}
-	return 0, 0
+	if expr == nil {
+		return 0, 0
+	}
+	matched := expr.matchedTerms(func(t *FTSExpr) bool {
+		_, _, ok := CaseInsensitiveSpan(body, t.Term)
+		return ok
+	})
+	if start, end, ok := firstFTSTermSpan(body, matched); ok {
+		return start, end
+	}
+	start, end, _ := firstFTSTermSpan(body, expr.positiveTerms())
+	return start, end
+}
+
+// sqliteFTSSnippetRange centers a snippet like FTSSnippetRange, but takes each
+// operand's match from SQLite. hits holds '1' or '0' for each of expr's terms
+// in query order. SQLite matches stemmed tokens, so `"foo bar"` matches
+// "foo-bar" and "run" matches "running"; substring evaluation would then
+// follow a branch the row did not match.
+func sqliteFTSSnippetRange(pattern, body string, expr *FTSExpr, hits string) (int, int) {
+	if start, end, ok := ftsPhraseSpan(pattern, body); ok {
+		return start, end
+	}
+	held := make(map[*FTSExpr]bool)
+	for i, t := range expr.terms() {
+		held[t] = i < len(hits) && hits[i] == '1'
+	}
+	matched := expr.matchedTerms(func(t *FTSExpr) bool { return held[t] })
+	start, end, _ := firstFTSTermSpan(body, matched)
+	return start, end
+}
+
+// sqliteFTSTermHitsSQL returns a SQL expression that yields one '1' or '0'
+// per term of expr, in query order, reporting whether the indexed content of
+// the row m.id matches that term's source text alone. It is meant for the
+// messages_fts query, whose table name the caller substitutes.
+func sqliteFTSTermHitsSQL(expr *FTSExpr) (string, []any) {
+	var parts []string
+	var args []any
+	for _, t := range expr.terms() {
+		parts = append(parts, "EXISTS (SELECT 1 FROM messages_fts AS term_fts "+
+			"WHERE term_fts.content MATCH ? AND term_fts.rowid = m.id)")
+		args = append(args, t.Raw)
+	}
+	return strings.Join(parts, " || "), args
+}
+
+// ftsPhraseSpan locates the de-quoted raw pattern in body.
+func ftsPhraseSpan(pattern, body string) (int, int, bool) {
+	if phrase := strings.Trim(pattern, "\""); phrase != "" {
+		return CaseInsensitiveSpan(body, phrase)
+	}
+	return 0, 0, false
+}
+
+// firstFTSTermSpan returns the span of the first of terms that ftsTermSpan
+// locates in body. Only when none is found does it try each term without
+// trailing '*' markers, which SQLite reads as a prefix marker, or as
+// punctuation inside quotes.
+func firstFTSTermSpan(body string, terms []*FTSExpr) (int, int, bool) {
+	for _, t := range terms {
+		if start, end, ok := ftsTermSpan(body, t.Term); ok {
+			return start, end, true
+		}
+	}
+	for _, t := range terms {
+		stem := strings.TrimRight(t.Term, "*")
+		if stem == t.Term {
+			continue
+		}
+		for _, word := range []string{stem, firstField(stem)} {
+			if start, end, ok := ftsTokenStartSpan(body, word); ok {
+				return start, end, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// ftsTermSpan locates term in body, falling back to its first word so a phrase
+// the engine matched across punctuation still centers near the match.
+func ftsTermSpan(body, term string) (int, int, bool) {
+	if start, end, ok := CaseInsensitiveSpan(body, term); ok {
+		return start, end, true
+	}
+	if word := firstField(term); word != "" && word != term {
+		return CaseInsensitiveSpan(body, word)
+	}
+	return 0, 0, false
+}
+
+// ftsTokenStartSpan locates word where it starts a token in body, preferring
+// an occurrence that is a whole token. SQLite matches tokens, so an occurrence
+// inside a longer word is never the match.
+func ftsTokenStartSpan(body, word string) (int, int, bool) {
+	if strings.TrimSpace(word) == "" {
+		return 0, 0, false
+	}
+	isWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+	found, foundStart, foundEnd := false, 0, 0
+	for off := 0; off < len(body); {
+		start, end, ok := CaseInsensitiveSpan(body[off:], word)
+		if !ok {
+			break
+		}
+		start, end = start+off, end+off
+		before, _ := utf8.DecodeLastRuneInString(body[:start])
+		after, _ := utf8.DecodeRuneInString(body[end:])
+		if start == 0 || !isWord(before) {
+			if end == len(body) || !isWord(after) {
+				return start, end, true
+			}
+			if !found {
+				found, foundStart, foundEnd = true, start, end
+			}
+		}
+		_, size := utf8.DecodeRuneInString(body[start:])
+		off = start + size
+	}
+	return foundStart, foundEnd, found
+}
+
+// firstField returns the first whitespace-separated word of s, or "".
+func firstField(s string) string {
+	if fields := strings.Fields(s); len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
 }
 
 // classifyFTSError maps a malformed FTS query into a SearchInputError so HTTP

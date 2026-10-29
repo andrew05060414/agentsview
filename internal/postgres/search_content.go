@@ -14,7 +14,7 @@ import (
 
 // SearchContent implements content search for the PostgreSQL read-only store.
 // The "fts" mode falls back to ILIKE over message content, with one predicate
-// per prepared FTS term to preserve SQLite's implicit-AND semantics.
+// per literal word or phrase, preserving implicit AND and explicit Boolean operators.
 func (s *Store) SearchContent(
 	ctx context.Context, f db.ContentSearchFilter,
 ) (db.ContentSearchPage, error) {
@@ -145,10 +145,18 @@ func (s *Store) searchContentSubstringPG(
 
 	var branches []string
 	if pgHasSource(f, "messages") {
-		branches = append(branches, pgMessagesBranch(f, escapedPat, pb))
+		branch, err := pgMessagesBranch(f, escapedPat, pb)
+		if err != nil {
+			return db.ContentSearchPage{}, err
+		}
+		branches = append(branches, branch)
 	}
 	if pgHasSource(f, "thinking") {
-		branches = append(branches, pgThinkingBranch(f, escapedPat, pb))
+		branch, err := pgThinkingBranch(f, escapedPat, pb)
+		if err != nil {
+			return db.ContentSearchPage{}, err
+		}
+		branches = append(branches, branch)
 	}
 	if pgHasSource(f, "tool_input") {
 		branches = append(branches, pgToolInputBranch(f, escapedPat, pb))
@@ -178,10 +186,13 @@ func (s *Store) searchContentSubstringPG(
 // Placeholders continue from pb's current position.
 func pgMessagesBranch(
 	f db.ContentSearchFilter, escapedPat string, pb *paramBuilder,
-) string {
-	contentPred := pgContentSearchPredicate(
+) (string, error) {
+	contentPred, err := pgContentSearchPredicate(
 		"COALESCE(m.dialogue_text, m.content)", f, escapedPat, pb,
 	)
+	if err != nil {
+		return "", err
+	}
 
 	sysPred := "TRUE"
 	if f.ExcludeSystem {
@@ -203,38 +214,22 @@ func pgMessagesBranch(
 		JOIN scoped sc ON sc.id = m.session_id
 		WHERE %s
 		  AND %s`,
-		contentPred, sysPred)
+		contentPred, sysPred), nil
 }
 
 func pgContentSearchPredicate(
 	column string, f db.ContentSearchFilter, escapedPat string,
 	pb *paramBuilder,
-) string {
+) (string, error) {
 	if f.Mode != "fts" {
 		ilikePat := "%" + escapedPat + "%"
 		ilikeParam := pb.add(ilikePat)
 		return fmt.Sprintf(
 			"%s ILIKE '%%'||%s||'%%' ESCAPE E'\\\\'",
 			column, ilikeParam,
-		)
+		), nil
 	}
-
-	terms := db.FTSTerms(db.PrepareFTSQuery(f.Pattern))
-	clauses := make([]string, 0, len(terms))
-	for _, term := range terms {
-		if term == "" {
-			continue
-		}
-		termParam := pb.add(escapeLike(term))
-		clauses = append(clauses, fmt.Sprintf(
-			"%s ILIKE '%%'||%s||'%%' ESCAPE E'\\\\'",
-			column, termParam,
-		))
-	}
-	if len(clauses) == 0 {
-		return "FALSE"
-	}
-	return strings.Join(clauses, " AND ")
+	return pgFTSExpression(f.Pattern, column, pb)
 }
 
 // pgToolInputBranch builds the tool_input source branch SQL.
@@ -586,10 +581,16 @@ func pgSubstringSnippet(f db.ContentSearchFilter, body string) string {
 
 // pgThinkingBranch suppresses a legacy thinking hit when its rendered message
 // already matched. Classified messages keep both independent source hits.
-func pgThinkingBranch(f db.ContentSearchFilter, escapedPat string, pb *paramBuilder) string {
-	predicate := pgContentSearchPredicate("m.thinking_text", f, escapedPat, pb)
+func pgThinkingBranch(f db.ContentSearchFilter, escapedPat string, pb *paramBuilder) (string, error) {
+	predicate, err := pgContentSearchPredicate("m.thinking_text", f, escapedPat, pb)
+	if err != nil {
+		return "", err
+	}
 	if pgHasSource(f, "messages") {
-		messagePredicate := pgContentSearchPredicate("m.content", f, escapedPat, pb)
+		messagePredicate, err := pgContentSearchPredicate("m.content", f, escapedPat, pb)
+		if err != nil {
+			return "", err
+		}
 		predicate += " AND (m.dialogue_text IS NOT NULL OR NOT (" + messagePredicate + "))"
 	}
 	sysPred := "TRUE"
@@ -604,7 +605,7 @@ func pgThinkingBranch(f db.ContentSearchFilter, escapedPat string, pb *paramBuil
         COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
         FROM messages m JOIN sessions s ON s.id=m.session_id
         JOIN scoped sc ON sc.id=m.session_id
-        WHERE %s AND %s`, predicate, sysPred)
+        WHERE %s AND %s`, predicate, sysPred), nil
 }
 
 func pgThinkingCandidateBranch(f db.ContentSearchFilter, lit string, pb *paramBuilder) string {

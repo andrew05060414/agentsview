@@ -152,7 +152,10 @@ func (s *Store) fetchHybridKeywordBatchPG(
 
 	kf := f
 	kf.Mode = "fts"
-	contentPred := pgContentSearchPredicate("COALESCE(m.dialogue_text, m.content)", kf, escapeLike(f.Pattern), pb)
+	contentPred, err := pgContentSearchPredicate("COALESCE(m.dialogue_text, m.content)", kf, escapeLike(f.Pattern), pb)
+	if err != nil {
+		return nil, err
+	}
 	limitP := pb.add(k)
 	offsetP := pb.add(offset)
 
@@ -197,9 +200,10 @@ func (s *Store) fetchHybridKeywordBatchPG(
 // pgSubstringSnippet), rune-snapped via db.SnippetBounds. Centering on the raw
 // pattern would fall back to the message start for quoted phrases or multi-term
 // queries whose pattern is not a literal substring; FTSSnippetRange instead
-// locates the de-quoted phrase, then the first matched term, then the start. The
-// result is the raw, unredacted centering text SemanticSnippet later locates in
-// the full content; redaction always runs on the full content, not this window.
+// locates the de-quoted phrase, then the operand that satisfied the Boolean
+// query, then the start. The result is the raw, unredacted centering text
+// SemanticSnippet later locates in the full content; redaction always runs on
+// the full content, not this window.
 func pgKeywordApproxSnippet(content, pattern string) string {
 	start, end := db.FTSSnippetRange(pattern, content)
 	lo, hi := db.SnippetBounds(content, start, end, db.ContentSnippetRadius)
