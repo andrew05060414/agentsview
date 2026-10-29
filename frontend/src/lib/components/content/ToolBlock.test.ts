@@ -7,6 +7,7 @@ import retainedFixtureSource from "../../utils/__fixtures__/retained-tool-image-
 const SMALL_PNG_DATA_URI =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 import ToolBlock from "./ToolBlock.svelte";
+import { ui } from "../../stores/ui.svelte.js";
 
 const copyToClipboardMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const searchState = vi.hoisted(() => ({ active: false, current: "", query: "" }));
@@ -776,5 +777,143 @@ describe("ToolBlock collapsed previews", () => {
     });
     expect(text(".tool-preview")).toContain("active task");
     expect(text(".tool-preview")).not.toContain("legacy todo");
+  });
+});
+
+describe("ToolBlock result images", () => {
+  const imageResult = JSON.stringify([{ type: "input_image", image_url: SMALL_PNG_DATA_URI }]);
+  const previews = () =>
+    Array.from(document.querySelectorAll<HTMLImageElement>(".tool-images img"), (img) => ({
+      src: img.getAttribute("src"),
+      alt: img.getAttribute("alt"),
+    }));
+
+  it("shows a generated image while collapsed and keeps its payload out of the text", async () => {
+    await render({
+      toolCall: call(
+        "image_generation",
+        { id: "ig_1", status: "completed", revised_prompt: "A teal circle" },
+        {
+          category: "Tool",
+          result_content: imageResult,
+          result_events: [
+            {
+              event_index: 0,
+              status: "completed",
+              source: "image_generation_call",
+              content: imageResult,
+              content_length: imageResult.length,
+            },
+          ],
+        },
+      ),
+    });
+    expect(previews()).toEqual([{ src: SMALL_PNG_DATA_URI, alt: "A teal circle" }]);
+
+    await click(".tool-header");
+    expect(text(".tool-content")).toContain("revised_prompt: A teal circle");
+    expect(text(".tool-content")).not.toContain("base64");
+    expect(text(".output-header .tool-preview")).toMatch(/^\[Image: image\/png, \d+ bytes\]$/);
+    expect(text(".history-header .tool-preview")).toMatch(
+      /^completed: \[Image: image\/png, \d+ bytes\]$/,
+    );
+    expect(previews()).toHaveLength(1);
+  });
+
+  it("shows other tools' images only once the block is expanded", async () => {
+    await render({
+      toolCall: call(
+        "view_image",
+        { path: "/workspace/shot.png" },
+        { result_content: imageResult },
+      ),
+    });
+    expect(previews()).toEqual([]);
+    await click(".tool-header");
+    expect(previews()).toEqual([{ src: SMALL_PNG_DATA_URI, alt: "Image from tool output" }]);
+  });
+
+  it("opens the image at full size and closes it again", async () => {
+    await render({
+      toolCall: call(
+        "image_generation",
+        { revisedPrompt: "A teal circle" },
+        { result_content: imageResult },
+      ),
+    });
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+
+    await click('.tool-images button[aria-label="Show image at full size"]');
+    const dialog = document.querySelector('[role="dialog"]');
+    expect(dialog?.getAttribute("aria-label")).toBe("A teal circle");
+    expect(dialog?.querySelector(".kit-modal-header")).toBeNull();
+    expect(dialog?.querySelector("img")?.getAttribute("src")).toBe(SMALL_PNG_DATA_URI);
+    expect(dialog?.querySelector("img")?.getAttribute("alt")).toBe("A teal circle");
+    expect(document.querySelector(".tool-header")?.getAttribute("aria-expanded")).toBe("false");
+
+    await click('[role="dialog"] button[aria-label="Close full-size image"]');
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(ui.activeModal).toBeNull();
+  });
+
+  it("loads offloaded images in the preview and the full-size view", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response("image"));
+    vi.stubGlobal("fetch", fetchMock);
+    const createObjectURL = vi
+      .fn()
+      .mockReturnValueOnce("blob:preview")
+      .mockReturnValueOnce("blob:full-size");
+    vi.stubGlobal(
+      "URL",
+      class extends URL {
+        static override createObjectURL = createObjectURL;
+        static override revokeObjectURL = vi.fn();
+      },
+    );
+    const offloaded = JSON.stringify([
+      {
+        type: "agentsview_image",
+        version: 1,
+        text: "![Image: image/png, 3 bytes](asset://abc.png)",
+        image_ref: "asset://abc.png",
+      },
+    ]);
+    await render({ toolCall: call("image_generation", {}, { result_content: offloaded }) });
+
+    await vi.waitFor(() => {
+      expect(previews().map((preview) => preview.src)).toEqual(["blob:preview"]);
+    });
+    await click('.tool-images button[aria-label="Show image at full size"]');
+    await vi.waitFor(() => {
+      expect(document.querySelector('[role="dialog"] img')?.getAttribute("src")).toBe(
+        "blob:full-size",
+      );
+    });
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      expect.stringMatching(/\/api\/v1\/assets\/abc\.png$/),
+      expect.stringMatching(/\/api\/v1\/assets\/abc\.png$/),
+    ]);
+    ui.activeModal = null;
+  });
+
+  it("holds the app modal slot so Escape closes only the dialog", async () => {
+    await render({ toolCall: call("image_generation", {}, { result_content: imageResult }) });
+    await click('.tool-images button[aria-label="Show image at full size"]');
+    expect(ui.activeModal).toBe("toolImage");
+
+    // The global Escape handler clears the slot before it would leave the session.
+    ui.activeModal = null;
+    await tick();
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("releases the modal slot when an open viewer unmounts", async () => {
+    await render({ toolCall: call("image_generation", {}, { result_content: imageResult }) });
+    await click('.tool-images button[aria-label="Show image at full size"]');
+    expect(ui.activeModal).toBe("toolImage");
+
+    for (const component of components.splice(0)) await unmount(component);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(ui.activeModal).toBeNull();
   });
 });

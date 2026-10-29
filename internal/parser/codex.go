@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -506,6 +507,9 @@ func (b *codexSessionBuilder) handleResponseItem(ctx context.Context,
 	case "agent_message":
 		b.handleAgentMessage(payload, ts)
 		return
+	case "image_generation_call":
+		b.handleImageGenerationCall(ctx, payload, ts)
+		return
 	}
 
 	role := payload.Get("role").Str
@@ -801,6 +805,59 @@ func (b *codexSessionBuilder) handleFunctionCall(
 			b.claimPendingAgentEvents(callID, agentID)
 		}
 	}
+}
+
+// handleImageGenerationCall records a generated image as a call whose result
+// holds the image. The response item carries both the call and its outcome;
+// the image_generation_end event that follows repeats them and is not read.
+func (b *codexSessionBuilder) handleImageGenerationCall(ctx context.Context,
+	payload gjson.Result, ts time.Time,
+) {
+	// The id is a slice of the whole line, image included; a copy keeps the
+	// stored call from holding the payload in memory.
+	callID := strings.Clone(payload.Get("id").Str)
+	inputJSON := payload.Raw
+	image, hasImage := generatedImageResult(payload.Get("result").Str)
+	// A result attaches to its call by id, so an item without one keeps the
+	// image in its input.
+	if hasImage && callID != "" {
+		input, ok := jsonWithoutField(jsontext.Value(payload.Raw), "result")
+		hasImage = ok
+		if ok {
+			inputJSON = input
+		}
+	}
+	// The viewer hides tool markers, so the call shows once, as its block.
+	content := formatToolHeader("Tool", generatedImageCallName)
+	messageOrdinal := b.sink.AppendMessage(ParsedMessage{
+		Role:            RoleAssistant,
+		Content:         content,
+		DialogueText:    new(""),
+		Timestamp:       ts,
+		HasToolUse:      true,
+		ContentLength:   len(content),
+		Model:           b.model,
+		ReasoningEffort: b.reasoningEffort,
+		ToolCalls: []ParsedToolCall{{
+			ToolUseID: callID,
+			ToolName:  generatedImageCallName,
+			Category:  "Tool",
+			InputJSON: inputJSON,
+			Rendering: content,
+		}},
+	})
+	if !hasImage || callID == "" {
+		return
+	}
+	b.sink.AppendToolResultEvent(ctx, callID, &ParsedToolCallPosition{
+		MessageOrdinal: messageOrdinal,
+	}, ParsedToolResultEvent{
+		ToolUseID: callID,
+		Source:    "image_generation_call",
+		Status:    "completed",
+		Content:   image,
+		Timestamp: ts,
+	})
 }
 
 func (b *codexSessionBuilder) handleFunctionCallOutput(ctx context.Context,
