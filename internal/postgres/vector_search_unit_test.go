@@ -85,7 +85,7 @@ func TestStoreVectorSearcherWiring(t *testing.T) {
 	assert.False(t, s.HasSemantic(), "searcher cleared")
 }
 
-func TestStoreSemanticReadinessPreservesNegotiationReason(t *testing.T) {
+func TestStoreSemanticReadinessReportsUnavailableReasonAndReadyWithoutCounts(t *testing.T) {
 	s := &Store{}
 	s.SetSemanticUnavailableReason("no compatible embeddings generation")
 
@@ -98,5 +98,6 @@ func TestStoreSemanticReadinessPreservesNegotiationReason(t *testing.T) {
 	status, err = s.SemanticReadiness(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, "ready", status.State)
-	assert.Empty(t, status.Reason)
+	assert.Equal(t, "counts_unavailable", status.Reason)
+	assert.Empty(t, status.Generation)
 }
