@@ -621,7 +621,9 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (153: show images Codex generates, in local rollouts and Codex Cloud, as
 // tool-result images. Re-parse Codex-format and Codex Cloud sources in place;
 // source and session identities are unchanged.)
-const dataVersion = 153
+// (154: repair growing VS Code-format replies. Re-parse VS Code Copilot and
+// Positron sources in place; source and session identities are unchanged.)
+const dataVersion = 154
 
 const archiveOnlyVersionBase = 1 << 20
 
