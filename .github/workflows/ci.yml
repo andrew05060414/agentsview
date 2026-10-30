@@ -26,7 +26,37 @@ permissions:
 
 # Timeout p99 measurements: https://github.com/kenn-io/agentsview/pull/2547
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      groups: ${{ steps.changes.outputs.groups }}
+      all: ${{ steps.changes.outputs.all }}
+    steps:
+      - uses: kenn-io/actions/changes@main
+        id: changes
+        with:
+          filters: |
+            go:
+              - '!{frontend/**,desktop/**,*.md,docs/{README,changelog,contributing}.md,docs/agents/**/*.md,docs/internal/**/!(session-format-sources).md,docs/website/**/*.md}'
+              - 'desktop/src-tauri/icons/**'
+              - 'desktop/scripts/prepare-sidecar.sh'
+            frontend:
+              - '!{*.md,docs/*.md,docs/agents/**/*.md,docs/internal/**/*.md,docs/website/**/*.md,desktop/**}'
+            node:
+              - '!{cmd/**,internal/!(web)/**,testdata/**,plugins/**,support/**,*.go,*.md,docs/*.md,docs/agents/**/*.md,docs/internal/**/*.md,docs/website/**/*.md,desktop/**}'
+              - 'internal/importer/claude_ai_requests.txt'
+            desktop:
+              - '!{cmd/**,internal/!(web)/**,testdata/**,plugins/**,support/**,*.go,*.md,docs/*.md,docs/agents/**/*.md,docs/internal/**/*.md,docs/website/**/*.md,frontend/**}'
+              - 'frontend/chrome-extension/claude_fetch.js'
+              - 'internal/importer/claude_ai_requests.txt'
+
   lint:
+    needs: changes
+    if: &go-lane ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.all == 'true' || contains(fromJSON(needs.changes.outputs.groups), 'go')) }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -92,6 +122,8 @@ jobs:
         uses: $/.github/actions/go-cache-save
 
   frontend:
+    needs: changes
+    if: &frontend-lane ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.all == 'true' || contains(fromJSON(needs.changes.outputs.groups), 'go') || contains(fromJSON(needs.changes.outputs.groups), 'frontend')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -151,6 +183,8 @@ jobs:
         working-directory: frontend
 
   frontend-node-26:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.all == 'true' || contains(fromJSON(needs.changes.outputs.groups), 'node')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 11
     steps:
@@ -207,6 +241,8 @@ jobs:
           bash desktop/scripts/test-repair-appimage-diricon.sh
 
   test:
+    needs: changes
+    if: *go-lane
     name: Go ${{ matrix.testSet == 'lint' && 'Lint' || 'Test' }} (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout }}
@@ -410,6 +446,8 @@ jobs:
 
   # Isolated Windows suites share setup; each matrix entry gets its own runner.
   test-isolated-packages-windows:
+    needs: changes
+    if: *go-lane
     name: Go Test (windows-latest, ${{ matrix.name }})
     runs-on: windows-latest
     timeout-minutes: 30
@@ -606,6 +644,8 @@ jobs:
 
   # Keep the derived-mirror suite concurrent with the main Windows package set.
   test-duckdb-windows:
+    needs: changes
+    if: *go-lane
     name: Go Test (windows-latest, DuckDB)
     runs-on: windows-latest
     timeout-minutes: 30
@@ -656,6 +696,8 @@ jobs:
           CGO_ENABLED: "1"
 
   test-race:
+    needs: changes
+    if: *go-lane
     name: Go Test (race detector, ${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
@@ -740,6 +782,8 @@ jobs:
 
   # Owns Windows Rust test coverage for PR and main-push desktop artifacts.
   desktop-windows-unit:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.all == 'true' || contains(fromJSON(needs.changes.outputs.groups), 'desktop')) }}
     name: Desktop Unit Tests (Windows)
     runs-on: windows-latest
     timeout-minutes: 10
@@ -783,6 +827,8 @@ jobs:
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib
 
   integration:
+    needs: changes
+    if: *go-lane
     name: Integration (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 32
@@ -859,6 +905,8 @@ jobs:
           TEST_CLICKHOUSE_URL: clickhouse://localhost:19000/default
 
   e2e:
+    needs: changes
+    if: *frontend-lane
     name: e2e (${{ matrix.browser }})
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout }}
