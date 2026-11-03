@@ -217,12 +217,13 @@ func selectedClaudeAIPath(conv claudeAIConversation) ([]claudeAIMessage, error) 
 		seen[id] = true
 		var parent string
 		if m.Parent.Kind() != jsontext.KindString || json.Unmarshal(m.Parent, &parent) != nil {
-			// Claude.ai sends a null or absent parent for some conversations that
-			// never got a reply (a lone prompt). That is the chain's end, not
-			// corruption, only when the chain already holds every message the
-			// conversation lists: nothing is left out, so nothing is guessed.
-			if k := m.Parent.Kind(); (k == jsontext.KindNull || len(m.Parent) == 0) &&
-				len(path)+1 == len(conv.Messages) {
+			// Claude.ai sometimes sends a null or absent parent, not only for a
+			// lone prompt but also partway up a longer chat. Treat it like the
+			// root sentinel: the selected path starts here. Rejecting it dropped
+			// the whole conversation on every sync (claude-ai:639bf810…,
+			// 2026-11). Messages above it that the leaf no longer reaches are
+			// left out, the same as abandoned branches.
+			if k := m.Parent.Kind(); k == jsontext.KindNull || len(m.Parent) == 0 {
 				path = append(path, m)
 				break
 			}
