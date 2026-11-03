@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"net/url"
 	"slices"
 	"strconv"
@@ -131,12 +132,14 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 					CurrentLeaf jsontext.Value `json:"current_leaf_message_uuid"`
 				}
 				if err := json.Unmarshal(summary, &marker); err != nil || marker.UUID == "" || marker.UpdatedAt == "" {
+					log.Printf("claude-ai sync: list entry %q unusable (uuid or updated_at missing): %v", marker.UUID, err)
 					stats.Errors++
 					cb.progress(stats)
 					continue
 				}
 				var leaf string
 				if err := json.Unmarshal(marker.CurrentLeaf, &leaf); err != nil || leaf == "" && string(marker.CurrentLeaf) != "null" {
+					log.Printf("claude-ai sync: claude-ai:%s has an unusable current_leaf_message_uuid (%d bytes: %.40s)", marker.UUID, len(marker.CurrentLeaf), marker.CurrentLeaf)
 					stats.Errors++
 					cb.progress(stats)
 					continue
