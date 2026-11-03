@@ -521,8 +521,9 @@ type Message struct {
 	Role      string `json:"role"`
 	Content   string `json:"content"`
 	// DialogueText is content without inline thinking and tool renderings,
-	// nil falls back to Content for unclassified rows and v4 imports.
-	DialogueText *string `json:"-"`
+	// nil means unclassified, including v4 imports. Search falls back to
+	// Content; dialogue-only exports report a coverage gap instead.
+	DialogueText *string `json:"dialogue_text,omitzero"`
 	// ThinkingText holds the concatenated text of all thinking
 	// blocks for this message; "" if none.
 	ThinkingText      string         `json:"thinking_text"`

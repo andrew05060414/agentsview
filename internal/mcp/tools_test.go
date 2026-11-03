@@ -63,7 +63,7 @@ func seedFTSSession(t *testing.T, d *db.DB, id, project, content, endedAt string
 		s.EndedAt = &ended
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg(id, 0, content),
+		dialogueUserMsg(id, 0, content),
 	}))
 }
 
@@ -475,10 +475,10 @@ func TestGetSessionOverview_ChronologicalTail(t *testing.T) {
 		s.FirstMessage = &first
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "open the door"),
-		dbtest.AsstMsg("s1", 1, "opening"),
-		dbtest.UserMsg("s1", 2, "now close it"),
-		dbtest.AsstMsg("s1", 3, "closed"),
+		dialogueUserMsg("s1", 0, "open the door"),
+		dialogueAsstMsg("s1", 1, "opening"),
+		dialogueUserMsg("s1", 2, "now close it"),
+		dialogueAsstMsg("s1", 3, "closed"),
 	}))
 
 	_, out, err := ts.sessionOverview(t.Context(), nil, sessionOverviewIn{
@@ -521,9 +521,9 @@ func TestGetMessages_RoleFilterAndTruncation(t *testing.T) {
 		Content: "system noise", IsSystem: true, ContentLength: len("system noise"),
 	}
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, string(long)),
+		dialogueUserMsg("s1", 0, string(long)),
 		sysMsg,
-		dbtest.AsstMsg("s1", 2, "short reply"),
+		dialogueAsstMsg("s1", 2, "short reply"),
 	}))
 
 	_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{
@@ -548,8 +548,8 @@ func TestGetMessages_BodyCursorContinuesUnicodeMessage(t *testing.T) {
 		s.UserMessageCount = 2
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("body", 0, "αβγδεζηθικ"),
-		dbtest.UserMsg("body", 1, "next message"),
+		dialogueUserMsg("body", 0, "αβγδεζηθικ"),
+		dialogueUserMsg("body", 1, "next message"),
 	}))
 
 	_, first, err := ts.getMessages(t.Context(), nil, getMessagesIn{
@@ -590,7 +590,7 @@ func TestGetMessages_BodyCursorContinuesPastMaximumChunk(t *testing.T) {
 	ts, d := newTestToolset(t)
 	body := strings.Repeat("界", maxMaxCharsPerMessage+5)
 	dbtest.SeedSessionWithMessages(t, d, "oversized", "proj", []db.Message{
-		dbtest.UserMsg("oversized", 0, body),
+		dialogueUserMsg("oversized", 0, body),
 	}, dbtest.WithMessageCounts(1, 1))
 
 	_, first, err := ts.getMessages(t.Context(), nil, getMessagesIn{
@@ -615,7 +615,7 @@ func TestGetMessages_BodyCursorContinuesPastMaximumChunk(t *testing.T) {
 func TestGetMessages_BodyCursorRejectsChangedTranscript(t *testing.T) {
 	ts, d := newTestToolset(t)
 	dbtest.SeedSessionWithMessages(t, d, "body", "proj", []db.Message{
-		dbtest.UserMsg("body", 0, "abcdefghij"),
+		dialogueUserMsg("body", 0, "abcdefghij"),
 	}, dbtest.WithMessageCounts(1, 1))
 
 	_, first, err := ts.getMessages(t.Context(), nil, getMessagesIn{
@@ -624,7 +624,7 @@ func TestGetMessages_BodyCursorRejectsChangedTranscript(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, first.Messages[0].BodyCursor)
 	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "body", []db.Message{
-		dbtest.UserMsg("body", 0, "changed body"),
+		dialogueUserMsg("body", 0, "changed body"),
 	}))
 
 	_, _, err = ts.getMessages(t.Context(), nil, getMessagesIn{
@@ -648,12 +648,12 @@ func TestGetMessages_ExplicitSystemRoleStillFiltered(t *testing.T) {
 		s.UserMessageCount = 1
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "hello"),
+		dialogueUserMsg("s1", 0, "hello"),
 		{
 			SessionID: "s1", Ordinal: 1, Role: "system",
 			Content: "system noise", IsSystem: true, ContentLength: len("system noise"),
 		},
-		dbtest.AsstMsg("s1", 2, "short reply"),
+		dialogueAsstMsg("s1", 2, "short reply"),
 	}))
 
 	_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{
@@ -683,8 +683,8 @@ func TestSearchContent_SubstringMatch(t *testing.T) {
 		s.EndedAt = &ended
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "error code DEADBEEF here"),
-		dbtest.AsstMsg("s1", 1, "looking into it"),
+		dialogueUserMsg("s1", 0, "error code DEADBEEF here"),
+		dialogueAsstMsg("s1", 1, "looking into it"),
 	}))
 
 	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{
@@ -709,11 +709,11 @@ func TestSearchContent_ContextRedactsSecretByDefault(t *testing.T) {
 		ended := "2024-06-15T10:00:00Z"
 		s.EndedAt = &ended
 	})
-	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
+	require.NoError(t, d.InsertMessages(t.Context(), classifiedMessages([]db.Message{
 		dbtest.UserMsg("s1", 0, "my key is AKIA7QHWN2DKR4FYPLJM ok"),
 		dbtest.AsstMsg("s1", 1, "noted"),
 		dbtest.UserMsg("s1", 2, "DEADBEEF marks the match"),
-	}))
+	})))
 
 	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{
 		Pattern: "DEADBEEF", Mode: "substring", Context: 2,
@@ -780,7 +780,7 @@ func TestSearchContent_ExcludesOneShotByDefault(t *testing.T) {
 		s.UserMessageCount = 1
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("one", 0, "marker ZEBRA42"),
+		dialogueUserMsg("one", 0, "marker ZEBRA42"),
 	}))
 	// Multi-turn with the same marker; old ended_at keeps it inactive.
 	dbtest.SeedSession(t, d, "multi", "proj", func(s *db.Session) {
@@ -790,8 +790,8 @@ func TestSearchContent_ExcludesOneShotByDefault(t *testing.T) {
 		s.EndedAt = &ended
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("multi", 0, "marker ZEBRA42"),
-		dbtest.AsstMsg("multi", 1, "ok"),
+		dialogueUserMsg("multi", 0, "marker ZEBRA42"),
+		dialogueAsstMsg("multi", 1, "ok"),
 	}))
 
 	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{
@@ -831,9 +831,9 @@ func TestSearchContent_SessionClassOptIns(t *testing.T) {
 					s.IsAutomated = session.automated
 					s.EndedAt = new("2024-06-15T10:00:00Z")
 				})
-				messages := []db.Message{dbtest.UserMsg(session.id, 0, session.content)}
+				messages := []db.Message{dialogueUserMsg(session.id, 0, session.content)}
 				if session.users > 1 {
-					messages = append(messages, dbtest.AsstMsg(session.id, 1, "reply"))
+					messages = append(messages, dialogueAsstMsg(session.id, 1, "reply"))
 				}
 				require.NoError(t, d.InsertMessages(t.Context(), messages))
 			}
@@ -866,10 +866,10 @@ func TestSearchContent_OrdinalRangeSpansRun(t *testing.T) {
 		s.EndedAt = &ended
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("run1", 0, "the question"),
-		dbtest.AsstMsg("run1", 1, "RUNHIT step one"),
-		dbtest.AsstMsg("run1", 2, "RUNHIT step two"),
-		dbtest.UserMsg("run1", 3, "next question"),
+		dialogueUserMsg("run1", 0, "the question"),
+		dialogueAsstMsg("run1", 1, "RUNHIT step one"),
+		dialogueAsstMsg("run1", 2, "RUNHIT step two"),
+		dialogueUserMsg("run1", 3, "next question"),
 	}))
 
 	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{
@@ -899,7 +899,7 @@ func TestSearchContent_SidechainSubordinateRoundTrip(t *testing.T) {
 		s.EndedAt = &ended
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("side1", 0, "the question"),
+		dialogueUserMsg("side1", 0, "the question"),
 		{
 			SessionID: "side1", Ordinal: 1, Role: "assistant",
 			Content: "SIDEHIT step a", ContentLength: len("SIDEHIT step a"),
@@ -937,8 +937,8 @@ func TestSearchContent_SingleMessageOrdinalRangeAndOmittedFields(t *testing.T) {
 		s.EndedAt = &ended
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("solo1", 0, "SOLOHIT alone"),
-		dbtest.UserMsg("solo1", 1, "an unrelated follow-up"),
+		dialogueUserMsg("solo1", 0, "SOLOHIT alone"),
+		dialogueUserMsg("solo1", 1, "an unrelated follow-up"),
 	}))
 
 	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{
@@ -974,11 +974,11 @@ func TestGetMessages_DescAndFromAnchor(t *testing.T) {
 		s.UserMessageCount = 3
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "m0"),
-		dbtest.AsstMsg("s1", 1, "m1"),
-		dbtest.UserMsg("s1", 2, "m2"),
-		dbtest.AsstMsg("s1", 3, "m3"),
-		dbtest.UserMsg("s1", 4, "m4"),
+		dialogueUserMsg("s1", 0, "m0"),
+		dialogueAsstMsg("s1", 1, "m1"),
+		dialogueUserMsg("s1", 2, "m2"),
+		dialogueAsstMsg("s1", 3, "m3"),
+		dialogueUserMsg("s1", 4, "m4"),
 	}))
 
 	// desc with no anchor -> newest first.
@@ -1013,9 +1013,9 @@ func TestGetMessages_FromZeroAnchors(t *testing.T) {
 		s.UserMessageCount = 2
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "m0"),
-		dbtest.AsstMsg("s1", 1, "m1"),
-		dbtest.UserMsg("s1", 2, "m2"),
+		dialogueUserMsg("s1", 0, "m0"),
+		dialogueAsstMsg("s1", 1, "m1"),
+		dialogueUserMsg("s1", 2, "m2"),
 	}))
 
 	zero := 0
@@ -1039,7 +1039,7 @@ func TestGetMessages_ExcludesSystemPrefixedUserMessage(t *testing.T) {
 		s.UserMessageCount = 1
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "real question"),
+		dialogueUserMsg("s1", 0, "real question"),
 		// User role, is_system not set, but a system content prefix.
 		{
 			SessionID: "s1", Ordinal: 1, Role: "user",
@@ -1070,11 +1070,11 @@ func TestGetMessages_NextFromCursor(t *testing.T) {
 		s.EndedAt = &ended
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "m0"),
-		dbtest.AsstMsg("s1", 1, "m1"),
-		dbtest.UserMsg("s1", 2, "m2"),
-		dbtest.AsstMsg("s1", 3, "m3"),
-		dbtest.UserMsg("s1", 4, "m4"),
+		dialogueUserMsg("s1", 0, "m0"),
+		dialogueAsstMsg("s1", 1, "m1"),
+		dialogueUserMsg("s1", 2, "m2"),
+		dialogueAsstMsg("s1", 3, "m3"),
+		dialogueUserMsg("s1", 4, "m4"),
 	}))
 
 	// asc page 1: ordinals 0,1 -> next_from 2.
@@ -1130,12 +1130,12 @@ func TestGetMessages_NextFromUsesScannedNotVisible(t *testing.T) {
 		s.EndedAt = &ended
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "v0"),
+		dialogueUserMsg("s1", 0, "v0"),
 		{
 			SessionID: "s1", Ordinal: 1, Role: "system",
 			Content: "sys", IsSystem: true, ContentLength: 3,
 		},
-		dbtest.UserMsg("s1", 2, "v2"),
+		dialogueUserMsg("s1", 2, "v2"),
 	}))
 
 	// asc, limit 2: raw page = ordinals 0,1; ordinal 1 (system) is filtered.
@@ -1163,8 +1163,8 @@ func TestGetMessages_FilteredReconcilesWithMessageCount(t *testing.T) {
 	// is_system was backfilled, so the flag is unset). message_count is
 	// the row total, mirroring the sync engine's write-time derivation.
 	msgs := []db.Message{
-		dbtest.UserMsg("s1", 0, "hello"),
-		dbtest.AsstMsg("s1", 1, "hi"),
+		dialogueUserMsg("s1", 0, "hello"),
+		dialogueAsstMsg("s1", 1, "hi"),
 		{
 			SessionID: "s1", Ordinal: 2, Role: "system",
 			Content: "sys", IsSystem: true, ContentLength: 3,
@@ -1173,14 +1173,14 @@ func TestGetMessages_FilteredReconcilesWithMessageCount(t *testing.T) {
 			SessionID: "s1", Ordinal: 3, Role: "tool",
 			Content: "tool output", ContentLength: 11,
 		},
-		dbtest.UserMsg("s1", 4,
+		dialogueUserMsg("s1", 4,
 			"This session is being continued from a previous conversation"),
-		dbtest.AsstMsg("s1", 5, "more"),
+		dialogueAsstMsg("s1", 5, "more"),
 		{
 			SessionID: "s1", Ordinal: 6, Role: "tool",
 			Content: "tool output 2", ContentLength: 13,
 		},
-		dbtest.UserMsg("s1", 7, "bye"),
+		dialogueUserMsg("s1", 7, "bye"),
 	}
 	dbtest.SeedSessionWithMessages(t, d, "s1", "proj", msgs,
 		dbtest.WithMessageCounts(len(msgs), 3))
@@ -1238,7 +1238,7 @@ func TestSearchSessions_TimestamplessExcludedByCreatedAt(t *testing.T) {
 		s.UserMessageCount = 1
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("fresh", 0, "uniquesearchmarker here"),
+		dialogueUserMsg("fresh", 0, "uniquesearchmarker here"),
 	}))
 
 	_, out, err := ts.searchSessions(t.Context(), nil, searchSessionsIn{
@@ -1306,6 +1306,11 @@ func TestServer_EndToEnd(t *testing.T) {
 func TestServer_SearchContentIncludeOneShot(t *testing.T) {
 	var requests []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/messages") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"messages":[{"session_id":"one-shot","ordinal":0,"role":"user","content":"wire one-shot marker","dialogue_text":"wire one-shot marker"}]}`))
+			return
+		}
 		query := r.URL.Query()
 		requests = append(requests, r.URL.RawQuery)
 		assert.Equal(t, "/api/v1/search/content", r.URL.Path)
@@ -1420,6 +1425,15 @@ type fakeContentSearchService struct {
 	lastReq service.ContentSearchRequest
 	result  *service.ContentSearchResult
 	err     error
+}
+
+func (f *fakeContentSearchService) Messages(_ context.Context, id string, filter service.MessageFilter) (*service.MessageList, error) {
+	for _, match := range f.result.Matches {
+		if match.SessionID == id && filter.Around != nil && match.Ordinal == *filter.Around {
+			return &service.MessageList{Messages: []db.Message{dialogueUserMsg(id, match.Ordinal, match.Snippet)}}, nil
+		}
+	}
+	return &service.MessageList{}, nil
 }
 
 func (f *fakeContentSearchService) SearchContent(
@@ -1584,11 +1598,11 @@ func TestSearchContent_ContextThreading(t *testing.T) {
 				Role: "user", Ordinal: 10, Timestamp: "2024-06-15T09:00:00Z",
 				Snippet: "hit", Score: &score,
 				ContextBefore: []db.Message{
-					{Ordinal: 8, Role: "user", Content: "before msg"},
-					{Ordinal: 9, Role: "assistant", Content: long},
+					{Ordinal: 8, Role: "user", Content: "before msg", DialogueText: new("before msg")},
+					{Ordinal: 9, Role: "assistant", Content: long, DialogueText: new(long)},
 				},
 				ContextAfter: []db.Message{
-					{Ordinal: 11, Role: "assistant", Content: "after msg"},
+					{Ordinal: 11, Role: "assistant", Content: "after msg", DialogueText: new("after msg")},
 				},
 			}},
 		},
@@ -1625,9 +1639,9 @@ func TestGetMessages_AroundValidation(t *testing.T) {
 		s.UserMessageCount = 2
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "m0"),
-		dbtest.AsstMsg("s1", 1, "m1"),
-		dbtest.UserMsg("s1", 2, "m2"),
+		dialogueUserMsg("s1", 0, "m0"),
+		dialogueAsstMsg("s1", 1, "m1"),
+		dialogueUserMsg("s1", 2, "m2"),
 	}))
 
 	anchor, from, before := 1, 0, 2
@@ -1671,11 +1685,11 @@ func TestGetMessages_AroundNextFromIsLastPlusOne(t *testing.T) {
 		s.UserMessageCount = 3
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "m0"),
-		dbtest.AsstMsg("s1", 1, "m1"),
-		dbtest.UserMsg("s1", 2, "m2"),
-		dbtest.AsstMsg("s1", 3, "m3"),
-		dbtest.UserMsg("s1", 4, "m4"),
+		dialogueUserMsg("s1", 0, "m0"),
+		dialogueAsstMsg("s1", 1, "m1"),
+		dialogueUserMsg("s1", 2, "m2"),
+		dialogueAsstMsg("s1", 3, "m3"),
+		dialogueUserMsg("s1", 4, "m4"),
 	}))
 
 	anchor, before, after := 2, 1, 1
@@ -1705,11 +1719,11 @@ func TestGetMessages_AroundDefaultRolesExcludesTool(t *testing.T) {
 		s.UserMessageCount = 2
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "m0"),
+		dialogueUserMsg("s1", 0, "m0"),
 		{SessionID: "s1", Ordinal: 1, Role: "tool", Content: "tool dump", ContentLength: 9},
-		dbtest.AsstMsg("s1", 2, "m2"),
+		dialogueAsstMsg("s1", 2, "m2"),
 		{SessionID: "s1", Ordinal: 3, Role: "tool", Content: "tool dump 2", ContentLength: 11},
-		dbtest.UserMsg("s1", 4, "m4"),
+		dialogueUserMsg("s1", 4, "m4"),
 	}))
 
 	anchor := 2
@@ -1735,12 +1749,12 @@ func TestGetMessages_AroundSuppressesSystemAnchor(t *testing.T) {
 		s.UserMessageCount = 2
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "m0"),
+		dialogueUserMsg("s1", 0, "m0"),
 		{
 			SessionID: "s1", Ordinal: 1, Role: "system",
 			Content: "sys", IsSystem: true, ContentLength: 3,
 		},
-		dbtest.AsstMsg("s1", 2, "m2"),
+		dialogueAsstMsg("s1", 2, "m2"),
 	}))
 
 	anchor, before, after := 1, 1, 1
@@ -1766,9 +1780,9 @@ func TestGetMessages_AroundSuppressesToolRoleAnchor(t *testing.T) {
 		s.UserMessageCount = 2
 	})
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		dbtest.UserMsg("s1", 0, "m0"),
+		dialogueUserMsg("s1", 0, "m0"),
 		{SessionID: "s1", Ordinal: 1, Role: "tool", Content: "tool dump", ContentLength: 9},
-		dbtest.AsstMsg("s1", 2, "m2"),
+		dialogueAsstMsg("s1", 2, "m2"),
 	}))
 
 	anchor, before, after := 1, 1, 1
@@ -1796,7 +1810,7 @@ func TestGetMessages_AroundClampsOversizedWindow(t *testing.T) {
 		s.MessageCount = total
 		s.UserMessageCount = total
 	})
-	require.NoError(t, d.InsertMessages(t.Context(), dbtest.UserMessagesf("s1", total, "m%d")))
+	require.NoError(t, d.InsertMessages(t.Context(), classifiedMessages(dbtest.UserMessagesf("s1", total, "m%d"))))
 
 	anchor, huge := total/2, 1_000_000_000
 	_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{
@@ -1826,7 +1840,7 @@ func TestSearchSessions_DateRange(t *testing.T) {
 			s.EndedAt = new(f.end)
 			s.SessionName = new("datefilter name")
 		})
-		require.NoError(t, d.InsertMessages(t.Context(), []db.Message{dbtest.UserMsg(f.id, 0, "datefilter message")}))
+		require.NoError(t, d.InsertMessages(t.Context(), []db.Message{dialogueUserMsg(f.id, 0, "datefilter message")}))
 	}
 	srv := newServer(ServeOptions{Service: ts.svc, Now: ts.now})
 	st, ct := newInMemoryPair(t, srv)
