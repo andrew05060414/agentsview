@@ -425,8 +425,8 @@ func TestParseClaudeAIDetail_SelectedPath(t *testing.T) {
 }
 
 func TestParseClaudeAIDetail_LoneMessageWithoutParent(t *testing.T) {
-	// A conversation whose only message has a null/absent parent still imports;
-	// the same shape with another message left out of the chain stays an error.
+	// A null/absent parent is treated as the start of the selected path,
+	// whether or not other messages sit outside that path.
 	for _, parent := range []string{`,"parent_message_uuid":null`, ``} {
 		input := `{"uuid":"tree","created_at":"2026-03-01T10:00:00Z","updated_at":"2026-03-01T10:05:00Z","current_leaf_message_uuid":"q","chat_messages":[{"uuid":"q","sender":"human","text":"Question"` + parent + `}]}`
 		result, err := ParseClaudeAIDetail([]byte(input))
@@ -435,8 +435,27 @@ func TestParseClaudeAIDetail_LoneMessageWithoutParent(t *testing.T) {
 		assert.Equal(t, "Question", result.Messages[0].Content)
 	}
 	input := `{"uuid":"tree","created_at":"2026-03-01T10:00:00Z","updated_at":"2026-03-01T10:05:00Z","current_leaf_message_uuid":"q","chat_messages":[{"uuid":"q","sender":"human","text":"Question","parent_message_uuid":null},{"uuid":"other","parent_message_uuid":"q","sender":"assistant"}]}`
-	_, err := ParseClaudeAIDetail([]byte(input))
-	require.ErrorContains(t, err, "parent must be a string")
+	result, err := ParseClaudeAIDetail([]byte(input))
+	require.NoError(t, err)
+	require.Len(t, result.Messages, 1)
+	assert.Equal(t, "Question", result.Messages[0].Content)
+}
+
+func TestParseClaudeAIDetail_NullParentMidChain(t *testing.T) {
+	// The leaf's chain reaches a message whose parent is null/absent; the path
+	// starts there and the message above it (no longer reached) is left out.
+	const question = `{"uuid":"q","parent_message_uuid":"00000000-0000-4000-8000-000000000000","sender":"human","text":"Old"}`
+	for _, parent := range []string{`,"parent_message_uuid":null`, ``} {
+		input := `{"uuid":"tree","created_at":"2026-03-01T10:00:00Z","updated_at":"2026-03-01T10:05:00Z","current_leaf_message_uuid":"b","chat_messages":[` +
+			question + `,{"uuid":"a","sender":"human","text":"Restart"` + parent + `},{"uuid":"b","parent_message_uuid":"a","sender":"assistant","text":"Reply"}]}`
+		result, err := ParseClaudeAIDetail([]byte(input))
+		require.NoError(t, err)
+		var contents []string
+		for _, m := range result.Messages {
+			contents = append(contents, m.Content)
+		}
+		assert.Equal(t, []string{"Restart", "Reply"}, contents)
+	}
 }
 
 func TestParseClaudeAIDetail_InvalidTree(t *testing.T) {
@@ -449,8 +468,6 @@ func TestParseClaudeAIDetail_InvalidTree(t *testing.T) {
 		{"empty leaf", `"current_leaf_message_uuid":"",`, question + "," + answer, "expected current_leaf"},
 		{"root leaf", `"current_leaf_message_uuid":"00000000-0000-4000-8000-000000000000",`, question + "," + answer, "expected current_leaf"},
 		{"missing leaf message", `"current_leaf_message_uuid":"missing",`, question + "," + answer, "message missing is missing"},
-		{"null parent", `"current_leaf_message_uuid":"a",`, question + `,{"uuid":"a","parent_message_uuid":null}`, "parent must be a string"},
-		{"absent parent", `"current_leaf_message_uuid":"a",`, question + `,{"uuid":"a"}`, "parent must be a string"},
 		{"numeric parent", `"current_leaf_message_uuid":"a",`, question + `,{"uuid":"a","parent_message_uuid":42}`, "parent must be a string"},
 		{"orphan parent", `"current_leaf_message_uuid":"a",`, question + `,{"uuid":"a","parent_message_uuid":"missing"}`, "message missing is missing"},
 		{"cycle", `"current_leaf_message_uuid":"a",`, `{"uuid":"q","parent_message_uuid":"a"},` + answer, "cycle"},
