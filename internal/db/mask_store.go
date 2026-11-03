@@ -12,9 +12,11 @@ import (
 // sessionForStoragePolicy, toolCallResultUpdatesForStorage) is the single place
 // every write path passes through before text reaches SQLite. Masking there
 // means the stored rows, the full-text triggers, the vector mirror and the
-// PostgreSQL push all see placeholders and never the secret. Signals and secret
-// findings keep being computed from the unprojected messages, so a session that
-// leaked a secret is still flagged. Masking is deterministic and idempotent, so
+// PostgreSQL push all see placeholders and never the secret. Secret findings
+// and the leak count are computed from the masked text (MaskMessagesForStorage),
+// so they describe what the archive actually stores: a secret the masker
+// replaced is no longer a finding, and a session is only flagged for what
+// masking could not remove. Masking is deterministic and idempotent, so
 // comparing stored rows with freshly parsed (and projected) messages stays
 // stable: a second sync of an unchanged source writes nothing.
 
@@ -52,8 +54,8 @@ func maskSessionForStorage(s Session) Session {
 }
 
 // maskMessagesForStorage returns msgs with secrets masked. The input slice and
-// the tool-call slices it references are never modified (they are still used to
-// compute signals and findings); the result shares them when nothing changed.
+// the tool-call slices it references are never modified (callers still hold the
+// unmasked graph for signals); the result shares them when nothing changed.
 func maskMessagesForStorage(msgs []Message) []Message {
 	m := mask.Default()
 	if m == nil || len(msgs) == 0 {
@@ -216,7 +218,8 @@ func maskRecallEntryForStorage(e RecallEntry) RecallEntry {
 	return e
 }
 
-// MaskMessagesForStorage applies the write boundary's secret masking to msgs.
-// Callers that compare freshly parsed messages with stored rows use it so both
-// sides are in stored form.
+// MaskMessagesForStorage applies the write boundary's secret masking to msgs
+// (msgs itself comes back when masking is off or nothing matched). Callers that
+// compare freshly parsed messages with stored rows, or derive records from the
+// stored text such as secret findings, use it so both sides are in stored form.
 func MaskMessagesForStorage(msgs []Message) []Message { return maskMessagesForStorage(msgs) }

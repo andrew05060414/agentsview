@@ -74,6 +74,10 @@ type MaskFindingsReport struct {
 	Rows            int `json:"rows"`
 	Rewritten       int `json:"rewritten"`
 	UnresolvedBlank int `json:"unresolved_set_to_generic"`
+	// Neutralized counts findings whose exact value the masker replaced. They
+	// are deleted (the stored text no longer holds the secret) and the leak
+	// count of their sessions is recomputed.
+	Neutralized int `json:"neutralized_removed"`
 }
 
 // MaskStats mirrors the numbers of the 2026-10-27 scan report: sessions,
@@ -780,7 +784,7 @@ func (db *DB) MaskBackfill(ctx context.Context, opts MaskBackfillOptions) (*Mask
 		if err := db.applyFindingRewrite(ctx, findingUpdates); err != nil {
 			return rep, err
 		}
-		logf("secret_findings rewritten: %d", len(findingUpdates))
+		logf("secret_findings rewritten: %d (neutralized and removed: %d)", len(findingUpdates), rep.Findings.Neutralized)
 	}
 	rep.Seconds = time.Since(start).Seconds()
 	return rep, nil
@@ -864,18 +868,25 @@ func (db *DB) applyMaskBatch(ctx context.Context, t maskTable, rows []maskedRow,
 
 type findingUpdate struct {
 	id         int64
+	session    string
+	definite   bool
+	neutralize bool // the masker replaced the finding's exact value: delete it
 	redacted   string
 	start, end int
 }
 
 // planFindingRewrite computes, for each secret_findings row, the placeholder of
-// the original span and its new offsets in the masked text. Rows whose source
-// text no longer resolves get the generic "{{SECRET_unknown}}" form; either way
-// the stored prefix/suffix of the old redacted form disappears.
+// the original span and its new offsets in the masked text. A finding whose
+// exact value the masker replaces is neutralized: the stored text no longer
+// holds it, so it is planned for deletion (new text is scanned from the masked
+// form and never records such findings). Rows whose source text no longer
+// resolves get the generic "{{SECRET_unknown}}" form and stay; either way the
+// stored prefix/suffix of the old redacted form disappears.
 func (db *DB) planFindingRewrite(ctx context.Context, m *mask.Masker) ([]findingUpdate, MaskFindingsReport, error) {
 	var rep MaskFindingsReport
 	rd := db.Reader()
-	rs, err := rd.Query(ctx, `SELECT id, session_id, location_kind, message_ordinal, call_index, event_index, match_start, match_end
+	rs, err := rd.Query(ctx, `SELECT id, session_id, location_kind, message_ordinal, call_index, event_index, match_start, match_end,
+	                                 confidence = 'definite'
 	                          FROM secret_findings ORDER BY id`)
 	if err != nil {
 		return nil, rep, err
@@ -886,11 +897,12 @@ func (db *DB) planFindingRewrite(ctx context.Context, m *mask.Masker) ([]finding
 		ord           int64
 		call, event   sql.NullInt64
 		mstart, mend  int
+		definite      bool
 	}
 	var all []frow
 	for rs.Next() {
 		var f frow
-		if err := rs.Scan(&f.id, &f.session, &f.kind, &f.ord, &f.call, &f.event, &f.mstart, &f.mend); err != nil {
+		if err := rs.Scan(&f.id, &f.session, &f.kind, &f.ord, &f.call, &f.event, &f.mstart, &f.mend, &f.definite); err != nil {
 			_ = rs.Close()
 			return nil, rep, err
 		}
@@ -918,13 +930,15 @@ func (db *DB) planFindingRewrite(ctx context.Context, m *mask.Masker) ([]finding
 		default:
 			qerr = sql.ErrNoRows
 		}
-		u := findingUpdate{id: f.id, redacted: mask.PlaceholderPrefix + "unknown" + mask.PlaceholderSuffix, start: f.mstart, end: f.mend}
+		u := findingUpdate{id: f.id, session: f.session, definite: f.definite, redacted: mask.PlaceholderPrefix + "unknown" + mask.PlaceholderSuffix, start: f.mstart, end: f.mend}
 		if qerr == nil && text.Valid && f.mstart >= 0 && f.mend <= len(text.String) && f.mstart < f.mend {
 			span := text.String[f.mstart:f.mend]
 			ph := mask.Placeholder(span)
 			masked := m.Text(text.String)
 			if i := strings.Index(masked, ph); i >= 0 {
 				u.start, u.end = i, i+len(ph)
+				u.neutralize = true
+				rep.Neutralized++
 			}
 			u.redacted = ph
 			rep.Rewritten++
@@ -941,9 +955,33 @@ func (db *DB) applyFindingRewrite(ctx context.Context, ups []findingUpdate) erro
 		return nil
 	}
 	return db.Update(ctx, func(tx *sql.Tx) error {
+		touched := map[string]bool{}
 		for _, u := range ups {
+			if u.neutralize {
+				if _, err := tx.ExecContext(ctx, `DELETE FROM secret_findings WHERE id = ?`, u.id); err != nil {
+					return err
+				}
+				if u.definite {
+					touched[u.session] = true
+				}
+				continue
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE secret_findings SET redacted_match = ?, match_start = ?, match_end = ? WHERE id = ?`,
 				u.redacted, u.start, u.end, u.id); err != nil {
+				return err
+			}
+		}
+		// The leak count is the number of definite findings. Recompute it for
+		// sessions that lost some, and bump local_modified_at like any other
+		// finding rewrite so recall discovery and the push see the session.
+		for id := range touched {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE sessions
+				SET secret_leak_count = (
+				        SELECT COUNT(*) FROM secret_findings
+				        WHERE session_id = ? AND confidence = 'definite'),
+				    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+				WHERE id = ?`, id, id); err != nil {
 				return err
 			}
 		}

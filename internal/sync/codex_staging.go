@@ -578,11 +578,8 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
 		// deduplication and result_content_length parity without storing bytes.
 		ev.Content = ""
 	}
-	// Findings come from the unmasked content (a session that leaked a secret
-	// stays flagged), while the scratch rows that are later published into
-	// tool_result_events, and every summary derived from them, carry the
-	// masked text.
-	unmaskedContent := ev.Content
+	// The scratch rows that are later published into tool_result_events, and
+	// every summary and finding derived from them, carry the masked text.
 	if blanked == 0 {
 		if masked := db.MaskText(ev.Content); masked != ev.Content {
 			if contentLength == len(ev.Content) {
@@ -617,11 +614,7 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
 	s.statusByCallKey[stageKey] = ev.Status
 	eventIndex := int(s.eventByCallKey[stageKey])
 	s.eventByCallKey[stageKey]++
-	findingContent := storedContent
-	if blanked == 0 {
-		findingContent = unmaskedContent
-	}
-	s.addEventFindings(stageKey, eventIndex, findingContent)
+	s.addEventFindings(stageKey, eventIndex, storedContent)
 	if blanked == 0 && eventIndex == 0 {
 		if s.singleSummaryLengths == nil {
 			s.singleSummaryLengths = make(map[string]int)

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -62,6 +63,7 @@ func TestMaskBackfillMasksStoredRows(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, d.MaskRebuildIndexes(ctx))
 	assert.Equal(t, 1, rep.Findings.Rows)
+	assert.Equal(t, 1, rep.Findings.Neutralized)
 
 	phSecret, phBare, phGoogle := mask.Placeholder(secret), mask.Placeholder(bare), mask.Placeholder(fakeGoogleKey())
 	got, err := d.GetAllMessages(ctx, "bf1")
@@ -90,11 +92,13 @@ func TestMaskBackfillMasksStoredRows(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "debug "+phGoogle, *sess.FirstMessage)
 
-	// Findings keep no prefix or suffix of the key.
+	// The finding's exact value was masked, so it no longer describes the stored
+	// text: it is removed and the session stops counting as a leak, which lets
+	// it back into recall extraction.
 	fs, err := d.SessionSecretFindings(ctx, "bf1")
 	require.NoError(t, err)
-	require.Len(t, fs, 1)
-	assert.Equal(t, phSecret, fs[0].RedactedMatch)
+	assert.Empty(t, fs)
+	assert.Equal(t, 0, sess.SecretLeakCount)
 
 	// Derived bookkeeping that copies text is masked too.
 	state, err := d.GetSyncState(ctx, "last_push_boundary_state:default")
@@ -129,4 +133,76 @@ func TestMaskBackfillMasksStoredRows(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, rep2.Final.Spans)
 	assert.Empty(t, rep2.Updates)
+}
+
+// A finding the masker cannot tie to stored text is not proven neutralized, so
+// the backfill keeps it (in generic placeholder form) and the session stays
+// flagged.
+func TestMaskBackfillKeepsUnresolvedFindings(t *testing.T) {
+	disableIngestMasking(t) // store plaintext on purpose
+	d := testDB(t)
+	ctx := t.Context()
+	insertSession(t, d, "bf2", "p", func(s *Session) { s.MessageCount = 1 })
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "bf2",
+		[]Message{userMsg("bf2", 0, "nothing sensitive here")}))
+	require.NoError(t, d.ReplaceSessionSecretFindings(ctx, "bf2", []SecretFinding{{
+		SessionID: "bf2", RuleName: "anthropic-key", Confidence: "definite", LocationKind: "message",
+		MessageOrdinal: 0, MatchStart: 900, MatchEnd: 950,
+		RedactedMatch: "sk-ant-...Jk0", RulesVersion: "t",
+	}}, 1, "t"))
+
+	rules, err := mask.LoadRules()
+	require.NoError(t, err)
+	rep, err := d.MaskBackfill(ctx, MaskBackfillOptions{Rules: rules, Apply: true, Workers: 2})
+	require.NoError(t, err)
+	assert.Equal(t, 1, rep.Findings.Rows)
+	assert.Zero(t, rep.Findings.Neutralized)
+	assert.Equal(t, 1, rep.Findings.UnresolvedBlank)
+
+	fs, err := d.SessionSecretFindings(ctx, "bf2")
+	require.NoError(t, err)
+	require.Len(t, fs, 1)
+	assert.Equal(t, mask.PlaceholderPrefix+"unknown"+mask.PlaceholderSuffix, fs[0].RedactedMatch)
+	sess, err := d.GetSession(ctx, "bf2")
+	require.NoError(t, err)
+	assert.Equal(t, 1, sess.SecretLeakCount)
+}
+
+// Recall extraction refuses sessions with recorded leaks. A leaked session whose
+// secrets the backfill masks must become eligible, and stay out until then.
+func TestMaskBackfillMakesLeakedSessionExtractable(t *testing.T) {
+	disableIngestMasking(t) // store plaintext on purpose
+	d := testDB(t)
+	ctx := t.Context()
+	secret := fakeAnthropicKey()
+	seedExtractCandidate(t, d, "bf3", 2*time.Hour, nil)
+	text := "my key is " + secret
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "bf3", []Message{userMsg("bf3", 0, text)}))
+	require.NoError(t, d.ReplaceSessionSecretFindings(ctx, "bf3", []SecretFinding{{
+		SessionID: "bf3", RuleName: "anthropic-key", Confidence: "definite", LocationKind: "message",
+		MessageOrdinal: 0, MatchStart: len("my key is "), MatchEnd: len(text),
+		RedactedMatch: "sk-ant-...Jk0", RulesVersion: "rules-v1",
+	}}, 1, "rules-v1"))
+	_, err := d.EnsureExtractGeneration(ctx, ExtractGeneration{
+		Fingerprint: "fp-a", Model: "m", Segmenter: "turns-v1",
+	})
+	require.NoError(t, err)
+	q := ExtractCandidateQuery{
+		Fingerprint:  "fp-a",
+		QuietCutoff:  time.Now().Add(-30 * time.Minute),
+		ScanVersions: []string{"rules-v1"},
+	}
+	ids, err := d.ExtractCandidates(ctx, q)
+	require.NoError(t, err)
+	require.NotContains(t, ids, "bf3", "a session with a recorded leak is excluded")
+
+	rules, err := mask.LoadRules()
+	require.NoError(t, err)
+	rep, err := d.MaskBackfill(ctx, MaskBackfillOptions{Rules: rules, Apply: true, Workers: 2})
+	require.NoError(t, err)
+	require.Equal(t, 1, rep.Findings.Neutralized)
+
+	ids, err = d.ExtractCandidates(ctx, q)
+	require.NoError(t, err)
+	assert.Contains(t, ids, "bf3", "the masked session is eligible again")
 }

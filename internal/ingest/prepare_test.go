@@ -11,6 +11,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/friction"
 	"go.kenn.io/agentsview/internal/ingest"
+	"go.kenn.io/agentsview/internal/mask"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/signals"
 )
@@ -197,6 +198,9 @@ func TestFinalizeKeepsUsageWithoutMessagesAndStampsFinalID(t *testing.T) {
 }
 
 func TestFinalizeProjectsStoredContentBeforeSecretFindings(t *testing.T) {
+	// The fixture key must stay detectable in the full-content control, so the
+	// storage masker (which would remove it first) is off here.
+	t.Cleanup(mask.SetDefaultForTest(nil))
 	parsed := parser.ParseResult{
 		Session: parser.ParsedSession{
 			ID: "session-1", Agent: parser.AgentClaude,

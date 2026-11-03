@@ -61,12 +61,10 @@ func TestSyncMasksSecretsAtIngestion(t *testing.T) {
 
 	findings, err := database.SessionSecretFindings(t.Context(), ids[0])
 	require.NoError(t, err)
-	require.NotEmpty(t, findings, "a masked session still records that it leaked a secret")
-	for _, f := range findings {
-		assert.Contains(t,
-			[]string{mask.Placeholder(awsKey), mask.Placeholder(googleKey)},
-			f.RedactedMatch, "finding %s keeps no fragment of the key", f.RuleName)
-	}
+	assert.Empty(t, findings,
+		"findings describe the stored text, which no longer holds the secrets")
+	assert.Zero(t, sess.SecretLeakCount,
+		"a fully masked session is not flagged, so recall extraction can use it")
 
 	again := engine.SyncAll(t.Context(), nil)
 	assert.Zero(t, again.Synced, "an unchanged source must not be rewritten")

@@ -86,8 +86,8 @@ func (db *DB) sessionForStorage(session Session) Session {
 
 // sessionAndMessagesForStorage is the write-boundary projection: the policy
 // projection followed by secret masking. ProjectSessionForStoragePolicy, which
-// callers use before they compute signals and secret findings, deliberately
-// stays unmasked so a session that leaked a secret is still flagged.
+// callers use before they compute signals, stays unmasked; secret findings are
+// scanned from MaskMessagesForStorage so they describe the stored text.
 func (db *DB) sessionAndMessagesForStorage(
 	session Session, messages []Message,
 ) (Session, []Message) {

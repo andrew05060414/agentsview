@@ -248,11 +248,17 @@ func ComputeFinalStreak(rows []signals.ToolCallRow) int {
 	return streak
 }
 
-// ScanSecretsFromMessages detects secrets in normalized retained content.
+// ScanSecretsFromMessages detects secrets in normalized retained content as
+// the archive will store it. Text the storage projection masks is scanned in
+// its masked form, so a secret that masking removes is not a finding (it would
+// otherwise keep the session out of recall extraction although the stored copy
+// is clean) and match offsets address the stored rows. With masking off this
+// scans the content unchanged.
 func ScanSecretsFromMessages(
 	_ db.Session, messages []db.Message,
 	scan func(string) []secrets.Match,
 ) (findings []db.SecretFinding, definiteCount int) {
+	messages = db.MaskMessagesForStorage(messages)
 	findings = make([]db.SecretFinding, 0)
 	add := func(
 		sessionID, location string, ordinal int, callIndex, eventIndex *int,
