@@ -138,11 +138,16 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 					continue
 				}
 				var leaf string
-				if err := json.Unmarshal(marker.CurrentLeaf, &leaf); err != nil || leaf == "" && string(marker.CurrentLeaf) != "null" {
-					log.Printf("claude-ai sync: claude-ai:%s has an unusable current_leaf_message_uuid (%d bytes: %.40s)", marker.UUID, len(marker.CurrentLeaf), marker.CurrentLeaf)
-					stats.Errors++
-					cb.progress(stats)
-					continue
+				// An absent current_leaf_message_uuid is treated like null (a chat with
+				// no selected message yet) and skipped below. Claude.ai lists such chats;
+				// on 2026-11-03 five of them failed every Chrome sync on Arknights.
+				if len(marker.CurrentLeaf) > 0 {
+					if err := json.Unmarshal(marker.CurrentLeaf, &leaf); err != nil || leaf == "" && string(marker.CurrentLeaf) != "null" {
+						log.Printf("claude-ai sync: claude-ai:%s has an unusable current_leaf_message_uuid %.40s", marker.UUID, marker.CurrentLeaf)
+						stats.Errors++
+						cb.progress(stats)
+						continue
+					}
 				}
 				if leaf == "" || leaf == "00000000-0000-4000-8000-000000000000" {
 					runner.failedLast = false
