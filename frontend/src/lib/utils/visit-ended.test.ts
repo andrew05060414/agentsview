@@ -1,37 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import {
-  SERVER_URL_KEY,
-  SERVER_URL_REVISION_KEY,
-  setAuthToken,
-  setServerUrl,
-} from "../api/runtime.js";
+import type { BrowserTelemetryReporter } from "@kenn-io/kit-ui/utils/browser-telemetry";
 import { setupVisitEndedReporting } from "./visit-ended.js";
-
-const REMOTE = "https://example.com/remote";
-const OTHER_REMOTE = "https://example.org/remote";
-const LOCAL_EVENTS_URL = "/agentsview/api/v1/telemetry/events";
-
-function eventsUrl(server: string): string {
-  return server ? `${server}/api/v1/telemetry/events` : LOCAL_EVENTS_URL;
-}
-
-function storeServer(server: string): void {
-  if (server) localStorage.setItem(SERVER_URL_KEY, server);
-  else localStorage.removeItem(SERVER_URL_KEY);
-  localStorage.setItem(SERVER_URL_REVISION_KEY, String(Math.random()));
-}
-
-function storageEventFromOtherTab(key: string | null, newValue: string | null): void {
-  window.dispatchEvent(new StorageEvent("storage", { key, newValue, storageArea: localStorage }));
-}
+import { setupTelemetryReporting } from "./telemetry.js";
 
 describe("visit ended reporting", () => {
   let now: number;
   let hidden: boolean;
   let stop: (() => void) | undefined;
-  let base: HTMLBaseElement;
   const fetch = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
-    async () => new Response(null, { status: 202 }),
+    async () => new Response('{"status":"queued"}', { status: 202 }),
   );
   const advance = (ms: number) => {
     now += ms;
@@ -41,12 +18,19 @@ describe("visit ended reporting", () => {
     hidden = value;
     document.dispatchEvent(new Event("visibilitychange"));
   };
-  const buckets = () =>
-    fetch.mock.calls.map(([, init]) => JSON.parse(init?.body as string).properties.duration_bucket);
+  const buckets = async () => {
+    await vi.advanceTimersByTimeAsync(0);
+    return fetch.mock.calls
+      .map(([, init]) => JSON.parse(init?.body as string))
+      .filter((event) => event.event === "visit_ended")
+      .map((event) => event.properties.duration_bucket);
+  };
   const close = () => window.dispatchEvent(new Event("pagehide"));
   const reopen = () => window.dispatchEvent(new Event("pageshow"));
-  const lastAuthorization = () =>
-    new Headers(fetch.mock.lastCall?.[1]?.headers).get("Authorization");
+  const start = async () => {
+    stop = setupTelemetryReporting();
+    await vi.advanceTimersByTimeAsync(0);
+  };
 
   beforeEach(() => {
     now = 0;
@@ -54,15 +38,12 @@ describe("visit ended reporting", () => {
     fetch.mockClear();
     vi.stubGlobal("fetch", fetch);
     vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-02T12:00:00Z"));
     vi.spyOn(performance, "now").mockImplementation(() => now);
     vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
-    base = document.createElement("base");
-    base.href = `${window.location.origin}/agentsview/`;
-    document.head.append(base);
   });
   afterEach(() => {
     stop?.();
-    base.remove();
     vi.restoreAllMocks();
     vi.useRealTimers();
     vi.unstubAllGlobals();
@@ -76,14 +57,14 @@ describe("visit ended reporting", () => {
     [300_000, "5_to_30m"],
     [1_799_999, "5_to_30m"],
     [1_800_000, "over_30m"],
-  ])("reports %i visible milliseconds as %s once on close", (ms, bucket) => {
-    stop = setupVisitEndedReporting();
+  ])("reports %i visible milliseconds as %s once on close", async (ms, bucket) => {
+    await start();
     advance(ms);
     close();
     close();
-    expect(buckets()).toEqual([bucket]);
+    expect(await buckets()).toEqual([bucket]);
     expect(fetch).toHaveBeenCalledWith(
-      LOCAL_EVENTS_URL,
+      expect.any(String),
       expect.objectContaining({
         keepalive: true,
         body: JSON.stringify({
@@ -94,237 +75,144 @@ describe("visit ended reporting", () => {
     );
   });
 
-  it("delivers and resets visits when AbortSignal.timeout is unavailable", () => {
-    vi.stubGlobal("AbortSignal", { timeout: undefined });
-    stop = setupVisitEndedReporting();
-    advance(120_000);
-    close();
-    close();
-    reopen();
-    advance(30_000);
-    close();
-    expect(buckets()).toEqual(["1_to_5m", "under_1m"]);
-    expect(fetch.mock.calls.every(([, init]) => init?.keepalive)).toBe(true);
-  });
-
-  it("keeps the replacement visit after queued server changes from a cached page", () => {
-    stop = setupVisitEndedReporting();
-    advance(120_000);
-    close();
-    storeServer(REMOTE);
-    storeServer("");
-    reopen();
-    storageEventFromOtherTab(SERVER_URL_KEY, REMOTE);
-    storageEventFromOtherTab(SERVER_URL_KEY, null);
-    advance(30_000);
-    close();
-    expect(buckets()).toEqual(["1_to_5m", "under_1m"]);
-  });
-
-  it("sums twenty visible minutes across short tab switches", () => {
-    stop = setupVisitEndedReporting();
+  it("sums twenty visible minutes across short tab switches", async () => {
+    await start();
     for (let i = 0; i < 20; i++) {
       advance(60_000);
       visibility(true);
       advance(300_000);
       visibility(false);
     }
-    expect(buckets()).toEqual([]);
+    expect(await buckets()).toEqual([]);
     close();
-    expect(buckets()).toEqual(["5_to_30m"]);
+    expect(await buckets()).toEqual(["5_to_30m"]);
   });
 
-  it.each([
-    { change: "connecting in this tab", from: "", to: REMOTE, run: () => setServerUrl(REMOTE) },
-    { change: "disconnecting in this tab", from: REMOTE, to: "", run: () => setServerUrl("") },
-    {
-      change: "a round trip to remote in this tab",
-      from: "",
-      to: "",
-      run: () => {
-        setServerUrl(REMOTE);
-        setServerUrl("");
-      },
-    },
-    {
-      change: "a round trip to local in this tab",
-      from: REMOTE,
-      to: REMOTE,
-      run: () => {
-        setServerUrl("");
-        setServerUrl(REMOTE);
-      },
-    },
-    {
-      change: "a switch in another tab",
-      from: REMOTE,
-      to: OTHER_REMOTE,
-      run: () => {
-        storeServer(OTHER_REMOTE);
-        storageEventFromOtherTab(SERVER_URL_KEY, OTHER_REMOTE);
-      },
-    },
-    {
-      change: "a round trip in another tab",
-      from: REMOTE,
-      to: REMOTE,
-      run: () => {
-        storeServer("");
-        storeServer(REMOTE);
-        storageEventFromOtherTab(SERVER_URL_KEY, null);
-        storageEventFromOtherTab(SERVER_URL_KEY, REMOTE);
-      },
-    },
-    {
-      change: "a clear and restore in another tab",
-      from: REMOTE,
-      to: REMOTE,
-      run: () => {
-        localStorage.clear();
-        storeServer(REMOTE);
-        storageEventFromOtherTab(null, null);
-        storageEventFromOtherTab(SERVER_URL_KEY, REMOTE);
-      },
-    },
-    {
-      change: "a clear with no storage event",
-      from: REMOTE,
-      to: "",
-      run: () => localStorage.clear(),
-    },
-  ])(
-    "discards a visit across $change and reports the next visit to the current server",
-    ({ from, to, run }) => {
-      setServerUrl(from);
-      setAuthToken("old-token");
-      stop = setupVisitEndedReporting();
-      advance(120_000);
-      run();
-      close();
-      expect(fetch).not.toHaveBeenCalled();
-
-      reopen();
-      setAuthToken("current-token");
-      advance(30_000);
-      close();
-      expect(buckets()).toEqual(["under_1m"]);
-      expect(fetch.mock.lastCall?.[0]).toBe(eventsUrl(to));
-      expect(lastAuthorization()).toBe("Bearer current-token");
-    },
-  );
-
-  it.each([
-    { change: "a clear while local", run: () => storageEventFromOtherTab(null, null) },
-    { change: "an unrelated key", run: () => storageEventFromOtherTab("other-key", REMOTE) },
-    {
-      change: "a session storage change",
-      run: () =>
-        window.dispatchEvent(
-          new StorageEvent("storage", {
-            key: SERVER_URL_KEY,
-            newValue: REMOTE,
-            storageArea: sessionStorage,
-          }),
-        ),
-    },
-    { change: "reselecting the same server", run: () => setServerUrl("") },
-  ])("keeps a visit across $change", ({ run }) => {
-    stop = setupVisitEndedReporting();
-    advance(120_000);
-    run();
-    close();
-    expect(buckets()).toEqual(["1_to_5m"]);
-  });
-
-  it.each([
-    {
-      start: "after hidden expiry",
-      startHidden: false,
-      endFirstVisit: () => {
-        advance(120_000);
-        visibility(true);
-        advance(1_800_000);
-      },
-      expected: ["1_to_5m", "under_1m"],
-    },
-    {
-      start: "after a cached page returns",
-      startHidden: false,
-      endFirstVisit: () => {
-        advance(120_000);
-        close();
-      },
-      expected: ["1_to_5m", "under_1m"],
-    },
-    {
-      start: "for an initially hidden page",
-      startHidden: true,
-      endFirstVisit: () => {},
-      expected: ["under_1m"],
-    },
-  ])(
-    "captures the server at the next visible start $start",
-    ({ startHidden, endFirstVisit, expected }) => {
-      hidden = startHidden;
-      stop = setupVisitEndedReporting();
-      endFirstVisit();
-      setServerUrl(REMOTE);
-      setAuthToken("current-token");
-      visibility(false);
-      reopen();
-      advance(30_000);
-      close();
-      expect(buckets()).toEqual(expected);
-      expect(fetch.mock.lastCall?.[0]).toBe(eventsUrl(REMOTE));
-      expect(lastAuthorization()).toBe("Bearer current-token");
-    },
-  );
-
-  it("ends a visit after thirty hidden minutes and starts a fresh one on return", () => {
-    stop = setupVisitEndedReporting();
+  it("ends a visit after thirty hidden minutes and starts a fresh one on return", async () => {
+    await start();
     advance(120_000);
     visibility(true);
     advance(1_799_999);
-    expect(buckets()).toEqual([]);
+    expect(await buckets()).toEqual([]);
     advance(1);
-    expect(buckets()).toEqual(["1_to_5m"]);
+    expect(await buckets()).toEqual(["1_to_5m"]);
     visibility(false);
     advance(30_000);
     close();
-    expect(buckets()).toEqual(["1_to_5m", "under_1m"]);
+    expect(await buckets()).toEqual(["1_to_5m", "under_1m"]);
   });
 
-  it("ends a visit on return when a suspended hidden timer never fired", () => {
-    stop = setupVisitEndedReporting();
+  it("ends a visit on return when a suspended hidden timer never fired", async () => {
+    await start();
     advance(120_000);
     visibility(true);
     now += 2_400_000;
     vi.setSystemTime(Date.now() + 2_400_000);
-    expect(buckets()).toEqual([]);
+    expect(await buckets()).toEqual([]);
     visibility(false);
     advance(30_000);
     close();
-    expect(buckets()).toEqual(["1_to_5m", "under_1m"]);
+    expect(await buckets()).toEqual(["1_to_5m", "under_1m"]);
   });
 
-  it("sends nothing for hidden-only pages", () => {
+  it("sends nothing for hidden-only pages", async () => {
     hidden = true;
-    stop = setupVisitEndedReporting();
+    await start();
     advance(2_400_000);
     close();
-    expect(buckets()).toEqual([]);
+    expect(await buckets()).toEqual([]);
   });
 
   it("drops pending time and removes timers and listeners on cleanup", () => {
-    stop = setupVisitEndedReporting();
+    const reportVisit = vi.fn();
+    const unsubscribe = vi.fn();
+    let quiet!: Parameters<BrowserTelemetryReporter["onQuietChange"]>[0];
+    const reporter: BrowserTelemetryReporter = {
+      reportVisit,
+      stop: vi.fn(),
+      disable: vi.fn(),
+      reportScreen: vi.fn(),
+      reportDaily: vi.fn(),
+      onQuietChange(listener) {
+        quiet = listener;
+        return unsubscribe;
+      },
+    };
+    stop = setupVisitEndedReporting(reporter);
+    quiet(false, "enabled");
     advance(120_000);
     visibility(true);
     stop();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
     advance(1_800_000);
     visibility(false);
     reopen();
     advance(120_000);
     close();
-    expect(buckets()).toEqual([]);
+    expect(reportVisit).not.toHaveBeenCalled();
+  });
+  it.each([
+    ["initial", "queued"],
+    ["initial", "disabled"],
+    ["daily", "queued"],
+    ["daily", "disabled"],
+  ])("keeps visit time through a pending %s check with a %s receipt", async (check, status) => {
+    if (check === "daily") {
+      await start();
+      advance(120_000);
+    }
+    let reply!: (response: Response) => void;
+    fetch.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          reply = resolve;
+        }),
+    );
+    if (check === "initial") {
+      stop = setupTelemetryReporting();
+      advance(5_000);
+    } else {
+      vi.setSystemTime(new Date("2026-10-03T00:00:00Z"));
+      window.dispatchEvent(new Event("focus"));
+      advance(5_000);
+    }
+    expect(await buckets()).toEqual([]);
+    reply(new Response(JSON.stringify({ status }), { status: 202 }));
+    await vi.advanceTimersByTimeAsync(0);
+    close();
+    expect(await buckets()).toEqual(
+      status === "queued" ? [check === "initial" ? "under_1m" : "1_to_5m"] : [],
+    );
+    if (status === "disabled") {
+      const timers = vi.getTimerCount();
+      visibility(true);
+      expect(vi.getTimerCount()).toBe(timers);
+    }
+  });
+
+  it("stops and resets visit tracking when a check is unauthorized", async () => {
+    await start();
+    advance(120_000);
+    fetch.mockImplementation(async () => new Response(null, { status: 401 }));
+    vi.setSystemTime(new Date("2026-10-03T00:00:00Z"));
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    visibility(true);
+    expect(vi.getTimerCount()).toBe(0);
+    visibility(false);
+    advance(120_000);
+    close();
+    reopen();
+    window.dispatchEvent(new Event("focus"));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    fetch.mockImplementation(async () => new Response('{"status":"queued"}', { status: 202 }));
+    vi.setSystemTime(new Date("2026-10-04T00:00:00Z"));
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(0);
+    advance(30_000);
+    close();
+    expect(await buckets()).toEqual(["under_1m"]);
   });
 });

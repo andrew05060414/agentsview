@@ -1,6 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": ["config:recommended", "schedule:weekly"],
+  "timezone": "America/New_York",
   "dependencyDashboard": true,
   "enabledManagers": ["github-actions", "gomod", "npm"],
   "osvVulnerabilityAlerts": true,
@@ -8,9 +9,13 @@
   "minimumReleaseAgeBehaviour": "timestamp-required",
   "prCreation": "not-pending",
   "internalChecksFilter": "strict",
+  "constraints": {
+    "ghActionsLock": "v0.3.0"
+  },
   "vulnerabilityAlerts": {
     "minimumReleaseAge": null,
-    "prCreation": "immediate"
+    "prCreation": "immediate",
+    "schedule": ["at any time"]
   },
   "packageRules": [
     {
@@ -35,10 +40,15 @@
     },
     {
       "description": [
-        "Update Vite+ and its Vite alias together. Review bundled tool pins with each toolchain upgrade."
+        "Update Vite+, its Vite alias, and Vitest together so npm can regenerate the lockfile."
       ],
       "matchManagers": ["npm"],
-      "matchPackageNames": ["vite-plus", "@voidzero-dev/vite-plus-core"],
+      "matchPackageNames": [
+        "vite-plus",
+        "@voidzero-dev/vite-plus-core",
+        "vitest",
+        "@vitest/**"
+      ],
       "groupName": "Vite+ toolchain",
       "groupSlug": "vite-plus-toolchain"
     },
@@ -51,8 +61,6 @@
         "vite",
         "rolldown",
         "tsdown",
-        "vitest",
-        "@vitest/**",
         "oxlint",
         "oxlint-tsgolint",
         "oxfmt"
@@ -63,6 +71,22 @@
       "matchManagers": ["npm"],
       "matchPackageNames": ["typescript"],
       "allowedVersions": "<7"
+    },
+    {
+      "description": [
+        "rawcapture passes modernc.org/sqlite's *libc.TLS to sqlite3 calls, so libc must match the major version modernc.org/sqlite requires (v1). libc v2 also ships no Windows port."
+      ],
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["modernc.org/libc"],
+      "allowedVersions": "<2"
+    },
+    {
+      "description": ["kenn-io releases open right away: no release-age wait and no weekly window."],
+      "matchPackageNames": ["kenn-io/**", "github.com/kenn-io/**", "go.kenn.io/**", "@kenn-io/**"],
+      "groupName": "kenn-io dependencies",
+      "groupSlug": "kenn-io-dependencies",
+      "minimumReleaseAge": null,
+      "schedule": ["at any time"]
     }
   ]
 }

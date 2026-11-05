@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,19 +26,20 @@ const (
 
 // Per-archive metadata key bases; see archiveMetadataKey.
 const (
-	lastPushCutoffKeyBase      = "agentsview_last_push_cutoff"
-	lastPushAtKeyBase          = "agentsview_last_push_at"
-	lastPushMachineKeyBase     = "agentsview_last_push_machine"
-	pushScopeKeyBase           = "agentsview_push_scope"
-	deletionRevisionKeyBase    = "agentsview_deletion_revision"
-	identityRevisionKeyBase    = "agentsview_identity_revision"
-	mappingRevisionKeyBase     = "agentsview_mapping_revision"
-	curationFingerprintKeyBase = "agentsview_curation_fingerprint"
-	cursorUsageMaxIDKeyBase    = "agentsview_cursor_usage_max_id"
-	usageSnapshotReadyKeyBase  = "agentsview_usage_snapshot_ready"
-	storedCountRepairKeyBase   = "agentsview_stored_message_count_repair"
-	databaseIDKeyBase          = "agentsview_source_database_id"
-	fullPushRunKeyBase         = "agentsview_full_push_run"
+	lastPushCutoffKeyBase       = "agentsview_last_push_cutoff"
+	lastPushAtKeyBase           = "agentsview_last_push_at"
+	lastPushMachineKeyBase      = "agentsview_last_push_machine"
+	pushScopeKeyBase            = "agentsview_push_scope"
+	deletionRevisionKeyBase     = "agentsview_deletion_revision"
+	identityRevisionKeyBase     = "agentsview_identity_revision"
+	mappingRevisionKeyBase      = "agentsview_mapping_revision"
+	curationFingerprintKeyBase  = "agentsview_curation_fingerprint"
+	cursorUsageMaxIDKeyBase     = "agentsview_cursor_usage_max_id"
+	usageSnapshotReadyKeyBase   = "agentsview_usage_snapshot_ready"
+	messageDialogueReadyKeyBase = "agentsview_message_dialogue_ready"
+	storedCountRepairKeyBase    = "agentsview_stored_message_count_repair"
+	databaseIDKeyBase           = "agentsview_source_database_id"
+	fullPushRunKeyBase          = "agentsview_full_push_run"
 )
 
 // archiveMetadataKey scopes a sync_metadata key to one source archive so
@@ -247,6 +249,7 @@ var mirrorTables = []tableSpec{
 			col("role", tString),
 			col("content", tString),
 			col("thinking_text", tString),
+			col("dialogue_text", tNullString),
 			col("timestamp", tNullTime),
 			col("has_thinking", tBool),
 			col("has_tool_use", tBool),
@@ -293,6 +296,30 @@ var mirrorTables = []tableSpec{
 			col("dedup_key", tString),
 		},
 		orderBy: []string{"session_id", "id"},
+	},
+	{
+		// One row per session, the latest push winning. Times and groups
+		// stay the archive's text so every backend returns the same values.
+		name: "session_plan_usage",
+		columns: []columnSpec{
+			col("session_id", tString),
+			col("has_plan_usage", tBool),
+			col("data_as_of", tNullString),
+			col("data_status", tString),
+			col("usage_source", tString),
+			col("weekly_percent", tNullFloat),
+			col("five_hour_percent", tNullFloat),
+			col("credits", tNullString),
+			colDefault("groups_json", tString, "'[]'"),
+			col("is_final", tBool),
+			col("outcome_kind", tString),
+			col("outcome_at", tNullString),
+			col("counted_under", tString),
+			col("has_coverage", tBool),
+			col("last_capture_at", tNullString),
+			col("uncaptured_turns", tInt),
+		},
+		orderBy: []string{"session_id"},
 	},
 	{
 		name: "cursor_usage_events",
@@ -648,7 +675,7 @@ func CheckSchemaCompat(ctx context.Context, conn *sql.DB) error {
 			missing = append(missing, t.name)
 			continue
 		}
-		for _, c := range append(t.columns, col(pushVersionCol, tVersion)) {
+		for _, c := range append(slices.Clip(t.columns), col(pushVersionCol, tVersion)) {
 			if _, has := cols[c.name]; !has {
 				missing = append(missing, t.name+"."+c.name)
 			}
@@ -675,14 +702,14 @@ func CheckSchemaCompat(ctx context.Context, conn *sql.DB) error {
 		}
 		for _, fill := range [][2]string{{"usage_messages_backfill", "usage"}, {"terminal_event_snapshots_backfill", "terminal event"}} {
 			if metadata[fill[0]] != "1" {
-				return fmt.Errorf("clickhouse %s backfill is incomplete; run `agentsview clickhouse push` with a role that can finish it", fill[1])
+				return fmt.Errorf("clickhouse %s backfill is incomplete; run `agentsview replica clickhouse push` with a role that can finish it", fill[1])
 			}
 		}
 		return nil
 	}
 	sort.Strings(missing)
 	return fmt.Errorf(
-		"clickhouse mirror schema is missing %s; run `agentsview clickhouse push` with a role that can create tables",
+		"clickhouse mirror schema is missing %s; run `agentsview replica clickhouse push` with a role that can create tables",
 		strings.Join(missing, ", "),
 	)
 }

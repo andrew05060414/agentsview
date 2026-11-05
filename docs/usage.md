@@ -73,7 +73,7 @@ failed, so partial totals are visible.
 The panel reports when the backend or selected filters cannot provide outcome
 totals. Clear machine, model, termination, minimum-message, recent-activity, and
 time-of-day filters to use it. The CLI exposes the same metrics through
-[`agentsview stats`](/docs/stats/).
+[`agentsview report stats`](/docs/stats/).
 
 ### Date Range Picker
 
@@ -239,6 +239,11 @@ the results through their normal pushes.
 
 ![Tool usage](/docs/assets/generated/screenshots/tool-usage.png)
 
+![Sessions and calls behind a selected tool rate](/docs/assets/generated/screenshots/tool-rate-evidence.png)
+
+For a model's assessment of one session, use
+[Analyze tool effectiveness](/docs/recall/#tool-effectiveness-reports).
+
 ### Top Skills
 
 The Top Skills panel ranks skill-backed tool calls by call count, session count,
@@ -292,7 +297,7 @@ session-intelligence signals. It shows:
 ![Session Health section on the dashboard](/docs/assets/generated/screenshots/session-health.png)
 
 See [Session Intelligence](/docs/session-intelligence/#outcome-classification)
-for the full four-outcome model that both this section and `agentsview stats`
+for the full four-outcome model that both this section and `agentsview report stats`
 derive from.
 
 ### CSV Export
@@ -423,11 +428,30 @@ Each session item shows:
 
 Antigravity sessions show the conversation title Antigravity saves in
 `conversation_summaries.db`. Renames appear shortly after that file changes,
-or on the next `agentsview sync`. Names set in AgentsView still win. The same
-file also gives each session its workspace folder, which sets the project, and
-its parent conversation when it has one. AgentsView records these once: a
+or on the next `agentsview source sync`. Names set in AgentsView still win. The
+same file also gives each session its workspace folder, which sets the project,
+and its parent conversation when it has one. AgentsView records these once: a
 workspace or parent already recorded is kept even if Antigravity later changes
 or drops it.
+
+Qoder's database title lookup applies to `~/.qoder/projects` and
+`~/.qoder-cn/projects`. The Qoder app stores titles in `main.sqlite` under
+its data directory: `com.qoder.app.stable` (or `com.qodercn.app.stable` for
+Qoder CN) inside `~/Library/Application Support` on macOS,
+`$XDG_CONFIG_HOME` or `~/.config` on Linux, and `%APPDATA%` on Windows. If
+you moved the app's data directory, AgentsView does not find it. Names take
+precedence in this order:
+
+1. A name set in AgentsView.
+2. A non-blank database title.
+3. A file-side name, with a sidecar title ahead of an in-chat rename.
+
+Renames appear at the next sync pass: a watched change in any agent root,
+manual `agentsview source sync`, or startup. For these two roots, blank database
+titles or read errors preserve the archived name. A missing database, schema,
+or session row uses non-empty file-side names; an empty file-side name
+preserves the archived title. Other Qoder roots use file-side names, including
+clearing the archived title when empty.
 
 When a session has a native resume target, the sidebar also exposes a direct
 native session link so supported agents can reopen their own session instead of
@@ -503,13 +527,20 @@ filter categories that can be combined:
 
 ![Session filter dropdown](/docs/assets/generated/screenshots/session-filters.png)
 
+![Label and pull request filters](/docs/assets/generated/screenshots/session-label-filters.png)
+
+Label and pull-request filters can find child and automated sessions. The
+sidebar shows the containing tree; an explicit single-turn exclusion still
+applies. Use [launcher links](/docs/session-api/#agentsview-session-parent) to
+attach independently launched workers to their manager and roll up their costs.
+
 - **Starred** — toggle to show only starred sessions
 - **Recently Active** — toggle to show only sessions updated within the last 24
   hours
 - **Agent** — searchable multi-select of
   [supported agents](/docs/configuration/#session-discovery). Click an agent
   to toggle its selection; multiple agents can be active at once.
-- **Machine** — searchable multi-select of machine names. Surfaces in shared
+- **Machine** — searchable multi-select of machine labels. Surfaces in shared
   [PostgreSQL sync](/docs/pg-sync/) deployments when more than five machines
   have pushed sessions.
 - **Status** — three-pill multi-select of the
@@ -517,6 +548,11 @@ filter categories that can be combined:
   **Unclean**), tinted to match the indicator colors. The underlying
   `?termination=` URL parameter and API also accept the parser-side values
   `clean` and `awaiting_user`, but those aren't exposed as sidebar pills.
+- **Labels** — enter an exact label such as `ticket=example` and press Enter.
+  Add several labels to require all of them. Create labels through the
+  [CLI or API](/docs/session-api/#agentsview-session-label).
+- **Pull request** — enter `owner/repo#123` and press Enter to find sessions
+  linked to that pull request by Claude Code.
 - **Min Prompts** — filter to sessions with at least 2, 3, 5, or 10 user
   messages
 - **Include single-turn** — toggle to include sessions with one or fewer user
@@ -555,6 +591,10 @@ prefix use a single segment after `/sessions/`.
 Session URLs work as bookmarks and can be shared with teammates when using
 [PostgreSQL sync](/docs/pg-sync/) for shared deployments.
 
+A link from another tool that carries the agent's bare session UUID (Pi, OMP,
+Codex) opens the matching session. If the ID is ambiguous, use the full ID with
+its provider prefix.
+
 ### Open a session by ID
 
 Press `Cmd+G` on macOS or `Ctrl+G` elsewhere. Paste a complete session ID or
@@ -578,7 +618,7 @@ Available URL filters:
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
 | `project`                      | comma-separated project names                                                                                             |
 | `agent`                        | comma-separated agent ids                                                                                                 |
-| `machine`                      | comma-separated machine names                                                                                             |
+| `machine`                      | exact IDs or aliases, comma-separated ID/alias lists, or one unique whole display label                                   |
 | `termination`                  | comma-separated [status](#session-status-indicator) tiers — any of `active`, `stale`, `unclean`, `clean`, `awaiting_user` |
 | `date`, `date_from`, `date_to` | ISO date or activity-overlap range bounds                                                                                 |
 | `active_since`                 | `true` to limit to the last 24 hours                                                                                      |
@@ -587,6 +627,14 @@ Available URL filters:
 | `include_one_shot`             | `false` to hide single-turn sessions (default)                                                                            |
 | `include_automated`            | `true` to include automated sessions                                                                                      |
 | `exclude_project`              | comma-separated projects to hide (e.g. `unknown`)                                                                         |
+
+Unknown or ambiguous machine selectors, including stale saved filters, return
+HTTP 400 with known choices. The full selector stays selected until you edit or
+clear it.
+
+A URL with one machine's display name, such as `?machine=Workstation`, switches
+to that machine's ID after the server resolves it, so the picker shows it
+checked. Unknown or ambiguous names show an error instead of earlier results.
 
 ### Navigation
 
@@ -874,7 +922,7 @@ with `?breakdown=true` — see
 
 For aggregate token usage and estimated cost reports across all sessions, see
 the [Token Usage & Costs](/docs/token-usage/) page and the
-[`agentsview usage daily`](/docs/commands/#agentsview-usage-daily) CLI command.
+[`agentsview report usage daily`](/docs/commands/#agentsview-usage-daily) CLI command.
 
 For a scriptable report on the current session, use
 [`agentsview session usage <id>`](/docs/session-api/#agentsview-session-usage)
@@ -1022,7 +1070,7 @@ sessions. Results update after a 300ms typing pause.
 
 !!! tip
 
-    For deeper searches across full transcripts — including tool inputs, tool result
+    For deeper searches across full transcripts — including thinking, tool inputs, tool result
     content, and regex patterns — use the
     [`agentsview session search`](/docs/session-api/#agentsview-session-search) CLI
     or the `GET /api/v1/search/content` HTTP endpoint added in 0.30.0. The command
@@ -1311,7 +1359,7 @@ organized into sections:
 | Section            | What You Can Configure                                                                                   |
 | ------------------ | -------------------------------------------------------------------------------------------------------- |
 | Language           | Interface language (Azerbaijani, English, French, Japanese, Korean, Spanish, Simplified Chinese, or Traditional Chinese)       |
-| Appearance         | Theme (light/dark), high-contrast mode, chart colors, message layout, zoom, block visibility             |
+| Appearance         | Theme (light/dark), high-contrast mode, chart colors, message colors, message layout, zoom, block visibility |
 | Date ranges        | Browser-local checkbox for linking date selections across Sessions, Usage, Activity, Trends, and Quality |
 | Session Providers  | Enable session providers, inspect their session directories, and add alternate agent homes               |
 | Archive content    | Choose whether future imports keep, drop, or offload tool-result images                                  |
@@ -1332,8 +1380,8 @@ load; a saved language preference takes precedence.
 
 ![Chart color palette setting](/docs/assets/generated/screenshots/settings-chart-colors.png)
 
-Language, theme, high contrast, message layout, zoom, block visibility, and
-Date ranges preferences use local storage in the current browser or desktop
+Language, theme, high contrast, message colors, message layout, zoom, block
+visibility, and Date ranges preferences use local storage in the current browser or desktop
 webview profile. Each profile keeps its own choices. The optional `zoom_level`
 setting supplies a default when no local zoom or text-size preference exists.
 
@@ -1390,10 +1438,47 @@ Settings > Appearance also offers a **high-contrast** mode for greater
 legibility. The theme and high-contrast preferences persist across sessions.
 
 The **Chart colors** control selects the categorical palette used by the
-dashboard skill trend, Trends, and Usage charts. Choose **Agentsview** for the
-project palette or **Matplotlib** for its gray-free categorical families. This
-setting is server-wide rather than browser-local, so all clients connected to
-the same writable server use the same palette.
+dashboard skill trend, Trends, and Usage charts:
+
+- **Agentsview**: the project palette.
+- **Matplotlib**: matplotlib's categorical families without their grays.
+- **Color-blind safe**: Petroff's color sequences, chosen so series stay
+  distinguishable with common forms of color blindness. Past the tenth series,
+  colors repeat with a pattern: Usage bars, areas, and treemap tiles are
+  hatched, then cross-hatched, then dotted, and Trends lines are dashed.
+  Legends and lists show the same pattern.
+
+This setting is server-wide rather than browser-local, so all clients connected to
+the same server use the same palette. You can change it even when the server
+reads from a read-only store such as PostgreSQL, ClickHouse, or DuckDB.
+
+### Message Colors
+
+**Message colors** in Settings > Appearance sets the color of each message
+type: user messages, assistant text, thinking blocks, tool calls, and code
+blocks. It helps readers who cannot easily tell the default blue and purple
+apart.
+
+- **Color-blind safe** applies hues that stay distinct with the common forms
+  of color blindness: blue for user messages and vermillion for assistant
+  text. The hues are the Okabe-Ito colors behind matplotlib's
+  `seaborn-v0_8-colorblind` style. Thinking and code use darker versions of
+  its pink and yellow, because the originals are too faint on light themes.
+  The preset also turns on line patterns.
+- **Mark message types with line patterns** gives each type its own bar:
+  solid for user messages, double for assistant text, dotted for thinking,
+  and dashed for tool calls. Code blocks get a dashed frame when they have a
+  custom color. Types then differ by shape, not only by color. The patterns
+  also stay visible in the Stream layout, which hides the role header.
+- Each type has a color picker, a hex field, and quick-pick swatches. One
+  color applies to light, dark, and high-contrast modes. The message
+  background is a light tint of the color, and the label text is the color
+  mixed toward the theme's text color.
+- When a color would make label text hard to read (below 4.5:1) or the color
+  bar hard to see (below 3:1) in any mode, the setting names the modes and
+  the measured ratio. The color still applies, so you can decide.
+- **Reset** restores one type's theme color. **Reset to defaults** restores
+  every type and turns off patterns.
 
 ### Iframe Embedding
 
@@ -1426,6 +1511,16 @@ spinning animation while syncing.
 
 The status bar also shows a version mismatch warning (red) if the frontend and
 backend versions differ. Click it to reload.
+
+### History from another machine
+
+[Attach a saved archive](/docs/configuration/#history-from-a-saved-archive) to
+browse a retired machine's Claude and Codex sessions beside your current ones.
+Choose a backup snapshot or an existing archive directory. Use `machine_name`
+to label a single-machine archive without changing its captured identity.
+Ordinary sync reads pending archive sources after local work. Once indexed, the
+history remains browsable with the drive disconnected. Reparsing requires the
+archive to be available again.
 
 ### Full Resync
 

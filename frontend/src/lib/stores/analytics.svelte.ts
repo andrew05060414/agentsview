@@ -1,9 +1,10 @@
+import { groupedModelCsv, toggleGroupedModel } from "../utils/model-groups.js";
 import { m } from "../i18n/index.js";
 import { queryStepFrom, type QueryStep } from "../utils/refresh.js";
 import { LiveQuery } from "../utils/liveQuery.svelte.js";
 import type { AutomatedScope } from "../api/types.js";
 import type {
-  DbAnalyticsSummary as AnalyticsSummary,
+  AnalyticsSummaryResponse as AnalyticsSummary,
   DbActivityResponse as ActivityResponse,
   DbProjectsAnalyticsResponse as ProjectsAnalyticsResponse,
   DbHourOfWeekResponse as HourOfWeekResponse,
@@ -18,7 +19,7 @@ import {
   type DbHeatmapResponse,
   type DbTopSessionsResponse,
 } from "../api/generated/index";
-import { isAbortError, responseTimingOf } from "../api/runtime.js";
+import { ApiError, isAbortError, responseTimingOf } from "../api/runtime.js";
 import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
 import { rollingRange, today } from "../utils/dates.js";
@@ -243,7 +244,7 @@ class AnalyticsStore {
     this.selectedDow = null;
     this.selectedHour = null;
     sessions.filters.project = "";
-    sessions.filters.machine = "";
+    sessions.setSelectedMachines([]);
     sessions.filters.agent = "";
     sessions.filters.termination = "";
     sessions.filters.minUserMessages = 0;
@@ -290,14 +291,16 @@ class AnalyticsStore {
     void this.fetchAll();
   }
 
+  get modelAliases(): Record<string, string> {
+    return this.summary?.model_aliases ?? {};
+  }
+
+  get displayedModels(): string {
+    return groupedModelCsv(this.model, this.modelAliases);
+  }
+
   toggleModel(model: string) {
-    const current = new Set(this.model.split(",").filter((value) => value.length > 0));
-    if (current.has(model)) {
-      current.delete(model);
-    } else {
-      current.add(model);
-    }
-    this.model = [...current].join(",");
+    this.model = toggleGroupedModel(this.model, model, this.modelAliases);
     void this.fetchAll();
   }
 
@@ -365,16 +368,16 @@ class AnalyticsStore {
 
   clearMachine() {
     this.machine = "";
-    sessions.filters.machine = "";
+    sessions.setSelectedMachines([]);
     sessions.activeSessionId = null;
     void sessions.load();
     void this.fetchAll();
   }
 
   removeMachine(machine: string) {
-    const current = this.machine ? this.machine.split(",") : [];
-    this.machine = current.filter((m) => m !== machine).join(",");
-    sessions.filters.machine = this.machine;
+    const remaining = sessions.selectedMachines.filter((m) => m !== machine);
+    sessions.setSelectedMachines(remaining);
+    this.machine = sessions.filters.machine;
     sessions.activeSessionId = null;
     void sessions.load();
     void this.fetchAll();
@@ -527,10 +530,14 @@ class AnalyticsStore {
       }
       status = "error";
       if (this.versions[panel] === v) {
-        // On refetch failure with cached data, swallow the error so
-        // existing values stay visible instead of flipping to an
-        // error state. First-load failures still surface.
-        if (isFirstLoad) {
+        // A rejected machine filter invalidates cached results. Other
+        // refetch failures keep existing values visible; first-load
+        // failures still surface.
+        if (e instanceof ApiError && e.code === "invalid_machine_filter") {
+          this[panel] = null;
+          this.signals = null;
+          this.errors[panel] = e.message;
+        } else if (isFirstLoad) {
           this.errors[panel] = e instanceof Error ? e.message : m.shared_failed_to_load();
         } else {
           console.warn(`analytics.${panel} refetch failed:`, e);
@@ -627,9 +634,10 @@ class AnalyticsStore {
   }
 
   async fetchSummary(): Promise<FetchResult> {
+    const params = { ...this.filterParams(), group_models: true };
     return await this.executeFetch(
       "summary",
-      (options) => AnalyticsService.getApiV1AnalyticsSummary(this.filterParams(), options),
+      (options) => AnalyticsService.getApiV1AnalyticsSummary(params, options),
       (data) => {
         this.summary = data;
       },

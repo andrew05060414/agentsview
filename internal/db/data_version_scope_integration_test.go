@@ -2,6 +2,8 @@ package db_test
 
 import (
 	"database/sql"
+	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,10 +12,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/codexcloud/mirror"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/pricing"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
@@ -142,6 +146,64 @@ func TestClaudeFormatPRLinkUpgradePreservesSessionIdentity(t *testing.T) {
 			assert.Equal(t, source, database.GetSessionFilePath(t.Context(), id))
 			require.Len(t, session.PRLinks, 1)
 			assert.Equal(t, 7, session.PRLinks[0].Number)
+			var count int
+			require.NoError(t, database.Reader().QueryRow(t.Context(), "SELECT count(*) FROM sessions").Scan(&count))
+			assert.Equal(t, 1, count)
+		})
+	}
+}
+
+func TestClaudeFormatCommandArgsUpgradeReparsesInPlace(t *testing.T) {
+	providers := []parser.AgentType{parser.AgentClaude, parser.AgentCowork, parser.AgentQoder, parser.AgentIcodemate}
+	scope := db.ScopedDataVersionProviders(164, 165)
+	assert.ElementsMatch(t, append(providers, parser.AgentGrok, parser.AgentIflow), scope)
+	version := db.CurrentDataVersion()
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+	const envelope = "<command-message>explain</command-message>\n<command-name>/explain</command-name>\n<command-args>how app.<zone> gets its cert</command-args>"
+	for _, provider := range providers {
+		t.Run(string(provider), func(t *testing.T) {
+			database := dbtest.OpenTestDB(t)
+			root := t.TempDir()
+			sessionID := "c0000000-0000-4000-8000-000000000165"
+			source := filepath.Join(root, "project", sessionID+".jsonl")
+			if provider == parser.AgentCowork {
+				workspace := filepath.Join(root, "org", "workspace")
+				localID := "local_50000000-0000-4000-8000-000000000165"
+				dbtest.WriteTestFile(t, filepath.Join(workspace, localID+".json"), []byte(`{"sessionId":"`+localID+`","cliSessionId":"`+sessionID+`"}`))
+				source = filepath.Join(workspace, localID, ".claude", "projects", "project", sessionID+".jsonl")
+			}
+			body := testjsonl.NewSessionBuilder().
+				AddClaudeUserWithSessionID("2026-11-04T12:00:00Z", envelope, sessionID).
+				AddClaudeAssistant("2026-11-04T12:00:05Z", "It is DNS-validated.").
+				String()
+			dbtest.WriteTestFile(t, source, []byte(body))
+			cfg := sync.EngineConfig{Machine: "local", AgentDirs: map[parser.AgentType][]string{provider: {root}}}
+			engine := sync.NewEngine(t.Context(), database, cfg)
+			require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+			engine.Close()
+			var id string
+			require.NoError(t, database.Reader().QueryRow(t.Context(), "SELECT id FROM sessions").Scan(&id))
+			// Model the archive the previous parser wrote: the envelope stored raw.
+			require.NoError(t, database.Update(t.Context(), func(tx *sql.Tx) error {
+				if _, err := tx.ExecContext(t.Context(), "UPDATE messages SET content = ? WHERE session_id = ? AND ordinal = 0", envelope, id); err != nil {
+					return err
+				}
+				_, err := tx.ExecContext(t.Context(), fmt.Sprintf("UPDATE sessions SET data_version=%d; PRAGMA user_version=%d", version-1, version-1))
+				return err
+			}))
+			path := database.Path()
+			require.NoError(t, database.Close())
+			database, err := db.OpenIsolated(t.Context(), path)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, database.Close()) })
+			assert.False(t, database.NeedsResync(), "Claude upgrade must reparse in place")
+			engine = sync.NewEngine(t.Context(), database, cfg)
+			t.Cleanup(engine.Close)
+			require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+			assert.Equal(t, source, database.GetSessionFilePath(t.Context(), id))
+			var content string
+			require.NoError(t, database.Reader().QueryRow(t.Context(), "SELECT content FROM messages WHERE session_id = ? AND ordinal = 0", id).Scan(&content))
+			assert.Equal(t, "/explain how app.<zone> gets its cert", content)
 			var count int
 			require.NoError(t, database.Reader().QueryRow(t.Context(), "SELECT count(*) FROM sessions").Scan(&count))
 			assert.Equal(t, 1, count)
@@ -327,6 +389,228 @@ func TestCodexGitBranchUpgradeReparsesCodexInPlace(t *testing.T) {
 	var sessions int
 	require.NoError(t, database.Reader().QueryRow(ctx, "SELECT count(*) FROM sessions").Scan(&sessions))
 	assert.Equal(t, 2, sessions, "the reparse must keep the existing session identities")
+}
+
+func TestCodexParentInventoryUpgradeRepairsUnchangedForks(t *testing.T) {
+	version := db.CurrentDataVersion()
+	oldVersion := version - 1
+	agents := []parser.AgentType{parser.AgentCodex, parser.AgentTraeX, parser.AgentAugureCode}
+	require.ElementsMatch(t, agents, db.ScopedDataVersionProviders(161, 162))
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: agents}))
+	for _, agent := range agents {
+		t.Run(string(agent), func(t *testing.T) {
+			ctx := t.Context()
+			database := dbtest.OpenTestDB(t)
+			root := t.TempDir()
+			const parent = "11111111-1111-4111-8111-111111111111"
+			const child = "22222222-2222-4222-8222-222222222222"
+			const page = "44444444-4444-4444-8444-444444444444"
+			const stamp = "2026-09-01T10:00:00Z"
+			source := filepath.Join(root, "rollout-2026-09-01T11-00-00-"+child+".jsonl")
+			body := testjsonl.JoinJSONL(
+				testjsonl.CodexForkedSessionMetaJSON(child, parent, "/work/project", "user", stamp),
+				testjsonl.CodexTurnContextWithIDJSON("gpt-5", "page-turn", stamp),
+				testjsonl.CodexMsgJSON("assistant", "copied page", stamp),
+				testjsonl.CodexTurnContextWithIDJSON("gpt-5", "child-turn", stamp),
+				testjsonl.CodexMsgJSON("assistant", "new answer", stamp),
+			)
+			dbtest.WriteTestFile(t, source, []byte(body))
+			dbtest.WriteTestFile(t, filepath.Join(root, "rollout-2026-09-01T10-00-00-"+parent+".jsonl"), []byte(testjsonl.JoinJSONL(
+				testjsonl.CodexSessionMetaJSON(parent, "/work/project", "user", stamp),
+				testjsonl.CodexTurnContextWithIDJSON("gpt-5", "head-turn", stamp),
+			)))
+			cfg := sync.EngineConfig{Machine: "local", AgentDirs: map[parser.AgentType][]string{agent: {root}}}
+			engine := sync.NewEngine(ctx, database, cfg)
+			t.Cleanup(engine.Close)
+			require.Zero(t, engine.SyncAll(ctx, nil).Failed)
+			engine.Close()
+			id := string(agent) + ":" + child
+			messages, err := database.GetAllMessages(ctx, id)
+			require.NoError(t, err)
+			require.Len(t, messages, 2)
+			require.Equal(t, "new answer", messages[1].Content)
+			note := "Keep the child answer"
+			_, err = database.PinMessage(ctx, id, messages[1].ID, &note)
+			require.NoError(t, err)
+			before, err := database.GetSessionFull(ctx, id)
+			require.NoError(t, err)
+			require.NotNil(t, before)
+			digest, found, err := database.GetProviderStatHash(ctx, agent, source)
+			require.NoError(t, err)
+			require.True(t, found, "the persisted stat gate must be populated")
+
+			// Reproduce an old archive that missed this page while retaining
+			// its fork's current version, unchanged bytes and freshness digest.
+			dbtest.WriteTestFile(t, filepath.Join(root, "rollout-2026-09-01T12-00-00-"+parent+"_"+page+".jsonl"), []byte(testjsonl.JoinJSONL(
+				testjsonl.CodexTurnContextWithIDJSON("gpt-5", "page-turn", stamp),
+			)))
+			require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+				if _, err := tx.ExecContext(ctx, "UPDATE sessions SET data_version=?", oldVersion); err != nil {
+					return err
+				}
+				_, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version=%d", oldVersion))
+				return err
+			}))
+			path := database.Path()
+			require.NoError(t, database.Close())
+			database, err = db.OpenIsolated(ctx, path)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, database.Close()) })
+			needsSync, fullRebuild, err := db.ArchiveResyncState(ctx, path)
+			require.NoError(t, err)
+			require.True(t, needsSync)
+			require.False(t, fullRebuild)
+			require.Equal(t, oldVersion, database.GetSessionDataVersion(ctx, id))
+			afterDigest, found, err := database.GetProviderStatHash(ctx, agent, source)
+			require.NoError(t, err)
+			require.True(t, found)
+			assert.Equal(t, digest, afterDigest, "repair must bypass an unchanged persisted digest")
+			engine = sync.NewEngine(ctx, database, cfg)
+			t.Cleanup(engine.Close)
+			stats := engine.SyncAll(ctx, nil)
+			require.Zero(t, stats.Failed)
+			after, err := database.GetSessionFull(ctx, id)
+			require.NoError(t, err)
+			require.NotNil(t, after)
+			assert.Equal(t, before.ID, after.ID)
+			assert.Equal(t, before.SourceSessionID, after.SourceSessionID)
+			assert.Equal(t, before.FilePath, after.FilePath)
+			assert.Equal(t, before.FileHash, after.FileHash)
+			assert.Equal(t, db.CurrentDataVersion(), after.DataVersion)
+			messages, err = database.GetAllMessages(ctx, id)
+			require.NoError(t, err)
+			require.Len(t, messages, 1)
+			assert.Equal(t, "new answer", messages[0].Content)
+			pins, err := database.ListPinnedMessages(ctx, "", "")
+			require.NoError(t, err)
+			require.Len(t, pins, 1)
+			assert.Equal(t, messages[0].ID, pins[0].MessageID)
+			assert.Equal(t, &note, pins[0].Note)
+			assert.Equal(t, &messages[0].Content, pins[0].Content)
+			needsSync, _, err = db.ArchiveResyncState(ctx, path)
+			require.NoError(t, err)
+			assert.False(t, needsSync)
+		})
+	}
+}
+
+func TestCodexServiceTierUpgradeReparsesCodexInPlace(t *testing.T) {
+	version := db.CurrentDataVersion()
+	scope := db.ScopedDataVersionProviders(154, 155)
+	assert.ElementsMatch(t,
+		[]parser.AgentType{parser.AgentCodex, parser.AgentTraeX, parser.AgentAugureCode}, scope)
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+	ctx := t.Context()
+	database := dbtest.OpenTestDB(t)
+	root := t.TempDir()
+	const id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+	sessionID := "codex:" + id
+	source := filepath.Join(root, "rollout-"+id+".jsonl")
+	body := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(id, root, "codex_cli_rs", "2026-10-08T12:00:00Z"),
+		`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model_provider_id":"openai","service_tier":"priority"}}}`,
+		testjsonl.CodexTurnContextJSON("gpt-5.3-chat-latest", "2026-10-08T12:00:01Z"),
+		testjsonl.CodexMsgJSON("assistant", "answer", "2026-10-08T12:00:02Z"),
+	)
+	dbtest.WriteTestFile(t, source, []byte(body))
+	cfg := sync.EngineConfig{Machine: "local", AgentDirs: map[parser.AgentType][]string{parser.AgentCodex: {root}}}
+	engine := sync.NewEngine(ctx, database, cfg)
+	require.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+	engine.Close()
+	_, found, err := database.GetProviderStatHash(ctx, parser.AgentCodex, source)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	// Simulate an archive that does not yet have the billing identity.
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, fmt.Sprintf(
+			"UPDATE messages SET provider_id=''; UPDATE sessions SET data_version=%d; PRAGMA user_version=%d",
+			version-1, version-1,
+		))
+		return err
+	}))
+	path := database.Path()
+	require.NoError(t, database.Close())
+	database, err = db.OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	needsSync, fullRebuild, err := db.ArchiveResyncState(ctx, path)
+	require.NoError(t, err)
+	assert.True(t, needsSync)
+	assert.False(t, fullRebuild)
+	assert.Equal(t, version-1, database.GetSessionDataVersion(ctx, sessionID))
+	engine = sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	assert.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+	after, err := database.GetSessionFull(ctx, sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, version, after.DataVersion)
+	messages, err := database.GetAllMessages(ctx, sessionID)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, pricing.OpenAIPriorityProviderID, messages[0].ProviderID)
+	needsSync, _, err = db.ArchiveResyncState(ctx, path)
+	require.NoError(t, err)
+	assert.False(t, needsSync)
+}
+
+func TestCodexCodeModeWaitOutputUpgradeReparsesInPlace(t *testing.T) {
+	scope := db.ScopedDataVersionProviders(163, 164)
+	assert.ElementsMatch(t,
+		[]parser.AgentType{parser.AgentCodex, parser.AgentTraeX, parser.AgentAugureCode},
+		scope)
+	version := db.CurrentDataVersion()
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+	ctx := t.Context()
+	database := dbtest.OpenTestDB(t)
+	root := t.TempDir()
+	const id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+	const output = testjsonl.CodexCodeModeWaitOutput
+	sessionID := "codex:" + id
+	source := filepath.Join(root, "rollout-"+id+".jsonl")
+	body := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(id, root, "codex_cli_rs", "2026-10-08T12:00:00Z"),
+		testjsonl.CodexMsgJSON("user", "wait for the script", "2026-10-08T12:00:01Z"),
+		testjsonl.CodexFunctionCallWithCallIDJSON("wait", "call_wait", map[string]any{
+			"cell_id": "6", "yield_time_ms": 30000, "max_tokens": 5000,
+		}, "2026-10-08T12:00:02Z"),
+		testjsonl.CodexFunctionCallOutputJSON("call_wait", jsontext.Value(output), "2026-10-08T12:00:03Z"),
+	)
+	dbtest.WriteTestFile(t, source, []byte(body))
+	cfg := sync.EngineConfig{Machine: "local", AgentDirs: map[parser.AgentType][]string{parser.AgentCodex: {root}}}
+	engine := sync.NewEngine(ctx, database, cfg)
+	require.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+	engine.Close()
+
+	// Simulate the previous parser, which dropped code-mode wait results.
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, fmt.Sprintf(
+			"DELETE FROM tool_result_events; UPDATE tool_calls SET result_content='', result_content_length=0; UPDATE sessions SET data_version=%d; PRAGMA user_version=%d",
+			version-1, version-1,
+		))
+		return err
+	}))
+	path := database.Path()
+	require.NoError(t, database.Close())
+	database, err := db.OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	engine = sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+
+	messages, err := database.GetAllMessages(ctx, sessionID)
+	require.NoError(t, err)
+	var resultContent string
+	for _, message := range messages {
+		for _, call := range message.ToolCalls {
+			if call.ToolUseID == "call_wait" {
+				resultContent = call.ResultContent
+			}
+		}
+	}
+	assert.Equal(t, output, resultContent)
 }
 
 func TestCodexRepositoryUpgradeRepairsExistingIdentity(t *testing.T) {
@@ -566,4 +850,338 @@ func TestCodexRepositoryUpgradeRepairsExistingIdentity(t *testing.T) {
 			assert.Zero(t, engine.SyncAll(ctx, nil).Synced, "unchanged sources must stop reparsing after the upgrade")
 		})
 	}
+}
+
+func TestCodexCloudToolTextUpgradeReparsesInPlace(t *testing.T) {
+	scope := db.ScopedDataVersionProviders(151, 152)
+	assert.Equal(t, []parser.AgentType{parser.AgentCodexCloud}, scope)
+	version := db.CurrentDataVersion()
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+	ctx := t.Context()
+	database := dbtest.OpenTestDB(t)
+	root := t.TempDir()
+	source := filepath.Join(root, "account-key", "thread-a.jsonl.zstd")
+	fetched := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	_, err := mirror.Append(source, 0, []mirror.Record{
+		{Kind: mirror.KindThread, FetchedAt: fetched, Data: jsontext.Value(`{"id":"thread-a","createdAt":1759320000,"updatedAt":1759323600,"cwd":"/workspace/project-a"}`)},
+		{Kind: mirror.KindItem, FetchedAt: fetched, Data: jsontext.Value(`{"turnId":"turn-1","startedAtMs":1759320000000,"item":` +
+			`{"type":"commandExecution","id":"c1","command":"make","cwd":"/workspace/project-a","status":"completed"}}`)},
+	})
+	require.NoError(t, err)
+	cfg := sync.EngineConfig{Machine: "local", AgentDirs: map[parser.AgentType][]string{parser.AgentCodexCloud: {root}}}
+	engine := sync.NewEngine(ctx, database, cfg)
+	require.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+	engine.Close()
+	const id = "codex-cloud:thread-a"
+	messages, err := database.GetAllMessages(ctx, id)
+	require.NoError(t, err)
+	require.NotEmpty(t, messages)
+	// Reproduce the previous parser, which wrote the call as plain prose.
+	messages[0].Content = "$ make"
+	messages[0].ContentLength = len(messages[0].Content)
+	require.NoError(t, database.ReplaceSessionMessages(ctx, id, messages))
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE sessions SET data_version=%d; PRAGMA user_version=%d", version-1, version-1))
+		return err
+	}))
+	path := database.Path()
+	require.NoError(t, database.Close())
+	database, err = db.OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	_, fullRebuild, err := db.ArchiveResyncState(ctx, path)
+	require.NoError(t, err)
+	assert.False(t, fullRebuild, "the Codex cloud upgrade must reparse in place")
+
+	engine = sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+	messages, err = database.GetAllMessages(ctx, id)
+	require.NoError(t, err)
+	require.NotEmpty(t, messages)
+	assert.Equal(t, "[Bash]\n$ make", messages[0].Content)
+	require.Len(t, messages[0].ToolCalls, 1)
+	assert.Equal(t, source, database.GetSessionFilePath(ctx, id))
+	var sessions int
+	require.NoError(t, database.Reader().QueryRow(ctx, "SELECT count(*) FROM sessions").Scan(&sessions))
+	assert.Equal(t, 1, sessions)
+}
+
+func TestPiSubagentRelationshipUpgradeReparsesInPlace(t *testing.T) {
+	scope := db.ScopedDataVersionProviders(155, 156)
+	assert.ElementsMatch(t, []parser.AgentType{
+		parser.AgentPi, parser.AgentOMO, parser.AgentPrimeAgent, parser.AgentStepCode,
+	}, scope)
+	version := db.CurrentDataVersion()
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+	ctx := t.Context()
+	database := dbtest.OpenTestDB(t)
+	root := t.TempDir()
+	stem := "2026-10-09T10-00-00-000Z_parent-uuid"
+	parentPath := filepath.Join(root, "encoded-cwd", stem+".jsonl")
+	childPath := filepath.Join(root, "encoded-cwd", stem, "run-abc", "run-0", "session.jsonl")
+	dbtest.WriteTestFile(t, parentPath, []byte(
+		`{"type":"session","version":3,"id":"parent-uuid","timestamp":"2026-10-09T10:00:00Z","cwd":"/work/project"}`+"\n"+
+			`{"type":"message","id":"p1","timestamp":"2026-10-09T10:00:01Z","message":{"role":"user","content":"run a subagent"}}`+"\n"))
+	parentPathJSON, err := json.Marshal(parentPath)
+	require.NoError(t, err)
+	dbtest.WriteTestFile(t, childPath, []byte(
+		`{"type":"session","version":3,"id":"child-uuid","timestamp":"2026-10-09T10:05:00Z","cwd":"/work/project","parentSession":`+string(parentPathJSON)+`}`+"\n"+
+			`{"type":"message","id":"c1","timestamp":"2026-10-09T10:05:01Z","message":{"role":"user","content":"do the task"}}`+"\n"))
+	cfg := sync.EngineConfig{Machine: "local", AgentDirs: map[parser.AgentType][]string{parser.AgentPi: {root}}}
+	engine := sync.NewEngine(ctx, database, cfg)
+	require.Equal(t, 2, engine.SyncAll(ctx, nil).Synced)
+	engine.Close()
+	const id = "pi:child-uuid"
+	// Reproduce the previous parser, which typed the child as a fork.
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			fmt.Sprintf("UPDATE sessions SET relationship_type='fork' WHERE id=?; UPDATE sessions SET data_version=%d; PRAGMA user_version=%d", version-1, version-1), id)
+		return err
+	}))
+	path := database.Path()
+	require.NoError(t, database.Close())
+	database, err = db.OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	_, fullRebuild, err := db.ArchiveResyncState(ctx, path)
+	require.NoError(t, err)
+	assert.False(t, fullRebuild, "the Pi subagent upgrade must reparse in place")
+
+	engine = sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	require.Equal(t, 2, engine.SyncAll(ctx, nil).Synced)
+	var rel, parent string
+	require.NoError(t, database.Reader().QueryRow(ctx,
+		"SELECT relationship_type, parent_session_id FROM sessions WHERE id=?", id).Scan(&rel, &parent))
+	assert.Equal(t, "subagent", rel)
+	assert.Equal(t, "pi:parent-uuid", parent)
+	assert.Equal(t, childPath, database.GetSessionFilePath(ctx, id), "source path is unchanged")
+	var sessions int
+	require.NoError(t, database.Reader().QueryRow(ctx, "SELECT count(*) FROM sessions").Scan(&sessions))
+	assert.Equal(t, 2, sessions)
+}
+
+func TestOMPParentLinkUpgradePreservesSessionIdentityAndCuration(t *testing.T) {
+	scope := db.ScopedDataVersionProviders(157, 158)
+	require.Equal(t, []parser.AgentType{parser.AgentOMP}, scope)
+	version := db.CurrentDataVersion()
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+	ctx := t.Context()
+	database := dbtest.OpenTestDB(t)
+	ompRoot, piRoot := t.TempDir(), t.TempDir()
+	project := filepath.Join(ompRoot, "synthetic-project")
+	rootStem := "2026-09-20T10-00-00-000Z_root-file-token"
+	parentSource := filepath.Join(project, rootStem+".jsonl")
+	childSource := filepath.Join(project, rootStem, "Worker.jsonl")
+	grandchildSource := filepath.Join(project, rootStem, "Worker", "Reviewer.jsonl")
+	unavailableSource := filepath.Join(project, "unavailable-file-token.jsonl")
+	piSource := filepath.Join(piRoot, "synthetic-project", "unaffected.jsonl")
+	writeOMP := func(source, id, parent, prompt string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"type":"title","v":1,"title":"","pad":"   "}
+{"type":"session","version":3,"id":%q,"timestamp":"2026-09-20T10:00:00Z","cwd":"/synthetic/project","parentSession":%q}
+{"type":"message","id":"user-message","timestamp":"2026-09-20T10:00:01Z","message":{"role":"user","content":%q}}
+`, id, parent, prompt)
+		dbtest.WriteTestFile(t, source, []byte(body))
+	}
+	writeOMP(parentSource, "parent-header-id", "", "Synthetic parent task")
+	writeOMP(childSource, "child-header-id", parentSource, "Synthetic worker task")
+	writeOMP(grandchildSource, "grandchild-header-id", childSource, "Synthetic review task")
+	writeOMP(unavailableSource, "unavailable-header-id", "", "Synthetic retained task")
+	dbtest.WriteTestFile(t, piSource, []byte(`{"type":"session","version":3,"id":"unaffected-pi-id","timestamp":"2026-09-20T10:00:00Z","cwd":"/synthetic/project"}
+{"type":"message","id":"pi-user-message","timestamp":"2026-09-20T10:00:01Z","message":{"role":"user","content":"Synthetic Pi task"}}
+`))
+	cfg := sync.EngineConfig{Machine: "local", AgentDirs: map[parser.AgentType][]string{
+		parser.AgentOMP: {ompRoot}, parser.AgentPi: {piRoot},
+	}}
+	engine := sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	require.Equal(t, 5, engine.SyncAll(ctx, nil).Synced)
+	engine.Close()
+
+	const childID = "omp:child-header-id"
+	displayName, note := "Saved worker task", "Keep this worker prompt"
+	require.NoError(t, database.RenameSession(ctx, childID, &displayName))
+	starred, err := database.StarSession(ctx, childID)
+	require.NoError(t, err)
+	require.True(t, starred)
+	childMessages, err := database.GetAllMessages(ctx, childID)
+	require.NoError(t, err)
+	require.Len(t, childMessages, 1)
+	pinnedMessageID := childMessages[0].ID
+	pinID, err := database.PinMessage(ctx, childID, pinnedMessageID, &note)
+	require.NoError(t, err)
+	require.NotZero(t, pinID)
+
+	// Pi shares the parser, but its archived output must not be invalidated by
+	// this OMP-only upgrade. A reparse would replace this stored sentinel.
+	piMessages, err := database.GetAllMessages(ctx, "pi:unaffected-pi-id")
+	require.NoError(t, err)
+	require.Len(t, piMessages, 1)
+	piMessages[0].Content = "Retained Pi archive output"
+	piMessages[0].ContentLength = len(piMessages[0].Content)
+	require.NoError(t, database.ReplaceSessionMessages(ctx, "pi:unaffected-pi-id", piMessages))
+
+	expected := []struct {
+		id, source, parent, name, content string
+		wantVersion                       int
+	}{
+		{"omp:parent-header-id", parentSource, "", "", "Synthetic parent task", version},
+		{childID, childSource, "omp:parent-header-id", "Worker", "Synthetic worker task", version},
+		{"omp:grandchild-header-id", grandchildSource, childID, "Reviewer", "Synthetic review task", version},
+		{"omp:unavailable-header-id", unavailableSource, "", "", "Synthetic retained task", version - 1},
+		{"pi:unaffected-pi-id", piSource, "", "", "Retained Pi archive output", version},
+	}
+	before := make(map[string]*db.Session, len(expected))
+	for _, want := range expected {
+		session, err := database.GetSessionFull(ctx, want.id)
+		require.NoError(t, err)
+		require.NotNil(t, session, want.id)
+		before[want.id] = session
+	}
+	require.NoError(t, os.Remove(unavailableSource))
+
+	// Reproduce the old parser's verbatim path parents and missing subagent
+	// classifications without touching source bytes or source identities.
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+		for _, old := range []struct{ id, parentSource string }{
+			{childID, parentSource},
+			{"omp:grandchild-header-id", childSource},
+		} {
+			if _, err := tx.ExecContext(ctx, `UPDATE sessions
+				SET parent_session_id=?, parser_parent_session_id=?,
+				    relationship_type='', parser_relationship_type='', session_name=NULL
+				WHERE id=?`, "omp:"+old.parentSource, "omp:"+old.parentSource, old.id); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE sessions SET data_version=?", version-1); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version=%d", version-1))
+		return err
+	}))
+	path := database.Path()
+	require.NoError(t, database.Close())
+	database, err = db.OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	require.False(t, database.NeedsResync(), "the OMP repair must upgrade in place")
+	needsSync, fullRebuild, err := db.ArchiveResyncState(ctx, path)
+	require.NoError(t, err)
+	assert.True(t, needsSync)
+	assert.False(t, fullRebuild)
+	assert.Equal(t, version-1, database.GetSessionDataVersion(ctx, childID))
+	assert.Equal(t, version, database.GetSessionDataVersion(ctx, "pi:unaffected-pi-id"))
+
+	engine = sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(ctx, nil)
+	assert.Equal(t, 3, stats.Synced, "only the available OMP sources need reparsing")
+	assert.Equal(t, 1, stats.Skipped)
+	assert.Zero(t, stats.Failed)
+	assert.False(t, stats.Aborted)
+	for _, want := range expected {
+		t.Run(want.id, func(t *testing.T) {
+			after, err := database.GetSessionFull(ctx, want.id)
+			require.NoError(t, err)
+			require.NotNil(t, after)
+			assert.Equal(t, before[want.id].ID, after.ID)
+			require.NotNil(t, after.FilePath)
+			assert.Equal(t, want.source, *after.FilePath)
+			assert.Equal(t, before[want.id].FileHash, after.FileHash)
+			assert.Equal(t, before[want.id].SourceSessionID, after.SourceSessionID)
+			assert.Equal(t, want.wantVersion, after.DataVersion)
+			var parserRelationship string
+			require.NoError(t, database.Reader().QueryRow(ctx,
+				"SELECT COALESCE(parser_relationship_type, '') FROM sessions WHERE id=?", want.id,
+			).Scan(&parserRelationship))
+			if want.parent == "" {
+				assert.Nil(t, after.ParentSessionID)
+				assert.Nil(t, after.ParserParentSessionID)
+				assert.Empty(t, after.RelationshipType)
+				assert.Empty(t, parserRelationship)
+			} else {
+				assert.Equal(t, &want.parent, after.ParentSessionID)
+				assert.Equal(t, &want.parent, after.ParserParentSessionID)
+				assert.Equal(t, "subagent", after.RelationshipType)
+				assert.Equal(t, "subagent", parserRelationship)
+				assert.Equal(t, &want.name, after.SessionName)
+			}
+			messages, err := database.GetAllMessages(ctx, want.id)
+			require.NoError(t, err)
+			require.Len(t, messages, 1)
+			assert.Equal(t, want.content, messages[0].Content)
+		})
+	}
+
+	child, err := database.GetSessionFull(ctx, childID)
+	require.NoError(t, err)
+	require.NotNil(t, child)
+	assert.Equal(t, &displayName, child.DisplayName)
+	stars, err := database.ListStarredSessionIDs(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{childID}, stars)
+	// The all-pins view includes the joined message content.
+	pins, err := database.ListPinnedMessages(ctx, "", "")
+	require.NoError(t, err)
+	require.Len(t, pins, 1)
+	assert.Equal(t, childID, pins[0].SessionID)
+	assert.Equal(t, pinnedMessageID, pins[0].MessageID)
+	assert.Equal(t, &note, pins[0].Note)
+	assert.Equal(t, &childMessages[0].Content, pins[0].Content)
+	var count int
+	require.NoError(t, database.Reader().QueryRow(ctx, "SELECT count(*) FROM sessions").Scan(&count))
+	assert.Equal(t, 5, count, "the upgrade must not replace or duplicate session identities")
+}
+
+func TestCopilotUsageRecordUpgradeReparsesInPlace(t *testing.T) {
+	ctx := t.Context()
+	scope := db.ScopedDataVersionProviders(162, 163)
+	require.Contains(t, scope, parser.AgentCopilot)
+	version := db.CurrentDataVersion()
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+	database := dbtest.OpenTestDB(t)
+	root := t.TempDir()
+	source := filepath.Join(root, "session-state", "receipt-upgrade", "events.jsonl")
+	dbtest.WriteTestFile(t, source, []byte(`{"type":"session.start","timestamp":"2026-09-01T12:00:00Z","data":{"sessionId":"receipt-upgrade"}}
+{"type":"user.message","timestamp":"2026-09-01T12:00:01Z","data":{"content":"Synthetic task"}}
+{"type":"session.usage_record","timestamp":"2026-09-01T12:00:02Z","data":{"usage":{"model":"gpt-5.4","inputTokens":100,"outputTokens":7}}}
+`))
+	cfg := sync.EngineConfig{Machine: "local", AgentDirs: map[parser.AgentType][]string{parser.AgentCopilot: {root}}}
+	engine := sync.NewEngine(ctx, database, cfg)
+	require.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+	engine.Close()
+	const id = "copilot:receipt-upgrade"
+	// Reproduce the archive left by the parser that ignored receipts.
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM usage_events WHERE session_id=?`, id)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE sessions SET total_output_tokens=0, has_total_output_tokens=0, peak_context_tokens=0, has_peak_context_tokens=0, data_version=? WHERE id=?`, version-1, id)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version=%d", version-1))
+		return err
+	}))
+	path := database.Path()
+	require.NoError(t, database.Close())
+	database, err := db.OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	assert.False(t, database.NeedsResync())
+	assert.Equal(t, version-1, database.GetSessionDataVersion(ctx, id))
+	engine = sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+	after, err := database.GetSessionFull(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, 7, after.TotalOutputTokens)
+	assert.Equal(t, version, database.GetSessionDataVersion(ctx, id))
+	var count int
+	require.NoError(t, database.Reader().QueryRow(ctx, "SELECT count(*) FROM usage_events WHERE session_id=? AND source='usage-record'", id).Scan(&count))
+	assert.Equal(t, 1, count)
 }

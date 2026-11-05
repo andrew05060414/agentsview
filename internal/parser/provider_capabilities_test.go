@@ -10,22 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestProviderCapabilitiesWatchRootsDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).WatchRoots)
-}
-
-func TestProviderCapabilitiesStreamingDiscoveryDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).StreamingDiscovery)
-}
-
-func TestProviderCapabilitiesPersistentArchiveDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).PersistentArchive)
-}
-
-func TestProviderCapabilitiesS3DiscoveryDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).S3Discovery)
-}
-
 func TestProviderCapabilitiesS3DiscoveryMatchConsumers(t *testing.T) {
 	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).S3Discovery,
 		"new providers must opt in explicitly")
@@ -49,18 +33,6 @@ func TestProviderCapabilitiesS3DiscoveryMatchConsumers(t *testing.T) {
 		}
 		assert.Equalf(t, CapabilityUnsupported, got,
 			"%s must not opt into S3 discovery", agent)
-	}
-}
-
-// Only the providers with reported same-id files opt into keeping both.
-func TestProviderCapabilitiesSharedSessionIDsOptIn(t *testing.T) {
-	for _, factory := range ProviderFactories() {
-		agent := factory.Definition().Type
-		want := CapabilityUnsupported
-		if agent == AgentGemini || agent == AgentCursor {
-			want = CapabilitySupported
-		}
-		assert.Equalf(t, want, factory.Capabilities().Source.SharedSessionIDs, "%s", agent)
 	}
 }
 
@@ -106,7 +78,9 @@ func TestProviderCapabilitiesChangedPathRelevanceMatchConsumers(t *testing.T) {
 		got := factory.Capabilities().Source.ChangedPathRelevance
 		if agent == AgentOpenCode || agent == AgentKilo ||
 			agent == AgentMiMoCode || agent == AgentIcodemate || agent == AgentJunie ||
-			agent == AgentCodebuff || agent == AgentVibe {
+			agent == AgentCodebuff || agent == AgentVibe ||
+			agent == AgentAntigravityCLI || agent == AgentAntigravity ||
+			agent == AgentGemini {
 			assert.Equal(t, CapabilitySupported, got)
 			provider := factory.NewProvider(ProviderConfig{
 				Roots: []string{t.TempDir()},

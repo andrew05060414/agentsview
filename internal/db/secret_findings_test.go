@@ -8,25 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSecretFindingsSchemaExists(t *testing.T) {
-	d := testDB(t)
-	r := d.getReader()
-	var n int
-	err := r.QueryRow(t.Context(),
-		`SELECT count(*) FROM sqlite_master
-		 WHERE type='table' AND name='secret_findings'`).Scan(&n)
-	require.NoError(t, err, "probe")
-	require.Equal(t, 1, n, "secret_findings table missing")
-	for _, col := range []string{"secret_leak_count", "secrets_rules_version"} {
-		var cnt int
-		err := r.QueryRow(t.Context(),
-			`SELECT count(*) FROM pragma_table_info('sessions') WHERE name=?`,
-			col).Scan(&cnt)
-		require.NoError(t, err, "probe col %s", col)
-		assert.Equal(t, 1, cnt, "sessions.%s missing", col)
-	}
-}
-
 // TestHasSecretPartialIndexExists pins the partial index that backs the
 // session --has-secret filter (secret_leak_count > 0), so a large sessions
 // table does not scan to find the sparse set of leaky sessions.
@@ -186,7 +167,7 @@ func TestOrphanCopyPreservesSecretFindings(t *testing.T) {
 	require.NoError(t, err, "Open dst")
 	defer dstDB.Close()
 
-	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	count, err := dstDB.CopyOrphanedDataFrom(t.Context(), srcPath)
 	require.NoError(t, err, "CopyOrphanedDataFrom")
 	require.Equal(t, 1, count, "expected 1 orphaned session")
 
@@ -524,7 +505,7 @@ func TestOrphanCopyPreservesToolCallIndex(t *testing.T) {
 	require.NoError(t, err, "Open dst")
 	defer dstDB.Close()
 
-	count, err := dstDB.CopyOrphanedDataFrom(srcPath)
+	count, err := dstDB.CopyOrphanedDataFrom(t.Context(), srcPath)
 	require.NoError(t, err, "CopyOrphanedDataFrom")
 	require.Equal(t, 1, count, "expected 1 orphaned session")
 

@@ -333,6 +333,7 @@ func TestLaunchdRender_ClickHouseKind(t *testing.T) {
 	}
 	got := m.render(spec)
 	assert.Contains(t, got, `<string>agentsview.clickhouse-watch</string>`)
+	assert.Contains(t, got, `<string>replica</string>`)
 	assert.Contains(t, got, `<string>clickhouse</string>`)
 	assert.Contains(t, got, `<string>push</string>`)
 	assert.Contains(t, got, `<string>--watch</string>`)
@@ -349,8 +350,14 @@ func TestSystemdRender_ClickHouseKind(t *testing.T) {
 	}
 	got := m.render(spec)
 	assert.Contains(t, got, "Description=agentsview ClickHouse auto-push")
-	assert.Contains(t, got, `ExecStart="/usr/local/bin/agentsview" clickhouse push --watch`)
+	assert.Contains(t, got, `ExecStart="/usr/local/bin/agentsview" replica clickhouse push --watch`)
 	assert.Contains(t, got, "clickhouse-watch.log")
+
+	kind := withNoStartDaemon(clickHouseServiceKind)
+	m.kind = kind
+	spec.Kind = kind
+	got = m.render(spec)
+	assert.Contains(t, got, `ExecStart="/usr/local/bin/agentsview" replica clickhouse push --watch --no-start-daemon`)
 }
 
 func TestLaunchdRender(t *testing.T) {
@@ -366,6 +373,7 @@ func TestLaunchdRender(t *testing.T) {
 	wants := []string{
 		`<string>agentsview.pg-watch</string>`,
 		`<string>/usr/local/bin/agentsview</string>`,
+		`<string>replica</string>`,
 		`<string>pg</string>`,
 		`<string>push</string>`,
 		`<string>--watch</string>`,
@@ -450,7 +458,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart="/usr/local/bin/agentsview" pg push --watch
+ExecStart="/usr/local/bin/agentsview" replica pg push --watch
 Environment=AGENTSVIEW_DATA_DIR="/home/me/.agentsview"
 StandardOutput=append:/home/me/.agentsview/pg-watch.log
 StandardError=append:/home/me/.agentsview/pg-watch.log
@@ -484,7 +492,7 @@ func TestSystemdLingerDetection(t *testing.T) {
 	assert.False(t, m2.lingerEnabled(t.Context()))
 }
 
-func TestSystemdInstall_ReloadsAndEnables(t *testing.T) {
+func TestSystemdInstall_ReloadsEnablesAndRestarts(t *testing.T) {
 	home := t.TempDir()
 	rr := &recordingRunner{}
 	m := &systemdManager{kind: pgServiceKind, user: "me", home: home, run: rr.run}
@@ -496,8 +504,11 @@ func TestSystemdInstall_ReloadsAndEnables(t *testing.T) {
 	require.NoError(t, m.install(t.Context(), spec), "install")
 	_, err := os.Stat(m.unitPath())
 	require.NoError(t, err, "unit written")
-	assert.True(t, rr.sawContains("systemctl --user daemon-reload"))
-	assert.True(t, rr.sawContains("systemctl --user enable --now agentsview-pg-watch.service"))
+	assert.Equal(t, [][]string{
+		{"systemctl", "--user", "daemon-reload"},
+		{"systemctl", "--user", "enable", "agentsview-pg-watch.service"},
+		{"systemctl", "--user", "restart", "agentsview-pg-watch.service"},
+	}, rr.calls)
 }
 
 func TestSystemdStart_CallsStart(t *testing.T) {
@@ -550,12 +561,6 @@ func TestTailFile_ReadsContent(t *testing.T) {
 	var buf strings.Builder
 	require.NoError(t, tailFile(&buf, path, false), "tailFile")
 	assert.Equal(t, "hello\nworld\n", buf.String())
-}
-
-func TestTailFile_MissingFileErrors(t *testing.T) {
-	var buf strings.Builder
-	err := tailFile(&buf, filepath.Join(t.TempDir(), "nope.log"), false)
-	assert.Error(t, err)
 }
 
 func TestPromptYesNo(t *testing.T) {

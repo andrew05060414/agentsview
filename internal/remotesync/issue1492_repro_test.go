@@ -40,7 +40,7 @@ func archiveEntries(t *testing.T, data []byte) map[string][]byte {
 
 func resolveTargetsForTest(t *testing.T, cfg config.Config) TargetSet {
 	t.Helper()
-	targets, err := ResolveTargets(cfg)
+	targets, err := ResolveTargets(t.Context(), cfg)
 	require.NoError(t, err)
 	return targets
 }
@@ -279,7 +279,7 @@ func TestIssue1492VanishedVSCodeWorkspaceIsEvictedFromMirror(t *testing.T) {
 
 	manifest, err := BuildManifest(t.Context(), fresh)
 	require.NoError(t, err)
-	diff, err := MirrorDiff(mirror, manifest)
+	diff, err := diffManifest(mirror, manifest)
 	require.NoError(t, err)
 	assert.Equal(t, []string{mirrorWorkspace}, diff.Deletions)
 }
@@ -543,7 +543,7 @@ func TestIssue1492VanishedZedDatabaseRemainsEvictable(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(filepath.Dir(mirrorPath), 0o755))
 	require.NoError(t, os.WriteFile(mirrorPath, []byte("stale"), 0o644))
-	diff, err := MirrorDiff(mirror, manifest)
+	diff, err := diffManifest(mirror, manifest)
 	require.NoError(t, err)
 	assert.Equal(t, []string{mirrorPath}, diff.Deletions)
 }
@@ -575,7 +575,7 @@ func TestIssue1492UnreadableCuratedRootFailsResolution(t *testing.T) {
 		storage := filepath.Join(root, "workspaceStorage")
 		require.NoError(t, os.Chmod(storage, 0o000))
 		t.Cleanup(func() { require.NoError(t, os.Chmod(storage, 0o755)) })
-		_, err := ResolveTargets(cfg)
+		_, err := ResolveTargets(t.Context(), cfg)
 		require.Error(t, err,
 			"an unreadable editor root must not resolve to an empty target set")
 		assert.ErrorIs(t, err, os.ErrPermission)
@@ -596,7 +596,7 @@ func TestIssue1492UnreadableCuratedRootFailsResolution(t *testing.T) {
 
 		require.NoError(t, os.Chmod(parent, 0o000))
 		t.Cleanup(func() { require.NoError(t, os.Chmod(parent, 0o755)) })
-		_, err := ResolveTargets(cfg)
+		_, err := ResolveTargets(t.Context(), cfg)
 		require.Error(t, err,
 			"an unreadable RooCode root must not resolve to an empty target set")
 		assert.ErrorIs(t, err, os.ErrPermission)
@@ -617,7 +617,7 @@ func TestIssue1492UnreadableCuratedRootFailsResolution(t *testing.T) {
 		tasksDir := filepath.Join(root, "tasks")
 		require.NoError(t, os.Chmod(tasksDir, 0o000))
 		t.Cleanup(func() { require.NoError(t, os.Chmod(tasksDir, 0o755)) })
-		_, err := ResolveTargets(cfg)
+		_, err := ResolveTargets(t.Context(), cfg)
 		require.Error(t, err,
 			"an unreadable Kilo Legacy tasks directory must not resolve to an empty target set")
 		assert.ErrorIs(t, err, os.ErrPermission)
@@ -635,7 +635,7 @@ func TestIssue1492UnreadableCuratedRootFailsResolution(t *testing.T) {
 
 		require.NoError(t, os.Chmod(parent, 0o000))
 		t.Cleanup(func() { require.NoError(t, os.Chmod(parent, 0o755)) })
-		_, err := ResolveTargets(cfg)
+		_, err := ResolveTargets(t.Context(), cfg)
 		require.Error(t, err,
 			"an unreadable Zed root must not resolve to an empty target set")
 		assert.ErrorIs(t, err, os.ErrPermission)

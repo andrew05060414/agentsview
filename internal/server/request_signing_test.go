@@ -42,13 +42,13 @@ func TestRestrictedIngressGrantsRequireNativeAuth(t *testing.T) {
 	keyFile := filepath.Join(dir, "key")
 	require.NoError(t, os.WriteFile(keyFile, []byte(base64.StdEncoding.EncodeToString(key)), 0o600))
 	replayPath := filepath.Join(dir, "replay.db")
-	require.NoError(t, requestsign.InitReplay(replayPath))
+	require.NoError(t, requestsign.InitReplay(t.Context(), replayPath))
 	policyPath := filepath.Join(dir, "policy.json")
 	policy := requestsign.Policy{ExternalURL: ts.URL + externalPrefix, ReplayDB: replayPath, Keys: []requestsign.PolicyKey{{ID: "reader-key", File: keyFile, Grant: "reader"}}}
 	data, err := json.Marshal(policy)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(policyPath, data, 0o600))
-	handler, closeState, err := srv.RestrictedHandler(policyPath)
+	handler, closeState, err := srv.RestrictedHandler(t.Context(), policyPath)
 	require.NoError(t, err)
 	defer closeState()
 	signer, err := requestsign.NewSigner(ts.URL+externalPrefix, requestsign.Key{ID: "reader-key", Secret: key})
@@ -111,6 +111,8 @@ func TestRestrictedIngressGrantsRequireNativeAuth(t *testing.T) {
 			assert.Equal(t, tc.status, resp.StatusCode, string(body))
 			if tc.path == "/api/v1/version" && tc.status == 200 {
 				assert.Contains(t, string(body), `"read_only":true`)
+				assert.NotContains(t, string(body), `"friction_readable":true`,
+					"the restricted allowlist serves no friction routes")
 				assert.Empty(t, resp.Header.Get("X-Agentsview-Archive-Stale"))
 			}
 			if tc.path == "/api/v1/sessions" && tc.status == 200 {
@@ -210,7 +212,7 @@ func TestContributorGrantWithoutAuthTokenForbidsReaderRequest(t *testing.T) {
 	key, err := requestsign.ReadSecret(keyFile)
 	require.NoError(t, err)
 	replayPath := filepath.Join(dir, "replay.db")
-	require.NoError(t, requestsign.InitReplay(replayPath))
+	require.NoError(t, requestsign.InitReplay(t.Context(), replayPath))
 	policyPath := filepath.Join(dir, "policy.json")
 	policy := requestsign.Policy{
 		ExternalURL: ts.URL + externalPrefix,
@@ -222,7 +224,7 @@ func TestContributorGrantWithoutAuthTokenForbidsReaderRequest(t *testing.T) {
 	require.NoError(t, os.WriteFile(policyPath, data, 0o600))
 
 	var closeState func() error
-	handler, closeState, err = srv.RestrictedHandler(policyPath)
+	handler, closeState, err = srv.RestrictedHandler(t.Context(), policyPath)
 	require.NoError(t, err)
 	defer closeState()
 	signer, err := requestsign.NewSigner(ts.URL+externalPrefix, requestsign.Key{ID: "contributor-key", Secret: key})

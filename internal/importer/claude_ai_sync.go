@@ -48,8 +48,17 @@ func browserRequest(shapes string, shape int, substitutions ...string) string {
 	return strings.NewReplacer(substitutions...).Replace(strings.Split(strings.TrimSpace(shapes), "\n")[shape])
 }
 
-func claudeAIFreshness(updatedAt, leaf string, session *db.Session) uint64 {
-	return browserFreshness(updatedAt+"\x00"+leaf, session)
+// claudeAICountsMarker refreshes usage-only fingerprints that cached a shorter
+// branch with older counts. Full archives already stored the selected branch.
+func claudeAICountsMarker(store db.Store) string {
+	if storeArchiveContent(store).UsageOnly() {
+		return "selected-branch-counts\x00"
+	}
+	return ""
+}
+
+func claudeAIFreshness(store db.Store, updatedAt, leaf string, session *db.Session) uint64 {
+	return browserFreshness(claudeAICountsMarker(store)+updatedAt+"\x00"+leaf, session)
 }
 
 func browserFreshness(marker string, session *db.Session) uint64 {
@@ -157,7 +166,9 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 				}
 				id := "claude-ai:" + marker.UUID
 				err := runner.conversation(ctx, id, browserConversation{
-					freshness: func(session *db.Session) uint64 { return claudeAIFreshness(marker.UpdatedAt, leaf, session) },
+					freshness: func(session *db.Session) uint64 {
+						return claudeAIFreshness(store, marker.UpdatedAt, leaf, session)
+					},
 					fetch: func(ctx context.Context) ([]byte, error) {
 						return fetchClaudeAI(ctx, fetch, claudeAIRequest(claudeAIConversationRequest, org.UUID, marker.UUID, 0))
 					},
@@ -174,6 +185,7 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 							UpdatedAt string `json:"updated_at"`
 							Leaf      string `json:"current_leaf_message_uuid"`
 						}
+						// The chat can change between list and detail; cache only what was imported.
 						return json.Unmarshal(detail, &current) == nil && current.UpdatedAt == marker.UpdatedAt && current.Leaf == leaf
 					},
 				})
@@ -231,7 +243,16 @@ func syncConversation(ctx context.Context, store db.Store, result parser.ParseRe
 		}
 		status, err := upsertConversation(ctx, store, result, nil)
 		if refusalReason(err) == RefusalShorterExport {
-			return importSkipped, nil
+			// Stored messages already match; update the selected branch's counts
+			// without replacing rows that may have pins.
+			_, err = store.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{
+				Session: chatGPTSession(result.Session), Messages: msgs,
+				SkipSignalUpdates: true,
+			}})
+			if errors.Is(err, db.ErrSessionExcluded) {
+				return importSkipped, nil
+			}
+			return importUpdated, err
 		}
 		return status, err
 	}

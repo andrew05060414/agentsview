@@ -4,11 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json/v2"
+	"log"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // AntigravitySummariesDBName is the per-root store where Antigravity keeps
@@ -34,17 +37,41 @@ type antigravityTitleSnapshot struct {
 	readAt    time.Time
 }
 
-var antigravityTitleNow = time.Now
-
 var antigravityTitleCache = struct {
 	sync.Mutex
 	stores map[string]antigravityTitleSnapshot
 }{stores: make(map[string]antigravityTitleSnapshot)}
 
+// InvalidateAntigravityTitles expires both the summary read and the shared
+// native title cache that serves AntigravityStoreTitles. Like
+// InvalidateSQLiteTitles it retains the container state, so the forced
+// re-read does not repeat a missing-schema warning the state change already
+// reported.
 func InvalidateAntigravityTitles(path string) {
 	antigravityTitleCache.Lock()
-	defer antigravityTitleCache.Unlock()
-	delete(antigravityTitleCache.stores, path)
+	if prior, cached := antigravityTitleCache.stores[path]; cached {
+		prior.readAt = time.Time{}
+		antigravityTitleCache.stores[path] = prior
+	}
+	antigravityTitleCache.Unlock()
+	InvalidateSQLiteTitles(path)
+}
+
+// AntigravityStoreTitles reports the titles in a store, for callers that need
+// no workspace or parent. A row without a stored title carries no title
+// signal, so it is absent here.
+func AntigravityStoreTitles(ctx context.Context, path string) (map[string]string, SQLiteContainerState, error) {
+	summaries, state, err := AntigravityStoreSummaries(ctx, path)
+	if err != nil || len(summaries) == 0 {
+		return nil, state, err
+	}
+	titles := make(map[string]string, len(summaries))
+	for id, summary := range summaries {
+		if summary.TitlePresent {
+			titles[id] = summary.Title
+		}
+	}
+	return titles, state, nil
 }
 
 // Matching markers can hide writes, so cached summaries expire.
@@ -52,11 +79,14 @@ func AntigravityStoreSummaries(ctx context.Context, path string) (map[string]Ant
 	state, ok := StatSQLiteContainerState(path)
 	antigravityTitleCache.Lock()
 	defer antigravityTitleCache.Unlock()
-	now := antigravityTitleNow()
-	if prior, cached := antigravityTitleCache.stores[path]; ok && cached && prior.state == state && now.Sub(prior.readAt) < SQLiteContainerDigestVerifyInterval {
+	// The shared native-title clock drives this cache too, so one injected
+	// clock expires every native title read in a test.
+	now := sqliteTitleNow()
+	prior, cached := antigravityTitleCache.stores[path]
+	if ok && cached && prior.state == state && now.Sub(prior.readAt) < SQLiteContainerDigestVerifyInterval {
 		return prior.summaries, prior.state, prior.err
 	}
-	summaries, err := readAntigravitySummaries(ctx, path)
+	summaries, err := readAntigravitySummaries(ctx, path, !cached || prior.state != state)
 	if ctx.Err() != nil {
 		return nil, state, ctx.Err()
 	}
@@ -72,7 +102,9 @@ func AntigravityStoreSummaries(ctx context.Context, path string) (map[string]Ant
 	return summaries, state, err
 }
 
-func readAntigravitySummaries(ctx context.Context, path string) (map[string]AntigravitySummary, error) {
+func readAntigravitySummaries(
+	ctx context.Context, path string, stateChanged bool,
+) (map[string]AntigravitySummary, error) {
 	if !IsRegularFile(path) {
 		return nil, nil
 	}
@@ -85,17 +117,24 @@ func readAntigravitySummaries(ctx context.Context, path string) (map[string]Anti
 	// The workspace and parent columns are undocumented, so stores without
 	// them still yield titles.
 	workspaceColumn, parentColumn := "NULL", "NULL"
-	columns, err := store.QueryContext(ctx, "SELECT name FROM pragma_table_info('conversation_summaries')")
+	var hasTable, hasID, hasTitle bool
+	columns, err := store.QueryContext(ctx, `SELECT name,
+		EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversation_summaries')
+		FROM pragma_table_info('conversation_summaries')`)
 	if err != nil {
 		return nil, err
 	}
 	defer columns.Close()
 	for columns.Next() {
 		var name string
-		if err := columns.Scan(&name); err != nil {
+		if err := columns.Scan(&name, &hasTable); err != nil {
 			return nil, err
 		}
 		switch name {
+		case "conversation_id":
+			hasID = true
+		case "title":
+			hasTitle = true
 		case "workspace_uris":
 			workspaceColumn = name
 		case "parent_conversation_id":
@@ -104,6 +143,14 @@ func readAntigravitySummaries(ctx context.Context, path string) (map[string]Anti
 	}
 	if err := columns.Err(); err != nil {
 		return nil, err
+	}
+	if missing := missingTitleSchema(
+		"conversation_summaries", "conversation_id", hasTable, hasID, hasTitle,
+	); missing != "" {
+		if stateChanged {
+			log.Printf("Warning: title database %s is missing %s", path, missing)
+		}
+		return nil, nil
 	}
 	rows, err := store.QueryContext(ctx, "SELECT conversation_id, title, "+
 		workspaceColumn+", "+parentColumn+" FROM conversation_summaries")
@@ -119,7 +166,7 @@ func readAntigravitySummaries(ctx context.Context, path string) (map[string]Anti
 			return nil, err
 		}
 		summary := AntigravitySummary{
-			Title:                strings.TrimSpace(title.String),
+			Title:                strings.TrimSpace(stringutil.SanitizeUTF8(title.String)),
 			TitlePresent:         title.Valid,
 			Cwd:                  antigravityWorkspace(workspaceURIs.String),
 			ParentConversationID: strings.TrimSpace(parentID.String),
@@ -228,5 +275,7 @@ func applyAntigravityTitle(ctx context.Context, sess *ParsedSession, src antigra
 // PreservesStoredSessionName reports whether a parse carries no title signal
 // for an agent whose titles live outside the transcript.
 func PreservesStoredSessionName(sess ParsedSession) bool {
-	return (sess.Agent == AgentCodex || sess.Agent == AgentAntigravity) && !sess.SessionNamePresent
+	return (sess.Agent == AgentCodex ||
+		sess.Agent == AgentAntigravity ||
+		sess.Agent == AgentQoder) && !sess.SessionNamePresent
 }

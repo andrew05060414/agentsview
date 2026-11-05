@@ -499,7 +499,7 @@ func TestExportSessionsCursorResetMainStderrIsOnlyStructuredJSON(t *testing.T) {
 	assert.NotEmpty(t, got.DatabaseID)
 }
 
-func TestExportSessionsMainStillPrintsFatalForNonCursorErrors(t *testing.T) {
+func TestExportSessionsMainPrintsValidationHintForInvalidFormat(t *testing.T) {
 	dataDir := testDataDir(t)
 	seedExportSessionsArchiveAt(t, filepath.Join(dataDir, "sessions.db"))
 
@@ -519,9 +519,9 @@ func TestExportSessionsMainStillPrintsFatalForNonCursorErrors(t *testing.T) {
 
 	var exitErr *exec.ExitError
 	require.ErrorAs(t, err, &exitErr)
-	assert.Equal(t, 1, exitErr.ExitCode())
+	assert.Equal(t, 65, exitErr.ExitCode())
 	assert.Contains(t, string(exitErr.Stderr), "fatal:")
-	assert.Contains(t, string(exitErr.Stderr), "invalid argument \"xml\"")
+	assert.Contains(t, string(exitErr.Stderr), "\nhint:")
 }
 
 func TestExportSessionsCursorResetMainHelperProcess(t *testing.T) {
@@ -839,7 +839,7 @@ func TestExportSessionsJSONGolden(t *testing.T) {
 	assert.NotContains(t, stdout, `"machine":"golden-host"`)
 	assert.NotContains(t, stdout, `"root_path":"/`)
 
-	assertGoldenBytes(t, "session_export_v6.json", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v7.json", []byte(stdout))
 }
 
 func TestExportSessionsNDJSONGolden(t *testing.T) {
@@ -854,7 +854,7 @@ func TestExportSessionsNDJSONGolden(t *testing.T) {
 	require.NoError(t, err, "export sessions ndjson golden")
 	require.Empty(t, stderr)
 
-	assertGoldenBytes(t, "session_export_v6.ndjson", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v7.ndjson", []byte(stdout))
 }
 
 func firstExportSessionsCursor(t *testing.T) string {

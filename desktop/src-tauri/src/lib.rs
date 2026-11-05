@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver as StdReceiver, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -79,11 +79,15 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(125);
 /// noticed soon after it ends, and well above the request cost of one
 /// loopback GET.
 const BACKEND_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const BACKEND_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const BACKEND_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const STATUS_POLL_MAX_INTERVAL: Duration = Duration::from_secs(1);
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(1250);
 const STATUS_PROBE_FAILURE_NOTICE_AFTER: u32 = 10;
 const STATUS_PROBE_FAILURE_FAIL_AFTER: u32 = 30;
 const LOGIN_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
+
+static LOGIN_SHELL_ENV: OnceLock<Vec<(OsString, OsString)>> = OnceLock::new();
 // Stopping the detached daemon before an update install must outlast
 // both a daemon that is still mid-startup (serve stop refuses with
 // "retry once it is ready" while the startup sync runs, which takes
@@ -112,6 +116,16 @@ const DOCK_MODE_SETTINGS_FILE_NAME: &str = "settings.json";
 // process time to spawn so we don't false-positive on slow startup.
 #[cfg(target_os = "linux")]
 const WEBVIEW_HEALTH_PROBE_DELAY: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "linux")]
+const HOST_WAYLAND_CLIENT_FALLBACKS: &[&str] = &[
+    "/usr/lib/libwayland-client.so.0",
+    "/usr/lib64/libwayland-client.so.0",
+    "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0",
+    "/lib/x86_64-linux-gnu/libwayland-client.so.0",
+    "/usr/lib/aarch64-linux-gnu/libwayland-client.so.0",
+    "/lib/aarch64-linux-gnu/libwayland-client.so.0",
+];
 
 type DynError = Box<dyn Error>;
 type CommandRx = Receiver<CommandEvent>;
@@ -297,6 +311,8 @@ pub fn run() {
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
+    #[cfg(target_os = "linux")]
+    apply_appimage_host_wayland_preload();
 
     let mut updater_builder = tauri_plugin_updater::Builder::new();
     // Override the placeholder pubkey from tauri.conf.json with
@@ -1074,7 +1090,7 @@ fn sidecar_env() -> Vec<(OsString, OsString)> {
     build_sidecar_env(
         std::env::vars_os().collect(),
         if should_probe {
-            read_login_shell_env().unwrap_or_default()
+            cached_login_shell_env()
         } else {
             Vec::new()
         },
@@ -1083,6 +1099,15 @@ fn sidecar_env() -> Vec<(OsString, OsString)> {
         is_windows,
         is_windows,
     )
+}
+
+// The login shell is a snapshot of the user's launch environment. Cache both
+// successful and failed probes for this desktop process so repeated sidecar
+// commands do not rerun shell startup or repeat a 3s timeout.
+fn cached_login_shell_env() -> Vec<(OsString, OsString)> {
+    LOGIN_SHELL_ENV
+        .get_or_init(|| read_login_shell_env().unwrap_or_default())
+        .clone()
 }
 
 // read_login_shell_env invokes the user's login shell and
@@ -1748,9 +1773,7 @@ fn forward_sidecar_logs(
                             );
                         }
                         if let Some(status) = stdout_update.status {
-                            let escaped = status.replace('\\', "\\\\").replace('\'', "\\'");
-                            let _ =
-                                window.eval(format!("window.__setStatus('{escaped}');").as_str());
+                            let _ = window.eval(status_update_script(status.as_str()).as_str());
                         }
                         if let Some(port) = stdout_update.port {
                             save_sidecar_port(window.app_handle(), port);
@@ -2043,6 +2066,10 @@ fn js_string_literal(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
+fn status_update_script(status: &str) -> String {
+    format!("window.__setStatus({});", js_string_literal(status))
+}
+
 fn startup_failure_footer(handle: &AppHandle) -> String {
     match desktop_log_file_path(handle) {
         Ok(path) => format!(
@@ -2319,8 +2346,7 @@ fn poll_background_status_after_launcher_exit(
                     failed_status_probes = 0;
                     unhealthy_since = None;
                     if !long_startup_notice_shown && !status.trim().is_empty() {
-                        let escaped = status.replace('\\', "\\\\").replace('\'', "\\'");
-                        let _ = window.eval(format!("window.__setStatus('{escaped}');").as_str());
+                        let _ = window.eval(status_update_script(status.as_str()).as_str());
                     }
                 }
                 BackendStatusProbe::Unhealthy(status) => {
@@ -2583,6 +2609,209 @@ fn combined_probe_output(stdout: &str, stderr: &str) -> String {
         (false, true) => stdout.to_string(),
         (true, false) => stderr.to_string(),
         (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+// AppImage WebKit loads the bundled libwayland-client while EGL comes from
+// the host Mesa stack. On Wayland sessions such as Hyprland with i915 that
+// mismatch aborts WebKitWebProcess with
+// `Could not create default EGL display: EGL_BAD_PARAMETER` even when
+// WEBKIT_DISABLE_DMABUF_RENDERER=1. Prepend the host client on LD_PRELOAD
+// so the content process resolves it first. APPIMAGE or APPDIR marks an
+// official AppImage or a Homebrew cask that launches one.
+// AGENTSVIEW_NO_WAYLAND_PRELOAD leaves the environment unchanged. Dev
+// builds and distro packages set neither root variable.
+#[cfg(target_os = "linux")]
+fn apply_appimage_host_wayland_preload() {
+    let appimage = std::env::var("APPIMAGE").ok();
+    let appdir = std::env::var("APPDIR").ok();
+    let disabled = std::env::var_os("AGENTSVIEW_NO_WAYLAND_PRELOAD").is_some();
+    if disabled || (appimage.is_none() && appdir.is_none()) {
+        return;
+    }
+
+    let Some(process_elf) = read_elf_identity(Path::new("/proc/self/exe")) else {
+        return;
+    };
+    let existing_preload = std::env::var("LD_PRELOAD").ok();
+    let listing = read_ldconfig_library_listing();
+    let ordered = ordered_wayland_client_paths(
+        listing.as_str(),
+        std::env::consts::ARCH,
+        HOST_WAYLAND_CLIENT_FALLBACKS,
+    );
+    let existing_candidate_paths = loadable_wayland_client_paths(&ordered, process_elf);
+    let Some(preload) = appimage_host_wayland_preload(
+        appimage.as_deref(),
+        appdir.as_deref(),
+        existing_preload.as_deref(),
+        disabled,
+        existing_candidate_paths.as_slice(),
+    ) else {
+        return;
+    };
+    let library = match preload.split_once(' ') {
+        Some((library, _)) => library,
+        None => preload.as_str(),
+    };
+    eprintln!("[agentsview] using host libwayland-client for AppImage WebKit: {library}");
+    std::env::set_var("LD_PRELOAD", preload);
+}
+
+#[cfg(target_os = "linux")]
+fn read_ldconfig_library_listing() -> String {
+    let output = match std::process::Command::new("ldconfig").arg("-p").output() {
+        Ok(output) => output,
+        Err(_) => return String::new(),
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8(output.stdout).unwrap_or_default()
+}
+
+// The loader ignores a preload whose ELF class, byte order, or machine
+// differs from the process, so a 32-bit /usr/lib copy on a lib64 host
+// must not win over the 64-bit one.
+#[cfg(any(test, target_os = "linux"))]
+fn loadable_wayland_client_paths(ordered: &[String], process_elf: [u8; 4]) -> Vec<&str> {
+    ordered
+        .iter()
+        .map(String::as_str)
+        .filter(|path| read_elf_identity(Path::new(*path)) == Some(process_elf))
+        .collect()
+}
+
+// EI_CLASS, EI_DATA, and the two e_machine bytes from an ELF header.
+#[cfg(any(test, target_os = "linux"))]
+fn read_elf_identity(path: &Path) -> Option<[u8; 4]> {
+    let mut header = [0u8; 20];
+    fs::File::open(path).ok()?.read_exact(&mut header).ok()?;
+    if !header.starts_with(b"\x7fELF") {
+        return None;
+    }
+    Some([header[4], header[5], header[18], header[19]])
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn ordered_wayland_client_paths(
+    ldconfig_output: &str,
+    arch: &str,
+    fallbacks: &[&str],
+) -> Vec<String> {
+    let mut preferred = Vec::new();
+    let mut other = Vec::new();
+    for line in ldconfig_output.lines() {
+        let Some((tag, path)) = parse_ldconfig_wayland_client_line(line) else {
+            continue;
+        };
+        if ldconfig_tag_matches_arch(arch, tag) {
+            preferred.push(path);
+        } else {
+            other.push(path);
+        }
+    }
+
+    let mut ordered = Vec::new();
+    for path in preferred
+        .into_iter()
+        .chain(other)
+        .chain(fallbacks.iter().copied())
+    {
+        if path.is_empty() || path.chars().any(char::is_whitespace) {
+            continue;
+        }
+        if ordered.iter().any(|existing| existing == path) {
+            continue;
+        }
+        ordered.push(path.to_string());
+    }
+    ordered
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn parse_ldconfig_wayland_client_line(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    let rest = line.strip_prefix("libwayland-client.so.0")?;
+    match rest.chars().next() {
+        Some('(') => {}
+        Some(ch) if ch.is_whitespace() => {}
+        _ => return None,
+    }
+    let rest = rest.trim_start();
+    let (tag, rest) = if let Some(after_open) = rest.strip_prefix('(') {
+        let (tag, after_tag) = after_open.split_once(')')?;
+        (tag, after_tag.trim_start())
+    } else {
+        ("", rest)
+    };
+    let path = rest.strip_prefix("=>")?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some((tag, path))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn ldconfig_tag_matches_arch(arch: &str, tag: &str) -> bool {
+    match arch {
+        "x86_64" => tag.split(',').any(|part| part.trim() == "x86-64"),
+        "aarch64" => tag.to_ascii_lowercase().contains("aarch64"),
+        _ => false,
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn appimage_host_wayland_preload(
+    appimage: Option<&str>,
+    appdir: Option<&str>,
+    existing_preload: Option<&str>,
+    disabled: bool,
+    existing_candidate_paths: &[&str],
+) -> Option<String> {
+    if disabled || (appimage.is_none() && appdir.is_none()) {
+        return None;
+    }
+    if existing_preload.is_some_and(|preload| preload.contains("libwayland-client")) {
+        return None;
+    }
+    let path = existing_candidate_paths
+        .iter()
+        .copied()
+        .find(|path| host_wayland_candidate_allowed(path, appdir))?;
+    Some(merge_host_wayland_preload(path, existing_preload))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn host_wayland_candidate_allowed(path: &str, appdir: Option<&str>) -> bool {
+    if !path.starts_with('/') || path.chars().any(char::is_whitespace) {
+        return false;
+    }
+    match appdir {
+        Some(appdir) if !appdir.is_empty() => !path_is_inside_appdir(path, appdir),
+        _ => true,
+    }
+}
+
+// Whole path components, so APPDIR=/tmp/app keeps /tmp/app-extra eligible.
+#[cfg(any(test, target_os = "linux"))]
+fn path_is_inside_appdir(path: &str, appdir: &str) -> bool {
+    let dir_parts: Vec<&str> = appdir.split('/').filter(|part| !part.is_empty()).collect();
+    if dir_parts.is_empty() {
+        return false;
+    }
+    let path_parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    path_parts.starts_with(dir_parts.as_slice())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn merge_host_wayland_preload(path: &str, existing_preload: Option<&str>) -> String {
+    match existing_preload
+        .map(str::trim)
+        .filter(|preload| !preload.is_empty())
+    {
+        Some(preload) => format!("{path} {preload}"),
+        None => path.to_string(),
     }
 }
 
@@ -3866,6 +4095,12 @@ struct BackendProbeState {
     last: Option<(u16, bool)>,
 }
 
+#[derive(serde::Deserialize)]
+struct BackendPingResponse {
+    ok: bool,
+    service: String,
+}
+
 impl BackendProbeState {
     /// Records one probe result and reports whether the current page needs
     /// to be reloaded.
@@ -3873,11 +4108,10 @@ impl BackendProbeState {
     /// The window is reloaded when a reachable backend is not the one the
     /// window was last known to be on: it answers on a different port, or it
     /// answers again after having been unreachable. A backend that comes back
-    /// on the same port may be a different process, and the version endpoint
-    /// carries no per-process identity to tell them apart, so the
-    /// down-then-up transition is the signal. Recovery fires once per
-    /// transition, never on every probe, and never while the backend is down,
-    /// because there would be nothing to reload.
+    /// on the same port may be a different process, so the down-then-up
+    /// transition is the signal. Recovery fires once per transition, never on
+    /// every probe, and never while the backend is down, because there would
+    /// be nothing to reload.
     ///
     /// The first observation never reloads: start-up has already pointed the
     /// window at the backend.
@@ -3905,7 +4139,7 @@ fn spawn_backend_probe(window: WebviewWindow, handle: AppHandle) {
     thread::spawn(move || {
         loop {
             if let Some(port) = current_backend_port(&handle) {
-                let reachable = backend_endpoint_ready(port);
+                let reachable = backend_liveness_ready(port);
                 let deep_link_state = handle.state::<DeepLinkState>();
                 if let Ok(mut dispatch) = deep_link_state.dispatch.lock() {
                     // Recheck after HTTP: startup may have published a new port.
@@ -3951,24 +4185,37 @@ fn wait_for_server_stopped(port: u16, timeout: Duration) -> bool {
 fn backend_endpoint_ready(port: u16) -> bool {
     let request =
         format!("GET /api/v1/version HTTP/1.1\r\nHost: {HOST}:{port}\r\nConnection: close\r\n\r\n");
-    let response = match read_http_response(port, request.as_str()) {
+    let response = match read_http_response(port, request.as_str(), BACKEND_READY_PROBE_TIMEOUT) {
         Some(resp) => resp,
         None => return false,
     };
-    response.starts_with(b"HTTP/1.1 401 ")
-        || response.starts_with(b"HTTP/1.0 401 ")
+    response_is_auth_challenge(response.as_slice())
         || version_response_looks_valid(response.as_slice())
 }
 
-fn read_http_response(port: u16, request: &str) -> Option<Vec<u8>> {
+fn backend_liveness_ready(port: u16) -> bool {
+    // Runtime recovery only needs process liveness. Unlike the version
+    // endpoint, this probe does not wait for archive-backed state.
+    let request =
+        format!("GET /api/ping HTTP/1.1\r\nHost: {HOST}:{port}\r\nConnection: close\r\n\r\n");
+    let response = match read_http_response(port, request.as_str(), BACKEND_LIVENESS_PROBE_TIMEOUT)
+    {
+        Some(resp) => resp,
+        None => return false,
+    };
+    response_is_auth_challenge(response.as_slice())
+        || ping_response_looks_valid(response.as_slice())
+}
+
+fn read_http_response(port: u16, request: &str, timeout: Duration) -> Option<Vec<u8>> {
     let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-    let mut stream = match TcpStream::connect_timeout(&addr.into(), Duration::from_millis(250)) {
+    let mut stream = match TcpStream::connect_timeout(&addr.into(), timeout) {
         Ok(stream) => stream,
         Err(_) => return None,
     };
 
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
 
     if stream.write_all(request.as_bytes()).is_err() {
         return None;
@@ -3984,15 +4231,25 @@ fn read_http_response(port: u16, request: &str) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-fn version_response_looks_valid(response: &[u8]) -> bool {
+fn response_is_auth_challenge(response: &[u8]) -> bool {
+    response.starts_with(b"HTTP/1.1 401 ") || response.starts_with(b"HTTP/1.0 401 ")
+}
+
+fn success_response_body(response: &[u8]) -> Option<&[u8]> {
     if !(response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200")) {
-        return false;
+        return None;
     }
-    let body = if let Some(idx) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-        &response[(idx + 4)..]
-    } else if let Some(idx) = response.windows(2).position(|w| w == b"\n\n") {
-        &response[(idx + 2)..]
-    } else {
+    if let Some(idx) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some(&response[(idx + 4)..]);
+    }
+    response
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|idx| &response[(idx + 2)..])
+}
+
+fn version_response_looks_valid(response: &[u8]) -> bool {
+    let Some(body) = success_response_body(response) else {
         return false;
     };
     let body = String::from_utf8_lossy(body);
@@ -4001,6 +4258,14 @@ fn version_response_looks_valid(response: &[u8]) -> bool {
         && body.contains("\"build_date\"")
         && body.contains("\"api_version\"")
         && body.contains("\"data_version\"")
+}
+
+fn ping_response_looks_valid(response: &[u8]) -> bool {
+    let Some(body) = success_response_body(response) else {
+        return false;
+    };
+    serde_json::from_slice::<BackendPingResponse>(body)
+        .is_ok_and(|ping| ping.ok && ping.service == "agentsview")
 }
 
 #[tauri::command]
@@ -4419,6 +4684,16 @@ mod tests {
         assert!(script.contains("fatal: opening database"));
         assert!(script.contains("role', 'alert'"));
         assert!(script.contains("Attach logs"));
+    }
+
+    #[test]
+    fn status_update_script_serializes_multiline_startup_status() {
+        let status = "agentsview is starting up.\n  phase: opening user's \"main\" database\n  log: C:\\AgentsView\\serve.log";
+
+        assert_eq!(
+            status_update_script(status),
+            r#"window.__setStatus("agentsview is starting up.\n  phase: opening user's \"main\" database\n  log: C:\\AgentsView\\serve.log");"#
+        );
     }
 
     #[test]
@@ -5839,6 +6114,76 @@ agentsview running at http://127.0.0.1:18082
         assert!(!ready, "empty response");
     }
 
+    #[test]
+    fn backend_liveness_probe_uses_ping_endpoint() {
+        let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true,\"healthy\":true,\"service\":\"agentsview\",\"pid\":42}";
+        let (port, request) = spawn_response_server(response);
+        let ready = backend_liveness_ready(port);
+        let request = request.join().expect("response server should finish");
+
+        assert!(request.starts_with("GET /api/ping HTTP/1.1\r\n"));
+        assert!(request.contains(&format!("Host: {HOST}:{port}\r\n")));
+        assert!(!request.contains("/api/v1/version"));
+        assert!(!request.contains("Authorization:"));
+        assert!(ready);
+    }
+
+    #[test]
+    fn backend_liveness_probe_preserves_status_boundaries() {
+        let cases: &[(&str, &[u8], bool)] = &[
+            (
+                "HTTP/1.0 401",
+                b"HTTP/1.0 401 Unauthorized\r\nConnection: close\r\n\r\nUnauthorized\n",
+                true,
+            ),
+            (
+                "HTTP/1.1 401",
+                b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\nUnauthorized\n",
+                true,
+            ),
+            (
+                "healthy agentsview",
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true,\"healthy\":true,\"service\":\"agentsview\",\"pid\":42}",
+                true,
+            ),
+            (
+                "stalled agentsview",
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true,\"healthy\":false,\"service\":\"agentsview\",\"pid\":42}",
+                true,
+            ),
+            (
+                "not ok",
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":false,\"service\":\"agentsview\"}",
+                false,
+            ),
+            (
+                "wrong service",
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true,\"service\":\"other\"}",
+                false,
+            ),
+            (
+                "unrelated HTML 200",
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<html></html>",
+                false,
+            ),
+            ("403", b"HTTP/1.1 403 Forbidden\r\n\r\n", false),
+            ("503", b"HTTP/1.1 503 Service Unavailable\r\n\r\n", false),
+            ("HTTP/1.1 4010", b"HTTP/1.1 4010 Invalid\r\n\r\n", false),
+        ];
+
+        for &(name, response, expected) in cases {
+            let (port, request) = spawn_response_server(response);
+            let ready = backend_liveness_ready(port);
+            request.join().expect("response server should finish");
+            assert_eq!(ready, expected, "{name}");
+        }
+
+        let (port, request) = spawn_response_server(b"");
+        let ready = backend_liveness_ready(port);
+        request.join().expect("response server should finish");
+        assert!(!ready, "empty response");
+    }
+
     fn spawn_response_server(response: &[u8]) -> (u16, std::thread::JoinHandle<String>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind response server");
         listener
@@ -5903,6 +6248,101 @@ agentsview running at http://127.0.0.1:18082
         assert!(should_probe_login_shell(None, false));
         assert!(!should_probe_login_shell(Some(&OsString::from("1")), false));
         assert!(!should_probe_login_shell(None, true));
+    }
+
+    #[cfg(unix)]
+    fn run_sidecar_env_cache_child(
+        test_name: &str,
+        child_marker: &str,
+        script_body: &str,
+    ) -> Vec<u8> {
+        let dir = tempdir().expect("tempdir");
+        let shell = dir.path().join("login-shell-probe");
+        let counter = dir.path().join("probe-count");
+        fs::write(&shell, script_body).expect("write login shell probe");
+        let mut permissions = fs::metadata(&shell)
+            .expect("read login shell probe metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&shell, permissions).expect("make login shell probe executable");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(child_marker, "1")
+            .env("SHELL", &shell)
+            .env("HOME", dir.path())
+            .env("AGENTSVIEW_LOGIN_SHELL_CACHE_COUNTER", &counter)
+            .env_remove("AGENTSVIEW_DESKTOP_PATH")
+            .env_remove("AGENTSVIEW_DESKTOP_SKIP_LOGIN_SHELL_ENV")
+            .env_remove("SHELL_CACHE_RETRY")
+            .env_remove("SHELL_CACHE_VALUE")
+            .output()
+            .expect("run isolated login shell cache test");
+
+        assert!(
+            output.status.success(),
+            "isolated test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read(counter).expect("read login shell probe count")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_env_caches_successful_login_shell_probe() {
+        const CHILD_MARKER: &str = "AGENTSVIEW_LOGIN_SHELL_CACHE_SUCCESS_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let first: HashMap<_, _> = sidecar_env().into_iter().collect();
+            let second: HashMap<_, _> = sidecar_env().into_iter().collect();
+            let key = OsString::from("SHELL_CACHE_VALUE");
+            let expected = OsString::from("first");
+            assert_eq!(first.get(&key), Some(&expected));
+            assert_eq!(second.get(&key), Some(&expected));
+            return;
+        }
+
+        let count = run_sidecar_env_cache_child(
+            "tests::sidecar_env_caches_successful_login_shell_probe",
+            CHILD_MARKER,
+            concat!(
+                "#!/bin/sh\n",
+                "printf x >> \"$AGENTSVIEW_LOGIN_SHELL_CACHE_COUNTER\"\n",
+                "export SHELL_CACHE_VALUE=first\n",
+                "exec /usr/bin/env -0\n",
+            ),
+        );
+        assert_eq!(count, b"x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_env_caches_failed_login_shell_probe() {
+        const CHILD_MARKER: &str = "AGENTSVIEW_LOGIN_SHELL_CACHE_FAILURE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let first: HashMap<_, _> = sidecar_env().into_iter().collect();
+            let second: HashMap<_, _> = sidecar_env().into_iter().collect();
+            let key = OsString::from("SHELL_CACHE_RETRY");
+            assert_eq!(first.get(&key), None);
+            assert_eq!(second.get(&key), None);
+            return;
+        }
+
+        let count = run_sidecar_env_cache_child(
+            "tests::sidecar_env_caches_failed_login_shell_probe",
+            CHILD_MARKER,
+            concat!(
+                "#!/bin/sh\n",
+                "printf x >> \"$AGENTSVIEW_LOGIN_SHELL_CACHE_COUNTER\"\n",
+                "count=$(wc -c < \"$AGENTSVIEW_LOGIN_SHELL_CACHE_COUNTER\")\n",
+                "if [ \"$count\" -gt 1 ]; then\n",
+                "  export SHELL_CACHE_RETRY=unexpected\n",
+                "  exec /usr/bin/env -0\n",
+                "fi\n",
+                "exit 42\n",
+            ),
+        );
+        assert_eq!(count, b"x");
     }
 
     #[test]
@@ -6600,6 +7040,244 @@ agentsview running at http://127.0.0.1:18082
         // Opening a link does not establish readiness; the navigation can
         // fail while the backend is down and still needs recovery afterward.
         assert!(dispatch.observe_backend(8080, true));
+    }
+
+    #[test]
+    fn appimage_host_wayland_preload_uses_ldconfig_host_client() {
+        let ordered = ordered_wayland_client_paths(
+            "libwayland-client.so.0 (libc6,x86-64) => /usr/lib/libwayland-client.so.0",
+            "x86_64",
+            &[],
+        );
+        let candidates: Vec<&str> = ordered.iter().map(String::as_str).collect();
+        assert_eq!(
+            appimage_host_wayland_preload(
+                Some("/tmp/AgentsView.AppImage"),
+                Some("/tmp/app"),
+                Some(""),
+                false,
+                &candidates,
+            )
+            .as_deref(),
+            Some("/usr/lib/libwayland-client.so.0"),
+        );
+    }
+
+    #[test]
+    fn appimage_host_wayland_skips_client_built_for_another_arch() {
+        fn elf_header(class: u8, machine: u16) -> Vec<u8> {
+            let mut header = vec![0u8; 64];
+            header[..4].copy_from_slice(b"\x7fELF");
+            header[4] = class;
+            header[5] = 1;
+            header[18..20].copy_from_slice(&machine.to_le_bytes());
+            header
+        }
+        let dir = tempdir().expect("tempdir");
+        let lib32 = dir.path().join("lib/libwayland-client.so.0");
+        let lib64 = dir.path().join("lib64/libwayland-client.so.0");
+        let script = dir.path().join("script/libwayland-client.so.0");
+        for path in [&lib32, &lib64, &script] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        fs::write(&lib32, elf_header(1, 3)).unwrap();
+        fs::write(&lib64, elf_header(2, 62)).unwrap();
+        fs::write(&script, b"#!/bin/sh\n").unwrap();
+        let ordered: Vec<String> = [
+            lib32.to_str().unwrap(),
+            dir.path().join("missing.so.0").to_str().unwrap(),
+            script.to_str().unwrap(),
+            lib64.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        assert_eq!(
+            loadable_wayland_client_paths(&ordered, [2, 1, 62, 0]),
+            [lib64.to_str().unwrap()],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appimage_host_wayland_reads_running_process_elf_identity() {
+        let identity = read_elf_identity(Path::new("/proc/self/exe")).expect("process ELF header");
+        let class = if cfg!(target_pointer_width = "64") { 2 } else { 1 };
+        assert_eq!(identity[0], class);
+    }
+
+    #[test]
+    fn appimage_host_wayland_orders_client_paths_by_process_arch() {
+        let listing = "\
+libwayland-client.so.0 (libc6) => /usr/lib/i386-linux-gnu/libwayland-client.so.0
+libwayland-client.so.0 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libwayland-client.so.0
+";
+        assert_eq!(
+            ordered_wayland_client_paths(listing, "x86_64", &[]),
+            [
+                "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0",
+                "/usr/lib/i386-linux-gnu/libwayland-client.so.0",
+            ],
+        );
+
+        let listing = "\
+libwayland-client.so.0 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libwayland-client.so.0
+libwayland-client.so.0 (libc6,AArch64) => /usr/lib/aarch64-linux-gnu/libwayland-client.so.0
+";
+        assert_eq!(
+            ordered_wayland_client_paths(listing, "aarch64", &[]),
+            [
+                "/usr/lib/aarch64-linux-gnu/libwayland-client.so.0",
+                "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0",
+            ],
+        );
+    }
+
+    #[test]
+    fn appimage_host_wayland_preload_prepends_other_library_and_keeps_existing_client() {
+        assert_eq!(
+            appimage_host_wayland_preload(
+                Some("/tmp/AgentsView.AppImage"),
+                Some("/tmp/app"),
+                Some("/opt/other.so"),
+                false,
+                &["/usr/lib/libwayland-client.so.0"],
+            )
+            .as_deref(),
+            Some("/usr/lib/libwayland-client.so.0 /opt/other.so"),
+        );
+        assert_eq!(
+            appimage_host_wayland_preload(
+                Some("/tmp/AgentsView.AppImage"),
+                Some("/tmp/app"),
+                Some("/usr/lib/libwayland-client.so.0"),
+                false,
+                &["/usr/lib/libwayland-client.so.0"],
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn appimage_host_wayland_preload_requires_appimage_and_honors_opt_out() {
+        assert_eq!(
+            appimage_host_wayland_preload(
+                None,
+                None,
+                Some(""),
+                false,
+                &["/usr/lib/libwayland-client.so.0"],
+            ),
+            None,
+        );
+        assert_eq!(
+            appimage_host_wayland_preload(
+                Some("/tmp/AgentsView.AppImage"),
+                None,
+                Some(""),
+                false,
+                &["/usr/lib/libwayland-client.so.0"],
+            )
+            .as_deref(),
+            Some("/usr/lib/libwayland-client.so.0"),
+        );
+        assert_eq!(
+            appimage_host_wayland_preload(
+                None,
+                Some("/tmp/app"),
+                Some(""),
+                false,
+                &["/usr/lib/libwayland-client.so.0"],
+            )
+            .as_deref(),
+            Some("/usr/lib/libwayland-client.so.0"),
+        );
+        assert_eq!(
+            appimage_host_wayland_preload(
+                Some("/tmp/AgentsView.AppImage"),
+                Some("/tmp/app"),
+                Some(""),
+                true,
+                &["/usr/lib/libwayland-client.so.0"],
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn appimage_host_wayland_preload_skips_bundled_and_whitespace_paths() {
+        assert_eq!(
+            appimage_host_wayland_preload(
+                Some("/tmp/AgentsView.AppImage"),
+                Some("/tmp/app"),
+                Some(""),
+                false,
+                &[
+                    "/usr/lib/my lib/libwayland-client.so.0",
+                    "/tmp/app/usr/lib/libwayland-client.so.0",
+                    "/tmp/app-extra/usr/lib/libwayland-client.so.0",
+                ],
+            )
+            .as_deref(),
+            Some("/tmp/app-extra/usr/lib/libwayland-client.so.0"),
+        );
+    }
+
+    #[test]
+    fn appimage_host_wayland_parser_ignores_other_sonames_and_falls_back() {
+        let listing = "\
+libwayland-cursor.so.0 (libc6,x86-64) => /usr/lib/libwayland-cursor.so.0
+libwayland-egl.so.1 (libc6,x86-64) => /usr/lib/libwayland-egl.so.1
+libwayland-client.so (libc6,x86-64) => /usr/lib/libwayland-client.so
+";
+        assert_eq!(
+            ordered_wayland_client_paths(listing, "x86_64", &[]),
+            Vec::<String>::new(),
+        );
+
+        let fallback =
+            ordered_wayland_client_paths("", "x86_64", &["/usr/lib/libwayland-client.so.0"]);
+        let fallback_refs: Vec<&str> = fallback.iter().map(String::as_str).collect();
+        assert_eq!(
+            appimage_host_wayland_preload(
+                Some("/tmp/AgentsView.AppImage"),
+                Some("/tmp/app"),
+                Some(""),
+                false,
+                &fallback_refs,
+            )
+            .as_deref(),
+            Some("/usr/lib/libwayland-client.so.0"),
+        );
+
+        let none = ordered_wayland_client_paths("", "x86_64", &[]);
+        let none_refs: Vec<&str> = none.iter().map(String::as_str).collect();
+        assert_eq!(
+            appimage_host_wayland_preload(
+                Some("/tmp/AgentsView.AppImage"),
+                Some("/tmp/app"),
+                Some(""),
+                false,
+                &none_refs,
+            ),
+            None,
+        );
+
+        assert_eq!(
+            ordered_wayland_client_paths(
+                "libwayland-client.so.0 (libc6,x86-64) => /usr/lib/libwayland-client.so.0",
+                "x86_64",
+                &[
+                    "/usr/lib/libwayland-client.so.0",
+                    "/usr/lib64/libwayland-client.so.0",
+                ],
+            ),
+            [
+                "/usr/lib/libwayland-client.so.0",
+                "/usr/lib64/libwayland-client.so.0",
+            ],
+        );
     }
 }
 

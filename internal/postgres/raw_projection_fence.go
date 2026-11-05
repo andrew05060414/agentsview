@@ -23,12 +23,13 @@ type RawProjectionOptions struct {
 type RawProjectionStore struct {
 	curationGuard func(context.Context, *sql.Tx, string, RawIdentity) error
 	db            *sql.DB
+	readTx        *sql.Tx
 	options       RawProjectionOptions
 }
 
 var _ rawderive.ProjectionSink = (*RawProjectionStore)(nil)
 
-func NewRawProjectionStore(database *sql.DB, options RawProjectionOptions) (*RawProjectionStore, error) {
+func NewRawProjectionStore(ctx context.Context, database *sql.DB, options RawProjectionOptions) (*RawProjectionStore, error) {
 	if options.Content.ToolResultImages == config.ToolResultImagesOffload {
 		return nil, errors.New("tool_result_images = offload is not supported for hosted raw derivation; use keep or drop")
 	}
@@ -44,7 +45,6 @@ func NewRawProjectionStore(database *sql.DB, options RawProjectionOptions) (*Raw
 	if database == nil {
 		return nil, errors.New("raw projection requires a database")
 	}
-	ctx := context.Background()
 	var schema string
 	if err := database.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
 		return nil, err
@@ -58,6 +58,9 @@ func NewRawProjectionStore(database *sql.DB, options RawProjectionOptions) (*Raw
 	_, err := database.ExecContext(ctx, `SELECT s.provenance_kind,s.raw_group_id,s.raw_content_revision,j.projection_generation,j.projection_selected,c.recency_state FROM sessions s CROSS JOIN raw_ingest_jobs j CROSS JOIN raw_content_revisions c LIMIT 0`)
 	if err != nil {
 		return nil, fmt.Errorf("raw projection schema requires owner provisioning: %w", err)
+	}
+	if err := CheckDataVersionCompat(ctx, database); err != nil {
+		return nil, err
 	}
 	var indexes bool
 	if err := database.QueryRowContext(ctx, `SELECT to_regclass('raw_selected_job') IS NOT NULL AND to_regclass('raw_pending_signals') IS NOT NULL AND to_regclass('raw_hosted_jobs_due') IS NOT NULL AND to_regclass('raw_hosted_jobs_expired') IS NOT NULL`).Scan(&indexes); err != nil {
@@ -109,10 +112,16 @@ func selectRawSourceGenerationTx(ctx context.Context, tx *sql.Tx, m rawsync.Cano
 	if manifest == m.ManifestID && selected == version {
 		return generation, nil
 	}
-	generation++
+	return resetRawSourceSelectionTx(ctx, tx, m, version, generation+1, previousJob)
+}
+
+// resetRawSourceSelectionTx requires the current source-head lock and a verified
+// canonical manifest. The caller supplies the next selection generation.
+func resetRawSourceSelectionTx(ctx context.Context, tx *sql.Tx, m rawsync.CanonicalManifest, version string, generation, previousJob int64) (int64, error) {
+	source := rawSourceID(m)
 	var jobID int64
-	err = tx.QueryRowContext(ctx, `INSERT INTO raw_ingest_jobs(tenant_id,manifest_id,stage,processing_version,projection_generation) VALUES($1,$2,'parse',$3,$4)
- ON CONFLICT(tenant_id,manifest_id,stage,processing_version) DO UPDATE SET projection_generation=EXCLUDED.projection_generation,projection_selected=true,attempt_count=0,state='ready',available_at=clock_timestamp(),lease_owner='',lease_expires_at=NULL RETURNING id`, m.Identity.TenantID, m.ManifestID, version, generation).Scan(&jobID)
+	err := tx.QueryRowContext(ctx, `INSERT INTO raw_ingest_jobs(tenant_id,manifest_id,stage,processing_version,projection_generation) VALUES($1,$2,'parse',$3,$4)
+ ON CONFLICT(tenant_id,manifest_id,stage,processing_version) DO UPDATE SET projection_generation=EXCLUDED.projection_generation,projection_selected=true,attempt_count=0,state='ready',available_at=clock_timestamp(),lease_owner='',lease_expires_at=NULL,last_error_class='',last_error='' RETURNING id`, m.Identity.TenantID, m.ManifestID, version, generation).Scan(&jobID)
 	if err != nil {
 		return 0, err
 	}

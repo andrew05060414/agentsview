@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,17 +17,103 @@ import (
 	"go.kenn.io/agentsview/internal/storage"
 )
 
+// Preserve deployment recipe adoption at the PG service boundary, while a
+// missing listener token file and invalid listener host remain irrelevant.
+func TestScopedConfigPGVectorConsumersAdoptDeploymentRecipe(t *testing.T) {
+	for _, args := range [][]string{
+		{"session", "search", "task", "--pg", "--semantic"},
+		{"session", "search", "task", "--pg", "--hybrid"},
+		{"mcp", "--pg"},
+		{"doctor", "memory", "--pg"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			seedScopedConfigArchive(t)
+			t.Setenv("AGENTSVIEW_MODE", "pg-serve")
+			t.Setenv("AGENTSVIEW_PG_URL", "postgres://example.test/archive")
+			t.Setenv("AGENTSVIEW_AUTH_TOKEN_FILE", filepath.Join(os.Getenv("HOME"), "missing-token"))
+			t.Setenv("AGENTSVIEW_HOST", "")
+			t.Setenv("AGENTSVIEW_EMBEDDINGS_ENDPOINT", "http://127.0.0.1:30000/v1")
+			store := dbtest.OpenTestDBAt(t, filepath.Join(t.TempDir(), "pg.db"))
+			stubPGReadStore(t, store)
+			orig := wireReplicaReadVectorSearchFn
+			var adopted config.Config
+			wireReplicaReadVectorSearchFn = func(_ context.Context, cfg config.Config, backend storage.Replica, got db.Store) {
+				assert.Same(t, db.Store(store), got)
+				assert.Equal(t, "pg", backend.Name())
+				require.NotNil(t, cfg.DeploymentEmbeddings, "PG vector reads need the deployment embeddings transport")
+				var err error
+				adopted, err = adoptReplicaVectorConfig(t.Context(), cfg,
+					recipeProvider{gens: []storage.VectorGenerationInfo{publishedRecipe()}}, nil)
+				require.NoError(t, err)
+			}
+			t.Cleanup(func() { wireReplicaReadVectorSearchFn = orig })
+			cmd := parseCommand(t, args)
+			resolve := resolveService
+			if args[0] == "mcp" {
+				resolve = resolveMCPService
+			}
+			var cleanup func()
+			var err error
+			if args[0] == "doctor" {
+				_, cleanup, err = resolveDoctorMemoryService(cmd, doctorMemorySelection(cmd))
+			} else {
+				_, cleanup, err = resolve(cmd)
+			}
+			require.NoError(t, err)
+			t.Cleanup(cleanup)
+			assert.True(t, adopted.Vector.Enabled)
+			assert.Equal(t, publishedRecipe().Fingerprint, vectorGeneration(adopted.Vector.Embeddings).Fingerprint())
+			assert.Equal(t, "http://127.0.0.1:30000/v1", adopted.Vector.Embeddings.Servers["deployment"].Endpoint)
+		})
+	}
+}
+
+func TestScopedConfigPGDeploymentEmbeddingsValidation(t *testing.T) {
+	for _, args := range [][]string{
+		{"session", "list", "--pg"},
+		{"session", "search", "task", "--pg", "--semantic"},
+		{"mcp", "--pg"},
+		{"doctor", "memory", "--pg"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			seedScopedConfigArchive(t)
+			t.Setenv("AGENTSVIEW_MODE", "pg-serve")
+			t.Setenv("AGENTSVIEW_PG_URL", "postgres://example.test/archive")
+			t.Setenv("AGENTSVIEW_EMBEDDINGS_BATCH_SIZE", "invalid")
+			stubPGReadStore(t, dbtest.OpenTestDBAt(t, filepath.Join(t.TempDir(), "pg.db")))
+			resolve := resolveService
+			if args[0] == "mcp" {
+				resolve = resolveMCPService
+			}
+			cmd := parseCommand(t, args)
+			var cleanup func()
+			var err error
+			if args[0] == "doctor" {
+				_, cleanup, err = resolveDoctorMemoryService(cmd, doctorMemorySelection(cmd))
+			} else {
+				_, cleanup, err = resolve(cmd)
+			}
+			if args[1] == "list" {
+				require.NoError(t, err, "plain PG reads do not use deployment embeddings")
+				t.Cleanup(cleanup)
+			} else {
+				require.ErrorContains(t, err, "AGENTSVIEW_EMBEDDINGS_ENDPOINT is required")
+			}
+		})
+	}
+}
+
 func TestReplicaVectorReasons(t *testing.T) {
 	backend := pgReplica{}
 	assert.Equal(t,
 		"semantic search: PostgreSQL has no embedding generation matching fingerprint "+
-			"abc123 (present: def456, ghi789); run 'agentsview pg push' from a machine "+
+			"abc123 (present: def456, ghi789); run 'agentsview replica pg push' from a machine "+
 			"with a matching [vector.embeddings] config",
 		replicaVectorUnavailableReason(backend,
 			"PostgreSQL has no embedding generation matching fingerprint abc123",
 			[]storage.VectorGenerationInfo{{Fingerprint: "def456"}, {Fingerprint: "ghi789"}}))
 	assert.Equal(t,
-		"semantic search: no match (present: ); run 'agentsview pg push' from a "+
+		"semantic search: no match (present: ); run 'agentsview replica pg push' from a "+
 			"machine with a matching [vector.embeddings] config",
 		replicaVectorUnavailableReason(backend, "no match", nil))
 }
@@ -39,8 +128,8 @@ func TestWireReplicaVectorSearchRecordsVectorDisabledReason(t *testing.T) {
 	})
 	require.ErrorIs(t, err, db.ErrSemanticUnavailable)
 	assert.Contains(t, err.Error(), "PostgreSQL requires [vector] enabled")
-	assert.Contains(t, err.Error(), "agentsview pg push")
-	assert.NotContains(t, err.Error(), "agentsview embeddings build")
+	assert.Contains(t, err.Error(), "agentsview replica pg push")
+	assert.NotContains(t, err.Error(), "agentsview index embeddings build")
 }
 
 // nonVectorReplica is a replica that does not implement
@@ -80,7 +169,7 @@ func TestNewPGReadServiceRunsVectorWiring(t *testing.T) {
 	var gotBackend storage.Replica
 	calls := 0
 	orig := wireReplicaReadVectorSearchFn
-	wireReplicaReadVectorSearchFn = func(cfg config.Config, backend storage.Replica, store db.Store) {
+	wireReplicaReadVectorSearchFn = func(_ context.Context, cfg config.Config, backend storage.Replica, store db.Store) {
 		calls++
 		gotCfg = cfg
 		gotBackend = backend
@@ -90,7 +179,7 @@ func TestNewPGReadServiceRunsVectorWiring(t *testing.T) {
 
 	cfg := config.Config{}
 	cfg.Vector.Enabled = true
-	svc, cleanup, err := newPGReadService(cfg, config.PGConfig{
+	svc, cleanup, err := newPGReadService(t.Context(), cfg, config.PGConfig{
 		URL:    "postgres://example.test/agentsview",
 		Schema: "agentsview",
 	})
@@ -115,6 +204,6 @@ func TestWireReplicaReadVectorSearchIgnoresNonReplicaStore(t *testing.T) {
 	cfg.Vector.Enabled = true
 
 	require.NotPanics(t, func() {
-		wireReplicaReadVectorSearch(cfg, pgReplica{}, fakeStore)
+		wireReplicaReadVectorSearch(t.Context(), cfg, pgReplica{}, fakeStore)
 	})
 }

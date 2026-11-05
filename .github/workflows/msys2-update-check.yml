@@ -1,8 +1,12 @@
 name: MSYS2 Update Check
 
 env:
+  GOTRACEBACK: all
   # "|" falls back to direct on any proxy error (e.g. HTTP/2 INTERNAL_ERROR), not just 404/410.
   GOPROXY: "https://proxy.golang.org|direct"
+  # Compile with module-relative source paths so identical source shares one
+  # Go build cache across checkouts and worktrees.
+  GOFLAGS: -trimpath
 
 # Periodically run Windows CI with MSYS2 updates enabled to catch
 # toolchain drift, security fixes, and package metadata changes.
@@ -13,6 +17,7 @@ on:
     - cron: "0 9 * * 1"  # Every Monday at 09:00 UTC
   workflow_dispatch:
 
+# Timeout p99 measurements: https://github.com/kenn-io/agentsview/pull/2547
 jobs:
   windows-update-check:
     name: MSYS2 Update Check (${{ matrix.name }})
@@ -21,41 +26,61 @@ jobs:
       matrix:
         include:
           - name: Other packages
+            timeout: 27
             package: ./...
           # Keep CLI filters aligned with the CLI entries in ci.yml.
           - name: CLI A-P
+            timeout: 27
             package: ./cmd/agentsview
             run: '^Test[A-P]'
           - name: CLI remaining
+            timeout: 27
             package: ./cmd/agentsview
             skip: '^Test[A-P]'
           - name: Capture, Database, Parser
+            timeout: 38
             package: ./internal/capture ./internal/db ./internal/parser
           - name: DuckDB
+            timeout: 27
             package: ./internal/duckdb
           # Match normal Windows CI; complementary filters cover every sync test.
           - name: Sync A-R
+            timeout: 27
             package: ./internal/sync
             run: '^Test[A-R]'
           - name: Sync remaining
+            timeout: 27
             package: ./internal/sync
             skip: '^Test[A-R]'
     runs-on: windows-latest
+    timeout-minutes: ${{ matrix.timeout }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - name: Prepare Windows Go paths
+        uses: $/.github/actions/windows-go-paths
+
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
+          cache: false
+
+      - name: Restore Go caches
+        uses: $/.github/actions/go-cache-restore
+        with:
+          group: test-${{ runner.os }}-${{ runner.arch }}
+
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.5
 
       - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+        shell: bash
+        run: kit-retry 3 5 go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       - name: Setup MinGW (with updates)
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+        uses: msys2/setup-msys2@v2.33.0
         with:
           msystem: MINGW64
           update: true
@@ -78,7 +103,8 @@ jobs:
           New-Item -ItemType Directory -Path $testTemp | Out-Null
           icacls $testTemp /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "SystemTemp=$testTemp" >> $env:GITHUB_ENV
+          "TMP=$testTemp" >> $env:GITHUB_ENV
+          "TEMP=$testTemp" >> $env:GITHUB_ENV
           "AGENTSVIEW_CI_TEMP=$testTemp" >> $env:GITHUB_ENV
 
       - name: Run ${{ matrix.name }} tests

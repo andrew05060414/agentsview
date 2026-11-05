@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -138,7 +139,7 @@ func testBulkReadEntryPoints(t *testing.T, blocked bool) {
 		}, nil, false},
 		{"embeddable units", func(ctx context.Context) error {
 			var units []EmbeddableUnit
-			_, err := database.ScanEmbeddableUnits(ctx, "", false, func(unit EmbeddableUnit) error {
+			_, err := database.ScanEmbeddableUnits(ctx, "", false, UncappedRunRunes, func(unit EmbeddableUnit) error {
 				units = append(units, unit)
 				return nil
 			})
@@ -187,7 +188,7 @@ func testBulkReadEntryPoints(t *testing.T, blocked bool) {
 			return err
 		}, nil, false},
 		{"usage extraction", func(ctx context.Context) error {
-			spool, versions, err := cache.fill.extractSessions(ctx, snapshot.Versions)
+			spool, versions, err := cache.fill.extractSessions(ctx, snapshot.Versions, nil)
 			if spool != nil {
 				defer spool.Close()
 			}
@@ -429,13 +430,15 @@ func TestReadUsageCachedSessionsCrossesChunkBoundary(t *testing.T) {
 				SessionID: id, SyncMarker: fmt.Sprintf("sync-%d", i),
 				TranscriptRevision:    fmt.Sprintf("revision-%d", i),
 				UsageEventFingerprint: fmt.Sprintf("events-%d", i),
+				UsageGeneration:       fmt.Sprintf("generation-%d", i),
+				MessageOrdinal:        sql.NullInt64{Int64: int64(i), Valid: true},
 			},
 		}
 		_, err := tx.ExecContext(t.Context(), `INSERT INTO usage_cached_sessions(
 			session_id, source_sync_marker, source_transcript_rev,
-			usage_event_fingerprint, install_revision) VALUES (?, ?, ?, ?, ?)`,
+			usage_event_fingerprint, install_revision, source_usage_generation, source_message_ordinal) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			id, result.source.SyncMarker, result.source.TranscriptRevision,
-			result.source.UsageEventFingerprint, result.InstallRevision)
+			result.source.UsageEventFingerprint, result.InstallRevision, result.source.UsageGeneration, result.source.MessageOrdinal)
 		require.NoError(t, err)
 		ids = append(ids, id)
 		want[id] = result
@@ -451,6 +454,433 @@ func TestReadUsageCachedSessionsCrossesChunkBoundary(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 	assert.Equal(t, []int{maxSQLVars, 5}, runner.queryArgCounts)
+}
+
+func usageFactInstallFixture(tb testing.TB, count int, sessionIDs ...string) (*sql.Conn, *usageFactSpool) {
+	tb.Helper()
+	if len(sessionIDs) == 0 {
+		sessionIDs = []string{"session"}
+	}
+	database := testDB(tb)
+	snapshot, err := database.captureUsageQuery(tb.Context(), UsageFilter{}, usageQueryKindToken)
+	require.NoError(tb, err)
+	defer snapshot.Close()
+	cache, err := database.usageCache.Generation(tb.Context(), snapshot.DatabaseID)
+	require.NoError(tb, err)
+	spool, err := newUsageFactSpool(tb.Context())
+	require.NoError(tb, err)
+	tb.Cleanup(func() { require.NoError(tb, spool.Close()) })
+	tx, err := spool.db.BeginTx(tb.Context(), nil)
+	require.NoError(tb, err)
+	writer := usageFactSpoolWriter{ctx: tb.Context(), tx: tx}
+	for _, id := range sessionIDs {
+		for i := range count {
+			require.NoError(tb, writer.Add(id, i, usagefacts.Fact{
+				Source: "message", MessageOrdinal: &i, Model: "model",
+				InputTokens: 10, TokenEligible: true, ActivityEligible: true,
+				SourceUUID: fmt.Sprintf("message-%d", i),
+			}))
+		}
+	}
+	require.NoError(tb, writer.Flush())
+	require.NoError(tb, tx.Commit())
+	conn, err := cache.db.Conn(tb.Context())
+	require.NoError(tb, err)
+	tb.Cleanup(func() { require.NoError(tb, conn.Close()) })
+	_, err = conn.ExecContext(tb.Context(), `ATTACH DATABASE ? AS usage_fill_spool`, spool.path)
+	require.NoError(tb, err)
+	tb.Cleanup(func() {
+		_, err := conn.ExecContext(context.WithoutCancel(tb.Context()), `DETACH DATABASE usage_fill_spool`)
+		require.NoError(tb, err)
+	})
+	installUsageFactFixture(tb, conn, sessionIDs...)
+	return conn, spool
+}
+
+func installUsageFactFixture(tb testing.TB, conn *sql.Conn, sessionIDs ...string) {
+	tb.Helper()
+	if len(sessionIDs) == 0 {
+		sessionIDs = []string{"session"}
+	}
+	versions := make([]usageSourceVersion, len(sessionIDs))
+	for i, id := range sessionIDs {
+		versions[i].SessionID = id
+		_, err := conn.ExecContext(tb.Context(), `
+			INSERT OR REPLACE INTO usage_fill_spool.sessions(session_id, message_count)
+			SELECT ?, COUNT(*) FROM usage_fill_spool.facts WHERE session_id=?`, id, id)
+		require.NoError(tb, err)
+	}
+	_, err := conn.ExecContext(tb.Context(), `BEGIN IMMEDIATE`)
+	require.NoError(tb, err)
+	_, err = installSpoolSessions(tb.Context(), conn, versions)
+	if err != nil {
+		_, rollbackErr := conn.ExecContext(context.WithoutCancel(tb.Context()), `ROLLBACK`)
+		require.NoError(tb, rollbackErr)
+		require.NoError(tb, err)
+	}
+	_, err = conn.ExecContext(tb.Context(), `COMMIT`)
+	require.NoError(tb, err)
+}
+
+func TestUsageFactInstallPreservesUnchangedRows(t *testing.T) {
+	for _, count := range []int{8, 2048} {
+		t.Run(fmt.Sprintf("facts=%d", count), func(t *testing.T) {
+			conn, spool := usageFactInstallFixture(t, count)
+			_, err := conn.ExecContext(t.Context(), `
+				CREATE TABLE fact_writes(operation TEXT);
+				CREATE TRIGGER count_fact_insert AFTER INSERT ON usage_facts BEGIN
+					INSERT INTO fact_writes VALUES ('insert'); END;
+				CREATE TRIGGER count_fact_update AFTER UPDATE ON usage_facts BEGIN
+					INSERT INTO fact_writes VALUES ('update'); END;
+				CREATE TRIGGER count_fact_delete AFTER DELETE ON usage_facts BEGIN
+					INSERT INTO fact_writes VALUES ('delete'); END;`)
+			require.NoError(t, err)
+			for _, step := range []struct {
+				name, mutation                    string
+				insert, update, delete, remaining int
+			}{
+				{"unchanged with nulls", "", 0, 0, 0, count},
+				{"append", `INSERT INTO facts(session_id, fact_index, source,
+					raw_timestamp, uses_session_start, model, provider_id,
+					input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens,
+					cache_creation_1h_tokens, cache_read_tokens, web_search_requests,
+					cost_source, request_scoped, claude_message_id, claude_request_id,
+					source_uuid, usage_dedup_key, token_eligible, activity_eligible)
+					SELECT session_id, fact_index+1, source,
+						raw_timestamp, uses_session_start, model, provider_id,
+						input_tokens, output_tokens, reasoning_tokens, cache_creation_tokens,
+						cache_creation_1h_tokens, cache_read_tokens, web_search_requests,
+						cost_source, request_scoped, claude_message_id, claude_request_id,
+						'new-message', usage_dedup_key, token_eligible, activity_eligible
+					FROM facts ORDER BY fact_index DESC LIMIT 1`, 1, 0, 0, count + 1},
+				{"replace nullable and identity fields", `UPDATE facts SET
+					reported_cost_microdollars=42, source_uuid='replacement',
+					input_tokens=99 WHERE fact_index=0`, 0, 1, 0, count + 1},
+				{"shift first ordinals", `UPDATE facts SET
+					message_ordinal=1-message_ordinal WHERE fact_index<2`, 0, 2, 0, count + 1},
+				{"remove tail", `DELETE FROM facts
+					WHERE fact_index=(SELECT MAX(fact_index) FROM facts)`, 0, 0, 1, count},
+				{"clear", `DELETE FROM facts`, 0, 0, count, 0},
+			} {
+				if step.mutation != "" {
+					_, err := spool.db.ExecContext(t.Context(), step.mutation)
+					require.NoError(t, err)
+				}
+				_, err := conn.ExecContext(t.Context(), `DELETE FROM fact_writes`)
+				require.NoError(t, err)
+				installUsageFactFixture(t, conn)
+				for operation, want := range map[string]int{
+					"insert": step.insert, "update": step.update, "delete": step.delete,
+				} {
+					var got int
+					require.NoError(t, conn.QueryRowContext(t.Context(),
+						`SELECT COUNT(*) FROM fact_writes WHERE operation=?`, operation).Scan(&got))
+					assert.Equal(t, want, got, "%s: %s", step.name, operation)
+				}
+				var remaining, different int
+				require.NoError(t, conn.QueryRowContext(t.Context(),
+					`SELECT COUNT(*) FROM usage_facts`).Scan(&remaining))
+				assert.Equal(t, step.remaining, remaining, step.name)
+				require.NoError(t, conn.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM (
+					SELECT fact_index, message_ordinal, source_uuid, input_tokens,
+						reported_cost_microdollars FROM usage_facts
+					EXCEPT SELECT fact_index, message_ordinal, source_uuid, input_tokens,
+						reported_cost_microdollars FROM usage_fill_spool.facts
+				)`).Scan(&different))
+				assert.Zero(t, different, step.name)
+			}
+		})
+	}
+}
+
+func TestUsageFactInstallScopesChangesToBatch(t *testing.T) {
+	conn, spool := usageFactInstallFixture(t, 3, "session", "batch-peer", "outside")
+	var outsideRevision int64
+	require.NoError(t, conn.QueryRowContext(t.Context(), `
+		SELECT install_revision FROM usage_cached_sessions
+		WHERE session_id='outside'`).Scan(&outsideRevision))
+	_, err := spool.db.ExecContext(t.Context(), `
+		UPDATE facts SET session_id='spool-only' WHERE session_id='outside';
+		DELETE FROM facts WHERE session_id='session' AND fact_index>0`)
+	require.NoError(t, err)
+	installUsageFactFixture(t, conn, "session", "batch-peer")
+	rows, err := conn.QueryContext(t.Context(), `
+		SELECT cached.session_id, COUNT(facts.fact_index) FROM usage_cached_sessions cached
+		LEFT JOIN usage_facts facts ON cached.id=facts.cached_session_id
+		GROUP BY cached.session_id`)
+	require.NoError(t, err)
+	defer rows.Close()
+	counts := make(map[string]int)
+	for rows.Next() {
+		var id string
+		var count int
+		require.NoError(t, rows.Scan(&id, &count))
+		counts[id] = count
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	assert.Equal(t, map[string]int{"session": 1, "batch-peer": 3, "outside": 3}, counts)
+	var afterRevision int64
+	require.NoError(t, conn.QueryRowContext(t.Context(), `
+		SELECT install_revision FROM usage_cached_sessions
+		WHERE session_id='outside'`).Scan(&afterRevision))
+	assert.Equal(t, outsideRevision, afterRevision)
+}
+
+func BenchmarkUsageFactInstallSmallChange(b *testing.B) {
+	for _, count := range []int{8, 2048} {
+		b.Run(fmt.Sprintf("facts=%d", count), func(b *testing.B) {
+			conn, _ := usageFactInstallFixture(b, count)
+			var before, after int64
+			require.NoError(b, conn.QueryRowContext(b.Context(), `SELECT total_changes()`).Scan(&before))
+			for b.Loop() {
+				_, err := conn.ExecContext(b.Context(), `UPDATE usage_fill_spool.facts
+					SET output_tokens=output_tokens+1 WHERE session_id='session' AND fact_index=0`)
+				require.NoError(b, err)
+				installUsageFactFixture(b, conn)
+			}
+			require.NoError(b, conn.QueryRowContext(b.Context(), `SELECT total_changes()`).Scan(&after))
+			b.ReportMetric(float64(after-before)/float64(b.N), "rows/op")
+		})
+	}
+}
+
+func usageSpoolExtractionFixture(tb testing.TB, count int) (*DB, *usageCache) {
+	tb.Helper()
+	database := testDB(tb)
+	database.SetUsageCacheNotificationWork(func() (func(), bool) { return nil, false })
+	require.NoError(tb, database.UpsertSession(tb.Context(), Session{
+		ID: "session", Project: "project", Machine: defaultMachine, Agent: defaultAgent,
+	}))
+	messages := make([]Message, count)
+	for i := range messages {
+		messages[i] = Message{
+			SessionID: "session", Ordinal: i, Role: "assistant", Model: "model",
+			Timestamp: "2026-08-10T09:00:00Z", SourceUUID: fmt.Sprintf("message-%d", i),
+			TokenUsage: json.RawMessage(`{"input_tokens":10}`),
+		}
+	}
+	require.NoError(tb, database.InsertMessages(tb.Context(), messages))
+	snapshot, err := database.captureUsageQuery(tb.Context(), UsageFilter{}, usageQueryKindToken)
+	require.NoError(tb, err)
+	defer snapshot.Close()
+	cache, err := database.usageCache.Generation(tb.Context(), snapshot.DatabaseID)
+	require.NoError(tb, err)
+	_, err = cache.fill.Ensure(tb.Context(), snapshot.Versions, 0)
+	require.NoError(tb, err)
+	return database, cache
+}
+
+// Both stores put the session key first; compare every remaining fact value.
+func usageSpoolFactValues(t *testing.T, database *sql.DB, query string) [][]any {
+	t.Helper()
+	rows, err := database.QueryContext(t.Context(), query)
+	require.NoError(t, err)
+	defer rows.Close()
+	columns, err := rows.Columns()
+	require.NoError(t, err)
+	var result [][]any
+	for rows.Next() {
+		values := make([]any, len(columns))
+		pointers := make([]any, len(values))
+		for i := range values {
+			pointers[i] = &values[i]
+		}
+		require.NoError(t, rows.Scan(pointers...))
+		result = append(result, values[1:])
+	}
+	require.NoError(t, rows.Err())
+	return result
+}
+
+func TestUsageSpoolRetainsOnlyChangedFacts(t *testing.T) {
+	for _, count := range []int{8, 2048} {
+		t.Run(fmt.Sprintf("messages=%d", count), func(t *testing.T) {
+			database, cache := usageSpoolExtractionFixture(t, count)
+			activities := make([]Message, 3)
+			events := make([]UsageEvent, 3)
+			for i := range activities {
+				activities[i] = Message{
+					SessionID: "session", Ordinal: count + i, Role: "assistant", Model: "activity",
+					Timestamp: "2026-08-10T09:01:00Z",
+				}
+				events[i] = UsageEvent{
+					Source: "session", Model: "event", InputTokens: 5, DedupKey: fmt.Sprintf("event-%d", i),
+				}
+			}
+			require.NoError(t, database.InsertMessages(t.Context(), activities))
+			require.NoError(t, database.ReplaceSessionUsageEvents(t.Context(), "session", events))
+			versions := []usageSourceVersion{{SessionID: "session"}}
+			_, err := cache.fill.fillSessionsDetached(t.Context(), versions)
+			require.NoError(t, err)
+			// Simulate the dense layout from before fact kinds had separate ranges.
+			_, err = cache.db.ExecContext(t.Context(), `UPDATE usage_facts SET fact_index = CASE
+				WHEN fact_index >= ? THEN fact_index - ? + ?
+				WHEN fact_index >= ? THEN fact_index - ? + ? ELSE fact_index END`,
+				usageEventFactBase, usageEventFactBase, count+3,
+				usageActivityFactBase, usageActivityFactBase, count)
+			require.NoError(t, err)
+			for _, step := range []struct {
+				name, mutation string
+				spooled, total int
+			}{
+				{"upgrade with token append", fmt.Sprintf(`INSERT INTO messages(
+					session_id, ordinal, role, content, model, timestamp, token_usage, source_uuid)
+					VALUES ('session', %d, 'assistant', '', 'model', '2026-08-10T09:00:00Z',
+					'{"input_tokens":11}', 'upgrade-append')`, count+3), 7, count + 7},
+				{"unchanged", "", 0, count + 7},
+				{"remove appended token message", `DELETE FROM messages WHERE source_uuid='upgrade-append'`, 0, count + 6},
+				{"append preserves activity and event", fmt.Sprintf(`INSERT INTO messages(
+					session_id, ordinal, role, content, model, timestamp, token_usage, source_uuid)
+					VALUES ('session', %d, 'assistant', '', 'model', '2026-08-10T09:00:00Z',
+					'{"input_tokens":11}', 'appended')`, count+3), 1, count + 7},
+				{"edit", `UPDATE messages SET token_usage='{"input_tokens":99}'
+					WHERE session_id='session' AND ordinal=0`, 1, count + 7},
+				{"NULL to value", `UPDATE usage_events SET cost_microdollars=42`, 3, count + 7},
+				{"value to NULL", `UPDATE usage_events SET cost_microdollars=NULL`, 3, count + 7},
+				{"activity gains usage", fmt.Sprintf(`UPDATE messages SET token_usage='{"input_tokens":7}'
+					WHERE session_id='session' AND ordinal=%d`, count+2), 1, count + 7},
+				{"reorder", `UPDATE messages SET ordinal=-1 WHERE ordinal=0;
+					UPDATE messages SET ordinal=0 WHERE ordinal=1;
+					UPDATE messages SET ordinal=1 WHERE ordinal=-1`, 2, count + 7},
+				{"truncate", `DELETE FROM messages WHERE ordinal>=2;
+					DELETE FROM usage_events`, 0, 2},
+				{"empty", `DELETE FROM messages`, 0, 0},
+			} {
+				if step.mutation != "" {
+					_, err := database.getWriter().Exec(t.Context(), step.mutation)
+					require.NoError(t, err, step.name)
+				}
+				expected, err := cache.fill.captureFillInstallExpectations(t.Context(), versions)
+				require.NoError(t, err)
+				spool, extracted, err := cache.fill.extractSessions(t.Context(), versions, expected)
+				require.NoError(t, err, step.name)
+				var spooled, total int
+				require.NoError(t, spool.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM facts`).Scan(&spooled))
+				require.NoError(t, spool.db.QueryRowContext(t.Context(), `SELECT message_count + activity_count + event_count FROM sessions
+					WHERE session_id='session'`).Scan(&total))
+				assert.Equal(t, step.spooled, spooled, step.name)
+				assert.Equal(t, step.total, total, step.name)
+				_, lost, err := cache.fill.installSpool(t.Context(), spool,
+					[]usageSourceVersion{extracted["session"]}, nil, expected)
+				require.NoError(t, err, step.name)
+				assert.Empty(t, lost, step.name)
+				require.NoError(t, spool.Close())
+				full, _, err := cache.fill.extractSessions(t.Context(), versions, nil)
+				require.NoError(t, err)
+				want := usageSpoolFactValues(t, full.db, `SELECT * FROM facts ORDER BY fact_index`)
+				assert.Len(t, want, step.total, step.name)
+				assert.Equal(t, want, usageSpoolFactValues(t, cache.db,
+					`SELECT * FROM usage_facts ORDER BY fact_index`), step.name)
+				require.NoError(t, full.Close())
+			}
+		})
+	}
+}
+
+func TestUsageSpoolFallsBackAfterCacheRevisionChanges(t *testing.T) {
+	_, cache := usageSpoolExtractionFixture(t, 8)
+	versions := []usageSourceVersion{{SessionID: "session"}}
+	expected, err := cache.fill.captureFillInstallExpectations(t.Context(), versions)
+	require.NoError(t, err)
+	_, err = cache.fill.fillSessionsDetached(t.Context(), versions)
+	require.NoError(t, err)
+	spool, extracted, err := cache.fill.extractSessions(t.Context(), versions, expected)
+	require.NoError(t, err)
+	defer spool.Close()
+	var rows int
+	require.NoError(t, spool.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM facts`).Scan(&rows))
+	assert.Equal(t, 8, rows, "a changed baseline requires the complete snapshot")
+	installed, lost, err := cache.fill.installSpool(t.Context(), spool,
+		[]usageSourceVersion{extracted["session"]}, nil, expected)
+	require.NoError(t, err)
+	assert.Empty(t, installed)
+	assert.Equal(t, []string{"session"}, lost)
+	assert.Equal(t, 8, usageCacheCount(t, cache, "usage_facts"))
+}
+
+func TestUsageSpoolInvalidatesOnlyChangedIdentityPeers(t *testing.T) {
+	database, cache := usageSpoolExtractionFixture(t, 2)
+	for id, source := range map[string]string{
+		"retained": "message-0", "removed": "message-1", "added": "new-identity",
+	} {
+		insertSession(t, database, id, "project")
+		insertMessages(t, database, Message{
+			SessionID: id, Ordinal: 0, Role: "assistant", Model: "model",
+			Timestamp: "2026-08-10T09:00:00Z", SourceUUID: source,
+			TokenUsage: json.RawMessage(`{"input_tokens":20}`),
+		})
+	}
+	filter := UsageFilter{From: "2026-08-10", To: "2026-08-10", Timezone: "UTC"}
+	getDailyUsageRollupForTest(t, database, filter)
+	var retainedRevision int64
+	require.NoError(t, cache.db.QueryRowContext(t.Context(), `SELECT install_revision
+		FROM usage_rollup_installs WHERE session_id='retained'`).Scan(&retainedRevision))
+	_, err := database.getWriter().Exec(t.Context(), `UPDATE messages
+		SET source_uuid='new-identity' WHERE session_id='session' AND ordinal=1;
+		UPDATE sessions SET transcript_revision='changed' WHERE id='session'`)
+	require.NoError(t, err)
+	_, err = cache.fill.fillSessionsDetached(t.Context(), []usageSourceVersion{{SessionID: "session"}})
+	require.NoError(t, err)
+	var afterRevision int64
+	require.NoError(t, cache.db.QueryRowContext(t.Context(), `SELECT install_revision
+		FROM usage_rollup_installs WHERE session_id='retained'`).Scan(&afterRevision))
+	assert.Equal(t, retainedRevision, afterRevision, "an omitted unchanged identity keeps its peers valid")
+	var invalidated int
+	require.NoError(t, cache.db.QueryRowContext(t.Context(), `SELECT COUNT(*)
+		FROM usage_rollup_installs WHERE session_id IN ('removed', 'added')`).Scan(&invalidated))
+	assert.Zero(t, invalidated, "both departed and newly joined identity peers must be invalidated")
+	assert.Equal(t, getDailyUsageLegacyForRollupTest(t, database, filter),
+		getDailyUsageRollupForTest(t, database, filter))
+}
+
+func BenchmarkUsageSpoolWarmSingleChange(b *testing.B) {
+	for _, count := range []int{8, 2048} {
+		b.Run(fmt.Sprintf("messages=%d", count), func(b *testing.B) {
+			database, cache := usageSpoolExtractionFixture(b, count)
+			versions := []usageSourceVersion{{SessionID: "session"}}
+			expected, err := cache.fill.captureFillInstallExpectations(b.Context(), versions)
+			require.NoError(b, err)
+			_, err = database.getWriter().Exec(b.Context(), `UPDATE messages
+				SET token_usage='{"input_tokens":11}' WHERE session_id='session' AND ordinal=0`)
+			require.NoError(b, err)
+			var totalRows, totalBytes int64
+			b.ReportAllocs()
+			for b.Loop() {
+				spool, _, err := cache.fill.extractSessions(b.Context(), versions, expected)
+				require.NoError(b, err)
+				var rows int64
+				require.NoError(b, spool.db.QueryRowContext(b.Context(), `SELECT COUNT(*) FROM facts`).Scan(&rows))
+				info, err := os.Stat(spool.path)
+				require.NoError(b, err)
+				totalRows += rows
+				totalBytes += info.Size()
+				require.NoError(b, spool.Close())
+			}
+			b.ReportMetric(float64(totalRows)/float64(b.N), "spool-rows/op")
+			b.ReportMetric(float64(totalBytes)/float64(b.N), "spool-bytes/op")
+		})
+	}
+}
+
+func BenchmarkUsageFillWarmSingleChange(b *testing.B) {
+	for _, count := range []int{8, 2048} {
+		b.Run(fmt.Sprintf("messages=%d", count), func(b *testing.B) {
+			database, cache := usageSpoolExtractionFixture(b, count)
+			versions := []usageSourceVersion{{SessionID: "session"}}
+			tokens := 10
+			b.ReportAllocs()
+			for b.Loop() {
+				tokens++
+				_, err := database.getWriter().Exec(b.Context(), `UPDATE messages
+					SET token_usage=? WHERE session_id='session' AND ordinal=0`,
+					fmt.Sprintf(`{"input_tokens":%d}`, tokens))
+				require.NoError(b, err)
+				_, err = cache.fill.fillSessionsDetached(b.Context(), versions)
+				require.NoError(b, err)
+			}
+		})
+	}
 }
 
 func TestUsageFillEnsureRefillsOnlyChangedSessions(t *testing.T) {
@@ -601,6 +1031,16 @@ func TestUsageFillOlderExtractionCannotReplaceNewerCachedFacts(t *testing.T) {
 		}
 	}
 	require.Equal(t, "inside-message", oldVersion.SessionID)
+	// Seed a baseline, then change only its source version: the older fill
+	// must preserve all facts through an empty delta until it loses the race.
+	_, err = cache.fill.fillSessionsDetached(t.Context(), []usageSourceVersion{oldVersion})
+	require.NoError(t, err)
+	_, err = database.getWriter().Exec(t.Context(), `UPDATE sessions
+		SET transcript_revision='pending' WHERE id=?`, oldVersion.SessionID)
+	require.NoError(t, err)
+	current, err := cache.fill.recheckSourceVersions(t.Context(), []usageSourceVersion{oldVersion})
+	require.NoError(t, err)
+	oldVersion = current[oldVersion.SessionID]
 	oldExtracted := make(chan struct{})
 	releaseOld := make(chan struct{})
 	var oldExtractions atomic.Int32
@@ -633,7 +1073,7 @@ func TestUsageFillOlderExtractionCannotReplaceNewerCachedFacts(t *testing.T) {
 		WHERE id = ?`, oldVersion.SessionID)
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
-	current, err := cache.fill.recheckSourceVersions(
+	current, err = cache.fill.recheckSourceVersions(
 		t.Context(), []usageSourceVersion{{SessionID: oldVersion.SessionID}})
 	require.NoError(t, err)
 	newVersion := current[oldVersion.SessionID]
@@ -710,12 +1150,17 @@ func TestUsageCacheFillReportsDeletedSession(t *testing.T) {
 func TestUsageCacheFillInstallsExtractedSnapshotDespiteLaterWrite(t *testing.T) {
 	database := usageCandidateFixture(t)
 	snapshot, err := database.captureUsageQuery(
-		t.Context(), UsageFilter{}, usageQueryKindToken,
+		t.Context(), UsageFilter{From: "2026-08-10", To: "2026-08-10"}, usageQueryKindToken,
 	)
 	require.NoError(t, err)
 	cache, err := database.usageCache.Generation(t.Context(), snapshot.DatabaseID)
 	require.NoError(t, err)
 	version := snapshot.Versions[0]
+	var expectedGeneration string
+	var expectedOrdinal sql.NullInt64
+	require.NoError(t, database.getReader().QueryRowContext(t.Context(), `SELECT usage_generation,
+		(SELECT MAX(ordinal) FROM messages WHERE session_id=sessions.id) FROM sessions WHERE id=?`,
+		version.SessionID).Scan(&expectedGeneration, &expectedOrdinal))
 	var mutations atomic.Int32
 	var mutationErr atomic.Value
 	cache.fill.observer = usageFillObserver{
@@ -725,7 +1170,7 @@ func TestUsageCacheFillInstallsExtractedSnapshotDespiteLaterWrite(t *testing.T) 
 			}
 			_, updateErr := database.getWriter().Exec(t.Context(), `
 				UPDATE sessions SET transcript_revision = 'later'
-				WHERE id = ?`, version.SessionID)
+				WHERE id = ?; UPDATE messages SET token_usage='{"input_tokens":99}' WHERE session_id=?`, version.SessionID, version.SessionID)
 			if updateErr != nil {
 				mutationErr.Store(updateErr)
 			}
@@ -740,7 +1185,9 @@ func TestUsageCacheFillInstallsExtractedSnapshotDespiteLaterWrite(t *testing.T) 
 	}
 	assert.Equal(t, int32(1), mutations.Load(), "fill extracted more than once")
 	assert.False(t, results[version.SessionID].Deleted)
-	assert.Equal(t, version, results[version.SessionID].source)
+	assert.True(t, version.Equal(results[version.SessionID].source))
+	assert.Equal(t, expectedGeneration, results[version.SessionID].source.UsageGeneration)
+	assert.Equal(t, expectedOrdinal, results[version.SessionID].source.MessageOrdinal)
 }
 
 // A write that lands after the request's archive snapshot no longer forces a
@@ -1044,7 +1491,7 @@ func TestUsageCacheNotificationsCoalesceChangedSessions(t *testing.T) {
 	select {
 	case versions := <-batch:
 		require.Failf(t, "duplicate notification started another fill", "%#v", versions)
-	case <-time.After(3 * usageFillNotificationDebounce): //nolint:kennlint // absence check; the coalesced fill must not start a second batch
+	case <-time.After(3 * usageFillNotificationDebounce): //nolint:kennlint // deadlinetest: absence check; the coalesced fill must not start a second batch
 	}
 }
 
@@ -1099,7 +1546,7 @@ func TestUsageCacheNotificationObservesOnlyCommittedWrites(t *testing.T) {
 	select {
 	case value := <-observed:
 		require.Failf(t, "rolled-back message write emitted usage notification", "%s", value)
-	case <-time.After(100 * time.Millisecond): //nolint:kennlint // absence check; the rolled-back write must never notify
+	case <-time.After(100 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the rolled-back write must never notify
 	}
 }
 
@@ -1139,4 +1586,169 @@ func dumpCachedFacts(t *testing.T, cache *usageCache, sessionID string) [][]any 
 	}
 	require.NoError(t, rows.Err())
 	return result
+}
+
+func TestUsageSpoolTokenAppendReadsOnlyNewMessages(t *testing.T) {
+	for _, count := range []int{8, 2048} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			database, cache := usageSpoolExtractionFixture(t, count)
+			read := 0
+			cache.fill.observer.messageNormalized = func() { read++ }
+			require.NoError(t, database.InsertMessages(t.Context(), []Message{{
+				SessionID: "session", Ordinal: count, Role: "assistant", Model: "model",
+				Timestamp: "2026-08-10T09:00:00Z", TokenUsage: json.RawMessage(`{"input_tokens":17}`),
+			}}))
+			versions := []usageSourceVersion{{SessionID: "session"}}
+			expected, err := cache.fill.captureFillInstallExpectations(t.Context(), versions)
+			require.NoError(t, err)
+			spool, extracted, err := cache.fill.extractSessions(t.Context(), versions, expected)
+			require.NoError(t, err)
+			defer spool.Close()
+			assert.Equal(t, 1, read)
+			var rows int
+			require.NoError(t, spool.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM facts`).Scan(&rows))
+			assert.Equal(t, 1, rows)
+			_, lost, err := cache.fill.installSpool(t.Context(), spool, []usageSourceVersion{extracted["session"]}, nil, expected)
+			require.NoError(t, err)
+			assert.Empty(t, lost)
+			for _, messages := range [][]Message{
+				{{SessionID: "session", Ordinal: count + 1, Role: "user", Timestamp: "2026-08-10T08:59:59Z"}},
+				{
+					{SessionID: "session", Ordinal: count + 2, Role: "assistant", Model: "model", Timestamp: "2026-08-10T09:02:00Z", TokenUsage: json.RawMessage(`{"input_tokens":13}`)},
+					{SessionID: "session", Ordinal: count + 3, Role: "assistant", Model: "model", Timestamp: "2026-08-10T09:01:00Z", TokenUsage: json.RawMessage(`{"input_tokens":17}`)},
+				},
+				{{SessionID: "session", Ordinal: count + 4, Role: "assistant", Model: "model", Timestamp: "2026-08-10T09:02:00Z", TokenUsage: json.RawMessage(`{"input_tokens":19}`)}},
+			} {
+				require.NoError(t, database.InsertMessages(t.Context(), messages))
+				read = 0
+				cache.fill.observer.messageNormalized = func() { read++ }
+				_, err := cache.fill.fillSessionsDetached(t.Context(), versions)
+				require.NoError(t, err)
+				assert.Equal(t, len(messages), read, "seek past every consumed message, including user messages and out-of-order token facts")
+			}
+			insertSession(t, database, "fallback", "project")
+			insertMessages(t, database, Message{
+				SessionID: "fallback", Role: "assistant", Model: "model",
+				Timestamp: "2026-08-10T09:00:00Z", TokenUsage: json.RawMessage(`{"input_tokens":11}`),
+			})
+			_, err = cache.fill.fillSessionsDetached(t.Context(), []usageSourceVersion{{SessionID: "fallback"}})
+			require.NoError(t, err)
+			_, err = database.getWriter().Exec(t.Context(), `UPDATE messages SET token_usage='{"input_tokens":31}' WHERE session_id='fallback'`)
+			require.NoError(t, err)
+			require.NoError(t, database.InsertMessages(t.Context(), []Message{{
+				SessionID: "session", Ordinal: count + 5, Role: "assistant", Model: "model",
+				Timestamp: "2026-08-10T09:02:00Z", TokenUsage: json.RawMessage(`{"input_tokens":23}`),
+			}}))
+			versions = append(versions, usageSourceVersion{SessionID: "fallback"})
+			read = 0
+			_, err = cache.fill.fillSessionsDetached(t.Context(), versions)
+			require.NoError(t, err)
+			assert.Equal(t, 2, read, "one appended message and one edited history share the extraction batch")
+			_, err = database.getWriter().Exec(t.Context(), `DELETE FROM messages WHERE session_id='session' AND ordinal>=4`)
+			require.NoError(t, err)
+			_, err = cache.fill.fillSessionsDetached(t.Context(), versions)
+			require.NoError(t, err)
+
+			require.NoError(t, database.InsertMessages(t.Context(), []Message{{
+				SessionID: "session", Ordinal: 4, Role: "assistant", Model: "model",
+				Timestamp: "2026-08-10T09:00:00Z", TokenUsage: json.RawMessage(`{"input_tokens":17}`),
+			}}))
+			read = 0
+			_, err = cache.fill.fillSessionsDetached(t.Context(), []usageSourceVersion{{SessionID: "session"}})
+			require.NoError(t, err)
+			assert.Equal(t, 1, read, "an append after a separately refilled removal retains the surviving prefix")
+			full, _, err := cache.fill.extractSessions(t.Context(), versions, nil)
+			require.NoError(t, err)
+			defer full.Close()
+			assert.Equal(t, usageSpoolFactValues(t, full.db, `SELECT * FROM facts ORDER BY session_id, fact_index`),
+				usageSpoolFactValues(t, cache.db, `SELECT f.* FROM usage_facts f JOIN usage_cached_sessions c ON c.id=f.cached_session_id ORDER BY c.session_id, f.fact_index`))
+		})
+	}
+}
+
+func TestUsageSpoolAppendFallbacks(t *testing.T) {
+	mutate := func(query string) func(*testing.T, *DB, *usageCache) {
+		return func(t *testing.T, database *DB, _ *usageCache) {
+			t.Helper()
+			_, err := database.getWriter().Exec(t.Context(), query)
+			require.NoError(t, err)
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		setup     func(*testing.T, *DB, *usageCache)
+		afterFill func(*testing.T, *DB, *usageCache)
+	}{
+		{name: "model edit", setup: mutate(`UPDATE messages SET model='other-model' WHERE ordinal=0`)},
+		{name: "provider edit", setup: mutate(`UPDATE messages SET provider_id='other-provider' WHERE ordinal=0`)},
+		{name: "Claude message identity edit", setup: mutate(`UPDATE messages SET claude_message_id='other-message' WHERE ordinal=0`)},
+		{name: "reorder", setup: mutate(`UPDATE messages SET ordinal=-1 WHERE ordinal=0; UPDATE messages SET ordinal=0 WHERE ordinal=1; UPDATE messages SET ordinal=1 WHERE ordinal=-1`)},
+		{name: "gap insert", setup: func(t *testing.T, database *DB, cache *usageCache) {
+			t.Helper()
+			mutate(`DELETE FROM messages WHERE ordinal=2; INSERT INTO messages(session_id,ordinal,role,content,model,timestamp,token_usage) VALUES ('session',8,'assistant','','model','2026-08-10T09:00:00Z','{"input_tokens":11}')`)(t, database, cache)
+			_, err := cache.fill.fillSessionsDetached(t.Context(), []usageSourceVersion{{SessionID: "session"}})
+			require.NoError(t, err)
+			mutate(`INSERT INTO messages(session_id,ordinal,role,content,model,timestamp,token_usage) VALUES ('session',2,'assistant','','model','2026-08-10T09:00:00Z','{"input_tokens":11}')`)(t, database, cache)
+		}},
+		{name: "backdated append", setup: mutate(`INSERT INTO messages(session_id,ordinal,role,content,model,timestamp,token_usage) VALUES ('session',8,'assistant','','model','2026-08-09T09:00:00Z','{"input_tokens":11}')`)},
+		{name: "activity append", setup: mutate(`INSERT INTO messages(session_id,ordinal,role,content,model,timestamp) VALUES ('session',8,'assistant','','model','2026-08-10T10:00:00Z')`), afterFill: func(t *testing.T, database *DB, cache *usageCache) {
+			t.Helper()
+			require.NoError(t, database.InsertMessages(t.Context(), []Message{{
+				SessionID: "session", Ordinal: 9, Role: "assistant", Model: "model",
+				Timestamp: "2026-08-10T11:00:00Z", TokenUsage: json.RawMessage(`{"input_tokens":17}`),
+			}}))
+			read := 0
+			cache.fill.observer.messageNormalized = func() { read++ }
+			_, err := cache.fill.fillSessionsDetached(t.Context(), []usageSourceVersion{{SessionID: "session"}})
+			require.NoError(t, err)
+			assert.Equal(t, 9, read, "a cached activity fact requires complete extraction")
+		}},
+		{name: "removed message-source event", setup: func(t *testing.T, database *DB, cache *usageCache) {
+			t.Helper()
+			events := []UsageEvent{{
+				Source: "message", Model: "model", InputTokens: 23, DedupKey: "removed-event",
+			}}
+			// Artifact imports preserve source strings and use this validation pass.
+			_, err := ValidateAndSanitizeContext(t.Context(), nil, nil, events)
+			require.NoError(t, err)
+			require.NoError(t, database.ReplaceSessionUsageEvents(t.Context(), "session", events))
+			_, err = cache.fill.fillSessionsDetached(t.Context(), []usageSourceVersion{{SessionID: "session"}})
+			require.NoError(t, err)
+			require.NoError(t, database.ReplaceSessionUsageEvents(t.Context(), "session", nil))
+			require.NoError(t, database.InsertMessages(t.Context(), []Message{{
+				SessionID: "session", Ordinal: 8, Role: "assistant", Model: "model",
+				Timestamp: "2026-08-10T09:00:00Z", TokenUsage: json.RawMessage(`{"input_tokens":17}`),
+			}}))
+		}},
+		{name: "usage event", setup: mutate(`INSERT INTO usage_events(session_id,source,model,input_tokens,occurred_at) VALUES ('session','session','model',19,'2026-08-10T10:00:00Z')`)},
+		{name: "Claude suffix replace", setup: func(t *testing.T, database *DB, _ *usageCache) {
+			t.Helper()
+			_, err := database.WriteSessionIncremental(t.Context(), "session", []Message{{
+				SessionID: "session", Ordinal: 7, Role: "assistant", Model: "model",
+				Timestamp: "2026-08-10T09:00:00Z", TokenUsage: json.RawMessage(`{"input_tokens":23}`),
+			}}, IncrementalSessionUpdate{ReplaceFromOrdinal: new(7)})
+			require.NoError(t, err)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database, cache := usageSpoolExtractionFixture(t, 8)
+			tc.setup(t, database, cache)
+			versions := []usageSourceVersion{{SessionID: "session"}}
+			_, err := cache.fill.fillSessionsDetached(t.Context(), versions)
+			require.NoError(t, err)
+			assertFullExtraction := func() {
+				t.Helper()
+				full, _, err := cache.fill.extractSessions(t.Context(), versions, nil)
+				require.NoError(t, err)
+				defer full.Close()
+				assert.Equal(t, usageSpoolFactValues(t, full.db, `SELECT * FROM facts ORDER BY fact_index`),
+					usageSpoolFactValues(t, cache.db, `SELECT * FROM usage_facts ORDER BY fact_index`))
+			}
+			assertFullExtraction()
+			if tc.afterFill != nil {
+				tc.afterFill(t, database, cache)
+				assertFullExtraction()
+			}
+		})
+	}
 }

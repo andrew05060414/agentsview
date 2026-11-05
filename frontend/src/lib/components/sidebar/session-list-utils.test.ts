@@ -10,7 +10,7 @@ import {
   buildDisplayItems,
   computeTotalSize,
   findStart,
-  isSubagentDescendant,
+  subagentDescendantMatcher,
   selectPrimaryId,
 } from "./session-list-utils.js";
 import type { DisplayItem } from "./session-list-utils.js";
@@ -202,17 +202,6 @@ describe("buildDisplayItems (ungrouped)", () => {
   it("returns empty array for no groups", () => {
     const items = buildDisplayItems([], [], "none", new Set(), new Set());
     expect(items).toEqual([]);
-  });
-
-  it("all ids are unique", () => {
-    const groups = [
-      makeGroup("claude", 1, "a"),
-      makeGroup("claude", 1, "b"),
-      makeGroup("gpt", 1, "c"),
-    ];
-    const items = buildDisplayItems(groups, [], "none", new Set(), new Set());
-    const ids = items.map((i) => i.id);
-    expect(new Set(ids).size).toBe(ids.length);
   });
 });
 
@@ -595,57 +584,6 @@ describe("DisplayItem id stability", () => {
 // ---------------------------------------------------------------------------
 
 describe("starred-only session count", () => {
-  function filterGroupsForStarred(groups: SessionGroup[], starredIds: Set<string>): SessionGroup[] {
-    return groups
-      .map((g) => {
-        const filtered = g.sessions.filter((s) => starredIds.has(s.id));
-        const primaryStillPresent = filtered.some((s) => s.id === g.primarySessionId);
-        return {
-          ...g,
-          sessions: filtered,
-          primarySessionId: primaryStillPresent
-            ? g.primarySessionId
-            : selectPrimaryId(filtered, g.key),
-        };
-      })
-      .filter((g) => g.sessions.length > 0);
-  }
-
-  it("counts individual sessions, not groups", () => {
-    const g1 = makeGroup("claude", 3, "c");
-    const g2 = makeGroup("gpt", 3, "g");
-    const groups = [g1, g2];
-
-    const starred = new Set(["c-session-0", "c-session-2", "g-session-1"]);
-    const filtered = filterGroupsForStarred(groups, starred);
-
-    const count = filtered.reduce((n, g) => n + g.sessions.length, 0);
-    expect(count).toBe(3);
-    expect(filtered).toHaveLength(2);
-  });
-
-  it("excludes groups with no starred sessions", () => {
-    const g1 = makeGroup("claude", 2, "c");
-    const g2 = makeGroup("gpt", 2, "g");
-    const groups = [g1, g2];
-
-    const starred = new Set(["c-session-0"]);
-    const filtered = filterGroupsForStarred(groups, starred);
-
-    const count = filtered.reduce((n, g) => n + g.sessions.length, 0);
-    expect(count).toBe(1);
-    expect(filtered).toHaveLength(1);
-  });
-
-  it("returns zero when nothing is starred", () => {
-    const groups = [makeGroup("claude", 3, "c")];
-    const filtered = filterGroupsForStarred(groups, new Set());
-
-    const count = filtered.reduce((n, g) => n + g.sessions.length, 0);
-    expect(count).toBe(0);
-    expect(filtered).toHaveLength(0);
-  });
-
   it("preserves ancestry classification via allSessions when parent is unstarred", () => {
     // root -> teammate (unstarred) -> continuation (starred)
     // The continuation should still be classified as a teammate
@@ -694,42 +632,63 @@ describe("starred-only session count", () => {
     expect(contItem).toBeDefined();
     expect(contItem!.depth).toBe(2);
   });
+});
 
-  it("recomputes primarySessionId using recency when original primary is unstarred", () => {
-    // Root session s0 is the primary, children s1 and s2 are starred.
-    // s2 is more recent so it should become the new primary.
-    const root = makeSession({ id: "s0", agent: "claude" });
-    const child1 = makeSession({
-      id: "s1",
-      agent: "claude",
-      parent_session_id: "s0",
-      ended_at: "2025-01-01T01:00:00Z",
+describe("ancestry classification across a group", () => {
+  it("keeps continuations, subagent descendants, and teammate descendants in their sections", () => {
+    const chain = Array.from({ length: 100 }, (_, i) =>
+      makeSession({
+        id: `session-${i}`,
+        parent_session_id: i ? `session-${i - 1}` : undefined,
+        relationship_type: i === 50 ? "subagent" : i ? "continuation" : undefined,
+      }),
+    );
+    const teammate = makeSession({
+      id: "teammate",
+      parent_session_id: "session-0",
+      first_message: "<teammate-message>hello</teammate-message>",
     });
-    const child2 = makeSession({
-      id: "s2",
-      agent: "claude",
-      parent_session_id: "s0",
-      ended_at: "2025-01-02T01:00:00Z",
+    const continuation = makeSession({
+      id: "team-continuation",
+      parent_session_id: "teammate",
+      relationship_type: "continuation",
     });
-    const group: SessionGroup = {
-      key: "s0",
-      project: "test",
-      sessions: [root, child1, child2],
-      primarySessionId: "s0",
-      totalMessages: 30,
-      firstMessage: "hi",
-      startedAt: "2025-01-01T00:00:00Z",
-      endedAt: "2025-01-02T01:00:00Z",
-    };
+    const groups = buildSessionGroups([...chain, teammate, continuation]);
+    const items = buildDisplayItems(groups, [], "none", new Set(), new Set(["session-0"]));
+    expect(items.filter((item) => item.isChild).map((item) => item.session?.id)).toEqual(
+      chain.slice(1, 50).map((session) => session.id),
+    );
+    expect(items.filter((item) => item.isChild).every((item) => item.depth === 1)).toBe(true);
+    expect(items.find((item) => item.type === "subagent-group")?.memberSessionIds).toEqual(
+      chain.slice(50).map((session) => session.id),
+    );
+    expect(items.find((item) => item.type === "team-group")?.memberSessionIds).toEqual([
+      "teammate",
+      "team-continuation",
+    ]);
+  });
 
-    // Only children are starred, not the root.
-    const starred = new Set(["s1", "s2"]);
-    const filtered = filterGroupsForStarred([group], starred);
-
-    expect(filtered).toHaveLength(1);
-    // primarySessionId must be the most recent surviving session.
-    expect(filtered[0]!.primarySessionId).toBe("s2");
-    expect(filtered[0]!.sessions.some((s) => s.id === filtered[0]!.primarySessionId)).toBe(true);
+  it("classifies a shared child using each group's own ancestry pool", () => {
+    const a = makeSession({ id: "a", relationship_type: "subagent" });
+    const b = makeSession({ id: "b" });
+    const child = makeSession({ id: "shared", parent_session_ids: ["a", "b"] });
+    const groups = [a, b].map((root) => ({
+      ...makeGroup("claude"),
+      key: root.id,
+      primarySessionId: root.id,
+      sessions: [root, child],
+    }));
+    const items = buildDisplayItems(groups, [], "none", new Set(), new Set(["a", "b"]));
+    expect(
+      items
+        .filter((item) => item.type === "subagent-group")
+        .map((item) => [item.group?.key, item.memberSessionIds]),
+    ).toEqual([["a", ["shared"]]]);
+    expect(
+      items
+        .filter((item) => item.isChild)
+        .map((item) => [item.group?.key, item.session?.id, item.depth]),
+    ).toEqual([["b", "shared", 1]]);
   });
 });
 
@@ -867,7 +826,7 @@ describe("child classification precedence", () => {
     expect(childItems[2]!.session!.id).toBe("sub-old");
   });
 
-  it("isSubagentDescendant returns true for child of subagent", () => {
+  it("subagentDescendantMatcher returns true for child of subagent", () => {
     const subagent = makeSession({
       id: "sub",
       relationship_type: "subagent",
@@ -876,7 +835,7 @@ describe("child classification precedence", () => {
       id: "child",
       parent_session_id: "sub",
     });
-    expect(isSubagentDescendant(child, [subagent, child])).toBe(true);
+    expect(subagentDescendantMatcher([subagent, child])(child)).toBe(true);
   });
 });
 

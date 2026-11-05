@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { Virtualizer, type VirtualizerOptions } from "@tanstack/virtual-core";
 import { controlFrames } from "../../test/frames.js";
 import { realVirtualizer } from "../../test/virtualizer.js";
-import type { DbMessage as Message } from "../../api/generated/index.js";
+import { SessionsService, type DbMessage as Message } from "../../api/generated/index.js";
+import { ApiError } from "../../api/runtime.js";
 import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
 import { messages } from "../../stores/messages.svelte.js";
 import { readProgress } from "../../stores/read-progress.svelte.js";
@@ -30,6 +33,7 @@ const virtualizerMock = vi.hoisted(() => ({
   getTotalSize: vi.fn(() => 120),
   measureElement: vi.fn(),
   scrollToIndex: vi.fn(),
+  cancelScroll: vi.fn(),
   scrollToOffset: vi.fn(),
   getOffsetForIndex: vi.fn(),
 }));
@@ -163,6 +167,7 @@ describe("MessageList follow cancellation", () => {
     inSessionSearch.close();
     inSessionSearch.clearQuery();
     messages.clear();
+    sessions.activeSessionNotFound = false;
     sessions.activeSessionId = "s1";
     messages.sessionId = "s1";
     messages.messages = [makeMessage(10)];
@@ -206,6 +211,146 @@ describe("MessageList follow cancellation", () => {
     ui.followLatest = false;
     readProgress.reset();
     document.body.innerHTML = "";
+  });
+
+  it("keeps row positions matched to message heights when sort order changes", async () => {
+    ui.followLatest = false;
+    messages.messages = [makeMessage(0), makeMessage(1), makeMessage(2), makeMessage(3)];
+    const { instance } = realJumpScroll();
+    instance.setOptions({
+      ...instance.options,
+      measureElement: (row) => (row.querySelector(".is-user") ? 320 : 80),
+    });
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+
+    instance.measure();
+    await flushScrollUpdates();
+    expect(
+      [...document.querySelectorAll<HTMLElement>(".virtual-row")].map((row) => row.style.transform),
+    ).toEqual(["translateY(0px)", "translateY(320px)", "translateY(400px)", "translateY(720px)"]);
+
+    ui.sortNewestFirst = true;
+    await flushScrollUpdates();
+
+    const rows = [...document.querySelectorAll<HTMLElement>(".virtual-row")];
+    expect(rows.map((row) => row.querySelector(".role-label")?.textContent)).toEqual([
+      "Assistant",
+      "User",
+      "Assistant",
+      "User",
+    ]);
+    expect(rows.map((row) => row.style.transform)).toEqual([
+      "translateY(0px)",
+      "translateY(80px)",
+      "translateY(400px)",
+      "translateY(480px)",
+    ]);
+
+    ui.sortNewestFirst = false;
+    await flushScrollUpdates();
+
+    expect(
+      [...document.querySelectorAll<HTMLElement>(".virtual-row")].map((row) => row.style.transform),
+    ).toEqual(["translateY(0px)", "translateY(320px)", "translateY(400px)", "translateY(720px)"]);
+  });
+
+  it("opens a collapsed empty row when a jump targets a message inside it", async () => {
+    ui.followLatest = false;
+    const empty = (ordinal: number) => ({
+      ...makeMessage(ordinal),
+      content: "",
+      content_length: 0,
+    });
+    messages.messages = [makeMessage(10), empty(11), empty(12), makeMessage(13)];
+    setVirtualRows(3);
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+    const row = document.querySelector<HTMLDetailsElement>("details.empty-run")!;
+    expect(row.open).toBe(false);
+    expect(row.querySelectorAll(".role-label")).toHaveLength(0);
+
+    component.scrollToOrdinal(12);
+    await flushScrollUpdates();
+
+    expect(row.open).toBe(true);
+    expect([...row.querySelectorAll(".role-label")].map((el) => el.textContent)).toEqual([
+      "Assistant",
+      "User",
+    ]);
+  });
+
+  it("selects the clicked card inside an open empty row", async () => {
+    ui.followLatest = false;
+    const empty = (ordinal: number, role: string) => ({
+      ...makeMessage(ordinal),
+      role,
+      content: "",
+      content_length: 0,
+    });
+    messages.messages = [makeMessage(10), empty(11, "assistant"), empty(12, "user")];
+    setVirtualRows(2);
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+    component.scrollToOrdinal(11);
+    await flushScrollUpdates();
+
+    const userCard = document.querySelector<HTMLElement>('[data-message-ordinal="12"]')!;
+    userCard.querySelector<HTMLElement>(".role-label")!.click();
+    expect(ui.selectedOrdinal).toBe(12);
+  });
+
+  it("lands a jump on the target card of an open empty row", async () => {
+    ui.followLatest = false;
+    const empty = (ordinal: number) => ({
+      ...makeMessage(ordinal),
+      content: "",
+      content_length: 0,
+    });
+    messages.messages = [makeMessage(10), empty(11), empty(12)];
+    setVirtualRows(2);
+    virtualizerMock.getOffsetForIndex.mockReturnValue([100, "start"]);
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      const top = this.matches('[data-message-ordinal="12"]')
+        ? 260
+        : this.matches(".virtual-row")
+          ? 40
+          : 0;
+      return DOMRect.fromRect({ x: 0, y: top, width: 400, height: 100 });
+    });
+    component = mount(MessageList, { target: document.body });
+    await flushScrollUpdates();
+
+    component.scrollToOrdinal(12);
+
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToOffset).toHaveBeenCalledWith(320);
+    });
+  });
+
+  it("refreshes Docbank when the same transcript is remounted", async () => {
+    const { fileReferences } = await import("../../stores/file-references.svelte.js");
+    fileReferences.enabled = true;
+    await fileReferences.track(null, null);
+    messages.loadedRevision = "revision-1";
+    docbankLookup.mockResolvedValue({
+      integration: "enabled",
+      transcript_revision: "revision-1",
+      occurrences: [],
+    });
+    onTestFinished(() => {
+      fileReferences.enabled = false;
+    });
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await vi.waitFor(() => expect(docbankLookup).toHaveBeenCalledTimes(1));
+    await unmount(component);
+    component = undefined;
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await vi.waitFor(() => expect(docbankLookup).toHaveBeenCalledTimes(2));
   });
 
   it("keeps an ordinal jump on its message through an older load past five seconds", async () => {
@@ -287,7 +432,7 @@ describe("MessageList follow cancellation", () => {
       await flushScrollUpdates();
       flushFrames();
       await flushScrollUpdates();
-      expect(element.scrollTop).toBe(120);
+      expect(element.scrollTop).toBe(100);
 
       element.scrollTop = offset;
       await flushScrollUpdates();
@@ -400,6 +545,39 @@ describe("MessageList follow cancellation", () => {
       expect(ui.selectedOrdinal).toBe(ordinal);
     },
   );
+
+  it("counts a missing session once through a failed Retry, then again after recovery", async () => {
+    const previousSessions = sessions.sessions;
+    onTestFinished(() => {
+      sessions.sessions = previousSessions;
+    });
+    const session = { id: "s1" } as NonNullable<typeof sessions.activeSession>;
+    sessions.sessions = [session];
+    const request = vi
+      .spyOn(SessionsService, "getApiV1SessionsById")
+      .mockRejectedValue(new ApiError(404, "Missing"));
+    await sessions.refreshActiveSession();
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    expect(reportErrorShown).not.toHaveBeenCalled();
+    messages.messages = [];
+    messages.loading = true;
+    await tick();
+    expect(reportErrorShown).not.toHaveBeenCalled();
+    messages.loading = false;
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("session");
+    document.querySelector<HTMLButtonElement>("button")!.click();
+    await tick();
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(1);
+    request.mockResolvedValueOnce(session);
+    document.querySelector<HTMLButtonElement>("button")!.click();
+    await vi.waitFor(() => expect(document.querySelector("button")).toBeNull());
+    await sessions.refreshActiveSession();
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(2);
+  });
 
   it("renders empty and loading states in Simplified Chinese", async () => {
     setLocale("zh-CN");
@@ -959,6 +1137,57 @@ describe("MessageList follow cancellation", () => {
     expect(readProgress.get("s1")?.token).toBe("current");
   });
 
+  it("leaves cards of an open empty row unread until they are on screen", async () => {
+    const empty = (ordinal: number, role: string) => ({
+      ...makeMessage(ordinal),
+      role,
+      content: "",
+      content_length: 0,
+    });
+    messages.messages = [makeMessage(0), empty(1, "assistant"), empty(2, "user")];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    ui.followLatest = false;
+    const rows = (emptyRowStart: number) => [
+      { index: 0, key: "row-0", start: 0, end: 100 },
+      { index: 1, key: "row-1", start: emptyRowStart, end: emptyRowStart + 100 },
+    ];
+    // The empty row starts below the 200px viewport.
+    virtualizerMock.getVirtualItems.mockReturnValue(rows(300));
+    readProgress.baseline("s1", "previous", 0);
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: Element,
+    ) {
+      if (this.matches(".message-list-scroll")) {
+        return DOMRect.fromRect({ x: 0, y: 0, width: 400, height: 200 });
+      }
+      const top = this.matches('[data-message-ordinal="1"]')
+        ? 120
+        : this.matches('[data-message-ordinal="2"]')
+          ? 260
+          : 0;
+      return DOMRect.fromRect({ x: 0, y: top, width: 400, height: 60 });
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(readProgress.get("s1")?.token).toBe("previous");
+
+    const row = document.querySelector<HTMLDetailsElement>("details.empty-run")!;
+    row.querySelector("summary")!.click();
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    await tick();
+    expect(row.open).toBe(true);
+
+    // Scroll so the open row's first card is on screen and its second is not.
+    virtualizerMock.getVirtualItems.mockReturnValue(rows(100));
+    document.querySelector(".message-list-scroll")!.dispatchEvent(new Event("scroll"));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("previous");
+  });
+
   it("rechecks visible progress when filters change after mounting", async () => {
     messages.messages = [
       { ...makeMessage(0), role: "user" },
@@ -1121,3 +1350,9 @@ describe("MessageList follow cancellation", () => {
     expect(readProgress.get("s1")?.token).toBe("current");
   });
 });
+
+const docbankLookup = vi.hoisted(() => vi.fn());
+vi.mock("../../api/generated/sessions/sessions.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../api/generated/sessions/sessions.js")>()),
+  getApiV1SessionsByIdFileReferences: docbankLookup,
+}));

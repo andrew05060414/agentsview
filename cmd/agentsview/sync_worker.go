@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/agentsview/internal/archivesource"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/sync"
@@ -42,13 +43,15 @@ type workerLine struct {
 // "ok" only when the pass completed and discovery was authoritative; the parent
 // treats anything else, or a missing/duplicate result, as a failed run.
 type workerResult struct {
-	Status            string `json:"status"` // "ok" | "aborted" | "failed"
-	Synced            int    `json:"synced"`
-	Skipped           int    `json:"skipped"`
-	Failed            int    `json:"failed"`
-	Tombstoned        int    `json:"tombstoned,omitempty"`
-	DiscoveryComplete bool   `json:"discoveryComplete"`
-	Error             string `json:"error,omitempty"`
+	Status            string          `json:"status"` // "ok" | "aborted" | "failed"
+	Synced            int             `json:"synced"`
+	Skipped           int             `json:"skipped"`
+	Failed            int             `json:"failed"`
+	Tombstoned        int             `json:"tombstoned,omitempty"`
+	DiscoveryComplete bool            `json:"discoveryComplete"`
+	Error             string          `json:"error,omitempty"`
+	Deferred          int             `json:"deferred,omitempty"`
+	DeferredRetry     sync.WatchBatch `json:"deferredRetry,omitempty"`
 	// Stats carries the complete public SyncStats payload so the daemon's
 	// /sync and /resync responses keep result parity with in-process passes
 	// (total sessions, orphan counts, warnings, anomalies). The summary
@@ -81,7 +84,7 @@ func newSyncWorkerCommand() *cobra.Command {
 			// Load config the same flag-aware way `serve` does so config flags
 			// the daemon forwarded into the child argv (see syncWorkerChildArgs)
 			// override env/config.toml identically to a serve --background child.
-			cfg, err := config.LoadPFlags(cmd.Flags())
+			cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 			if err != nil {
 				return fmt.Errorf("sync-worker: loading config: %w", err)
 			}
@@ -90,7 +93,7 @@ func newSyncWorkerCommand() *cobra.Command {
 			// log.Printf diagnostics would otherwise flood the serve
 			// console instead of landing in the debug log.
 			setupLogFile(cfg.DataDir)
-			return runSyncWorker(cfg, request, cmd.OutOrStdout())
+			return runSyncWorkerContext(cmd.Context(), cfg, request, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(
@@ -105,11 +108,6 @@ func newSyncWorkerCommand() *cobra.Command {
 	// Register the serve config flags so forwarded overrides parse and apply.
 	config.RegisterServePFlags(cmd.Flags())
 	return cmd
-}
-
-// runSyncWorker runs one worker pass with a background context.
-func runSyncWorker(cfg config.Config, request syncWorkerRequest, out io.Writer) error {
-	return runSyncWorkerContext(context.Background(), cfg, request, out)
 }
 
 // runSyncWorkerContext dispatches on mode, streaming NDJSON progress and exactly
@@ -254,7 +252,11 @@ func runSyncWorkerStartup(
 			result.Error = auditErr.Error()
 		}
 	default:
-		result = workerResultFromStats(ctx, engine.SyncAll(ctx, onProgress))
+		stats := engine.SyncAll(ctx, onProgress)
+		result = workerResultFromStats(ctx, stats)
+	}
+	if mode == "startup" && result.Deferred > 0 && result.Failed == 0 && result.DiscoveryComplete && ctx.Err() == nil {
+		result.Status = "ok"
 	}
 
 	result.Stats.LinksPending = engine.PendingSubagentLinks()
@@ -332,6 +334,8 @@ func resyncBuildResultFromStats(
 		Tombstoned:        stats.Tombstoned,
 		DiscoveryComplete: stats.AuthoritativeDiscoveryComplete(),
 		Stats:             &statsCopy,
+		Deferred:          stats.Deferred,
+		DeferredRetry:     stats.DeferredRetryBatch(),
 	}
 	switch {
 	case ctx.Err() != nil:
@@ -344,8 +348,6 @@ func resyncBuildResultFromStats(
 	case stats.Aborted:
 		result.Status = "aborted"
 		result.DiscoveryComplete = false
-	case stats.Deferred > 0:
-		result.Status = "failed"
 	case !result.DiscoveryComplete:
 		result.Status = "failed"
 	default:
@@ -382,6 +384,8 @@ func workerResultFromStats(
 		Tombstoned:        stats.Tombstoned,
 		DiscoveryComplete: stats.AuthoritativeDiscoveryComplete(),
 		Stats:             &statsCopy,
+		Deferred:          stats.Deferred,
+		DeferredRetry:     stats.DeferredRetryBatch(),
 	}
 	switch {
 	case ctx.Err() != nil || stats.Aborted:
@@ -415,7 +419,10 @@ func openWorkerWriteDB(ctx context.Context, cfg config.Config, progress db.OpenP
 // daemon-only callbacks (emitter, watcher reconciliation, deferred maintenance).
 func workerEngineConfig(cfg config.Config) sync.EngineConfig {
 	return sync.EngineConfig{
-		AgentDirs:               cfg.AgentDirs,
+		AgentDirs: cfg.AgentDirs,
+		RebuildSources: func(ctx context.Context) (sync.RebuildOptions, error) {
+			return archivesource.RebuildContributors(ctx, cfg)
+		},
 		SourceMachines:          cfg.SourceMachines,
 		ProviderMetadata:        cfg.ProviderMetadata,
 		DisabledAgents:          cfg.DisabledAgents,

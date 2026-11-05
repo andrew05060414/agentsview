@@ -116,7 +116,7 @@ func doParseDiff(ctx context.Context, cfg ParseDiffConfig) (failed bool) {
 		fatal("%v", err)
 	}
 
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
 		fatal("loading config: %v", err)
 	}
@@ -309,7 +309,7 @@ func renderParseDiffReport(
 		fmt.Fprintln(w,
 			"Warning: this binary's data version is ahead of every "+
 				"examined session, so all of them are pending resync "+
-				"and no drift can be detected. Run parse-diff with a "+
+				"and no drift can be detected. Run archive diff with a "+
 				"binary built before the data-version bump, or against "+
 				"a freshly resynced archive, to vet a parser change.")
 		fmt.Fprintln(w)

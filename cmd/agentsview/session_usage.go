@@ -3,15 +3,17 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
-	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,11 +43,15 @@ func newSessionUsageCommand() *cobra.Command {
 			"otherwise they return exit 2. " +
 			"--no-sync and HTTP --own-only read only the archive; missing IDs return exit 2. " +
 			"If refresh is refused or fails, the command shows archived usage with a warning; " +
-			"JSON sets refresh_incomplete. Direct mode keeps its targeted source lookup.",
+			"JSON sets refresh_incomplete. Direct mode keeps its targeted source lookup.\n\n" +
+			"Exit 0 means token data, cost, or plan figures are present. " +
+			"A report without any of those figures is printed before a silent exit 3.",
+		Example: "  agentsview session usage <id> --json\n" +
+			"  agentsview session usage <id> --own-only --no-sync --json",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
-		Run: func(cmd *cobra.Command, args []string) {
-			runSessionUsage(cmd, args[0], outputFormat(cmd))
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSessionUsage(cmd, args[0], outputFormat(cmd))
 		},
 	}
 	cmd.Flags().Bool("no-sync", false,
@@ -56,74 +62,129 @@ func newSessionUsageCommand() *cobra.Command {
 }
 
 // runSessionUsage computes usage for one session and renders it,
-// exiting with the shared usage exit code (0 = token data or cost,
-// 2 = not found, 3 = neither). Uses Run + os.Exit (not RunE) so the
-// 2/3 codes survive — cobra RunE errors collapse to exit 1.
-func runSessionUsage(cmd *cobra.Command, sessionID, format string) {
+// returning the shared usage exit code (0 = token data or cost,
+// 2 = not found, 3 = neither) through the CLI error boundary.
+func runSessionUsage(cmd *cobra.Command, sessionID, format string) error {
 	out, code, err := sessionUsageDataForCommand(cmd, sessionID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(tokenUseExitErr)
+		return withExitCode(err, tokenUseExitErr)
 	}
 	if out != nil {
 		if format == "json" {
-			enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+			enc := jsontext.NewEncoder(cmd.OutOrStdout(), jsontext.WithIndent("  "))
 			if encErr := json.MarshalEncode(enc, out); encErr != nil {
-				fmt.Fprintf(os.Stderr, "error: %v\n", encErr)
-				os.Exit(tokenUseExitErr)
+				return withExitCode(encErr, tokenUseExitErr)
 			}
 		} else if rerr := renderSessionUsageHuman(
-			os.Stdout, out,
+			cmd.OutOrStdout(), out,
 		); rerr != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", rerr)
-			os.Exit(tokenUseExitErr)
+			return withExitCode(rerr, tokenUseExitErr)
 		}
 	}
-	os.Exit(code)
+	return sessionUsageExitError(sessionID, code)
+}
+
+func sessionUsageExitError(sessionID string, code int) error {
+	switch code {
+	case tokenUseExitOK:
+		return nil
+	case tokenUseExitNotFound:
+		return withCLIHint(withExitCode(
+			fmt.Errorf("%w: %s", errSessionNotFound, sessionID), code,
+		), "Run `agentsview session list --json` to find a session ID, then retry `agentsview session usage <id>`.")
+	default:
+		// A successfully rendered report carries no error diagnostic, even when
+		// it contains no token, cost, or plan figures.
+		return withSilentExitCode(errors.New("session has no usage data"), code)
+	}
 }
 
 func sessionUsageDataForCommand(
 	cmd *cobra.Command, sessionID string,
 ) (*sessionUsageOutput, int, error) {
+	read, cleanup, err := resolveSessionUsageReader(cmd)
+	if err != nil {
+		return nil, tokenUseExitErr, err
+	}
+	defer closeArchiveQueryBackend(cleanup)
+	return read(sessionID)
+}
+
+// resolveSessionUsageReader selects and opens one backend for all requested IDs.
+func resolveSessionUsageReader(cmd *cobra.Command) (
+	func(string) (*sessionUsageOutput, int, error), func(), error,
+) {
+	noSync, _ := cmd.Flags().GetBool("no-sync")
+	backend, err := resolveSessionUsageBackend(cmd, noSync)
+	if err != nil {
+		return nil, nil, err
+	}
+	return backend.read, backend.cleanup, nil
+}
+
+type sessionUsageBackend struct {
+	read    func(string) (*sessionUsageOutput, int, error)
+	service service.SessionService
+	cleanup func()
+}
+
+// resolveSessionUsageBackend shares transport selection with archive diagnostics.
+func resolveSessionUsageBackend(cmd *cobra.Command, noSync bool) (*sessionUsageBackend, error) {
 	ctx := cmd.Context()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	ownOnly, _ := cmd.Flags().GetBool("own-only")
-	noSync, _ := cmd.Flags().GetBool("no-sync")
 	query := sessionUsageQuery{
-		SessionID: sessionID, OwnOnly: ownOnly, NoSync: noSync,
+		OwnOnly: ownOnly, NoSync: noSync,
 	}
 
 	remote, _ := cmd.Flags().GetString("server")
 	if remote != "" {
 		if pgReadRequested(cmd) {
-			return nil, tokenUseExitErr, errors.New("--server and --pg are mutually exclusive")
+			return nil, errors.New("--server and --pg are mutually exclusive")
 		}
 		token, err := explicitServerToken(cmd)
 		if err != nil {
-			return nil, tokenUseExitErr, err
+			return nil, err
 		}
 		if !query.OwnOnly {
 			if err := requireRemoteSubagentUsageSupport(
 				ctx, remote, token, !query.NoSync,
 			); err != nil {
-				return nil, tokenUseExitErr, err
+				return nil, err
 			}
 		}
-		return httpSessionUsageData(ctx, remote, token, query)
+		return &sessionUsageBackend{
+			service: servicehttp.NewHTTPBackend(remote, token, false, ""),
+			read: func(id string) (*sessionUsageOutput, int, error) {
+				query.SessionID = id
+				return httpSessionUsageData(ctx, remote, token, query)
+			},
+		}, nil
 	}
-	cfg, err := config.LoadPFlags(cmd.Flags())
+	cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 	if err != nil {
-		return nil, tokenUseExitErr, fmt.Errorf("loading config: %w", err)
+		return nil, fmt.Errorf("loading config: %w", err)
 	}
 	if pgReadRequested(cmd) {
 		pgCfg, _, err := resolvePGReadConfig(cmd, cfg)
 		if err != nil {
-			return nil, tokenUseExitErr, err
+			return nil, err
 		}
-		return pgSessionUsageData(cfg, pgCfg, query)
+		store, cleanup, err := openPGReadStore(ctx, cfg, pgCfg)
+		if err != nil {
+			closeArchiveQueryBackend(cleanup)
+			return nil, fmt.Errorf("opening pg store: %w", err)
+		}
+		return &sessionUsageBackend{
+			service: service.NewReadOnlyBackend(store), cleanup: cleanup,
+			read: func(id string) (*sessionUsageOutput, int, error) {
+				query.SessionID = id
+				return storeSessionUsageData(ctx, "pg", cfg, store, query)
+			},
+		}, nil
 	}
 	backend, cleanup, err := resolveArchiveQueryBackendWithConfig(
 		ctx,
@@ -137,10 +198,22 @@ func sessionUsageDataForCommand(
 		},
 	)
 	if err != nil {
-		return nil, tokenUseExitErr, err
+		return nil, err
 	}
-	defer closeArchiveQueryBackend(cleanup)
-	return backend.SessionUsage(ctx, query)
+	var svc service.SessionService
+	switch b := backend.(type) {
+	case daemonArchiveQueryBackend:
+		svc = servicehttp.NewHTTPBackend(b.tr.URL, b.authToken, b.tr.ReadOnly, b.tr.BrowserURL)
+	case localArchiveQueryBackend:
+		svc = service.NewReadOnlyBackend(b.database)
+	}
+	return &sessionUsageBackend{
+		service: svc, cleanup: cleanup,
+		read: func(id string) (*sessionUsageOutput, int, error) {
+			query.SessionID = id
+			return backend.SessionUsage(ctx, query)
+		},
+	}, nil
 }
 
 func requireRemoteSubagentUsageSupport(
@@ -195,7 +268,6 @@ func httpSessionUsageData(
 			return nil, tokenUseExitErr, err
 		}
 		if query.OwnOnly || query.NoSync {
-			fmt.Fprintf(os.Stderr, "session not found: %s\n", sessionID)
 			return nil, tokenUseExitNotFound, nil
 		}
 		startupPending, archiveStale, statusErr := httpSessionSyncStatus(
@@ -219,7 +291,6 @@ func httpSessionUsageData(
 			if !errors.Is(err, errSessionNotFound) {
 				return nil, tokenUseExitErr, err
 			}
-			fmt.Fprintf(os.Stderr, "session not found: %s\n", sessionID)
 			return nil, tokenUseExitNotFound, nil
 		}
 	}
@@ -236,60 +307,29 @@ func httpSessionUsageData(
 			}
 		}
 	}
-	// Request the full breakdown so the remote path matches the
-	// shape returned by the direct store paths, and the same subagent
-	// attribution scope so --server and local agree field for field.
-	api, err := apiclient.NewHTTPClient(baseURL, token, sessionUsageHTTPClient)
-	if err != nil {
-		return nil, tokenUseExitErr, err
+	// The shared HTTP backend requests the full breakdown and the same
+	// subagent scope as the direct store paths, so --server and local
+	// agree field for field. The request keeps the CLI's usage timeout.
+	usageCtx := ctx
+	if timeout := sessionUsageHTTPClient.Timeout; timeout > 0 {
+		var cancel context.CancelFunc
+		usageCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
-	var subagents *bool
-	if !query.OwnOnly {
-		subagents = new(true)
-	}
-	response, err := api.GetAPIV1SessionsIDUsageWithResponse(ctx, &apiclient.GetAPIV1SessionsIDUsageRequestOptions{
-		PathParams: &apiclient.GetAPIV1SessionsIDUsagePath{ID: url.PathEscape(resolvedID)},
-		Query:      &apiclient.GetAPIV1SessionsIDUsageQuery{Breakdown: new(true), Subagents: subagents},
+	usage, err := backend.SessionUsage(usageCtx, service.SessionUsageRequest{
+		ID: resolvedID, OwnOnly: query.OwnOnly,
 	})
-	if response == nil {
-		return nil, tokenUseExitErr, err
+	if err != nil {
+		return nil, tokenUseExitErr, fmt.Errorf("usage: %w", err)
 	}
-	resp := response.HTTPResponse
-	if resp.StatusCode == http.StatusNotFound {
-		fmt.Fprintf(os.Stderr, "session not found: %s\n", sessionID)
+	if usage == nil {
 		return nil, tokenUseExitNotFound, nil
 	}
-	if resp.StatusCode != http.StatusOK {
-		body := response.Body
-		return nil, tokenUseExitErr, fmt.Errorf(
-			"usage: HTTP %d: %s", resp.StatusCode, body,
-		)
+	out := &sessionUsageOutput{
+		SessionUsageReport: *usage,
+		ServerRunning:      true, RefreshIncomplete: refreshIncomplete,
 	}
-	if err != nil {
-		return nil, tokenUseExitErr, err
-	}
-	if len(response.Body) == 0 {
-		return nil, tokenUseExitErr, io.ErrUnexpectedEOF
-	}
-	wire := response.JSON200
-	out := sessionUsageOutput{
-		SessionID: wire.SessionID, Agent: wire.Agent, Project: wire.Project,
-		TotalOutputTokens: int(wire.TotalOutputTokens), PeakContextTokens: int(wire.PeakContextTokens),
-		HasTokenData: wire.HasTokenData, Cost: wire.Cost, HasCost: wire.HasCost, CostUSD: wire.CostUsd,
-		Models: wire.Models, UnpricedModels: wire.UnpricedModels,
-		BreakdownCount: int(wire.BreakdownCount), Breakdown: wire.Breakdown,
-		ServerRunning: true, RefreshIncomplete: refreshIncomplete,
-	}
-	if wire.CostSource != nil {
-		out.CostSource = export.CostSource(*wire.CostSource)
-	}
-	if wire.AiCredits != nil {
-		out.AICredits = *wire.AiCredits
-	}
-	if wire.SubagentCount != nil {
-		out.SubagentCount = int(*wire.SubagentCount)
-	}
-	return &out, usageExitCode(&out.SessionUsage), nil
+	return out, usageExitCode(out), nil
 }
 
 func httpSessionSyncStatus(
@@ -314,23 +354,8 @@ func httpSessionSyncStatus(
 	return response.JSON200.StartupPending, response.JSON200.ArchiveStale, nil
 }
 
-func pgSessionUsageData(
-	cfg config.Config, pgCfg config.PGConfig, query sessionUsageQuery,
-) (*sessionUsageOutput, int, error) {
-	store, cleanup, err := openPGReadStore(cfg, pgCfg)
-	if err != nil {
-		if cleanup != nil {
-			cleanup()
-		}
-		return nil, tokenUseExitErr, fmt.Errorf("opening pg store: %w", err)
-	}
-	if cleanup != nil {
-		defer cleanup()
-	}
-	return storeSessionUsageData("pg", cfg, store, query)
-}
-
 func storeSessionUsageData(
+	ctx context.Context,
 	storeName string,
 	cfg config.Config,
 	store db.Store,
@@ -342,7 +367,6 @@ func storeSessionUsageData(
 		}
 	}
 
-	ctx := context.Background()
 	sessionID := query.SessionID
 	resolvedID, err := resolveStoreSessionID(ctx, store, sessionID)
 	if err != nil {
@@ -350,34 +374,21 @@ func storeSessionUsageData(
 			return nil, tokenUseExitErr,
 				fmt.Errorf("resolving %s session id: %w", storeName, err)
 		}
-		fmt.Fprintf(os.Stderr, "session not found: %s\n", sessionID)
 		return nil, tokenUseExitNotFound, nil
 	}
 
-	var u *db.SessionUsage
-	if query.OwnOnly {
-		u, err = store.GetSessionUsage(ctx, resolvedID, true)
-	} else {
-		u, err = service.SessionUsageWithSubagents(
-			ctx, store, resolvedID, true)
-	}
+	u, err := service.LoadSessionUsage(ctx, store, service.SessionUsageRequest{
+		ID: resolvedID, OwnOnly: query.OwnOnly,
+	})
 	if err != nil {
 		return nil, tokenUseExitErr,
 			fmt.Errorf("querying %s session usage: %w", storeName, err)
 	}
 	if u == nil {
-		fmt.Fprintf(os.Stderr, "session not found: %s\n", sessionID)
 		return nil, tokenUseExitNotFound, nil
 	}
-	if u.Agent == "" {
-		if def, ok := parser.AgentByPrefix(u.SessionID); ok {
-			u.Agent = string(def.Type)
-		}
-	}
-	return &sessionUsageOutput{
-		SessionUsage:  *u,
-		ServerRunning: false,
-	}, usageExitCode(u), nil
+	out := &sessionUsageOutput{SessionUsageReport: *u}
+	return out, usageExitCode(out), nil
 }
 
 func resolveStoreSessionID(
@@ -421,13 +432,27 @@ func renderSessionUsageHuman(w io.Writer, out *sessionUsageOutput) error {
 		sanitizeTerminal(out.SessionID))
 	fmt.Fprintf(w, "%s %s\n", label("Agent"),
 		sanitizeTerminal(out.Agent))
-	fmt.Fprintf(w, "%s %d\n", label("Output"), out.TotalOutputTokens)
-	fmt.Fprintf(w, "%s %d\n", label("Peak ctx"), out.PeakContextTokens)
+	// A Codex cloud session that live capture never saw has only plan
+	// usage; zeros would read as a session that used nothing. Plan figures
+	// are shares of the plan's limits, never output or context tokens.
+	planOnly := out.Agent == string(parser.AgentCodexCloud) && !out.HasTokenData && !out.HasCost
+	if planOnly {
+		fmt.Fprintf(w, "%s n/a\n", label("Output"))
+		fmt.Fprintf(w, "%s n/a\n", label("Peak ctx"))
+	} else {
+		fmt.Fprintf(w, "%s %d\n", label("Output"), out.TotalOutputTokens)
+		fmt.Fprintf(w, "%s %d\n", label("Peak ctx"), out.PeakContextTokens)
+	}
 	if out.SubagentCount > 0 {
 		fmt.Fprintf(w, "%s %d (included)\n", label("Subagents"),
 			out.SubagentCount)
 	}
-	if out.HasCost {
+	switch {
+	case planOnly && hasPlanFigures(out.Plan):
+		fmt.Fprintf(w, "%s billed as plan usage\n", label("Cost"))
+	case planOnly:
+		fmt.Fprintf(w, "%s n/a\n", label("Cost"))
+	case out.HasCost:
 		models := strings.Join(out.Models, ", ")
 		prefix := "~"
 		if out.CostSource == export.CostSourceReported {
@@ -439,10 +464,10 @@ func renderSessionUsageHuman(w io.Writer, out *sessionUsageOutput) error {
 		}
 		fmt.Fprintf(w, "%s %s%s%s\n", label("Cost"), prefix,
 			money.FormatUSD(out.Cost, money.DisplayCents), suffix)
-	} else if len(out.UnpricedModels) > 0 {
+	case len(out.UnpricedModels) > 0:
 		fmt.Fprintf(w, "%s n/a (unpriced: %s)\n", label("Cost"),
 			sanitizeTerminal(strings.Join(out.UnpricedModels, ", ")))
-	} else {
+	default:
 		fmt.Fprintf(w, "%s n/a\n", label("Cost"))
 	}
 	if out.AICredits > 0 {
@@ -451,5 +476,182 @@ func renderSessionUsageHuman(w io.Writer, out *sessionUsageOutput) error {
 	if out.RefreshIncomplete {
 		fmt.Fprintln(w, "Usage refresh: incomplete; showing archived totals")
 	}
+	if line := planUsageLine(out.Agent, out.Plan); line != "" {
+		fmt.Fprintf(w, "%s %s\n", label("Plan usage"), sanitizeTerminal(line))
+	}
+	if line := captureCoverageLine(out.Coverage, out.Plan); line != "" {
+		fmt.Fprintf(w, "%s %s\n", label("Captured"), sanitizeTerminal(line))
+	}
 	return nil
+}
+
+// planUsageLine describes a session's plan usage in one line, "" for a
+// session that is not a codex-cloud chat and has no plan usage.
+func planUsageLine(agent string, plan *db.PlanUsageView) string {
+	// A codex-cloud chat with nothing recorded yet has an empty row, so it
+	// counts as plan usage; it reads the same as having no row.
+	if plan == nil || (!hasPlanFigures(plan) && plan.OutcomeKind == "" &&
+		plan.OutcomeAt == "" && plan.DataAsOf == "" && !plan.Final) {
+		if agent == string(parser.AgentCodexCloud) {
+			return "not checked yet; a sync checks it when Codex cloud import is on"
+		}
+		return ""
+	}
+	if plan.OutcomeKind == "counted_under" {
+		return "counted under session " + plan.CountedUnder
+	}
+	if !hasPlanFigures(plan) {
+		if msg := planOutcomeMessage(plan); msg != "" {
+			return msg
+		}
+		if plan.Final {
+			return "not reported by OpenAI"
+		}
+		return "not reported yet" + asOfLocal(cmp.Or(plan.OutcomeAt, plan.DataAsOf))
+	}
+	var parts []string
+	if plan.WeeklyPercent != nil {
+		parts = append(parts, planFigure(*plan.WeeklyPercent)+"% of weekly limit")
+	}
+	if plan.FiveHourPercent != nil {
+		parts = append(parts, planFigure(*plan.FiveHourPercent)+"% of 5-hour limit")
+	}
+	if plan.Credits != nil {
+		parts = append(parts, planCredits(*plan.Credits)+" credits")
+	}
+	line := strings.Join(parts, ", ") + asOfLocal(plan.DataAsOf)
+	if plan.DataStatus == "partial" {
+		if plan.Final {
+			line = "partial: " + line
+		} else {
+			line = "still updating: " + line
+		}
+	}
+	// The stored outcome is newer than the figures, so the figures may
+	// be stale; say what the later check found.
+	if plan.OutcomeKind != "" {
+		line += "; later, " + laterPlanCheck(plan.OutcomeKind)
+		if at := localTime(plan.OutcomeAt); at != "" {
+			line += " (" + at + ")"
+		}
+		line += ", so these figures may be out of date"
+	}
+	return line
+}
+
+// laterPlanCheck says what a plan usage check after the stored figures
+// found.
+func laterPlanCheck(kind string) string {
+	switch kind {
+	case "could_not_check":
+		return "AgentsView could not check plan usage"
+	case "account_unavailable":
+		return "usage became unavailable for this account"
+	case "too_many_descendants":
+		return "the chat had too many sub-agent chats for OpenAI's usage report"
+	case "settled_no_row":
+		return "OpenAI stopped reporting this chat"
+	default:
+		return "OpenAI's usage report left this chat out"
+	}
+}
+
+// planOutcomeMessage describes a plan usage outcome that ends a root's
+// checks without a row, or "" for the other outcomes.
+func planOutcomeMessage(plan *db.PlanUsageView) string {
+	switch plan.OutcomeKind {
+	case "account_unavailable":
+		return "usage isn't available for this account"
+	case "too_many_descendants":
+		return "too many sub-agent chats for OpenAI's usage report"
+	case "could_not_check":
+		return "AgentsView could not check plan usage"
+	case "settled_no_row":
+		return "not reported by OpenAI"
+	default:
+		return ""
+	}
+}
+
+// hasPlanFigures reports whether a plan usage row carries any figure.
+func hasPlanFigures(plan *db.PlanUsageView) bool {
+	return plan != nil && (plan.WeeklyPercent != nil || plan.FiveHourPercent != nil || plan.Credits != nil)
+}
+
+// planFigure rounds a plan usage percentage or credit amount to two
+// decimal places. A nonzero amount that rounds to zero prints as "<0.01",
+// so a small share never reads as none.
+func planFigure(v float64) string {
+	rounded := math.Round(v*100) / 100
+	if rounded == 0 && v > 0 {
+		return "<0.01"
+	}
+	return strconv.FormatFloat(rounded, 'f', -1, 64)
+}
+
+// planCredits formats OpenAI's decimal credits string, such as "0E-10",
+// like a percentage. A string that is not a number prints as sent.
+func planCredits(credits string) string {
+	v, err := strconv.ParseFloat(credits, 64)
+	if err != nil {
+		return credits
+	}
+	return planFigure(v)
+}
+
+// captureCoverageLine describes live token capture for a session, "" when
+// no live capture saw it.
+func captureCoverageLine(
+	coverage *db.CaptureCoverageView, plan *db.PlanUsageView,
+) string {
+	if coverage == nil {
+		return ""
+	}
+	line := "tokens captured live" + asOfLocal(coverage.LastCaptureAt)
+	if coverage.UncapturedTurns == 0 {
+		return line
+	}
+	turns := "turns"
+	if coverage.UncapturedTurns == 1 {
+		turns = "turn"
+	}
+	line += fmt.Sprintf("; %d %s not captured", coverage.UncapturedTurns, turns)
+	if coverage.UncapturedTurns == 1 {
+		line += ", so some of its tokens may be missing from the totals"
+	} else {
+		line += ", so some of their tokens may be missing from the totals"
+	}
+	// A complete report with no later failure counts every turn that ran
+	// before its data time. Whether a missed turn ran before it is not
+	// known here, so the line names the time instead of claiming it.
+	if plan == nil || plan.DataStatus != "available" || plan.OutcomeKind != "" || !hasPlanFigures(plan) {
+		return line
+	}
+	asOf := localTime(plan.DataAsOf)
+	if asOf == "" {
+		return line
+	}
+	if coverage.UncapturedTurns == 1 {
+		return line + "; plan usage counts it if it ran before " + asOf
+	}
+	return line + "; plan usage counts the ones that ran before " + asOf
+}
+
+// asOfLocal renders an RFC 3339 time as ", as of <local time>", or "" when
+// the time is absent or unreadable.
+func asOfLocal(ts string) string {
+	if t := localTime(ts); t != "" {
+		return ", as of " + t
+	}
+	return ""
+}
+
+// localTime renders an RFC 3339 time in the local zone, or "" when the
+// time is absent or unreadable.
+func localTime(ts string) string {
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return ""
+	}
+	return t.Local().Format("2006-01-02 15:04 MST")
 }

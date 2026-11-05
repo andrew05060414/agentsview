@@ -29,6 +29,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/gofrs/flock"
 	"github.com/spf13/pflag"
+	"go.kenn.io/agentsview/internal/friction"
 	"go.kenn.io/agentsview/internal/jsonutil"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pathutil"
@@ -95,9 +96,6 @@ type pgEnvOverrides struct {
 	URL         string
 	Schema      string
 	MachineName string
-	// AllowInsecure comes from AGENTSVIEW_PG_ALLOW_INSECURE under a
-	// deployment mode; nil leaves the target's setting in place.
-	AllowInsecure *bool
 }
 
 // ResolvedPGTarget is one PostgreSQL target after target selection,
@@ -280,6 +278,7 @@ type VectorEmbeddingsConfig struct {
 	DefaultServer string `toml:"default_server" json:"default_server,omitempty"`
 	// Servers is the set of named OpenAI-compatible endpoints that serve
 	// Model, keyed by the name `embeddings build --using <name>` selects.
+	// Nil means the table was omitted; an empty map means it was explicit.
 	Servers map[string]VectorEmbeddingsServerConfig `toml:"servers" json:"servers"`
 }
 
@@ -288,6 +287,7 @@ type VectorEmbeddingsConfig struct {
 // VectorEmbeddingsConfig.
 type VectorEmbeddingsServerConfig struct {
 	Endpoint string `toml:"endpoint" json:"endpoint"`
+	Local    bool   `toml:"local" json:"local,omitempty"`
 	// OllamaCPUFallback retries invalid Metal vectors once through Ollama's
 	// native CPU embedding path. It is transport-only and defaults to false.
 	OllamaCPUFallback bool `toml:"ollama_cpu_fallback" json:"ollama_cpu_fallback,omitempty"`
@@ -315,9 +315,25 @@ type VectorEmbeddingsServerConfig struct {
 	// 0 means one attempt. Default 3.
 	MaxRetries int `toml:"max_retries" json:"max_retries"`
 
-	// apiKey is read from AGENTSVIEW_EMBEDDINGS_API_KEY_FILE for the
-	// deployment server; it takes precedence over APIKeyEnv.
+	// apiKey is read from AGENTSVIEW_EMBEDDINGS_API_KEY or
+	// AGENTSVIEW_EMBEDDINGS_API_KEY_FILE for the deployment server; it takes
+	// precedence over APIKeyEnv.
 	apiKey string
+}
+
+const defaultNomicModel = "nomic-embed-text"
+
+func isNomicModel(model string) bool {
+	return model == defaultNomicModel || model == "nomic-embed-text:latest" || model == "nomic-embed-text:v1.5"
+}
+
+// ServerNames returns the available server names, including automatic
+// discovery when an untagged Nomic recipe has no configured server table.
+func (c VectorEmbeddingsConfig) ServerNames() []string {
+	if c.Servers == nil && c.Model == defaultNomicModel {
+		return []string{"automatic"}
+	}
+	return sortedServerNames(c.Servers)
 }
 
 // ResolvedDefaultServer returns the server name used when no explicit
@@ -327,10 +343,8 @@ func (c VectorEmbeddingsConfig) ResolvedDefaultServer() string {
 	if c.DefaultServer != "" {
 		return c.DefaultServer
 	}
-	if len(c.Servers) == 1 {
-		for name := range c.Servers {
-			return name
-		}
+	if names := c.ServerNames(); len(names) == 1 {
+		return names[0]
 	}
 	return ""
 }
@@ -343,10 +357,13 @@ func (c VectorEmbeddingsConfig) Server(name string) (string, VectorEmbeddingsSer
 		name = c.ResolvedDefaultServer()
 	}
 	s, ok := c.Servers[name]
+	if !ok && name == "automatic" && c.Servers == nil && c.Model == defaultNomicModel {
+		return name, normalizedEmbeddingsServers(map[string]VectorEmbeddingsServerConfig{"automatic": {}}, toml.MetaData{})[name], nil
+	}
 	if !ok {
 		return "", VectorEmbeddingsServerConfig{}, fmt.Errorf(
 			"[vector.embeddings] no server named %q; define it under [vector.embeddings.servers.%s] (have: %s)",
-			name, name, strings.Join(sortedServerNames(c.Servers), ", "))
+			name, name, strings.Join(c.ServerNames(), ", "))
 	}
 	return name, s, nil
 }
@@ -535,8 +552,8 @@ func (c VectorEmbeddingsServerConfig) EmbedTransport() (embedconfig.Transport, e
 	return embedconfig.Transport{Timeout: timeout}, nil
 }
 
-// APIKey returns the key read from a deployment secret file, else the
-// environment variable named by APIKeyEnv. Returns "" when neither is set.
+// APIKey returns a deployment-provided key when set. Otherwise it reads the
+// environment variable named by APIKeyEnv, returning "" when unset.
 func (c VectorEmbeddingsServerConfig) APIKey() string {
 	if c.apiKey != "" {
 		return c.apiKey
@@ -547,28 +564,42 @@ func (c VectorEmbeddingsServerConfig) APIKey() string {
 	return os.Getenv(c.APIKeyEnv)
 }
 
-// validateServers checks the named-servers section: at least one server, an
-// unambiguous default, and per-server transport settings that parse.
+// validateServers checks available servers, their default and transport
+// settings, and the dimensions supported by local Nomic.
 func (c VectorEmbeddingsConfig) validateServers() error {
-	if len(c.Servers) == 0 {
+	names := c.ServerNames()
+	if len(names) == 0 {
 		return errors.New("[vector.embeddings] at least one server is required when [vector] is enabled; " +
 			"define one under [vector.embeddings.servers.<name>]")
 	}
-	if c.DefaultServer == "" && len(c.Servers) > 1 {
+	if c.DefaultServer == "" && len(names) > 1 {
 		return fmt.Errorf(
 			"[vector.embeddings] default_server is required when more than one server is defined (have: %s)",
-			strings.Join(sortedServerNames(c.Servers), ", "))
+			strings.Join(names, ", "))
 	}
 	if c.DefaultServer != "" {
-		if _, ok := c.Servers[c.DefaultServer]; !ok {
+		if !slices.Contains(names, c.DefaultServer) {
 			return fmt.Errorf(
 				"[vector.embeddings] default_server %q is not a defined server (have: %s)",
-				c.DefaultServer, strings.Join(sortedServerNames(c.Servers), ", "))
+				c.DefaultServer, strings.Join(names, ", "))
 		}
 	}
+	local := c.Servers == nil
 	for _, name := range sortedServerNames(c.Servers) {
+		if c.Servers[name].Local && !isNomicModel(c.Model) {
+			return fmt.Errorf("[vector.embeddings.servers.%s] local requires nomic-embed-text; changing models requires rebuilding the index", name)
+		}
+		local = local || c.Servers[name].Local
 		if err := c.Servers[name].validate(name, c.ModelContextTokens); err != nil {
 			return err
+		}
+	}
+	if local {
+		if c.Dimension > 768 {
+			return fmt.Errorf("[vector.embeddings] dimension must be at most 768 for local %q, got %d", c.Model, c.Dimension)
+		}
+		if c.Dimension < 768 && !c.RequestDimensions {
+			return errors.New("[vector.embeddings] request_dimensions must be true for local Nomic dimensions below 768")
 		}
 	}
 	return nil
@@ -577,7 +608,10 @@ func (c VectorEmbeddingsConfig) validateServers() error {
 // validate checks one named server's transport settings.
 func (c VectorEmbeddingsServerConfig) validate(name string, modelContextTokens int) error {
 	section := fmt.Sprintf("[vector.embeddings.servers.%s]", name)
-	if c.Endpoint == "" {
+	if c.Local && c.Endpoint != "" {
+		return fmt.Errorf("%s local cannot be combined with endpoint", section)
+	}
+	if c.Endpoint == "" && !c.Local {
 		return fmt.Errorf("%s endpoint is required", section)
 	}
 	if c.OllamaCPUFallback {
@@ -644,11 +678,44 @@ type AutomatedConfig struct {
 	ExactMatches []string `toml:"exact_matches" json:"exact_matches,omitempty"`
 }
 
-// FrictionConfig controls Friction Log analysis. It is off by default because
-// reviewing transcripts costs CPU that users without a digest do not need.
+// DefaultFrictionBackfillDays bounds catch-up to recent complete local dates.
+const DefaultFrictionBackfillDays = 7
+
+// FrictionConfig controls the opt-in Friction Log review.
 type FrictionConfig struct {
 	// Enabled reviews changed sessions in the background after each sync.
 	Enabled bool `toml:"enabled" json:"enabled,omitempty"`
+	// Timezone is the IANA zone digests are dated in. An empty value uses
+	// the local zone; AGENTSVIEW_FRICTION_TZ overrides this setting.
+	Timezone string `json:"timezone,omitempty" toml:"timezone"`
+	// BackfillDays bounds catch-up to recent complete local dates.
+	BackfillDays int `json:"backfill_days" toml:"backfill_days"`
+	// SeatPatterns are globs over session file paths with one {seat} capture.
+	SeatPatterns []string `json:"seat_patterns,omitempty" toml:"seat_patterns"`
+}
+
+// Validate checks the zone name, backfill bound, and seat patterns.
+func (c FrictionConfig) Validate() error {
+	if tz := strings.TrimSpace(c.Timezone); tz != "" {
+		if tz == "Local" {
+			return fmt.Errorf("[friction] timezone %q is not an IANA zone", tz)
+		}
+		if _, err := time.LoadLocation(tz); err != nil {
+			return fmt.Errorf("[friction] timezone %q is not an IANA zone", tz)
+		}
+	}
+	if c.BackfillDays < 1 || c.BackfillDays > 3650 {
+		return errors.New("[friction] backfill_days must be between 1 and 3650")
+	}
+	for _, p := range c.SeatPatterns {
+		if strings.Count(p, "{seat}") != 1 {
+			return fmt.Errorf("[friction] seat_patterns entry %q must contain exactly one {seat}", p)
+		}
+	}
+	if _, err := friction.CompileSeatPatterns(c.SeatPatterns); err != nil {
+		return fmt.Errorf("[friction] seat_patterns: %w", err)
+	}
+	return nil
 }
 
 // AgentConfig holds per-agent runtime overrides.
@@ -795,17 +862,18 @@ type ChartPalette string
 const (
 	ChartPaletteAgentsview ChartPalette = "agentsview"
 	ChartPaletteMatplotlib ChartPalette = "matplotlib"
+	ChartPaletteColorblind ChartPalette = "colorblind"
 	DefaultChartPalette                 = ChartPaletteAgentsview
 )
 
 func ParseChartPalette(value string) (ChartPalette, error) {
 	palette := ChartPalette(value)
 	switch palette {
-	case ChartPaletteAgentsview, ChartPaletteMatplotlib:
+	case ChartPaletteAgentsview, ChartPaletteMatplotlib, ChartPaletteColorblind:
 		return palette, nil
 	default:
 		return "", fmt.Errorf(
-			`chart_palette must be "agentsview" or "matplotlib" (got %q)`,
+			`chart_palette must be "agentsview", "matplotlib", or "colorblind" (got %q)`,
 			value,
 		)
 	}
@@ -913,6 +981,9 @@ type sessionSourceConfig struct {
 //
 //nolint:recvcheck // Value encoding and pointer decoding intentionally implement distinct interfaces.
 type Config struct {
+	// CodexCloud is the [agents.codex-cloud] table, read from config.toml
+	// only.
+	CodexCloud           CodexCloudConfig            `json:"-" toml:"-"`
 	Host                 string                      `json:"host" toml:"host"`
 	Port                 int                         `json:"port" toml:"port"`
 	ChartPalette         ChartPalette                `json:"chart_palette" toml:"chart_palette"`
@@ -946,7 +1017,9 @@ type Config struct {
 	DuckDB               DuckDBConfig                `json:"duckdb,omitempty" toml:"duckdb"`
 	Vector               VectorConfig                `json:"vector,omitempty" toml:"vector"`
 	Recall               RecallConfig                `json:"recall,omitempty" toml:"recall"`
+	Integrations         IntegrationsConfig          `json:"integrations,omitempty" toml:"integrations"`
 	Insights             InsightsConfig              `json:"insights,omitempty" toml:"insights"`
+	Kata                 KataConfig                  `json:"-" toml:"kata"`
 	Friction             FrictionConfig              `json:"friction,omitempty" toml:"friction"`
 	Automated            AutomatedConfig             `json:"automated,omitempty" toml:"automated"`
 	Agent                map[string]AgentConfig      `json:"agent,omitempty" toml:"agent"`
@@ -993,8 +1066,8 @@ type Config struct {
 	// paths.
 	SyncIncludeCwdPrefixes []string `json:"-" toml:"sync_include_cwd_prefixes"`
 
-	// ScanProtectedPaths allows local Git discovery to read working
-	// directories inside macOS locations guarded by a TCC consent prompt
+	// ScanProtectedPaths allows local Git and skill metadata discovery to
+	// read paths inside macOS locations guarded by a TCC consent prompt
 	// (Documents, Downloads, Desktop, iCloud Drive, cloud-provider folders
 	// such as Dropbox, and removable or network volumes under /Volumes). It
 	// defaults to false so a first sync never
@@ -1013,6 +1086,7 @@ type Config struct {
 
 	DaemonIdleTimeout time.Duration `json:"daemon_idle_timeout,omitzero" toml:"daemon_idle_timeout"`
 
+	ModelAliases       map[string]string          `json:"model_aliases,omitempty" toml:"model_aliases"`
 	CustomModelPricing map[string]CustomModelRate `json:"custom_model_pricing,omitempty" toml:"custom_model_pricing"`
 
 	// RemoteHosts is the config-file list of remote targets that
@@ -1020,6 +1094,8 @@ type Config struct {
 	// pass. CLI/config-file only; never serialized to the
 	// settings API, so there is no web-UI editing of this list.
 	RemoteHosts []RemoteHost `json:"-" toml:"-"`
+	// ArchiveSources is file-only configuration, never exposed by settings APIs.
+	ArchiveSources []ArchiveSource `json:"-" toml:"-"`
 
 	// HostExplicit is true when the user passed --host on the CLI.
 	// Used to prevent auto-bind to 0.0.0.0 when the user
@@ -1034,9 +1110,15 @@ type Config struct {
 	// NoDaemonAutostart suppresses daemon autostart for this invocation
 	// only; pg push --embed sets it to keep the archive writer local.
 	NoDaemonAutostart bool `json:"-" toml:"-"`
+	// RequireDaemon sends archive writes only through a live writable daemon;
+	// never autostart one or open the archive directly.
+	RequireDaemon bool `json:"-" toml:"-"`
 
 	// vectorSectionDefined records a [vector] section in config.toml.
 	vectorSectionDefined bool
+	validationScope      ValidationScope
+	pgConfigErr          error
+	clickHouseConfigErr  error
 
 	pgEnvOverrides         pgEnvOverrides
 	clickHouseEnvOverrides clickHouseEnvOverrides
@@ -1321,6 +1403,7 @@ func Default() (Config, error) {
 		EventsCoalesceInterval:         10 * time.Second,
 		DaemonIdleTimeout:              20 * time.Minute,
 		Agent:                          map[string]AgentConfig{},
+		CodexCloud:                     defaultCodexCloudConfig(),
 		Vector: VectorConfig{
 			RecallMaxRevisionLag: DefaultRecallMaxRevisionLag,
 			Embeddings: VectorEmbeddingsConfig{
@@ -1338,6 +1421,8 @@ func Default() (Config, error) {
 				FailureBackoff:   "1h",
 			},
 		},
+		Friction: FrictionConfig{BackfillDays: DefaultFrictionBackfillDays},
+		Kata:     defaultKataConfig(),
 	}, nil
 }
 
@@ -1389,7 +1474,7 @@ func AgentHomeDirs(def parser.AgentDef, home string) []string {
 // The provided FlagSet must already be parsed by the caller.
 // Only flags that were explicitly set override the lower layers.
 func Load(fs *flag.FlagSet) (Config, error) {
-	cfg, err := loadConfigLayers()
+	cfg, err := loadConfigLayers(0)
 	if err != nil {
 		return cfg, err
 	}
@@ -1402,7 +1487,12 @@ func Load(fs *flag.FlagSet) (Config, error) {
 
 // LoadPFlags builds a Config from a parsed Cobra/pflag FlagSet.
 func LoadPFlags(fs *pflag.FlagSet) (Config, error) {
-	cfg, err := loadConfigLayers()
+	return LoadPFlagsFor(fs, 0)
+}
+
+// LoadPFlagsFor loads a command's config, warning about invalid unused sections.
+func LoadPFlagsFor(fs *pflag.FlagSet, scope ValidationScope) (Config, error) {
+	cfg, err := loadConfigLayers(scope)
 	if err != nil {
 		return cfg, err
 	}
@@ -1462,7 +1552,12 @@ func loadPGServeBase() (Config, error) {
 // without parsing CLI flags. Use this for subcommands that manage
 // their own flag sets.
 func LoadMinimal() (Config, error) {
-	cfg, err := loadConfigLayers()
+	return LoadMinimalFor(0)
+}
+
+// LoadMinimalFor loads a command's config without flags. Zero scope is strict.
+func LoadMinimalFor(scope ValidationScope) (Config, error) {
+	cfg, err := loadConfigLayers(scope)
 	if err != nil {
 		return cfg, err
 	}
@@ -1473,11 +1568,12 @@ func LoadMinimal() (Config, error) {
 }
 
 // loadConfigLayers leaves runtime roots unresolved until flags are applied.
-func loadConfigLayers() (Config, error) {
+func loadConfigLayers(scope ValidationScope) (Config, error) {
 	cfg, err := Default()
 	if err != nil {
 		return cfg, err
 	}
+	cfg.validationScope = scope
 	cfg.loadEnv()
 	if err := expandDataDir(&cfg); err != nil {
 		return cfg, err
@@ -1486,7 +1582,10 @@ func loadConfigLayers() (Config, error) {
 	if err := cfg.loadFile(); err != nil {
 		return cfg, fmt.Errorf("loading config file: %w", err)
 	}
-	return cfg, cfg.applyDeploymentEnv()
+	if scope.uses(ScopeDeployment) {
+		return cfg, cfg.applyDeploymentEnv()
+	}
+	return cfg, nil
 }
 
 func finishLoadedConfig(cfg *Config) error {
@@ -1508,11 +1607,30 @@ func finishLoadedConfig(cfg *Config) error {
 // writing config migrations or generated secrets. Use it for diagnostic
 // commands that must not mutate user state.
 func LoadReadOnly() (Config, error) {
+	return LoadReadOnlyFor(0)
+}
+
+// LoadReadOnlyFor loads scoped config without migrations or generated secrets.
+func LoadReadOnlyFor(scope ValidationScope) (Config, error) {
+	return loadReadOnlyFor(scope, "")
+}
+
+// LoadReadOnlyAt validates the complete config in dataDir, including deployment
+// environment, without migrations or generated secrets.
+func LoadReadOnlyAt(dataDir string) (Config, error) {
+	return loadReadOnlyFor(0, dataDir)
+}
+
+func loadReadOnlyFor(scope ValidationScope, dataDir string) (Config, error) {
 	cfg, err := Default()
 	if err != nil {
 		return cfg, err
 	}
+	cfg.validationScope = scope
 	cfg.loadEnv()
+	if dataDir != "" {
+		cfg.DataDir = dataDir
+	}
 	if err := expandDataDir(&cfg); err != nil {
 		return cfg, err
 	}
@@ -1520,8 +1638,10 @@ func LoadReadOnly() (Config, error) {
 	if err := cfg.loadFileReadOnly(); err != nil {
 		return cfg, fmt.Errorf("loading config file: %w", err)
 	}
-	if err := cfg.applyDeploymentEnv(); err != nil {
-		return cfg, err
+	if scope.uses(ScopeDeployment) {
+		if err := cfg.applyDeploymentEnv(); err != nil {
+			return cfg, err
+		}
 	}
 	if err := cfg.readInstallationID(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return cfg, fmt.Errorf("reading installation identity: %w", err)
@@ -1731,18 +1851,31 @@ func (c *Config) applyConfigTOML(data string) error {
 		DuckDB                         DuckDBConfig           `toml:"duckdb"`
 		Vector                         VectorConfig           `toml:"vector"`
 		Recall                         RecallConfig           `toml:"recall"`
+		Integrations                   IntegrationsConfig     `toml:"integrations"`
 		Insights                       InsightsConfig         `toml:"insights"`
+		Kata                           KataConfig             `toml:"kata"`
 		Friction                       FrictionConfig         `toml:"friction"`
 		Automated                      AutomatedConfig        `toml:"automated"`
 		Agent                          map[string]AgentConfig `toml:"agent"`
 		EventsCoalesceInterval         time.Duration          `toml:"events_coalesce_interval"`
 		DaemonIdleTimeout              time.Duration          `toml:"daemon_idle_timeout"`
 		RemoteHosts                    []RemoteHost           `toml:"remote_hosts"`
+		ArchiveSources                 []ArchiveSource        `toml:"archive_sources"`
 		SessionSources                 []sessionSourceConfig  `toml:"session_sources"`
+		ModelAliases                   map[string]string      `toml:"model_aliases"`
 	}
 	meta, err := toml.Decode(data, &file)
 	if err != nil {
 		return fmt.Errorf("parsing config: %w", err)
+	}
+	for _, key := range meta.Undecoded() {
+		if len(key) > 0 && key[0] == "archive_sources" {
+			return fmt.Errorf("unknown archive source setting %s", key.String())
+		}
+	}
+	c.ArchiveSources = file.ArchiveSources
+	if err := c.ValidateArchiveSources(); err != nil {
+		return err
 	}
 	if meta.IsDefined("vector") {
 		if err := rejectUnknownVectorKeys(meta); err != nil {
@@ -1751,8 +1884,16 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.vectorSectionDefined = true
 	}
 	if file.ZoomLevel != nil {
-		if err := file.ZoomLevel.Validate(); err != nil {
+		if err := c.validateSection(ScopeServer, "zoom_level", file.ZoomLevel.Validate); err != nil {
 			return err
+		}
+	}
+	for key, name := range file.ModelAliases {
+		if key == "" || name == "" || key == "__all__" || name == "__all__" || key == "__other__" || name == "__other__" || strings.Contains(key+name, ",") || key != strings.TrimSpace(key) || name != strings.TrimSpace(name) {
+			return fmt.Errorf("model_aliases.%q: names must be non-empty, trimmed, contain no commas, and differ from __all__ and __other__", key)
+		}
+		if target, ok := file.ModelAliases[name]; ok && target != name {
+			return fmt.Errorf("model_aliases.%q: alias chains are unsupported", key)
 		}
 	}
 	customModelPricing, err := decodeCustomModelPricing(data)
@@ -1792,11 +1933,13 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.Port = file.Port
 	}
 	if meta.IsDefined("chart_palette") {
-		palette, err := ParseChartPalette(string(file.ChartPalette))
-		if err != nil {
+		if err := c.validateSection(ScopeServer, "chart_palette", func() error {
+			_, err := ParseChartPalette(string(file.ChartPalette))
+			return err
+		}); err != nil {
 			return err
 		}
-		c.ChartPalette = palette
+		c.ChartPalette = file.ChartPalette
 	}
 	if file.ZoomLevel != nil {
 		c.ZoomLevel = file.ZoomLevel
@@ -1862,7 +2005,10 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 	legacyPG, namedPG, err := parsePGConfigSection(raw["pg"])
 	if err != nil {
-		return fmt.Errorf("pg: %w", err)
+		c.pgConfigErr = fmt.Errorf("pg: %w", err)
+		if _, semantic := errors.AsType[*targetValidationError](err); !semantic || c.validationScope.uses(ScopePG) {
+			return c.pgConfigErr
+		}
 	}
 	if len(namedPG) > 0 {
 		c.PG = PGConfig{}
@@ -1893,7 +2039,10 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 	legacyCH, namedCH, err := parseClickHouseConfigSection(raw["clickhouse"])
 	if err != nil {
-		return fmt.Errorf("clickhouse: %w", err)
+		c.clickHouseConfigErr = fmt.Errorf("clickhouse: %w", err)
+		if _, semantic := errors.AsType[*targetValidationError](err); !semantic || c.validationScope.uses(ScopeClickHouse) {
+			return c.clickHouseConfigErr
+		}
 	}
 	if len(namedCH) > 0 {
 		c.ClickHouse = ClickHouseConfig{}
@@ -1993,8 +2142,26 @@ func (c *Config) applyConfigTOML(data string) error {
 	if file.Vector.Embeddings.DefaultServer != "" {
 		c.Vector.Embeddings.DefaultServer = file.Vector.Embeddings.DefaultServer
 	}
-	if len(file.Vector.Embeddings.Servers) > 0 {
+	if meta.IsDefined("vector", "embeddings", "servers") {
 		c.Vector.Embeddings.Servers = normalizedEmbeddingsServers(file.Vector.Embeddings.Servers, meta)
+	}
+	if c.Vector.Enabled && c.Vector.Embeddings.Model == "" && !meta.IsDefined("vector", "embeddings", "servers") {
+		c.Vector.Embeddings.Model = defaultNomicModel
+		if !meta.IsDefined("vector", "embeddings", "dimension") {
+			c.Vector.Embeddings.Dimension = 768
+		}
+		if !meta.IsDefined("vector", "embeddings", "max_input_chars") {
+			c.Vector.Embeddings.MaxInputChars = 4000
+		}
+		if !meta.IsDefined("vector", "embeddings", "model_context_tokens") {
+			c.Vector.Embeddings.ModelContextTokens = 2048
+		}
+		if !meta.IsDefined("vector", "embeddings", "query_prefix") {
+			c.Vector.Embeddings.QueryPrefix = "search_query: "
+		}
+		if !meta.IsDefined("vector", "embeddings", "document_prefix") {
+			c.Vector.Embeddings.DocumentPrefix = "search_document: "
+		}
 	}
 	if file.Vector.Embed.RunAfterSync != nil {
 		c.Vector.Embed.RunAfterSync = file.Vector.Embed.RunAfterSync
@@ -2006,6 +2173,9 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.Vector.Embed.BackstopInterval = file.Vector.Embed.BackstopInterval
 	}
 	c.mergeRecallExtractTOML(file.Recall, meta)
+	if meta.IsDefined("integrations") {
+		c.Integrations = file.Integrations
+	}
 	if meta.IsDefined("insights") {
 		c.Insights = file.Insights
 		c.Insights.Endpoint = strings.TrimSpace(c.Insights.Endpoint)
@@ -2015,6 +2185,26 @@ func (c *Config) applyConfigTOML(data string) error {
 			strings.TrimSpace(c.Insights.DefaultAgent),
 		)
 	}
+	if meta.IsDefined("kata") {
+		mergeKataTOML(&c.Kata, file.Kata, meta)
+	}
+	if meta.IsDefined("friction", "enabled") {
+		c.Friction.Enabled = file.Friction.Enabled
+	}
+	if meta.IsDefined("friction", "timezone") {
+		c.Friction.Timezone = strings.TrimSpace(file.Friction.Timezone)
+	}
+	if meta.IsDefined("friction", "backfill_days") {
+		c.Friction.BackfillDays = file.Friction.BackfillDays
+	}
+	if meta.IsDefined("friction", "seat_patterns") {
+		c.Friction.SeatPatterns = make([]string, 0, len(file.Friction.SeatPatterns))
+		for _, p := range file.Friction.SeatPatterns {
+			if p = strings.TrimSpace(p); p != "" {
+				c.Friction.SeatPatterns = append(c.Friction.SeatPatterns, p)
+			}
+		}
+	}
 	// IsDefined distinguishes "unset" (leave default 10s) from an
 	// explicit "0s" (disable coalescing). Checking != 0 would silently
 	// ignore the latter.
@@ -2023,9 +2213,6 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 	if meta.IsDefined("daemon_idle_timeout") {
 		c.DaemonIdleTimeout = file.DaemonIdleTimeout
-	}
-	if meta.IsDefined("friction", "enabled") {
-		c.Friction.Enabled = file.Friction.Enabled
 	}
 	if file.Automated.Prefixes != nil {
 		c.Automated.Prefixes = file.Automated.Prefixes
@@ -2049,6 +2236,9 @@ func (c *Config) applyConfigTOML(data string) error {
 			c.Agent[name] = cfg
 		}
 	}
+	if file.ModelAliases != nil {
+		c.ModelAliases = file.ModelAliases
+	}
 	if len(customModelPricing) > 0 {
 		c.CustomModelPricing = customModelPricing
 	}
@@ -2070,6 +2260,7 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.sessionSourceConfigs = append([]sessionSourceConfig(nil), file.SessionSources...)
 	}
 
+	c.CodexCloud = parseCodexCloudTable(c.configPath(), raw["agents"])
 	if err := c.applyAgentDirectories(raw["agents"]); err != nil {
 		return err
 	}
@@ -2186,20 +2377,23 @@ func (c *Config) writeConfigMap(m map[string]any) error {
 }
 
 func (c *Config) withConfigLock(fn func() error) error {
+	return c.withFileLock(c.configPath()+".lock", fn)
+}
+
+func (c *Config) withFileLock(lockPath string, fn func() error) error {
 	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
 		return fmt.Errorf("creating data dir: %w", err)
 	}
-	lockPath := c.configPath() + ".lock"
 	// On macOS the flock syscall succeeds on a directory, whereas on
 	// Linux it errors. Detect that case explicitly so a path created as
 	// a directory is reported as an unusable lock on every platform.
 	if info, statErr := os.Stat(lockPath); statErr == nil && info.IsDir() {
 		return fmt.Errorf(
-			"locking config: %s is a directory, not a lock file", lockPath)
+			"locking %s: path is a directory, not a lock file", lockPath)
 	}
 	lock := flock.New(lockPath)
 	if err := lock.Lock(); err != nil {
-		return fmt.Errorf("locking config: %w", err)
+		return fmt.Errorf("locking %s: %w", lockPath, err)
 	}
 	defer func() {
 		_ = lock.Unlock()
@@ -2562,9 +2756,15 @@ func splitFlagList(value string) []string {
 }
 
 func finalize(cfg *Config) error {
-	var err error
 	if err := expandLocalPaths(cfg); err != nil {
 		return err
+	}
+	// The data directory is final only now: AGENTSVIEW_DATA_DIR is applied
+	// after Default, and expandLocalPaths expands it.
+	for _, def := range parser.Registry {
+		if def.DataDirRoot != "" {
+			cfg.AgentDirs[def.Type] = []string{filepath.Join(cfg.DataDir, filepath.FromSlash(def.DataDirRoot))}
+		}
 	}
 	if strings.TrimSpace(cfg.LocalMachineName) == "" {
 		return errors.New("identify local sync machine: hostname is empty")
@@ -2572,38 +2772,7 @@ func finalize(cfg *Config) error {
 	if err := cfg.resolveSessionSources(); err != nil {
 		return err
 	}
-	if err := normalizeProxyConfig(&cfg.Proxy); err != nil {
-		return err
-	}
-	cfg.PublicURL, err = resolvePublicURL(cfg.PublicURL, cfg.Proxy)
-	if err != nil {
-		return fmt.Errorf("invalid public url: %w", err)
-	}
-	cfg.PublicOrigins, err = normalizePublicOrigins(cfg.PublicOrigins)
-	if err != nil {
-		return fmt.Errorf("invalid public origins: %w", err)
-	}
-	if cfg.PublicURL != "" {
-		cfg.PublicOrigins, err = normalizePublicOrigins(
-			append(cfg.PublicOrigins, cfg.PublicURL),
-		)
-		if err != nil {
-			return fmt.Errorf("invalid public url: %w", err)
-		}
-	}
-	if cfg.DaemonIdleTimeout < 0 {
-		return fmt.Errorf("invalid daemon_idle_timeout: %s", cfg.DaemonIdleTimeout)
-	}
-	if err := cfg.Vector.Validate(); err != nil {
-		return err
-	}
-	if err := cfg.Recall.Extract.Validate(); err != nil {
-		return err
-	}
-	if err := cfg.Insights.Validate(); err != nil {
-		return err
-	}
-	return nil
+	return cfg.validateSections()
 }
 
 func (c *Config) resolveSessionSources() error {
@@ -2713,9 +2882,15 @@ func (c *Config) resolveSessionSources() error {
 				fmt.Sprintf("entry %d: agent is required", entry))
 			continue
 		}
-		if _, ok := parser.AgentByType(agent); !ok {
+		def, ok := parser.AgentByType(agent)
+		if !ok {
 			problems = append(problems,
 				fmt.Sprintf("entry %d: unknown agent %q; use a registered parser name such as claude, codex, or copilot", entry, input.Agent))
+			continue
+		}
+		if def.DataDirRoot != "" {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%s): %s keeps its sessions in the AgentsView data directory and takes no session_sources entry", entry, agent, agent))
 			continue
 		}
 		factory, hasFactory := parser.ProviderFactoryByType(agent)
@@ -3184,6 +3359,9 @@ func defaultAgentsviewDBDir(dbPath string) bool {
 
 // DefaultPGTargetName returns the effective named PG target for this config.
 func (c *Config) DefaultPGTargetName() (string, error) {
+	if c.pgConfigErr != nil {
+		return "", c.pgConfigErr
+	}
 	return defaultNamedTargetName("pg", "default_pg", c.DefaultPG, c.PGTargets)
 }
 
@@ -3193,6 +3371,9 @@ func (c *Config) validatePGTargets() error {
 }
 
 func (c *Config) PGTargetNames() ([]string, string, error) {
+	if c.pgConfigErr != nil {
+		return nil, "", c.pgConfigErr
+	}
 	return namedTargetNames("pg", "default_pg", c.DefaultPG, c.PGTargets)
 }
 
@@ -3242,8 +3423,14 @@ func (c *Config) resolvePGConfig(
 		if c.pgEnvOverrides.MachineName != "" {
 			pg.MachineName = c.pgEnvOverrides.MachineName
 		}
-		if c.pgEnvOverrides.AllowInsecure != nil {
-			pg.AllowInsecure = *c.pgEnvOverrides.AllowInsecure
+		if active, err := deploymentVarsActive("AGENTSVIEW_PG_ALLOW_INSECURE"); err != nil {
+			return pg, err
+		} else if active {
+			if v, set, err := lookupEnvBool("AGENTSVIEW_PG_ALLOW_INSECURE"); err != nil {
+				return pg, err
+			} else if set {
+				pg.AllowInsecure = v
+			}
 		}
 	}
 	if pg.URL != "" {
@@ -3340,6 +3527,9 @@ func (c *Config) ResolvePGTargets() ([]ResolvedPGTarget, error) {
 }
 
 func (c *Config) DefaultClickHouseTargetName() (string, error) {
+	if c.clickHouseConfigErr != nil {
+		return "", c.clickHouseConfigErr
+	}
 	return defaultNamedTargetName(
 		"clickhouse", "default_clickhouse", c.DefaultClickHouse, c.ClickHouseTargets,
 	)
@@ -3351,6 +3541,9 @@ func (c *Config) validateClickHouseTargets() error {
 }
 
 func (c *Config) ClickHouseTargetNames() ([]string, string, error) {
+	if c.clickHouseConfigErr != nil {
+		return nil, "", c.clickHouseConfigErr
+	}
 	return namedTargetNames(
 		"clickhouse", "default_clickhouse", c.DefaultClickHouse, c.ClickHouseTargets,
 	)

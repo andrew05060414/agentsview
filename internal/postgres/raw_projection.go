@@ -151,6 +151,7 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 	}
 	changed := false
 	derivedChanged := false
+	fresh := make(map[string][]byte)
 	for _, group := range ordered {
 		c, ok := candidates[group]
 		if !ok {
@@ -160,23 +161,60 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 		var old ingest.PreparedSession
 		var history *ingest.PriorSession
 		if exists {
-			old, err = loadRawPayload(ctx, tx, previous.CapturedSession)
-			if err != nil {
-				return err
-			}
 			metadata, decodeErr := decodeRawPayload(previous.Payload)
 			if decodeErr != nil {
 				return decodeErr
 			}
 			old.Session = metadata.Session
-			history = &ingest.PriorSession{Session: old.Session, Messages: old.Messages}
+		}
+		oldLoaded := false
+		loadOld := func(ctx context.Context) error {
+			if oldLoaded {
+				return nil
+			}
+			payload, loadErr := loadRawPayload(ctx, tx, previous.CapturedSession)
+			if loadErr != nil {
+				return loadErr
+			}
+			payload.Session = old.Session
+			old = payload
+			oldLoaded = true
+			return nil
+		}
+		if exists {
+			history = &ingest.PriorSession{
+				Session: old.Session,
+				LoadMessages: func(ctx context.Context) ([]db.Message, error) {
+					if err := loadOld(ctx); err != nil {
+						return nil, err
+					}
+					return old.Messages, nil
+				},
+			}
 		}
 		decision, err := ingest.ReconcileProviderHistory(ctx, c, history, s.options.Content)
 		if err != nil {
 			return err
 		}
+		var codexCloud *ingest.CodexCloudPrior
+		if exists && c.Session.Agent == string(parser.AgentCodexCloud) {
+			if err := loadOld(ctx); err != nil {
+				return err
+			}
+			codexCloud = &ingest.CodexCloudPrior{
+				Session: old.Session, UsageEvents: old.UsageEvents, PlanUsage: old.PlanUsage,
+				Current: previous.Version == lease.ProcessingVersion,
+			}
+			if ingest.CodexCloudKeepReason(len(c.Messages), *codexCloud) != "" {
+				decision.Action = ingest.HistoryPreserve
+				decision.PriorContributed = true
+			}
+		}
 		var prepared ingest.PreparedSession
 		if decision.Action == ingest.HistoryPreserve {
+			if err := loadOld(ctx); err != nil {
+				return err
+			}
 			prepared = old
 			if s.options.Content.ArchiveContent.OmitsToolContent() {
 				prepared.Signals.ToolObservations = []db.ToolObservation{}
@@ -187,6 +225,15 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 			prepared, err = ingest.Finalize(ctx, decision.Candidate, s.options.Content)
 			if err != nil {
 				return err
+			}
+			if codexCloud != nil && ingest.CarryCodexCloudUsage(&prepared, *codexCloud) {
+				decision.PriorContributed = true
+				// Finalize derived the signals before the carry put back the
+				// saved peak context, which the context signals read.
+				prepared.Signals, prepared.Findings = ingest.ComputeSignalsAndSecrets(prepared.Session, prepared.Messages)
+				if s.options.Content.ArchiveContent.OmitsToolContent() {
+					prepared.Signals.ToolObservations = []db.ToolObservation{}
+				}
 			}
 		}
 		prepared.Signals = ingest.RefreshSignalRecencyAt(prepared.Session, prepared.Messages, prepared.Signals, s.options.Now())
@@ -200,10 +247,24 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 		if err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO raw_content_revisions(session_id,group_id,content_revision,payload) VALUES($1,$2,$3,$4) ON CONFLICT(session_id) DO NOTHING`, sessionID, group, revision, payload)
+		inserted, err := tx.ExecContext(ctx, `INSERT INTO raw_content_revisions(session_id,group_id,content_revision,payload) VALUES($1,$2,$3,$4) ON CONFLICT(session_id) DO NOTHING`, sessionID, group, revision, payload)
 		if err != nil {
 			return err
 		}
+		count, err := inserted.RowsAffected()
+		if err != nil {
+			return err
+		}
+		// Reuse only bytes inserted by this transaction. Conflicts retain
+		// their stored payload and mutable derived state.
+		if count == 1 {
+			fresh[sessionID] = payload
+		}
+		dialogueChanged, err := syncRawDialogue(ctx, tx, sessionID, prepared.Messages)
+		if err != nil {
+			return err
+		}
+		derivedChanged = derivedChanged || dialogueChanged
 		visibleChange, err := publishRawRecency(ctx, tx, sessionID, prepared.Signals)
 		if err != nil {
 			return err
@@ -282,7 +343,7 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 			if !changed && !staleFrictionGroups[group] {
 				continue
 			}
-			changes, err := s.materializeGroup(ctx, tx, group)
+			changes, err := s.materializeGroup(ctx, tx, group, fresh)
 			if err != nil {
 				return err
 			}
@@ -328,11 +389,22 @@ func (s *RawProjectionStore) Project(ctx context.Context, lease rawderive.JobLea
 
 // loadRawPayload is transaction-bound and does not use alias resolution.
 func loadRawPayload(ctx context.Context, tx *sql.Tx, id string) (ingest.PreparedSession, error) {
-	var payload, recency []byte
-	err := tx.QueryRowContext(ctx, `SELECT payload,recency_state FROM raw_content_revisions WHERE session_id=$1`, id).Scan(&payload, &recency)
+	return loadRawPayloadBytes(ctx, tx, id, nil)
+}
+
+func loadRawPayloadBytes(ctx context.Context, tx *sql.Tx, id string, payload []byte) (ingest.PreparedSession, error) {
+	var recency []byte
+	var err error
+	if payload == nil {
+		err = tx.QueryRowContext(ctx, `SELECT payload,recency_state FROM raw_content_revisions WHERE session_id=$1`, id).Scan(&payload, &recency)
+	} else {
+		err = tx.QueryRowContext(ctx, `SELECT recency_state FROM raw_content_revisions WHERE session_id=$1`, id).Scan(&recency)
+	}
 	if err != nil {
 		return ingest.PreparedSession{}, err
 	}
+	// Fresh rows use the same gob representation and mutable overlays as
+	// retained rows; gob can change optional zero values during decoding.
 	p, err := decodeRawPayload(payload)
 	if err != nil {
 		return p, err
@@ -343,6 +415,26 @@ func loadRawPayload(ctx context.Context, tx *sql.Tx, id string) (ingest.Prepared
 			return p, err
 		}
 		state.apply(&p.Signals)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT ordinal, dialogue_text FROM raw_message_dialogue WHERE session_id=$1`, id)
+	if err != nil {
+		return p, err
+	}
+	defer rows.Close()
+	dialogue := make(map[int]*string)
+	for rows.Next() {
+		var ordinal int
+		var text string
+		if err := rows.Scan(&ordinal, &text); err != nil {
+			return p, err
+		}
+		dialogue[ordinal] = &text
+	}
+	if err := rows.Err(); err != nil {
+		return p, err
+	}
+	for i := range p.Messages {
+		p.Messages[i].DialogueText = dialogue[p.Messages[i].Ordinal]
 	}
 	return p, nil
 }

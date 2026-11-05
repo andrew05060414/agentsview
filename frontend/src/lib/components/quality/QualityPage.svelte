@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { m } from "../../i18n/index.js";
   import { onMount, onDestroy, untrack } from "svelte";
   import { analytics } from "../../stores/analytics.svelte.js";
@@ -52,6 +53,7 @@ import type { DbSignalCalibration as SignalCalibration, DbSignalSessionExample a
   >[0]>;
 
   let unsubEvents: (() => void) | undefined;
+  let initialFetchPending = $state(false);
   let selectedSignalId: string | null = $state(null);
   let signalExamples: SignalSessionExample[] = $state([]);
   let signalExamplesLoading = $state(false);
@@ -365,6 +367,14 @@ import type { DbSignalCalibration as SignalCalibration, DbSignalSessionExample a
     }
   }
 
+  function openFrictionLog(event: MouseEvent) {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return;
+    }
+    event.preventDefault();
+    router.navigate("friction");
+  }
+
   function openEvidenceListSession(event: MouseEvent) {
     if (
       !(event.target instanceof Element) ||
@@ -486,7 +496,8 @@ import type { DbSignalCalibration as SignalCalibration, DbSignalSessionExample a
     seedQualityYoke();
     sessions.loadProjects();
     sessions.loadAgents();
-    fetchQualitySignals();
+    initialFetchPending = sessions.machineFilterPending;
+    if (!initialFetchPending) fetchQualitySignals();
     unsubEvents = events.subscribeDebounced(() => {
       fetchQualitySignals();
     });
@@ -524,7 +535,8 @@ import type { DbSignalCalibration as SignalCalibration, DbSignalSessionExample a
       untrack(() => analytics.automatedScope) !==
         headerAutomatedScope;
 
-    if (changed) {
+    if ((changed || initialFetchPending) && !sessions.machineFilterPending) {
+      initialFetchPending = false;
       analytics.project = headerProject;
       analytics.machine = headerMachine;
       analytics.agent = headerAgent;
@@ -665,6 +677,18 @@ import type { DbSignalCalibration as SignalCalibration, DbSignalSessionExample a
           {/each}
         </div>
       {/if}
+      {#if sync.serverVersion?.friction_readable === true}
+        <Card level="default" padding="none" class="friction-link-card">
+          <article class="friction-link-content">
+            <span class="badge rule">{m.insights_page_rule_based()}</span>
+            <strong>{m.friction_quality_card_title()}</strong>
+            <p>{m.friction_quality_card_body()}</p>
+            <a class="friction-link" href={router.buildHref("friction")} onclick={openFrictionLog}>
+              {m.friction_quality_card_open()}
+            </a>
+          </article>
+        </Card>
+      {/if}
     </section>
 
     <section class="section-block" aria-labelledby="facts-title">
@@ -694,7 +718,7 @@ import type { DbSignalCalibration as SignalCalibration, DbSignalSessionExample a
         </div>
       {:else if error && !signals}
         <Card level="default" padding="none" class="state-panel error">
-          <div class="state-panel-alert" role="alert">
+          <div class="state-panel-alert" role="alert" {@attach errorTelemetry("analytics")}>
             <strong>{m.insights_page_could_not_load()}</strong>
             <span>{error}</span>
             <button onclick={fetchQualitySignals}>
@@ -884,7 +908,7 @@ import type { DbSignalCalibration as SignalCalibration, DbSignalSessionExample a
               {#if signalExamplesLoading}
                 <p class="evidence-state">{m.insights_page_loading_examples()}</p>
               {:else if signalExamplesError}
-                <p class="evidence-state error">{signalExamplesError}</p>
+                <p class="evidence-state error" {@attach errorTelemetry("analytics")}>{signalExamplesError}</p>
               {:else if signalExamples.length === 0}
                 <p class="evidence-state">
                   {m.insights_page_no_triggering_sessions()}
@@ -1566,6 +1590,23 @@ import type { DbSignalCalibration as SignalCalibration, DbSignalSessionExample a
     display: grid;
     gap: var(--space-3);
     min-width: 0;
+  }
+
+  .friction-link-content {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-5);
+  }
+
+  .friction-link-content p {
+    margin: 0;
+    color: var(--text-secondary);
+  }
+
+  .friction-link {
+    color: var(--accent-blue);
+    align-self: flex-start;
   }
 
   .recommendation-list :global(.recommendation strong) {

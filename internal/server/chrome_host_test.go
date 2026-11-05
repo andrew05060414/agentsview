@@ -22,6 +22,7 @@ import (
 	"go.kenn.io/agentsview/internal/chromehost"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/importer"
+	"go.kenn.io/kit/stacktest"
 )
 
 func testChromeConnection(t *testing.T, srv *Server) (string, net.Conn) {
@@ -33,7 +34,12 @@ func testChromeConnection(t *testing.T, srv *Server) (string, net.Conn) {
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
 	socket := filepath.Join(dir, "chrome", "host.sock")
 	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
+	// Stop the host before removing dir: its cleanup deletes the socket
+	// directory, and Windows denies a second concurrent delete.
+	t.Cleanup(func() {
+		cancel()
+		srv.chrome.shutdown()
+	})
 	require.NoError(t, srv.ServeChromeHost(ctx, socket))
 	conn, err := (&net.Dialer{}).DialContext(t.Context(), "unix", socket)
 	require.NoError(t, err)
@@ -51,6 +57,9 @@ func readChromePlatformRequest(t *testing.T, conn net.Conn, platform chromehost.
 	t.Helper()
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	body, err := chromehost.ReadFrame(conn)
+	if timeout, ok := errors.AsType[net.Error](err); ok && timeout.Timeout() {
+		stacktest.Dump(t)
+	}
 	require.NoError(t, err)
 	var request struct {
 		Version  int    `json:"version"`
@@ -166,7 +175,7 @@ func TestChromeHostAbsent(t *testing.T) {
 	req.RemoteAddr = "127.0.0.1:1234"
 	srv.mux.ServeHTTP(response, req)
 	assert.Equal(t, http.StatusConflict, response.Code)
-	assert.JSONEq(t, `{"code":"claude_ai_chrome_host_required","error":"Run agentsview chrome setup and keep Chrome open, then Sync again"}`, response.Body.String())
+	assert.JSONEq(t, `{"code":"claude_ai_chrome_host_required","error":"Run agentsview source chrome setup, restart AgentsView, and keep Chrome open, then Sync again"}`, response.Body.String())
 }
 
 func TestClaudeAIChromeStatus(t *testing.T) {
@@ -224,14 +233,15 @@ func TestClaudeAIChromeStatusArchiveChecks(t *testing.T) {
 
 func TestChromeHostLocalOnly(t *testing.T) {
 	for _, tt := range []struct {
-		name, method, route, remote, forwarded string
-		requireAuth                            bool
+		name, method, route, remote, forwarded, body string
+		requireAuth                                  bool
+		status                                       int
 	}{
-		{"remote auth", http.MethodPost, "/api/v1/import/claude-ai/sync?browser=chrome", "192.0.2.10:1234", "", true},
-		{"bind all", http.MethodPost, "/api/v1/import/claude-ai/sync?browser=chrome", "192.0.2.10:1234", "", false},
-		{"forwarded", http.MethodPost, "/api/v1/import/claude-ai/sync?browser=chrome", "127.0.0.1:1234", "for=192.0.2.10", true},
-		{"repeated browser", http.MethodPost, "/api/v1/import/claude-ai/sync?browser&browser=chrome", "192.0.2.10:1234", "", true},
-		{"status", http.MethodGet, "/api/v1/import/claude-ai/chrome", "192.0.2.10:1234", "", true},
+		{"remote auth", http.MethodPost, "/api/v1/import/claude-ai/sync?browser=chrome", "192.0.2.10:1234", "", "Chrome Sync requires a local connection", true, http.StatusForbidden},
+		{"bind all", http.MethodPost, "/api/v1/import/claude-ai/sync?browser=chrome", "192.0.2.10:1234", "", "Chrome Sync requires a local connection", false, http.StatusForbidden},
+		{"forwarded", http.MethodPost, "/api/v1/import/claude-ai/sync?browser=chrome", "127.0.0.1:1234", "for=192.0.2.10", "Chrome Sync requires a local connection", true, http.StatusForbidden},
+		{"repeated browser", http.MethodPost, "/api/v1/import/claude-ai/sync?browser&browser=chrome", "192.0.2.10:1234", "", `expected value to be one of \"chrome\" (query.browser: true)`, true, http.StatusBadRequest},
+		{"status", http.MethodGet, "/api/v1/import/claude-ai/chrome", "192.0.2.10:1234", "", "Chrome Sync requires a local connection", true, http.StatusForbidden},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := testServer(t, 5*time.Second)
@@ -247,8 +257,8 @@ func TestChromeHostLocalOnly(t *testing.T) {
 			req.Header.Set("Forwarded", tt.forwarded)
 			response := httptest.NewRecorder()
 			srv.Handler().ServeHTTP(response, req)
-			assert.Equal(t, http.StatusForbidden, response.Code)
-			assert.Contains(t, response.Body.String(), "Chrome Sync requires a local connection")
+			assert.Equal(t, tt.status, response.Code)
+			assert.Contains(t, response.Body.String(), tt.body)
 			assert.True(t, srv.chrome.Connected())
 			require.NoError(t, conn.SetReadDeadline(time.Now()))
 			_, err := chromehost.ReadFrame(conn)
@@ -295,7 +305,7 @@ func TestChromeHostIncompatibleReply(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				require.FailNow(t, "incompatible host did not stop Sync")
 			}
-			assert.Contains(t, response.Body.String(), "Restart AgentsView if you upgraded it, run agentsview chrome setup, reload the extension at chrome://extensions, then Sync again.")
+			assert.Contains(t, response.Body.String(), "Restart AgentsView if you upgraded it, run agentsview source chrome setup, reload the extension at chrome://extensions, then Sync again.")
 			assert.Contains(t, response.Body.String(), `"code":"claude_ai_chrome_host_update_required"`)
 			assert.NotContains(t, response.Body.String(), "event: done")
 			assert.NotContains(t, response.Body.String(), "private")
@@ -470,4 +480,58 @@ func TestChatGPTChromeSyncKeepsCompatibilityError(t *testing.T) {
 	assert.Contains(t, body, "Restart AgentsView if you upgraded it")
 	assert.Contains(t, body, `"code":"chrome_host_update_required"`)
 	assert.NotContains(t, body, "context canceled")
+}
+
+func TestChromeHostCloseRemovesEndpointFiles(t *testing.T) {
+	for _, tt := range []struct {
+		name                   string
+		existing, cancelServer bool
+	}{
+		{"shutdown removes created dir", false, false},
+		{"context cancel removes created dir", false, true},
+		{"shutdown keeps existing dir", true, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := testServer(t, 5*time.Second)
+			root, err := os.MkdirTemp("", "av") //nolint:usetesting // Keep the socket path below macOS's limit.
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, os.RemoveAll(root)) })
+			dir := filepath.Join(root, "chrome")
+			kept := filepath.Join(dir, "extension")
+			if tt.existing {
+				require.NoError(t, os.MkdirAll(kept, 0o700))
+			}
+			socket := filepath.Join(dir, "host.sock")
+			ctx, cancel := context.WithCancel(t.Context())
+			t.Cleanup(cancel)
+			require.NoError(t, srv.ServeChromeHost(ctx, socket))
+			conn, err := (&net.Dialer{}).DialContext(t.Context(), "unix", socket)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			require.FileExists(t, socket+".lock")
+
+			if tt.cancelServer {
+				cancel()
+			} else {
+				require.NoError(t, srv.Shutdown(t.Context()))
+			}
+
+			if tt.cancelServer {
+				// Cleanup removes the lock file, then the created directory.
+				require.Eventually(t, func() bool {
+					_, err := os.Lstat(dir)
+					return errors.Is(err, os.ErrNotExist)
+				}, 5*time.Second, 10*time.Millisecond)
+			}
+			assert.NoFileExists(t, socket+".lock")
+			assert.NoFileExists(t, socket)
+			if tt.existing {
+				assert.DirExists(t, kept)
+			} else {
+				assert.NoDirExists(t, dir)
+			}
+			_, err = (&net.Dialer{}).DialContext(t.Context(), "unix", socket)
+			assert.Error(t, err)
+		})
+	}
 }

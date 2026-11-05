@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -54,6 +55,48 @@ func TestPerformUpdateWithDaemonLifecycleRestartsStoppedDaemon(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"load", "stop", "perform", "restart"}, calls)
+}
+
+func TestScopedConfigUpdateUsesDeploymentAuthForStartupFallback(t *testing.T) {
+	seedScopedConfigArchive(t)
+	dir := os.Getenv("AGENTSVIEW_DATA_DIR")
+	tokenFile := filepath.Join(dir, "deployment-token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("update-secret\n"), 0o600))
+	t.Setenv("AGENTSVIEW_MODE", "serve")
+	t.Setenv("AGENTSVIEW_AUTH_TOKEN_FILE", tokenFile)
+	t.Setenv("AGENTSVIEW_HOST", "")
+	t.Setenv("AGENTSVIEW_EMBEDDINGS_ENDPOINT", "http://127.0.0.1:1/v1")
+	writeTestConfig(t, dir, "[vector]\nenabled=false\n[insights]\nmodel='incomplete'\n")
+	host, port := testAuthenticatedPingServer(t, "update-secret")
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10))
+	cfg, err := loadDaemonConfigForUpdate()
+	require.NoError(t, err)
+
+	// Exercise real discovery without signaling the test process or replacing
+	// a binary. A daemon without a written runtime record needs its token.
+	orig := stopDaemonRuntimeForUpgrade
+	calls := 0
+	stopDaemonRuntimeForUpgrade = func(_ context.Context, cfg config.Config, rt *DaemonRuntime) error {
+		calls++
+		assert.Equal(t, port, rt.Port)
+		assert.True(t, daemonRecordPingConfirmed(rt.Record, cfg.AuthToken))
+		return nil
+	}
+	t.Cleanup(func() { stopDaemonRuntimeForUpgrade = orig })
+	result, err := stopWritableDaemonsForUpdate(t.Context(), cfg)
+	require.NoError(t, err)
+	assert.True(t, result.Stopped)
+	assert.Equal(t, 1, calls)
+}
+
+func TestScopedConfigUpdateRejectsInvalidDeploymentAuth(t *testing.T) {
+	seedScopedConfigArchive(t)
+	t.Setenv("AGENTSVIEW_MODE", "serve")
+	t.Setenv("AGENTSVIEW_AUTH_TOKEN_FILE", filepath.Join(os.Getenv("HOME"), "missing-token"))
+	_, err := loadDaemonConfigForUpdate()
+	require.ErrorContains(t, err, "AGENTSVIEW_AUTH_TOKEN_FILE")
 }
 
 func TestPerformUpdateWithDaemonLifecycleRestartsAfterInstallFailure(t *testing.T) {
@@ -264,4 +307,115 @@ func TestRestartDaemonAfterUpdateArgsKeepsLegacyNonLoopbackWithAuthConfig(t *tes
 		"serve", "--background", "--host", "0.0.0.0", "--restart-port", "18080",
 		"--require-auth",
 	}, args)
+}
+
+func stubDistribution(t *testing.T, value string) {
+	t.Helper()
+	orig := distribution
+	distribution = value
+	t.Cleanup(func() { distribution = orig })
+}
+
+func TestUpdateRefusesInstallForPackageManagedBuild(t *testing.T) {
+	tests := []struct {
+		name         string
+		distribution string
+		wantErr      string
+	}{
+		{
+			name:         "homebrew",
+			distribution: "homebrew",
+			wantErr:      "Homebrew manages this installation; run `brew upgrade agentsview` instead",
+		},
+		{
+			name:         "other package manager",
+			distribution: "nix",
+			wantErr:      "nix manages this installation; upgrade agentsview through it instead",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubDistribution(t, tt.distribution)
+			dataDir := t.TempDir()
+			t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
+
+			_, err := executeCommand(newRootCommand(), "update", "--yes")
+
+			require.Error(t, err)
+			assert.Equal(t, tt.wantErr, err.Error())
+			// The refusal happens before any update check runs.
+			assert.NoFileExists(t, filepath.Join(dataDir, "update_check.json"))
+		})
+	}
+}
+
+func TestUpdateInstallRunsForSelfUpdatingBuilds(t *testing.T) {
+	tests := []struct {
+		name         string
+		distribution string
+	}{
+		{name: "source build", distribution: ""},
+		{name: "official direct download", distribution: "kenn"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubDistribution(t, tt.distribution)
+			origVersion := version
+			version = "1.0.0"
+			t.Cleanup(func() { version = origVersion })
+			dataDir := t.TempDir()
+			t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
+			// A fresh cached check for the running version lets the install
+			// path finish without the network once it is past the refusal.
+			cache := `{"checked_at":"` + time.Now().UTC().Format(time.RFC3339) +
+				`","version":"v1.0.0"}`
+			require.NoError(t, os.WriteFile(
+				filepath.Join(dataDir, "update_check.json"), []byte(cache), 0o600,
+			))
+
+			out, err := executeCommand(newRootCommand(), "update", "--yes")
+
+			require.NoError(t, err)
+			assert.Contains(t, out, "agentsview 1.0.0 is up to date.")
+			assert.NotContains(t, out, "manages this installation")
+		})
+	}
+}
+
+func TestUpdateCheckGivesPackageManagerGuidance(t *testing.T) {
+	tests := []struct {
+		name         string
+		distribution string
+		wantGuidance bool
+	}{
+		{name: "homebrew", distribution: "homebrew", wantGuidance: true},
+		{name: "source build", distribution: "", wantGuidance: false},
+		{name: "official direct download", distribution: "kenn", wantGuidance: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubDistribution(t, tt.distribution)
+			origVersion := version
+			version = "dev"
+			t.Cleanup(func() { version = origVersion })
+			dataDir := t.TempDir()
+			t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
+			// A fresh cached check lets --check answer without the network.
+			cache := `{"checked_at":"` + time.Now().UTC().Format(time.RFC3339) +
+				`","version":"v9.9.9"}`
+			require.NoError(t, os.WriteFile(
+				filepath.Join(dataDir, "update_check.json"), []byte(cache), 0o600,
+			))
+
+			out, err := executeCommand(newRootCommand(), "update", "--check")
+
+			require.NoError(t, err)
+			assert.Contains(t, out, "Latest release: v9.9.9")
+			if tt.wantGuidance {
+				assert.Contains(t, out, "run `brew upgrade agentsview` instead")
+			} else {
+				assert.NotContains(t, out, "manages this installation")
+			}
+		})
+	}
 }

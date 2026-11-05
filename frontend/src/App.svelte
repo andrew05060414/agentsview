@@ -11,28 +11,37 @@
   ): number | undefined {
     if (!userVisible) return;
 
-    const isUserPrompt = (item: PromptDisplayItem) =>
-      item.kind === "message" &&
-      item.message.role === "user" &&
-      !item.message.is_system;
-    const selectedIndex = items.findIndex((item) =>
-      item.ordinals.includes(selected ?? -1),
-    );
+    // One stop per displayed message, so each prompt in an empty group is
+    // its own stop.
+    const stops = items.flatMap((item) => {
+      switch (item.kind) {
+        case "message":
+          return [{
+            ordinal: item.ordinals[0]!,
+            prompt: item.message.role === "user" && !item.message.is_system,
+          }];
+        case "tool-group":
+          return item.ordinals.map((ordinal) => ({ ordinal, prompt: false }));
+        case "empty-group":
+          return item.messages.map((message) => ({
+            ordinal: message.ordinal,
+            prompt: message.role === "user",
+          }));
+      }
+    });
+    const selectedIndex = stops.findIndex((stop) => stop.ordinal === selected);
     if (selectedIndex < 0) {
-      const prompts = items.filter(isUserPrompt);
-      return (delta > 0 ? prompts[0] : prompts[prompts.length - 1])
-        ?.ordinals[0];
+      const prompts = stops.filter((stop) => stop.prompt);
+      return (delta > 0 ? prompts[0] : prompts[prompts.length - 1])?.ordinal;
     }
 
     for (
       let index = selectedIndex + delta;
-      index >= 0 && index < items.length;
+      index >= 0 && index < stops.length;
       index += delta
     ) {
-      const item = items[index]!;
-      if (isUserPrompt(item)) {
-        return item.ordinals[0];
-      }
+      const stop = stops[index]!;
+      if (stop.prompt) return stop.ordinal;
     }
   }
 </script>
@@ -64,6 +73,7 @@
   import TrendsPage from "./lib/components/trends/TrendsPage.svelte";
   import RecallPage from "./lib/components/recall/RecallPage.svelte";
   import QualityPage from "./lib/components/quality/QualityPage.svelte";
+  import FrictionPage from "./lib/components/friction/FrictionPage.svelte";
   import PinnedPage from "./lib/components/pinned/PinnedPage.svelte";
   import TrashPage from "./lib/components/trash/TrashPage.svelte";
   import RecentEditsPage from "./lib/components/recentedits/RecentEditsPage.svelte";
@@ -88,9 +98,7 @@
   import { m } from "./lib/i18n/index.js";
   import { setAuthToken, getAuthToken, setServerUrl } from "./lib/api/runtime.js";
   import { setupVisibilityHealthCheck } from "./lib/utils/health.js";
-  import { setupAppOpenedReporting } from "./lib/utils/app-opened.js";
-  import { reportTelemetry } from "./lib/utils/telemetry.js";
-  import { setupVisitEndedReporting } from "./lib/utils/visit-ended.js";
+  import { reportTelemetry, setupTelemetryReporting } from "./lib/utils/telemetry.js";
   import { registerShortcuts } from "./lib/utils/keyboard.js";
   import { shouldAutoSwitchTranscriptModeToNormal } from "./lib/utils/transcript-mode.js";
   import {
@@ -590,6 +598,8 @@
     });
   });
 
+  onMount(setupTelemetryReporting);
+
   // Telemetry: one session_viewed per transcript visit, sent once the
   // session's metadata hydrates. The store keeps the active id while
   // another page shows, so leaving the transcript resets the visit.
@@ -813,9 +823,6 @@
     sync.loadVersion();
     sync.checkForUpdate();
     sync.startPolling();
-    const appOpenedCleanup = setupAppOpenedReporting();
-    const visitEndedCleanup = setupVisitEndedReporting();
-    window.addEventListener("focus", reportScreenView);
 
     const healthCleanup = setupVisibilityHealthCheck({
       onBackendDegraded: () => sync.markBackendDegraded(),
@@ -827,9 +834,6 @@
       navigateUserPrompt,
     });
     return () => {
-      appOpenedCleanup();
-      visitEndedCleanup();
-      window.removeEventListener("focus", reportScreenView);
       healthCleanup();
       cleanup();
       window.removeEventListener("show-about", showAbout);
@@ -902,6 +906,10 @@
   <div class="page-scroll">
     <QualityPage />
   </div>
+{:else if router.route === "friction"}
+  <div class="page-scroll">
+    <FrictionPage />
+  </div>
 {:else if router.route === "pinned"}
   <div class="page-scroll">
     <PinnedPage />
@@ -915,11 +923,11 @@
     <RecentEditsPage />
   </div>
 {:else if router.route === "data"}
-  <div class="page-scroll data-page-host">
+  <div class="fixed-page-host">
     <DataPage />
   </div>
 {:else if router.route === "settings"}
-  <div class="page-scroll settings-page-host">
+  <div class="fixed-page-host settings-page-host">
     <SettingsPage />
   </div>
 {:else}
@@ -1029,14 +1037,17 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
+    /* Reserve the scrollbar's width up front so centered columns and
+       right-aligned controls do not shift when content first makes the page
+       scroll. */
+    scrollbar-gutter: stable;
   }
 
-  .settings-page-host {
-    display: flex;
-    overflow: hidden;
-  }
-
-  .data-page-host {
+  /* Settings and Data scroll inside their own panes. Keep these hosts apart from
+     .page-scroll because a stable gutter would also apply to hidden overflow. */
+  .fixed-page-host {
+    flex: 1;
+    min-height: 0;
     display: flex;
     overflow: hidden;
   }

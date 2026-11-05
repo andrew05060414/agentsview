@@ -3,10 +3,11 @@ title: Chat Import
 description: Import Claude.ai, ChatGPT, and Gemini Apps conversations into AgentsView
 ---
 
-AgentsView can import your conversation history from Claude.ai,
-ChatGPT, and Gemini Apps. These services let you export your data as a zip
-file — AgentsView reads these exports and adds the conversations
-to your local database alongside your agent coding sessions.
+Bring Claude.ai, ChatGPT, and Gemini Apps conversations into the same searchable
+archive as your coding sessions. [Sync Claude.ai through Chrome](#sync-claudeai-chats)
+to fetch new and changed chats, or import the services' exported files below.
+ChatGPT dot, Codex web, and Codex cloud task chats use the separate opt-in
+[Codex Cloud source](/docs/configuration/#codex-cloud).
 
 ## Exporting Your Data
 
@@ -73,9 +74,12 @@ list refreshes automatically.
 Setup registers Google Chrome only. Chromium, Edge, and Brave aren't supported.
 Set up Chrome once:
 
-1. Run `agentsview chrome setup`.
-2. Open `chrome://extensions` and turn on **Developer mode**.
-3. Click **Load unpacked** and select the folder printed by the command.
+1. Run `agentsview source chrome setup`.
+2. If AgentsView is already running, restart it. AgentsView opens its Chrome
+   connection only after setup, so a server started before setup can't reach
+   Chrome.
+3. Open `chrome://extensions` and turn on **Developer mode**.
+4. Click **Load unpacked** and select the folder printed by the command.
 
 Keep Chrome open during Sync. When the executable path or data directory changes,
 rerun setup and reload the extension at `chrome://extensions`. After an upgrade
@@ -84,12 +88,27 @@ then click **Sync** again. The extension reconnects when AgentsView restarts.
 Registration is per OS user; the last setup wins. The first connected Chrome
 profile is used until it disconnects.
 
+Most installs need nothing more. Chrome reaches AgentsView through a private
+socket at `<dataDir>/chrome/host.sock`, and setup writes that path into the
+launcher. If your data directory path is too long for a socket, AgentsView puts
+the socket in `av-chrome-<hash>/` inside `$XDG_RUNTIME_DIR`, or inside your temp
+directory when `$XDG_RUNTIME_DIR` isn't set. On macOS and Linux that directory
+must belong to you with mode 0700, so a shared `/tmp` doesn't qualify. If no
+directory qualifies, setup fails and the server logs why; use a shorter data
+directory or set `$XDG_RUNTIME_DIR`. If setup and the server see different
+values of `$XDG_RUNTIME_DIR` or `$TMPDIR`, Chrome can't connect; rerun setup
+after changing either. The server removes the socket and its directory when it
+stops.
+
+Earlier development builds put that socket in `~/av-chrome-<hash>/`. If you ran
+setup with one of them, rerun `agentsview source chrome setup` and reload the
+extension; until you do, the server logs a warning at startup and Chrome stays
+disconnected. You can delete the old `~/av-chrome-<hash>/` directories.
+
 There's no removal command. Remove the extension at `chrome://extensions`, then
 delete `<dataDir>/chrome/extension/` and the launcher,
 `<dataDir>/chrome/host.cmd` on Windows or `<dataDir>/chrome/host` on macOS and
-Linux. On macOS and Linux, delete `~/av-chrome-<hash>/` too if setup used that
-socket fallback directory. Also delete the native host registration for your
-platform:
+Linux. Also delete the native host registration for your platform:
 
 - Windows: `<dataDir>/chrome/io.kenn.agentsview.json` and the registry key
   `HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts\io.kenn.agentsview`.
@@ -99,9 +118,10 @@ platform:
   uses `$CHROME_CONFIG_HOME/google-chrome` first, then
   `$XDG_CONFIG_HOME/google-chrome`, then `~/.config/google-chrome`.
 
-If Sync reports a disconnected host after setup, open Chrome and enable the
-extension at `chrome://extensions`. If it still fails, check the server startup
-error log for a Chrome host endpoint bind failure.
+If Sync reports a disconnected host after setup, restart AgentsView if it was
+running during setup, then open Chrome and enable the extension at
+`chrome://extensions`. If it still fails, check the server startup error log for
+a Chrome host endpoint bind failure.
 
 Open **Import conversations** and select **Claude.ai**. Local web UIs connected
 to a writable archive show a Chrome card; other connections show file upload
@@ -109,6 +129,8 @@ alone. The card checks the connection automatically. **Sync** stays disabled
 until Chrome connects. **Not connected** asks you to open Chrome and shows the
 setup command and extension loading instructions. **Connected** enables **Sync**,
 which uses your existing Claude.ai session, including Google sign-in.
+
+![Claude.ai Sync with Chrome connected](/docs/assets/generated/screenshots/import-claude-sync.png)
 
 **Signed out** appears after Sync needs authentication. Click **Sign in**,
 finish in the Chrome profile with the AgentsView extension, then return and
@@ -119,7 +141,12 @@ During Sync, **Stop** cancels the run and progress replaces file upload. Results
 show the imported, updated, unchanged, and failed counts. Other failures show
 **Sync failed** with **Retry**.
 
-You can also run `agentsview import --type claude-ai --sync` while the server
+Closing the dialog does not stop Sync. While it runs, the header's **Import**
+button shows a spinner. Reopen the dialog to see progress, stop the run, or read
+a result or failure that arrived while it was closed. Reloading or closing the
+AgentsView page ends Sync.
+
+You can also run `agentsview source import --type claude-ai --sync` while the server
 and Chrome are running, with no AgentsView tab open.
 
 Sync reuses an open Claude.ai tab. When none is available, it opens a background
@@ -136,16 +163,20 @@ changes count as updates and refresh open session lists. Resync clears
 freshness, so the next Sync fetches each chat once. Search stays available
 during Sync.
 
-Changed chats show Claude.ai's visible branch, even when it has fewer turns. If
-a replacement loses a pin or note, Sync keeps the previous version in Trash with
-its pins and notes. Replacements that preserve every pin and note make no copy.
-Switching back on Claude.ai restores those turns, but dropped pins and notes
-stay in the Trash copy. Trashed and permanently deleted chats stay deleted.
+Changed chats show Claude.ai's visible branch, even when it has fewer turns.
+Usage-only archives also update their message and user-turn counts to follow
+that branch. The first Sync after upgrading refetches cached usage-only chat
+details once to repair their counts. If a replacement loses a pin or note, Sync
+keeps the previous version in Trash with its pins and notes. Replacements that
+preserve every pin and note make no copy. Switching back on Claude.ai restores
+those turns, but dropped pins and notes stay in the Trash copy. Trashed and
+permanently deleted chats stay deleted.
 
 Each chat has a 32 MiB response limit. Larger chats count as failed while Sync
-continues. An expired sign-in or two chat failures in a row ends Sync. Closing
-the dialog cancels it. Completed chats stay imported, and the next Sync fetches
-unfinished chats.
+continues. An expired sign-in or two chat failures in a row ends Sync. Completed
+chats stay imported and refresh in the session list. The next Sync fetches
+unfinished chats. After **Stop**, the server may briefly report that Chrome Sync
+is already running; wait a moment, then click **Retry**.
 
 Sign-in persists in the browser that holds it. To sign out of Chrome, open
 Claude.ai itself in Chrome and use its log-out menu. In the desktop app, open
@@ -215,12 +246,12 @@ ZIP imports follow the usual append and refusal rules.
 
 ## Importing via the CLI
 
-Use `agentsview import` to import from the command line:
+Use `agentsview source import` to import from the command line:
 
 ```bash
-agentsview import --type claude-ai ~/Downloads/claude-export.zip
-agentsview import --type chatgpt ~/Downloads/chatgpt-export.zip
-agentsview import --type gemini-apps ~/Downloads/takeout.zip
+agentsview source import --type claude-ai ~/Downloads/claude-export.zip
+agentsview source import --type chatgpt ~/Downloads/chatgpt-export.zip
+agentsview source import --type gemini-apps ~/Downloads/takeout.zip
 ```
 
 | Flag | Description |
@@ -334,7 +365,7 @@ different set of messages than the archive. List each session to replace by
 its ID, `chatgpt:<conversation id>` or `claude-ai:<conversation uuid>`:
 
 ```bash
-agentsview import --type chatgpt --replace 'chatgpt:<conversation-id>' ~/Downloads/chatgpt-export.zip
+agentsview source import --type chatgpt --replace 'chatgpt:<conversation-id>' ~/Downloads/chatgpt-export.zip
 ```
 
 Repeat `--replace` for each session. The import API takes the same list as a

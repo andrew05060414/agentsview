@@ -89,15 +89,16 @@ type customPricingStore interface {
 }
 
 var openPGReadStore = func(
+	ctx context.Context,
 	cfg config.Config,
 	pgCfg config.PGConfig,
 ) (db.Store, func(), error) {
 	applyClassifierConfig(cfg)
-	if err := pgCfg.ValidateRawDerivation(cfg.RequireAuth); err != nil {
+	if err := cfg.ValidatePGRawDerivation(pgCfg); err != nil {
 		return nil, nil, err
 	}
 	if pgCfg.RawTenant != "" {
-		store, err := postgres.NewHostedStore(pgCfg.URL, pgCfg.Schema, pgCfg.RawTenant, pgCfg.AllowInsecure)
+		store, err := postgres.NewHostedStore(ctx, pgCfg.URL, pgCfg.Schema, pgCfg.RawTenant, pgCfg.AllowInsecure)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -108,7 +109,7 @@ var openPGReadStore = func(
 		return store, func() { _ = store.Close() }, nil
 	}
 	backend := pgReplica{}
-	store, err := backend.OpenStore(postgres.ReplicaTarget(pgCfg))
+	store, err := backend.OpenStore(ctx, postgres.ReplicaTarget(pgCfg))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -119,21 +120,38 @@ var openPGReadStore = func(
 	return store, func() { _ = store.Close() }, nil
 }
 
-// detectTransport picks the transport mode:
+// detectClientTransportContext probes an existing daemon using deployment
+// credentials, without applying unrelated deployment settings or auto-starting.
+// Keep the resolved token in cfg for the API client selected by this probe.
+func detectClientTransportContext(
+	ctx context.Context, cfg *config.Config, waitTimeout time.Duration,
+) (transport, error) {
+	if err := ctx.Err(); err != nil {
+		return transport{}, err
+	}
+	if err := cfg.ApplyDeploymentAuth(); err != nil {
+		return transport{}, fmt.Errorf("loading daemon auth: %w", err)
+	}
+	return detectTransportContext(ctx, cfg.DataDir, cfg.AuthToken, waitTimeout)
+}
+
+// loadDaemonClientConfig is the scoped minimal loader for clients which probe
+// daemon ownership directly rather than using transport discovery.
+func loadDaemonClientConfig(scope config.ValidationScope) (config.Config, error) {
+	cfg, err := config.LoadMinimalFor(scope)
+	if err == nil {
+		err = cfg.ApplyDeploymentAuth()
+	}
+	return cfg, err
+}
+
+// detectTransportContext picks the transport mode:
 //  1. If a kit runtime record points to a live daemon, use HTTP.
 //  2. If a daemon start lock exists, wait up to waitTimeout for the
 //     daemon to become ready, then try again.
 //  3. If a writable local daemon owns the SQLite archive but is not
 //     reachable by ping, use direct read-only access.
 //  4. Otherwise use direct access.
-func detectTransport(
-	dataDir string, authToken string, waitTimeout time.Duration,
-) (transport, error) {
-	return detectTransportContext(
-		context.Background(), dataDir, authToken, waitTimeout,
-	)
-}
-
 func detectTransportContext(
 	ctx context.Context,
 	dataDir string,
@@ -201,16 +219,6 @@ func detectTransportContext(
 	return transport{Mode: transportDirect}, nil
 }
 
-func ensureTransport(
-	cfg *config.Config,
-	intent transportIntent,
-	waitTimeout time.Duration,
-) (transport, error) {
-	return ensureTransportContext(
-		context.Background(), cfg, intent, waitTimeout,
-	)
-}
-
 func ensureTransportContext(
 	ctx context.Context,
 	cfg *config.Config,
@@ -227,9 +235,12 @@ func ensureTransportContext(
 	if err := ctx.Err(); err != nil {
 		return transport{}, err
 	}
+	if err := cfg.ApplyDeploymentAuth(); err != nil {
+		return transport{}, fmt.Errorf("loading daemon auth: %w", err)
+	}
 	// cfg.NoDaemonAutostart applies the AGENTSVIEW_NO_DAEMON rule to this
 	// invocation only, without touching the process environment.
-	autostartDisabled := daemonAutostartDisabled() || cfg.NoDaemonAutostart
+	autostartDisabled := daemonAutostartDisabled() || cfg.NoDaemonAutostart || cfg.RequireDaemon
 	if (intent == transportIntentRead || intent == transportIntentArchiveWrite) &&
 		waitTimeout <= 0 {
 		waitTimeout = backgroundAutoStartReadyTimeout
@@ -314,12 +325,12 @@ func ensureTransportContext(
 	}
 	if intent == transportIntentRead {
 		if autostartDisabled {
-			return transport{}, errors.New(
-				"daemon autostart is disabled; direct SQLite reads are " +
-					"not supported for this command. Start a daemon with " +
-					"`agentsview daemon start` or unset " +
+			return transport{}, cliUnavailableError(errors.New(
+				"daemon autostart is disabled; direct SQLite reads are "+
+					"not supported for this command. Start a daemon with "+
+					"`agentsview daemon start` or unset "+
 					"AGENTSVIEW_NO_DAEMON",
-			)
+			), "run `agentsview daemon start`, then retry; unset AGENTSVIEW_NO_DAEMON only if this command should start a daemon automatically")
 		}
 		if tr.DirectReadOnly {
 			if tr.DirectReason != "" {
@@ -478,9 +489,13 @@ func daemonRuntimeAhead(rt *DaemonRuntime) bool {
 }
 
 func guardDaemonAutoStartConfig(cfg config.Config) error {
-	host := strings.TrimSpace(cfg.Host)
-	if host == "" || cfg.RequireAuth || isLoopbackHost(host) {
-		return nil
+	effective, err := config.LoadReadOnlyAt(cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("loading daemon configuration: %w", err)
+	}
+	host := strings.TrimSpace(effective.Host)
+	if host == "" || effective.RequireAuth || isLoopbackHost(host) {
+		return validateServeConfig(effective)
 	}
 	return fmt.Errorf(
 		"refusing to auto-start an unauthenticated daemon on non-loopback "+
@@ -563,7 +578,7 @@ func newService(ctx context.Context,
 				"opening db: %w", err,
 			)
 		}
-		closeVectorSearcher := installDirectVectorSearcher(cfg, d)
+		closeVectorSearcher := installDirectVectorSearcher(ctx, cfg, d)
 		cleanup := func() {
 			if closeVectorSearcher != nil {
 				if cerr := closeVectorSearcher(); cerr != nil {
@@ -574,7 +589,10 @@ func newService(ctx context.Context,
 		}
 		// engine is nil — CLI reads don't need it, and Sync
 		// is handled via the HTTP daemon when one is running.
-		return service.NewDirectBackend(d, nil), cleanup, nil
+		return service.NewDirectBackend(
+			d, nil, service.WithModelGroups(service.NewModelGroups(cfg.ModelAliases)),
+			service.WithConfiguredDocbank(cfg),
+		), cleanup, nil
 	}
 }
 
@@ -607,9 +625,9 @@ func appendDaemonCompatibilityHint(tr transport, err error) error {
 // --semantic|--hybrid` and `mcp --pg` get the same semantic search
 // the SQLite direct path wires via installDirectVectorSearcher.
 func newPGReadService(
-	cfg config.Config, pgCfg config.PGConfig,
+	ctx context.Context, cfg config.Config, pgCfg config.PGConfig,
 ) (service.SessionService, func(), error) {
-	store, cleanup, err := openPGReadStore(cfg, pgCfg)
+	store, cleanup, err := openPGReadStore(ctx, cfg, pgCfg)
 	if err != nil {
 		if cleanup != nil {
 			cleanup()
@@ -621,6 +639,9 @@ func newPGReadService(
 			priced.SetCustomPricing(cfg.CustomModelPricing)
 		}
 	}
-	wireReplicaReadVectorSearchFn(cfg, pgReplica{}, store)
-	return service.NewReadOnlyBackend(store), cleanup, nil
+	wireReplicaReadVectorSearchFn(ctx, cfg, pgReplica{}, store)
+	return service.NewReadOnlyBackend(
+		store, service.WithModelGroups(service.NewModelGroups(cfg.ModelAliases)),
+		service.WithConfiguredDocbank(cfg),
+	), cleanup, nil
 }

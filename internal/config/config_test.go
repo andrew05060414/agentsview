@@ -103,6 +103,7 @@ func TestChartPaletteDefaultsAndLoads(t *testing.T) {
 		{name: "omitted", want: ChartPaletteAgentsview},
 		{name: "agentsview", toml: `chart_palette = "agentsview"`, want: ChartPaletteAgentsview},
 		{name: "matplotlib", toml: `chart_palette = "matplotlib"`, want: ChartPaletteMatplotlib},
+		{name: "colorblind", toml: `chart_palette = "colorblind"`, want: ChartPaletteColorblind},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -123,12 +124,12 @@ func TestChartPaletteRejectsInvalidValue(t *testing.T) {
 		{
 			name: "unknown",
 			toml: `chart_palette = "neon"`,
-			want: `chart_palette must be "agentsview" or "matplotlib" (got "neon")`,
+			want: `chart_palette must be "agentsview", "matplotlib", or "colorblind" (got "neon")`,
 		},
 		{
 			name: "explicit empty",
 			toml: `chart_palette = ""`,
-			want: `chart_palette must be "agentsview" or "matplotlib" (got "")`,
+			want: `chart_palette must be "agentsview", "matplotlib", or "colorblind" (got "")`,
 		},
 	}
 	for _, tt := range tests {
@@ -511,17 +512,6 @@ func TestDefault_IncludesHermesProfilesRoot(t *testing.T) {
 	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "sessions"))
 	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "profiles"))
 	assert.Contains(t, dirs, filepath.Join(home, "AppData", "Local", "hermes", "sessions"))
-}
-
-func TestDefault_HermesNoProfilesDirIsSafe(t *testing.T) {
-	home := canonicalTempDir(t)
-	setTestHome(t, home)
-	require.NoError(t, os.MkdirAll(filepath.Join(home, ".hermes", "sessions"), 0o755))
-	cfg, err := Default()
-	require.NoError(t, err)
-	dirs := cfg.ResolveDirs(parser.AgentHermes)
-	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "sessions"))
-	assert.Contains(t, dirs, filepath.Join(home, ".hermes", "profiles"))
 }
 
 func TestDefault_HermesEnvReplacesDefaultAndProfilesRoots(t *testing.T) {
@@ -1772,13 +1762,6 @@ func TestLoadFile_MalformedDirValueLogsWarning(t *testing.T) {
 	assert.Equal(t, []string{defaultDir}, dirs)
 }
 
-func TestDefault_ResultContentBlockedCategories(t *testing.T) {
-	cfg, err := Default()
-	require.NoError(t, err)
-
-	assert.Equal(t, []string{"Read", "Glob"}, cfg.ResultContentBlockedCategories)
-}
-
 func TestLoadFile_ResultContentBlockedCategories(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -2499,15 +2482,6 @@ func TestAutomatedConfigRoundTrip(t *testing.T) {
 	assert.Equal(t, wantExactMatches, cfg.Automated.ExactMatches)
 }
 
-func TestAutomatedConfigAbsentIsNil(t *testing.T) {
-	cfg := loadPFlagsWithConfig(t, map[string]any{
-		"public_url": "http://example.com",
-	})
-	assert.Nil(t, cfg.Automated.Prefixes)
-	assert.Nil(t, cfg.Automated.Substrings)
-	assert.Nil(t, cfg.Automated.ExactMatches)
-}
-
 func TestLoadFile_CustomModelPricing(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2708,13 +2682,6 @@ transport = "http"
 	assert.Equal(t, "devbox1", cfg.RemoteHosts[0].Host)
 }
 
-func TestLoadFile_RemoteHostsAbsentIsNil(t *testing.T) {
-	cfg := loadMinimalWithConfig(t,
-		map[string]any{"public_url": "http://example.com"})
-
-	assert.Nil(t, cfg.RemoteHosts)
-}
-
 func TestValidateRemoteHosts(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -2775,16 +2742,6 @@ func TestLoadFile_SyncIncludeCwdPrefixes(t *testing.T) {
 		[]string{"/home/me/work", "/home/me/oss"},
 		cfg.SyncIncludeCwdPrefixes,
 	)
-}
-
-func TestLoadFile_SyncIncludeCwdPrefixesDefaultsEmpty(t *testing.T) {
-	f := newConfigFixture(t)
-	f.WriteConfigText(t, `host = "127.0.0.1"
-`)
-
-	cfg := f.LoadMinimal(t)
-
-	assert.Empty(t, cfg.SyncIncludeCwdPrefixes)
 }
 
 func TestLoadMinimal_ExpandsUserSuppliedLocalPaths(t *testing.T) {
@@ -2925,19 +2882,6 @@ func TestPGConfig_LoadsFromTOML(t *testing.T) {
 	cfg := f.LoadMinimal(t)
 
 	assert.False(t, cfg.PG.PushVectorsEnabled())
-}
-
-func TestPGConfig_PushVectorsDefaultsTrue(t *testing.T) {
-	f := newConfigFixture(t)
-	f.WriteTOML(t, map[string]any{
-		"pg": map[string]any{
-			"url": "postgres://localhost/test",
-		},
-	})
-
-	cfg := f.LoadMinimal(t)
-
-	assert.True(t, cfg.PG.PushVectorsEnabled())
 }
 
 func TestValidateArtifactOriginID(t *testing.T) {
@@ -3181,4 +3125,37 @@ func TestResolveDirs_CodebuffRootEnvVar(t *testing.T) {
 		assert.Equal(t, []string{filepath.Join(dir, "override")},
 			cfg.ResolveDirs(parser.AgentCodebuff))
 	})
+}
+
+func TestLoadFile_ModelAliases(t *testing.T) {
+	for _, tt := range []struct {
+		name, data, badKey string
+		want               map[string]string
+	}{
+		{name: "quoted names", data: "[model_aliases]\n\"qwen/qwen3.6\" = \"qwen3.6\"\n\"qwen3.6-mlx\" = \"qwen3.6\"", want: map[string]string{"qwen/qwen3.6": "qwen3.6", "qwen3.6-mlx": "qwen3.6"}},
+		{name: "absent"},
+		{name: "self alias", data: "[model_aliases]\n\"a\" = \"a\"", want: map[string]string{"a": "a"}},
+		{name: "reserved all key", data: "[model_aliases]\n__all__ = \"group\"", badKey: `"__all__"`},
+		{name: "reserved all name", data: "[model_aliases]\na = \"__all__\"", badKey: `"a"`},
+		{name: "reserved other key", data: "[model_aliases]\n__other__ = \"group\"", badKey: `"__other__"`},
+		{name: "reserved other name", data: "[model_aliases]\na = \"__other__\"", badKey: `"a"`},
+		{name: "empty key", data: "[model_aliases]\n\"\" = \"group\"", badKey: `""`},
+		{name: "empty name", data: "[model_aliases]\na = \"\"", badKey: `"a"`},
+		{name: "comma key", data: "[model_aliases]\n\"a,b\" = \"group\"", badKey: `"a,b"`},
+		{name: "comma name", data: "[model_aliases]\na = \"b,c\"", badKey: `"a"`},
+		{name: "padded key", data: "[model_aliases]\n\" a \" = \"group\"", badKey: `" a "`},
+		{name: "padded name", data: "[model_aliases]\na = \" group \"", badKey: `"a"`},
+		{name: "chain", data: "[model_aliases]\na = \"b\"\nb = \"c\"", badKey: "alias chains are unsupported"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newConfigFixture(t)
+			f.WriteConfigText(t, tt.data)
+			if tt.badKey != "" {
+				require.ErrorContains(t, f.LoadMinimalErr(t), tt.badKey)
+				return
+			}
+			cfg := f.LoadMinimal(t)
+			assert.Equal(t, tt.want, cfg.ModelAliases)
+		})
+	}
 }

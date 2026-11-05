@@ -82,7 +82,7 @@ func TestWaitForReplacementOrShutdownTreatsMissingFileAsNoChangeYet(t *testing.T
 	require.NoError(t, err)
 	require.NoError(t, os.Remove(path))
 
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the file stays missing, so only the context ends the wait
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond) //nolint:kennlint // deadlinetest: the deadline is the expected result; the file stays missing, so only the context ends the wait
 	defer cancel()
 
 	replaced := waitForReplacementOrShutdown(ctx, path, info, 10*time.Millisecond)
@@ -194,5 +194,5 @@ func TestProbeDuckDBMirrorForServeMissingFileIsActionable(t *testing.T) {
 	err := probeDuckDBMirrorForServe(t.Context(), path)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not exist")
-	assert.Contains(t, err.Error(), "agentsview duckdb push --full")
+	assert.Contains(t, err.Error(), "agentsview replica duckdb push --full")
 }

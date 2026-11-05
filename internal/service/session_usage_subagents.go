@@ -5,11 +5,13 @@ package service
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // SessionUsageWithSubagents returns rootID's usage with every reachable
@@ -142,8 +144,12 @@ func sessionUsageWithDescendants(
 		}
 	}
 	if rowSet == nil {
-		return combineSubagentUsageFromSessions(
+		combined, err := combineSubagentUsageFromSessions(
 			ctx, store, root, descendants, includeBreakdown, requireComplete)
+		if err != nil {
+			return nil, err
+		}
+		return withDescendantCoverage(ctx, store, combined, descendants)
 	}
 	rootStoredOutputTokens := root.TotalOutputTokens
 	storedRoot, err := store.GetSession(ctx, rootID)
@@ -168,12 +174,89 @@ func sessionUsageWithDescendants(
 			tokenExpectations[descendant.ID] = sessionTokenExpectationFromUsage(ownUsage)
 		}
 	}
-	return combineSubagentUsageFromRows(
+	combined, err := combineSubagentUsageFromRows(
 		ctx, rootID, root, rootStoredOutputTokens, descendants, rowSet.Rows,
 		rowSet.RawOutputTokensBySession,
 		rowSet.DiscardedContributingSessions,
 		rowSet.CanonicalTokenCoverageBySession, tokenExpectations,
 		includeBreakdown, requireComplete)
+	if err != nil {
+		return nil, err
+	}
+	return withDescendantCoverage(ctx, store, combined, descendants)
+}
+
+// withDescendantCoverage adds each descendant's live capture coverage to
+// the combined result. The plan figures stay the root's, since OpenAI
+// already counts a chat's sub-agents in its root's report. Coverage is per
+// session, so the combined token totals miss every descendant's
+// uncaptured turns too: the result counts them all and keeps the newest
+// capture time. Live capture never joins a sub-agent chat, which then has
+// no token records and no coverage row; once the result has coverage, each
+// such chat counts its user messages as uncaptured turns, one per turn.
+func withDescendantCoverage(
+	ctx context.Context, store db.Store, out *db.SessionUsage, descendants []db.Session,
+) (*db.SessionUsage, error) {
+	var merged db.SessionPlanUsage
+	if out.PlanUsage != nil {
+		merged = *out.PlanUsage
+	}
+	changed := false
+	uncounted := 0
+	for _, descendant := range descendants {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if descendant.Agent != string(parser.AgentCodexCloud) {
+			// Only codex-cloud chats have coverage rows; a remote store
+			// would pay a round trip for each other descendant.
+			continue
+		}
+		p, err := store.GetSessionPlanUsage(ctx, descendant.ID)
+		if err != nil {
+			return nil, err
+		}
+		if p == nil || !p.HasCoverage {
+			uncounted += descendant.UserMessageCount
+			continue
+		}
+		newer, err := laterCaptureTime(merged.LastCaptureAt, p.LastCaptureAt)
+		if err != nil {
+			return nil, fmt.Errorf("session %s: %w", descendant.ID, err)
+		}
+		merged.HasCoverage = true
+		merged.UncapturedTurns += p.UncapturedTurns
+		merged.LastCaptureAt = newer
+		changed = true
+	}
+	if merged.HasCoverage && uncounted > 0 {
+		merged.UncapturedTurns += uncounted
+		changed = true
+	}
+	if changed {
+		out.PlanUsage = &merged
+	}
+	return out, nil
+}
+
+// laterCaptureTime returns the later of two RFC 3339 capture times; an
+// empty time is earlier than any other.
+func laterCaptureTime(a, b string) (string, error) {
+	if a == "" || b == "" {
+		return max(a, b), nil
+	}
+	at, err := time.Parse(time.RFC3339Nano, a)
+	if err != nil {
+		return "", fmt.Errorf("last capture time %q: %w", a, err)
+	}
+	bt, err := time.Parse(time.RFC3339Nano, b)
+	if err != nil {
+		return "", fmt.Errorf("last capture time %q: %w", b, err)
+	}
+	if bt.After(at) {
+		return b, nil
+	}
+	return a, nil
 }
 
 func sessionUsageIDsContext(
@@ -525,8 +608,8 @@ func combineSubagentUsageFromSessions(
 	if err != nil {
 		return nil, err
 	}
-	combined := newSessionUsageAccumulator(ctx, out, len(root.Breakdown))
-	if err := combined.add(root, ""); err != nil {
+	combined := newSessionUsageAccumulator(out, len(root.Breakdown))
+	if err := combined.add(ctx, root, ""); err != nil {
 		return nil, err
 	}
 	allSessionsHaveTokens := root.HasTokenData
@@ -553,7 +636,7 @@ func combineSubagentUsageFromSessions(
 		) && (usage == nil || usage.BreakdownCount == 0) {
 			breakdownComplete = false
 		}
-		if err := combined.add(usage, descendant.ID); err != nil {
+		if err := combined.add(ctx, usage, descendant.ID); err != nil {
 			return nil, err
 		}
 	}
@@ -590,7 +673,6 @@ func sessionHasPositiveTokens(outputTokens, peakContextTokens int) bool {
 }
 
 type sessionUsageAccumulator struct {
-	ctx             context.Context
 	out             *db.SessionUsage
 	models          map[string]struct{}
 	unpriced        map[string]struct{}
@@ -603,32 +685,32 @@ type sessionUsageAccumulator struct {
 }
 
 func newSessionUsageAccumulator(
-	ctx context.Context, out *db.SessionUsage, breakdownSize int,
+	out *db.SessionUsage, breakdownSize int,
 ) *sessionUsageAccumulator {
 	return &sessionUsageAccumulator{
-		ctx: ctx, out: out, models: make(map[string]struct{}),
+		out: out, models: make(map[string]struct{}),
 		unpriced: make(map[string]struct{}), allPriced: true,
 		breakdown: make([]db.SessionUsageBreakdownEntry, 0, breakdownSize),
 	}
 }
 
 func (combined *sessionUsageAccumulator) add(
-	usage *db.SessionUsage, subagentID string,
+	ctx context.Context, usage *db.SessionUsage, subagentID string,
 ) error {
-	if err := combined.ctx.Err(); err != nil || usage == nil {
+	if err := ctx.Err(); err != nil || usage == nil {
 		return err
 	}
 	if usage.HasTokenData && !usage.HasCost {
 		combined.allPriced = false
 	}
 	for _, model := range usage.Models {
-		if err := combined.ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		combined.models[model] = struct{}{}
 	}
 	for _, model := range usage.UnpricedModels {
-		if err := combined.ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		combined.unpriced[model] = struct{}{}
@@ -649,7 +731,7 @@ func (combined *sessionUsageAccumulator) add(
 	}
 	combined.out.BreakdownCount += usage.BreakdownCount
 	for _, entry := range usage.Breakdown {
-		if err := combined.ctx.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		entry.Ordinal = len(combined.breakdown) + 1
@@ -681,6 +763,10 @@ func newCombinedSessionUsage(
 		TotalOutputTokens: root.TotalOutputTokens,
 		PeakContextTokens: root.PeakContextTokens,
 		HasTokenData:      root.HasTokenData,
+		// OpenAI already counts a chat's sub-agents in the root's plan
+		// usage, so the root's figures describe the combined result.
+		// withDescendantCoverage adds the descendants' capture coverage.
+		PlanUsage: root.PlanUsage,
 	}
 	for _, descendant := range descendants {
 		if err := ctx.Err(); err != nil {

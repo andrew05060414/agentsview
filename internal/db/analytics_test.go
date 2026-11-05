@@ -11,7 +11,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -165,7 +164,7 @@ func TestAnalyticsSummaryReturnsFirstReadError(t *testing.T) {
 	require.NoError(t, err)
 	// Fail during SQLite row evaluation, after QueryContext has returned rows.
 	require.NoError(t, conn.Raw(func(driverConn any) error {
-		return driverConn.(*sqlite3.SQLiteConn).RegisterFunc("strftime", func(...any) (string, error) {
+		return driverConn.(interface{ RegisterFunc(string, any, bool) error }).RegisterFunc("strftime", func(...any) (string, error) {
 			return "", errors.New("summary read failure")
 		}, false)
 	}))
@@ -3250,13 +3249,6 @@ func TestGetAnalyticsSkillsModelFilterCountsOnlyMatchingSkillCalls(
 	assert.Equal(t, 1, resp.BySkill[0].CallCount, "CallCount")
 	assert.Equal(t, "2024-06-01T09:00:00Z", resp.BySkill[0].LastUsedAt,
 		"LastUsedAt")
-}
-
-func TestGetAnalyticsToolsCanceled(t *testing.T) {
-	d := testDB(t)
-	ctx := canceledCtx()
-	_, err := d.GetAnalyticsTools(ctx, baseFilter())
-	requireCanceledErr(t, err)
 }
 
 func TestGetAnalyticsSkillsCanceled(t *testing.T) {

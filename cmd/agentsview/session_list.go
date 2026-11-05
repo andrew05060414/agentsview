@@ -23,6 +23,8 @@ type sessionListDocument struct {
 	MachineLabels service.MachineLabelCatalog `json:"machine_labels"`
 }
 
+const machineFilterHelp = "Exact machine IDs or aliases (comma-separated), or one unique whole display name. IDs and aliases take precedence over matching names; unknown or ambiguous values return an error"
+
 func newSessionListCommand() *cobra.Command {
 	var (
 		project, excludeProject, machine, agent string
@@ -45,8 +47,16 @@ func newSessionListCommand() *cobra.Command {
 		resume, active                          bool
 	)
 	cmd := &cobra.Command{
-		Use:          "list",
-		Short:        "List sessions with filters",
+		Use:   "list",
+		Short: "List sessions with filters",
+		Long: "Find sessions with metadata filters and stable cursor pagination. " +
+			"JSON includes full session IDs and a next_cursor. " +
+			"The cursor does not retain filters: repeat the same backend, filters, and sort (including --reverse) on every page. " +
+			"Changing the sort rejects the cursor; changing filters changes the selection.",
+		Example: "  agentsview session list --since 2026-10-01 --project example-project --sort recent --limit 20 --json\n" +
+			"  agentsview session list --since 2026-10-01 --project example-project --sort recent --limit 20 --cursor <cursor> --json\n" +
+			"  agentsview session list --agent codex --sort messages:desc --limit 20 --json\n" +
+			"  agentsview session list --agent codex --sort messages:desc --limit 20 --cursor <cursor> --json",
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -55,12 +65,6 @@ func newSessionListCommand() *cobra.Command {
 				return err
 			}
 			activeSince = resolvedActiveSince
-
-			svc, cleanup, err := resolveService(cmd)
-			if err != nil {
-				return err
-			}
-			defer cleanup()
 
 			f := service.ListFilter{
 				Project:            project,
@@ -110,7 +114,7 @@ func newSessionListCommand() *cobra.Command {
 			// captures the ordering.
 			keys, err := db.ParseSortSpec(sort)
 			if err != nil {
-				return fmt.Errorf("invalid sort %q: %w", sort, err)
+				return cliValidationError(fmt.Errorf("invalid sort %q: %w", sort, err), "choose --sort keys listed by `agentsview session list --help` (each accepts :asc or :desc)")
 			}
 			// An empty spec means the implicit default; materialize it so
 			// --reverse has a term to flip instead of silently no-opping.
@@ -126,6 +130,12 @@ func newSessionListCommand() *cobra.Command {
 				}
 			}
 			f.OrderBy = db.FormatSortSpec(keys)
+
+			svc, cleanup, err := resolveService(cmd)
+			if err != nil {
+				return err
+			}
+			defer cleanup()
 
 			list, err := svc.List(cmd.Context(), f)
 			if err != nil {
@@ -170,7 +180,7 @@ func newSessionListCommand() *cobra.Command {
 	flags.StringVar(&excludeProject, "exclude-project", "",
 		"Exclude sessions from the given project")
 	flags.StringVar(&machine, "machine", "",
-		"Filter by machine name")
+		machineFilterHelp)
 	flags.StringVar(&agent, "agent", "",
 		"Filter by agent (claude, codex, cursor, ...)")
 	flags.StringVar(&date, "date", "",

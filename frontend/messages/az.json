@@ -98,12 +98,15 @@
   "header_actions_import_archive_only": "Yalnız arxiv rejimində idxal mümkün deyil",
   "header_actions_import_conversations": "Söhbətləri idxal et",
   "header_actions_import": "İdxal et",
+  "header_actions_import_claude_syncing": "Claude.ai sinxronizasiyası işləyir. Gedişatı görmək və ya dayandırmaq üçün İdxal et pəncərəsini açın.",
   "header_actions_toggle_theme": "Temanı dəyişdir",
   "header_actions_settings": "Parametrlər",
   "header_actions_keyboard_shortcuts": "Klaviatura qısayolları",
   "header_actions_keyboard_shortcuts_shortcut": "Klaviatura qısayolları (?)",
   "status_bar_archive_stale": "Arxiv nəticələri köhnəlmiş ola bilər.",
   "status_bar_archive_rebuilding": "Arxiv nəticələri köhnəlmiş ola bilər. Yenidən qurma bitənədək dəyişikliklər dayandırılıb.",
+  "status_bar_archive_stale_rebuild": "Arxiv nəticələri köhnəlmiş ola bilər. Yenidən qurmaq üçün klikləyin.",
+  "status_bar_sync_failed": "Sinxronizasiya uğursuz oldu",
   "status_bar_sessions": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -159,8 +162,10 @@
   "command_palette_search_error": "Axtarış əlçatan deyil",
   "command_palette_search_failed": "Axtarış uğursuz oldu. Yenidən cəhd edin.",
   "command_palette_semantic_setup_title": "Semantik axtarış konfiqurasiya edilməyib",
-  "command_palette_semantic_setup_config_step": "1. config.toml faylına [vector] bölməsi əlavə edin, modeli və xidmət ünvanını semantik vektorlar serverinizə uyğunlaşdırın (OpenAI ilə uyğun olan istənilən xidmət ünvanı işləyir, məsələn, Ollama):",
-  "command_palette_semantic_setup_build_step": "2. Fon xidmətini yenidən başladın, sonra indeksi qurun:",
+  "command_palette_semantic_setup_config_step": "1. Bunu config.toml faylına əlavə edin:",
+  "command_palette_semantic_setup_local": "Artıq Ollama ilə Nomic istifadə edirsiniz? Ortaq yerli serverə keçərkən indeksinizi saxlamaq üçün tam konfiqurasiya nümunəsinə əməl edin.",
+  "command_palette_semantic_setup_local_link": "Server parametrləri",
+  "command_palette_semantic_setup_build_step": "2. Daemonu yenidən başladın, sonra indeks yaradın. CLI ilk endirmədən əvvəl icazə istəyir:",
   "command_palette_semantic_copy_config": "Konfiqurasiya parçasını kopyala",
   "command_palette_semantic_copy_command": "Əmri kopyala",
   "command_palette_semantic_copied": "Kopyalandı!",
@@ -387,9 +392,23 @@
       }
     }
   ],
+  "tool_block_image_alt": "Alət çıxışından şəkil",
+  "tool_block_image_open": "Şəkli tam ölçüdə göstər",
+  "tool_block_image_close": "Tam ölçülü şəkli bağla",
   "thinking_block_label": "Düşünmə",
   "compact_boundary_title": "Bu nöqtədə kontekst pəncərəsi sıxlaşdırılıb",
   "compact_boundary_label": "Kontekst sıxlaşdırılıb",
+  "transcript_empty_messages": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{count} boş mesaj",
+        "countPlural=other": "{count} boş mesaj"
+      }
+    }
+  ],
+  "transcript_empty_messages_title": "Bu mesajlarda mətn, düşüncə və ya alət çağırışı yoxdur",
   "compact_boundary_show_full_summary": "Tam xülasəni göstər",
   "sidebar_session_count": [
     {
@@ -444,6 +463,8 @@
   "sidebar_filters_no_match": "Uyğunluq yoxdur",
   "sidebar_filters_no_agents": "Agent yoxdur",
   "sidebar_filters_machine": "Kompüter",
+  "sidebar_filters_machine_loading": "Kompüterlər yüklənir...",
+  "sidebar_filters_machine_update_failed": "Kompüter filtrini yeniləmək mümkün olmadı. Yenidən cəhd edin.",
   "sidebar_filters_search_machines": "Kompüterləri axtar...",
   "sidebar_filters_no_machines": "Kompüter yoxdur",
   "sidebar_filters_min_prompts": "Minimum sorğu sayı",
@@ -836,6 +857,10 @@
   "usage_tokens_attribution_title": "Tokenlərin bölgüsü",
   "usage_attribution_treemap": "Ağac xəritəsi",
   "usage_attribution_list": "Siyahı",
+  "usage_label_scale_title": "Etiket ölçüsü miqyası",
+  "usage_label_scale_linear": "Xətti",
+  "usage_label_scale_sqrt": "Kök",
+  "usage_label_scale_log": "Log",
   "usage_chart_style": "Qrafik görünüşü",
   "usage_chart_style_smooth": "Hamar",
   "usage_chart_style_lines": "Xətlər",
@@ -862,7 +887,7 @@
   "settings_search_empty": "Uyğun gələn parametr yoxdur",
   "settings_search_clear": "Axtarışı təmizlə",
   "settings_search_result": "{category} göstərilir",
-  "settings_search_keywords_appearance": "Tema kontrast düzülüş mətn şrift bloklar miqyas",
+  "settings_search_keywords_appearance": "Tema kontrast düzülüş mətn şrift bloklar miqyas rəng",
   "settings_search_keywords_language": "Dil yerli parametrlər tərcümə",
   "settings_search_keywords_date_ranges": "Tarix aralıq əlaqəli səhifələr",
   "settings_search_keywords_terminal": "Terminal davam et işə sal icra faylı arqumentlər mübadilə buferi",
@@ -1722,6 +1747,14 @@
   "insights_page_template_tool_reliability": "Alətlərin etibarlılığı",
   "insights_page_template_model_cost": "Model və xərc",
   "insights_page_template_instruction_opportunities": "Təlimat imkanları",
+  "insights_page_template_friction_review": "Sürtünmə icmalı",
+  "friction_review_summary_title": "Model tərəfindən yazılmış xülasə",
+  "friction_review_summary_notice": "Bu hesabatın xülasəsi və nümunə başlıqlarından model tərəfindən yazılıb. Tapıntıları, hesabatları və tapşırıqları dəyişmir.",
+  "friction_review_summary_empty": "Bu hesabat üçün hələ xülasə yoxdur.",
+  "friction_review_summary_generate": "Xülasə yarat",
+  "friction_review_summary_regenerate": "Yenidən yarat",
+  "friction_review_summary_generating": "Yaradılır: {phase}",
+  "friction_review_summary_unavailable": "Bu arxiv üçün xülasə yaratmaq mümkün deyil.",
   "insights_page_scope_no_automated": "Avtomatlaşdırılmış sessiyalar olmadan",
   "insights_page_scope_both": "Hər ikisi",
   "insights_page_scope_only_automated": "Yalnız avtomatlaşdırılmış sessiyalar",
@@ -2048,6 +2081,7 @@
   "appearance_chart_palette": "Diaqram rəngləri",
   "appearance_chart_palette_agentsview": "AgentsView",
   "appearance_chart_palette_matplotlib": "Matplotlib",
+  "appearance_chart_palette_colorblind": "Rəng korluğu üçün təhlükəsiz",
   "appearance_message_layout": "Mesaj düzülüşü",
   "appearance_block_visibility": "Blokların görünməsi",
   "settings_github_token_saved": "GitHub tokeni yadda saxlanıldı.",
@@ -2601,8 +2635,8 @@
   "import_claude_stop": "Dayandır",
   "import_claude_terminal": "Terminal",
   "import_claude_copy_command": "Əmri kopyala",
-  "import_claude_setup_load": "Sonra {url} ünvanını açın, Developer mode seçimini aktivləşdirin, Load unpacked seçin və göstərilən qovluğu seçin.",
-  "import_claude_open_chrome": "Qoşulmaq üçün Chrome-u açın.",
+  "import_claude_setup_load": "Sonra AgentsView-u yenidən başladın, {url} ünvanını açın, Developer mode seçimini aktivləşdirin, Load unpacked seçin və göstərilən qovluğu seçin.",
+  "import_claude_open_chrome": "AgentsView genişləndirməsi aktiv olan Chrome-u açın. Quraşdırmanı AgentsView-u başlatdıqdan sonra işlətmisinizsə, AgentsView-u yenidən başladın.",
   "import_claude_tab_note": "Açıq claude.ai vərəqi yoxdursa, sinxronizasiya arxa planda vərəq açır. Vərəq sinxronizasiyadan sonra açıq qalır.",
   "import_claude_signed_out": "AgentsView genişləndirməsinin olduğu Chrome profilində claude.ai hesabına daxil olun. Genişləndirməni yalnız bir Chrome profilində aktivləşdirin. Sinxronizasiya ilk qoşulan profildən istifadə edir.",
   "import_chatgpt_tab_note": "Açıq chatgpt.com vərəqi yoxdursa, sinxronizasiya arxa planda vərəq açır. Vərəq sinxronizasiyadan sonra açıq qalır.",
@@ -2610,6 +2644,7 @@
   "import_claude_reload_extension": "Sonra {url} ünvanında genişləndirməni yenidən yükləyin.",
   "import_claude_update_app": "AgentsView-i yeniləmisinizsə, onu yenidən başladın.",
   "import_claude_syncing": "Sinxronizasiya edilir...",
+  "import_claude_sync_background": "Bu dialoqu bağlasanız da sinxronizasiya davam edir.",
   "import_claude_sync_failed": "Sinxronizasiya alınmadı",
   "import_claude_sign_in_failed": "Daxil olmaq alınmadı",
   "import_claude_desktop_note": "Daxil olmaq üçün e-poçt kodu istifadə olunur. Google hesabları üçün Chrome-da veb interfeysdən sinxronizasiya edin.",
@@ -2841,5 +2876,298 @@
   "usage_all_projects": "Bütün layihələr",
   "usage_clear_selection": "Seçimi təmizlə",
   "usage_open_project": "Aç",
-  "usage_loading": "Yüklənir..."
+  "usage_loading": "Yüklənir...",
+  "plan_usage_title": "Plan istifadəsi",
+  "plan_usage_trigger_weekly": "Plan istifadəsi: həftəlik {percent}%",
+  "plan_usage_as_of": "Plan istifadəsi, {time} vəziyyətinə",
+  "plan_usage_not_checked": "Plan istifadəsi: hələ yoxlanılmayıb",
+  "plan_usage_still_updating": "Plan istifadəsi: hələ yenilənir, {time} vəziyyətinə",
+  "plan_usage_not_reported_yet": "Plan istifadəsi: hələ bildirilməyib, {time} vəziyyətinə",
+  "plan_usage_partial": "Qismən plan istifadəsi, {time} vəziyyətinə",
+  "plan_usage_not_reported": "OpenAI bildirməyib",
+  "plan_usage_too_many_subagents": "OpenAI istifadə hesabatı üçün alt-agent söhbətləri çox çoxdur",
+  "plan_usage_could_not_check": "AgentsView plan istifadəsini yoxlaya bilmədi",
+  "plan_usage_account_unavailable": "Bu hesab üçün istifadə məlumatı əlçatan deyil",
+  "plan_usage_counted_under": "{title} söhbətində hesablanıb",
+  "plan_usage_stale": "O vaxtdan bəri: {reason} ({time}). Bu rəqəmlər köhnəlmiş ola bilər.",
+  "plan_usage_left_out_later": "OpenAI istifadə hesabatı bu söhbəti daxil etmədi",
+  "plan_usage_weekly_share": "Həftəlik Codex limitinin {percent}%-i",
+  "plan_usage_five_hour_share": "Beş saatlıq Codex limitinin {percent}%-i",
+  "plan_usage_credits": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} kredit",
+        "countPlural=other": "{countLabel} kredit"
+      }
+    }
+  ],
+  "plan_usage_credits_note": "Kreditlər OpenAI istifadə hesabatının verdiyi kimi göstərilir.",
+  "plan_usage_col_split": "Model, səy, sürət",
+  "plan_usage_col_weekly": "Həftəlik",
+  "plan_usage_col_five_hour": "5 saat",
+  "plan_usage_col_credits": "Kreditlər",
+  "capture_tokens_live": "Tokenlər canlı tutulub, {time} vəziyyətinə",
+  "capture_turns_not_captured": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} növbə tutulmayıb",
+        "countPlural=other": "{countLabel} növbə tutulmayıb"
+      }
+    }
+  ],
+  "capture_turns_not_captured_covered": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input time",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} növbə tutulmayıb; {time} tarixindən əvvəl baş veribsə, plan istifadəsi onu sayır",
+        "countPlural=other": "{countLabel} növbə tutulmayıb; plan istifadəsi {time} tarixindən əvvəl baş verənləri sayır"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_waiting": "Codex Cloud: ilk sinxronizasiya gözlənilir",
+  "status_bar_codex_cloud_importing_found": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Codex Cloud: idxal edilir, indiyədək {countLabel} söhbət tapılıb",
+        "countPlural=other": "Codex Cloud: idxal edilir, indiyədək {countLabel} söhbət tapılıb"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_importing_progress": "Codex Cloud: {total} söhbətdən {imported} idxal edilir",
+  "status_bar_codex_cloud_up_to_date": "Codex Cloud: {time} vəziyyətinə aktualdır",
+  "status_bar_codex_cloud_retrying": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Codex Cloud: {countLabel} söhbət idxal edilə bilmədi",
+        "countPlural=other": "Codex Cloud: {countLabel} söhbət idxal edilə bilmədi"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_error": "Codex Cloud: xəta",
+  "status_bar_codex_cloud_off": "Codex Cloud: söndürülüb",
+  "status_bar_codex_cloud_config_error": "Codex Cloud: ayarlar xətası",
+  "status_bar_codex_cloud_live_attention": "Codex Cloud: canlı tokenlər diqqət tələb edir",
+  "status_bar_codex_cloud_oldest_failure": "Ən köhnə uğursuzluq: {time}",
+  "status_bar_codex_cloud_last_success": "Son uğurlu sinxronizasiya: {time}",
+  "status_bar_codex_cloud_homes": "Codex qovluqları: {homes}",
+  "appearance_message_colors": "Mesaj rəngləri",
+  "appearance_message_colors_description": "Hər mesaj növünə ayrıca rəng verin. Rəng korluğu üçün hazır seçim geniş yayılmış rəng görmə pozuntularında da fərqlənən çalarlardan istifadə edir və xətt naxışları əlavə edir ki, növlər həm rəngə, həm də formaya görə fərqlənsin.",
+  "appearance_message_colors_preset": "Mesaj rəngləri üçün hazır seçim",
+  "appearance_message_colors_preset_default": "Mövzu üzrə standart",
+  "appearance_message_colors_preset_colorblind": "Rəng korluğu üçün təhlükəsiz",
+  "appearance_message_colors_preset_custom": "Fərdi",
+  "appearance_message_colors_patterns": "Mesaj növlərini rəngdən əlavə xətt naxışları ilə işarələ",
+  "appearance_message_colors_reset_all": "Standartlara qaytar",
+  "appearance_message_colors_reset_role": "Sıfırla",
+  "appearance_message_colors_reset_role_label": "{role} üçün rəngi sıfırla",
+  "appearance_message_colors_role_label": "{role} üçün rəng",
+  "appearance_message_colors_picker": "Rəng seçicini aç",
+  "appearance_message_colors_hex": "Hex rəng",
+  "appearance_message_colors_warning_text": "{modes} rejimində mətni oxumaq çətin ola bilər ({ratio}:1, tələb olunan {required}:1).",
+  "appearance_message_colors_warning_marker": "{modes} rejimində rəng işarəsi çətin görünə bilər ({ratio}:1, tələb olunan {required}:1).",
+  "appearance_message_colors_mode_light": "açıq",
+  "appearance_message_colors_mode_dark": "tünd",
+  "appearance_message_colors_mode_high_contrast_light": "yüksək kontrastlı açıq",
+  "appearance_message_colors_mode_high_contrast_dark": "yüksək kontrastlı tünd",
+  "appearance_message_colors_swatch_blue": "Göy",
+  "appearance_message_colors_swatch_vermillion": "Al qırmızı",
+  "appearance_message_colors_swatch_bluish_green": "Göyümtül yaşıl",
+  "appearance_message_colors_swatch_reddish_purple": "Qırmızımtıl bənövşəyi",
+  "appearance_message_colors_swatch_dark_yellow": "Tünd sarı",
+  "appearance_message_colors_swatch_gray": "Boz",
+  "appearance_message_colors_preview": "Önizləmə",
+  "appearance_message_colors_preview_user": "Tarix testi niyə uğursuz olur?",
+  "appearance_message_colors_preview_assistant": "Fikstur UTC gözləyir. Onu yenilədim.",
+  "nav_friction": "Sürtünmə jurnalı",
+  "friction_page_help_docs": "Sürtünmə jurnalı necə işləyir",
+  "friction_page_refresh": "Sürtünmə jurnalını yenilə",
+  "friction_date_label": "İcmal tarixi",
+  "friction_date_previous": "Əvvəlki icmal",
+  "friction_date_next": "Növbəti icmal",
+  "friction_date_no_match": "Uyğun tarix yoxdur",
+  "friction_build_now": "İndi yarat",
+  "friction_build_title": "Hələ icmalı olmayan hər tamamlanmış gün üçün icmal yaradır",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} icmal yaradıldı",
+        "countPlural=other": "{countNumber} icmal yaradıldı"
+      }
+    }
+  ],
+  "friction_build_nothing": "Hər tamamlanmış günün artıq icmalı var.",
+  "friction_build_failed": "Yaratma alınmadı: {error}",
+  "friction_empty_title": "Hələ sürtünmə icmalı yoxdur",
+  "friction_empty_hint": "İcmal hər yerli gün başa çatdıqda avtomatik yaradılır, saatlıq iş isə buraxılmış günləri tamamlayır. Çatışmayan günləri dərhal yaratmaq üçün İndi yarat düyməsindən istifadə edin.",
+  "friction_empty_hint_remote": "İcmal hər yerli gün başa çatdıqda avtomatik yaradılır, saatlıq iş isə buraxılmış günləri tamamlayır. Çatışmayan günləri dərhal yaratmaq üçün bu səhifəni AgentsView işləyən kompüterdə açın və ya serverdə require_auth parametrini aktiv edin.",
+  "friction_load_error": "Sürtünmə jurnalı yüklənmədi",
+  "friction_retry": "Yenidən cəhd et",
+  "friction_digest_heading": "Sürtünmə jurnalı — {date}",
+  "friction_digest_built": "{when} tarixində yaradılıb ({timezone})",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} sessiyada uğursuz oldu",
+        "countPlural=other": "{countNumber} sessiyada uğursuz oldu"
+      }
+    }
+  ],
+  "friction_clean_title": "Sürtünmə tapılmadı",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Skan edilən {countNumber} sessiyada heç nə qeyd olunmadı.",
+        "countPlural=other": "Skan edilən {countNumber} sessiyada heç nə qeyd olunmadı."
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "Bu gün aktiv sessiya olmayıb.",
+  "friction_deferral_said": "İş təxirə salındı: “{phrase}”",
+  "friction_pattern_retry_loop": "Təkrar cəhd dövrü",
+  "friction_pattern_runaway_loop": "Nəzarətsiz alət dövrü",
+  "friction_pattern_edit_churn": "Təkrarlanan redaktələr",
+  "friction_pattern_mid_task_compaction": "Tapşırıq ortasında kontekst sıxılması",
+  "friction_pattern_context_pressure": "Kontekst təzyiqi",
+  "friction_pattern_iteration_runaway": "İstifadəçi girişi olmadan uzun icra",
+  "friction_digest_missing": "{date} üçün icmal yoxdur.",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} sessiya yoxlanıldı",
+        "countPlural=other": "{countNumber} sessiya yoxlanıldı"
+      }
+    }
+  ],
+  "friction_headline_title": "Diqqət tələb edir",
+  "friction_p0_title": "Bir neçə sessiyada uğursuz olan alətlər",
+  "friction_patterns_new": "Yeni nümunələr",
+  "friction_patterns_recurring": "Təkrarlanan nümunələr",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} dəfə",
+        "countPlural=other": "{countNumber} dəfə"
+      }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} sessiya",
+        "countPlural=other": "{countNumber} sessiya"
+      }
+    }
+  ],
+  "friction_pattern_first_seen": "İlk dəfə {date} tarixində görüldü",
+  "friction_section_corrections": "Düzəlişlər",
+  "friction_section_errors": "Xətalar",
+  "friction_section_workarounds": "Müvəqqəti həllər",
+  "friction_section_deferrals": "Təxirə salınanlar",
+  "friction_section_patterns": "Nümunələr",
+  "friction_section_frustration": "Narazılıq",
+  "friction_section_interruptions": "Kəsintilər",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} kəsinti",
+        "countPlural=other": "{countNumber} kəsinti"
+      }
+    }
+  ],
+  "friction_kind_correction": "Düzəliş",
+  "friction_kind_error": "Xəta",
+  "friction_kind_workaround": "Müvəqqəti həll",
+  "friction_kind_deferral": "Təxirə salınma",
+  "friction_kind_pattern": "Nümunə",
+  "friction_kind_frustration": "Narazılıq",
+  "friction_kind_interruption": "Kəsinti",
+  "friction_disabled_title": "Bu serverdə sürtünmə jurnalı söndürülüb",
+  "friction_disabled_hint": "Bu server xülasələr yaratmır. config.toml faylında [friction] enabled = true təyin edin və daemonu yenidən başladın. Yalnız oxunan arxiv xülasə yarada bilməz.",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "Markdown-u göstər",
+  "friction_markdown_copy": "Markdown-u kopyala",
+  "friction_markdown_copied": "Markdown kopyalandı",
+  "friction_markdown_download": "Markdown-u endir",
+  "friction_markdown_loading": "Markdown yüklənir…",
+  "friction_markdown_error": "Markdown icmalı yüklənmədi.",
+  "friction_open_session": "{session} sessiyasını {ordinal} nömrəli mesajda aç",
+  "friction_open_session_start": "{session} sessiyasını aç",
+  "friction_quality_card_title": "Sürtünmə jurnalı",
+  "friction_quality_card_body": "Sessiyalarınızda tapılan düzəlişlərin, alət xətalarının, müvəqqəti həllərin, təxirə salınanların və təkrarlanan nümunələrin gündəlik icmalları.",
+  "friction_quality_card_open": "Sürtünmə jurnalını aç",
+  "friction_session_title": "Sürtünmə tapıntıları",
+  "friction_session_loading": "Sürtünmə tapıntıları yüklənir…",
+  "friction_session_error": "Sürtünmə tapıntıları əlçatan deyil.",
+  "friction_session_empty": "Bu sessiyada sürtünmə tapıntısı yoxdur.",
+  "friction_session_jump": "Mesaj {ordinal}",
+  "friction_session_jump_title": "{ordinal} nömrəli mesaja keç",
+  "docbank_subagent_open_session": "Fayl uyğunluqları sessiya kimi açıldıqda görünür.",
+  "docbank_checking": "Docbank yoxlanılır…",
+  "docbank_current": "Cari versiya",
+  "docbank_prior": "Əvvəlki versiya",
+  "docbank_trash": "Zibil qutusu",
+  "docbank_not_found": "Docbank-da yoxdur",
+  "docbank_read_unavailable": "Sessiya faylları əlçatan deyil",
+  "docbank_unavailable": "Docbank əlçatan deyil",
+  "docbank_limit_exceeded": "Docbank axtarış limitinə çatılıb",
+  "docbank_bytes_not_kept": "Şəkil baytları saxlanılmayıb",
+  "docbank_file": "Fayl {n} · {mediaType} · {size}",
+  "docbank_file_without_size": "Fayl {n} · {mediaType}",
+  "docbank_more": "Docbank-da daha {count} nəticə"
 }

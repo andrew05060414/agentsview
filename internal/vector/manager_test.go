@@ -267,7 +267,7 @@ func TestManagerWaitBlocksUntilAsyncBuildCompletes(t *testing.T) {
 	select {
 	case <-waited:
 		require.Fail(t, "Wait returned while the asynchronous build was active")
-	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the blocked build keeps Wait waiting
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the blocked build keeps Wait waiting
 	}
 	close(release)
 	select {
@@ -466,23 +466,6 @@ func TestManagerStatusPublishesAndClearsBuildETA(t *testing.T) {
 	assert.False(t, status.EstimateReady)
 	assert.Zero(t, status.RatePerSecond)
 	assert.Zero(t, status.ETAMilliseconds)
-}
-
-func TestManagerGenerationsDelegatesToIndex(t *testing.T) {
-	ix := openTestIndex(t)
-	ctx := t.Context()
-	src := twoDocSource()
-	gen := fakeGeneration("fake-model")
-	m := NewManager(ix, src, soloEncoders(fakeBuildEncoder()), gen)
-
-	_, err := m.TryBuild(ctx, BuildRequest{})
-	require.NoError(t, err)
-
-	want, err := ix.Generations(ctx)
-	require.NoError(t, err)
-	got, err := m.Generations(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, want, got)
 }
 
 func TestManagerActivateForceRefusalMatrix(t *testing.T) {

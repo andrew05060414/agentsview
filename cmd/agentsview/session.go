@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/servicehttp"
@@ -20,8 +21,16 @@ import (
 
 func newSessionCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:          "session",
-		Short:        "Programmatic access to session data",
+		Use:   "session",
+		Short: "Programmatic access to session data",
+		Long: "Find sessions, inspect transcripts and tool calls, search content, and read usage. " +
+			"Start with list and copy a full opaque ID into later commands. " +
+			"Local reads use the daemon. --server and --pg are mutually exclusive. " +
+			"--server-token-file or AGENTSVIEW_SERVER_TOKEN supplies remote authentication. " +
+			"Most read commands offer human or JSON output; watch and export have dedicated stream formats.",
+		Example: "  agentsview session list --since 7d --json\n" +
+			"  agentsview session get <id> --json\n" +
+			"  agentsview session list --server http://127.0.0.1:8080 --json",
 		GroupID:      groupData,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -45,6 +54,8 @@ func newSessionCommand() *cobra.Command {
 
 	cmd.AddCommand(newSessionGetCommand())
 	cmd.AddCommand(newSessionUsageCommand())
+	cmd.AddCommand(newSessionUsageBatchCommand())
+	cmd.AddCommand(newSessionDiagnoseCommand())
 	cmd.AddCommand(newSessionListCommand())
 	cmd.AddCommand(newSessionMessagesCommand())
 	cmd.AddCommand(newSessionToolCallsCommand())
@@ -66,9 +77,9 @@ func resolveService(
 	remote, _ := cmd.Flags().GetString("server")
 	if remote != "" {
 		if pgReadRequested(cmd) {
-			return nil, nil, errors.New(
+			return nil, nil, cliUsageError(errors.New(
 				"--server and --pg are mutually exclusive",
-			)
+			), "choose --server URL for a daemon, or --pg for a read-only PostgreSQL mirror")
 		}
 		token, err := explicitServerToken(cmd)
 		if err != nil {
@@ -77,7 +88,18 @@ func resolveService(
 		return servicehttp.NewHTTPBackend(remote, token, false, ""),
 			func() {}, nil
 	}
-	cfg, err := config.LoadPFlags(cmd.Flags())
+	scope := config.ScopeLocal
+	for _, name := range []string{"semantic", "hybrid"} {
+		if enabled, _ := cmd.Flags().GetBool(name); enabled {
+			scope |= config.ScopeVector
+		}
+	}
+	mode, _ := cmd.Flags().GetString("mode")
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == db.RecallQueryModeVector || mode == db.RecallQueryModeHybrid {
+		scope |= config.ScopeVector
+	}
+	cfg, err := config.LoadPFlagsFor(cmd.Flags(), scope)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"loading config: %w", err,
@@ -88,9 +110,14 @@ func resolveService(
 		return nil, nil, err
 	}
 	if usePG {
-		return newPGReadService(cfg, pgCfg)
+		if scope&config.ScopeVector != 0 {
+			if err := cfg.ApplyDeploymentEmbeddings(); err != nil {
+				return nil, nil, fmt.Errorf("loading deployment embeddings: %w", err)
+			}
+		}
+		return newPGReadService(cmd.Context(), cfg, pgCfg)
 	}
-	tr, err := ensureTransport(&cfg, transportIntentRead, 0)
+	tr, err := ensureTransportContext(cmd.Context(), &cfg, transportIntentRead, 0)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -108,12 +135,12 @@ func resolveSinceFlag(since, activeSince string) (string, error) {
 		return activeSince, nil
 	}
 	if activeSince != "" {
-		return "", errors.New(
-			"--since and --active-since are mutually exclusive")
+		return "", cliUsageError(errors.New(
+			"--since and --active-since are mutually exclusive"), "use --since for a relative duration/date, or --active-since for an RFC3339 timestamp")
 	}
 	t, err := timeutil.ParseSince(time.Now(), since)
 	if err != nil {
-		return "", err
+		return "", cliValidationError(err, "use --since 12h, 14d, 2w, 3m (months), 1y, or YYYY-MM-DD")
 	}
 	return t.UTC().Format(time.RFC3339), nil
 }
@@ -140,9 +167,9 @@ func resolveWritableServiceWithIntent(
 ) (service.SessionService, func(), error) {
 	if remote, _ := cmd.Flags().GetString("server"); remote != "" {
 		if pgReadRequested(cmd) {
-			return nil, nil, errors.New(
+			return nil, nil, cliUsageError(errors.New(
 				"--server and --pg are mutually exclusive",
-			)
+			), "choose --server URL for a daemon, or --pg for a read-only PostgreSQL mirror")
 		}
 		token, err := explicitServerToken(cmd)
 		if err != nil {
@@ -152,19 +179,19 @@ func resolveWritableServiceWithIntent(
 			func() {}, nil
 	}
 	if pgReadRequested(cmd) {
-		return nil, nil, errors.New(
+		return nil, nil, cliUsageError(errors.New(
 			"--pg is read-only and cannot be used with write commands",
-		)
+		), "omit --pg for a local write, or use --server URL for a writable daemon")
 	}
-	cfg, err := config.LoadPFlags(cmd.Flags())
+	cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
 	var tr transport
 	if fresh {
-		tr, err = ensureTransport(&cfg, transportIntentArchiveWrite, 0)
+		tr, err = ensureTransportContext(cmd.Context(), &cfg, transportIntentArchiveWrite, 0)
 	} else {
-		tr, err = detectTransport(cfg.DataDir, cfg.AuthToken, 0)
+		tr, err = detectClientTransportContext(cmd.Context(), &cfg, 0)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -268,10 +295,10 @@ func registerFormatFlags(flags *pflag.FlagSet) {
 // session group but cannot honor it.
 func rejectFormatFlags(cmd *cobra.Command, cmdName, streams string) error {
 	if cmd.Flags().Changed("format") || cmd.Flags().Changed("json") {
-		return fmt.Errorf(
+		return cliUsageError(fmt.Errorf(
 			"%s: streams %s; --format/--json not supported",
 			cmdName, streams,
-		)
+		), "omit --format and --json; this command already writes its documented stream format")
 	}
 	return nil
 }

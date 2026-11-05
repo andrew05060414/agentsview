@@ -1,11 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { StatusBar } from "@kenn-io/kit-ui";
+  import { StatusBar, Tooltip } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { perf } from "../../stores/perf.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { router } from "../../stores/router.svelte.js";
+  import { codexCloudStatus } from "../../stores/codexCloud.svelte.js";
+  import { SERVER_URL_CHANGE_EVENT } from "../../api/runtime.js";
+  import { codexCloudStatusLine } from "../../utils/codexCloudStatus.js";
   import { ActivityIcon } from "../../icons.js";
   import {
     formatNumber,
@@ -14,6 +17,7 @@
   } from "../../utils/format.js";
 
   const RELATIVE_TIME_REFRESH_MS = 10_000;
+  const CODEX_CLOUD_STATUS_REFRESH_MS = 10_000;
   const isMac = navigator.platform.toUpperCase().includes("MAC");
   const mod = isMac ? "⌘" : "Ctrl";
   let relativeTimeTick = $state(0);
@@ -65,11 +69,31 @@
     sync.lastSync ? formatTimestamp(sync.lastSync) : null,
   );
 
+  let codexCloudLine = $derived(codexCloudStatusLine(codexCloudStatus.rows));
+
+  // Read-only and archive-only backends cannot rebuild the archive.
+  let canRebuildArchive = $derived(!sync.syncing && !sync.readOnly && !sync.archiveOnly);
+
+  let showSyncError = $derived(!sync.syncing && sync.lastSyncError !== null);
+
   onMount(() => {
     const interval = window.setInterval(() => {
       relativeTimeTick = Date.now();
     }, RELATIVE_TIME_REFRESH_MS);
-    return () => window.clearInterval(interval);
+    const loadCodexCloudStatus = () => void codexCloudStatus.load();
+    loadCodexCloudStatus();
+    const codexCloudInterval = window.setInterval(
+      loadCodexCloudStatus,
+      CODEX_CLOUD_STATUS_REFRESH_MS,
+    );
+    // Some server switches skip the page reload; load at once so the
+    // previous server's rows do not linger until the next poll.
+    window.addEventListener(SERVER_URL_CHANGE_EVENT, loadCodexCloudStatus);
+    return () => {
+      window.clearInterval(interval);
+      window.clearInterval(codexCloudInterval);
+      window.removeEventListener(SERVER_URL_CHANGE_EVENT, loadCodexCloudStatus);
+    };
   });
 </script>
 
@@ -127,6 +151,23 @@
       </button>
       <span class="sep">&middot;</span>
     {/if}
+    {#if codexCloudLine}
+      {@const detail = codexCloudLine.detail}
+      <!-- The tooltip class opts the bubble into the fixed overlay zoom
+           compensation in app.css. -->
+      <Tooltip focusable align="end" class="tooltip">
+        {#snippet content()}
+          <span class="codex-cloud-detail">{detail}</span>
+        {/snippet}
+        <span
+          class="codex-cloud-status"
+          class:codex-cloud-status--warn={codexCloudLine.warn}
+        >
+          {codexCloudLine.summary}
+        </span>
+      </Tooltip>
+      <span class="sep">&middot;</span>
+    {/if}
     {#if sync.isDesktop}
       <div class="zoom-controls">
         <button
@@ -177,23 +218,35 @@
     {/if}
     {#if sync.archiveStale}
       {#if sync.versionMismatch}<span class="sep">&middot;</span>{/if}
-      <span class="archive-warn" role="status">
-        {sync.syncing && sync.progress?.resync ? m.status_bar_archive_rebuilding() : m.status_bar_archive_stale()}
+      {#if sync.syncing && sync.progress?.resync}
+        <span class="archive-warn" role="status">{m.status_bar_archive_rebuilding()}</span>
+      {:else if canRebuildArchive}
+        <button class="archive-warn archive-rebuild" onclick={() => sync.triggerSync()}>
+          {m.status_bar_archive_stale_rebuild()}
+        </button>
+      {:else}
+        <span class="archive-warn" role="status">{m.status_bar_archive_stale()}</span>
+      {/if}
+    {/if}
+    {#if showSyncError}
+      {#if sync.versionMismatch || sync.archiveStale}<span class="sep">&middot;</span>{/if}
+      <span class="sync-error" role="alert" title={sync.lastSyncError ?? undefined}>
+        {m.status_bar_sync_failed()}
       </span>
     {/if}
     {#if progressText}
-      {#if sync.versionMismatch || sync.archiveStale}<span class="sep">&middot;</span>{/if}
+      {#if sync.versionMismatch || sync.archiveStale || showSyncError}<span class="sep">&middot;</span>{/if}
       <span class="sync-progress" title={progressTitle ?? undefined}>
         {progressText}
       </span>
     {:else if lastSyncText}
-      {#if sync.versionMismatch || sync.archiveStale}<span class="sep">&middot;</span>{/if}
+      {#if sync.versionMismatch || sync.archiveStale || showSyncError}<span class="sep">&middot;</span>{/if}
       <span title={lastSyncTimestamp ?? undefined}>
         {m.status_bar_synced_ago({ time: lastSyncText })}
       </span>
     {/if}
     {#if sync.serverVersion}
-      {#if sync.versionMismatch || sync.archiveStale || progressText || sync.lastSync}
+      {#if sync.versionMismatch || sync.archiveStale || showSyncError || progressText || sync.lastSync}
         <span class="sep">&middot;</span>
       {/if}
       <button
@@ -228,8 +281,35 @@
     color: var(--accent-orange);
   }
 
+  .archive-rebuild:hover {
+    text-decoration: underline;
+  }
+
+  .sync-error {
+    color: var(--accent-red);
+    font-weight: 500;
+  }
+
   .sync-progress {
     color: var(--accent-green);
+  }
+
+  .codex-cloud-status {
+    font-size: 10px;
+    white-space: nowrap;
+    cursor: default;
+  }
+
+  .codex-cloud-status--warn {
+    color: var(--accent-red);
+    font-weight: 500;
+  }
+
+  /* The detail is one line per fact; long home paths break anywhere to
+   * stay inside the bubble. */
+  .codex-cloud-detail {
+    white-space: pre-line;
+    overflow-wrap: anywhere;
   }
 
   .perf-toggle {

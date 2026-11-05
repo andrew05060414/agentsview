@@ -1,8 +1,10 @@
 package parser
 
 import (
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
@@ -711,9 +713,9 @@ func TestCodexBuilderCanUseLexicalProjectDiscovery(t *testing.T) {
 
 	ctx := WithoutFilesystemProjectDiscovery(t.Context())
 	builder := newCodexSessionBuilder(
-		ctx, AgentCodex, false, nil, NewCodexCollectingSink(0),
+		AgentCodex, false, nil, NewCodexCollectingSink(0),
 	)
-	builder.handleSessionMeta(gjson.Parse(`{"id":"abc","cwd":`+
+	builder.handleSessionMeta(ctx, gjson.Parse(`{"id":"abc","cwd":`+
 		fmt.Sprintf("%q", cwd)+`}`), time.Time{})
 
 	assert.Equal(t, "recorded_cwd", builder.project)
@@ -746,6 +748,74 @@ func TestCodexInsertMessage_PreservesChronologyOnSameOrdinal(t *testing.T) {
 }
 
 func TestParseCodexSession_FunctionCalls(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		toolName   string
+		args       map[string]any
+		output     any
+		wantOutput string
+		wantEvents []ParsedToolResultEvent
+	}{
+		{
+			name:       "code-mode finished wait output becomes tool result",
+			toolName:   "wait",
+			args:       map[string]any{"cell_id": "6", "yield_time_ms": 30000, "max_tokens": 5000},
+			output:     jsontext.Value(testjsonl.CodexCodeModeWaitOutput),
+			wantOutput: testjsonl.CodexCodeModeWaitOutput,
+		},
+		{
+			name:       "code-mode running wait output becomes tool result",
+			toolName:   "wait",
+			args:       map[string]any{"cell_id": "6", "yield_time_ms": 30000, "max_tokens": 5000},
+			output:     "Script running with cell ID 6\nWall time 30 seconds",
+			wantOutput: "Script running with cell ID 6\nWall time 30 seconds",
+		},
+		{
+			name:     "subagent wait without ids keeps status events",
+			toolName: "wait",
+			args:     map[string]any{"timeout_ms": 300000},
+			output:   `{"status":{"dddddddd-dddd-4ddd-8ddd-dddddddddddd":{"completed":"Task complete."}}}`,
+			wantEvents: []ParsedToolResultEvent{{
+				ToolUseID:         "call_wait",
+				AgentID:           "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+				SubagentSessionID: "codex:dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+				Source:            "wait_output",
+				Status:            "completed",
+				Content:           "Task complete.",
+			}},
+		},
+		{
+			name:     "subagent wait completion adds no result",
+			toolName: "wait_agent",
+			args:     map[string]any{"timeout_ms": 300000},
+			output:   `{"message":"Wait completed.","timed_out":false}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			content := testjsonl.JoinJSONL(
+				testjsonl.CodexSessionMetaJSON("fc-wait", "/tmp", "user", tsEarly),
+				testjsonl.CodexMsgJSON("user", "wait for the task", tsEarlyS1),
+				testjsonl.CodexFunctionCallWithCallIDJSON(tt.toolName, "call_wait", tt.args, tsEarlyS5),
+				testjsonl.CodexFunctionCallOutputJSON("call_wait", tt.output, tsLate),
+			)
+			_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+			require.Len(t, msgs, 2)
+			require.Len(t, msgs[1].ToolCalls, 1)
+			call := msgs[1].ToolCalls[0]
+			assert.Equal(t, tt.toolName, call.ToolName)
+			if tt.wantOutput == "" {
+				assertToolResultEvents(t, call.ResultEvents, tt.wantEvents)
+			} else {
+				assertToolResultEvents(t, call.ResultEvents, []ParsedToolResultEvent{{
+					ToolUseID: "call_wait",
+					Source:    "function_call_output",
+					Content:   tt.wantOutput,
+				}})
+			}
+		})
+	}
+
 	t.Run("function calls", func(t *testing.T) {
 		content := loadFixture(t, "codex/function_calls.jsonl")
 		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
@@ -895,7 +965,7 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		line := `{"timestamp":"2026-07-08T03:20:43.376Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_abc","output":"Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess."}}`
 
 		b := newCodexSessionBuilder(
-			t.Context(), AgentCodex, false, nil, NewCodexCollectingSink(0),
+			AgentCodex, false, nil, NewCodexCollectingSink(0),
 		)
 		b.rememberToolCall("call_abc", "exec_command", &ParsedToolCallPosition{MessageOrdinal: 1, CallIndex: 0})
 		assert.False(t, b.codexIncrementalNeedsFullParse(line))
@@ -2024,6 +2094,59 @@ func TestParseCodexSession_ForkedSessionSkipsReplayedHistory(t *testing.T) {
 		require.Len(t, msgs, 2)
 		assert.Equal(t, 500, sess.TotalOutputTokens)
 	})
+}
+
+func TestParseCodexSessionForkLineage(t *testing.T) {
+	const (
+		parentID = "a1000000-0000-4000-8000-000000000001"
+		childID  = "a1000000-0000-4000-8000-000000000002"
+	)
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "rollout-2026-01-10T10-00-00-"+parentID+".jsonl"),
+		[]byte(testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON(parentID, "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextWithIDJSON("gpt-5", "parent-turn", tsEarly),
+			testjsonl.CodexMsgJSON("user", "parent question", tsEarly),
+		)), 0o600,
+	))
+	forkMeta := testjsonl.CodexForkedSessionMetaJSON(childID, parentID, "/tmp", "user", tsEarly)
+	subagentFork := testjsonl.CodexSessionMetaWithFieldsJSON(childID, "/tmp", "user", tsEarly, map[string]any{
+		"forked_from_id": parentID,
+		"source": map[string]any{"subagent": map[string]any{
+			"thread_spawn": map[string]any{"parent_thread_id": "spawner"},
+		}},
+	})
+	tests := []struct {
+		name         string
+		meta         string
+		wantParent   string
+		wantRelation RelationshipType
+	}{
+		{"ordinary fork links its source thread", forkMeta, "codex:" + parentID, RelFork},
+		{"subagent parent wins over fork source", subagentFork, "codex:spawner", RelSubagent},
+		{"plain session has no parent", testjsonl.CodexSessionMetaJSON(childID, "/tmp", "user", tsEarly), "", RelNone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(root, "rollout-2026-01-10T10-00-01-"+childID+".jsonl")
+			require.NoError(t, os.WriteFile(path, []byte(testjsonl.JoinJSONL(
+				tt.meta,
+				testjsonl.CodexTurnContextWithIDJSON("gpt-5", "child-turn", tsEarlyS1),
+				testjsonl.CodexMsgJSON("user", "child question", tsEarlyS1),
+				testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
+			)), 0o600))
+			sess, msgs, err := newCodexTestProvider(t, root).parseSession(path, "local", false)
+			require.NoError(t, err)
+			require.NotNil(t, sess)
+			assert.Equal(t, "codex:"+childID, sess.ID)
+			assert.Equal(t, tt.wantParent, sess.ParentSessionID)
+			assert.Equal(t, tt.wantRelation, sess.RelationshipType)
+			require.Len(t, msgs, 2)
+			assert.Equal(t, "child question", msgs[0].Content)
+			assert.Equal(t, "child answer", msgs[1].Content)
+		})
+	}
 }
 
 func TestParseCodexSessionWithCursorActiveForkGateNeverPersistsCheckpoint(
@@ -3477,42 +3600,115 @@ func TestParseCodexSessionFrom_CollabAgentSpawnEndRequiresFullParse(t *testing.T
 	assert.Contains(t, err.Error(), "full parse")
 }
 
+func TestParseCodexSessionFrom_CodeModeWaitStaysIncremental(t *testing.T) {
+	t.Parallel()
+
+	args := `{"cell_id":"g1","yield_time_ms":100000,"max_tokens":3000}`
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("inc-cell-wait", "/tmp", "codex_cli_rs", tsEarly),
+		testjsonl.CodexMsgJSON("user", "run code", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON("exec", "call_exec", `{"code":"await run()"}`, tsEarlyS5),
+		testjsonl.CodexFunctionCallOutputJSON("call_exec", "Script running with cell ID g1", tsLate),
+	)
+	path := createTestFile(t, "codex-cell-wait-inc.jsonl", initial)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	appendCodexProviderContent(t, path, testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallWithCallIDJSON("wait", "call_wait", args, tsLateS5),
+	))
+
+	msgs, _, consumed, err := parseCodexTestSessionFrom(t, path, info.Size(), 2, false)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	require.Len(t, msgs[0].ToolCalls, 1)
+	assert.Equal(t, "wait", msgs[0].ToolCalls[0].ToolName)
+	offset := info.Size() + consumed
+
+	appendCodexProviderContent(t, path, testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON("call_wait", []map[string]any{
+			{"type": "input_text", "text": "Script completed\nWall time 4.7 seconds\nOutput:\n"},
+		}, "2024-01-01T10:01:06Z"),
+	))
+
+	msgs, _, consumed, err = parseCodexTestSessionFrom(t, path, offset, 3, false)
+	require.NoError(t, err)
+	assert.Empty(t, msgs, "the output append must not replay earlier tool calls")
+	info, err = os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, info.Size()-offset, consumed)
+}
+
+func TestParseCodexSessionFrom_WaitOutputRequiresFullParse(t *testing.T) {
+	t.Parallel()
+
+	childID := "019c9c96-6ee7-77c0-ba4c-380f844289d5"
+	output := `{"status":{},"timed_out":true}`
+	initial := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("inc-wait-output", "/tmp", "codex_cli_rs", tsEarly),
+		testjsonl.CodexMsgJSON("user", "run child", tsEarlyS1),
+		testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "call_spawn", `{"agent_type":"awaiter","message":"run it"}`, tsEarlyS5),
+		testjsonl.CodexFunctionCallOutputJSON("call_spawn", `{"agent_id":"`+childID+`","nickname":"Fennel"}`, tsLate),
+		testjsonl.CodexFunctionCallWithCallIDJSON("wait", "call_wait", `{"ids":["`+childID+`"]}`, tsLateS5),
+	)
+	path := createTestFile(t, "codex-wait-output-inc.jsonl", initial)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	appendCodexProviderContent(t, path, testjsonl.JoinJSONL(
+		testjsonl.CodexFunctionCallOutputJSON("call_wait", output, "2024-01-01T10:01:06Z"),
+	))
+
+	_, _, _, err = parseCodexTestSessionFrom(t, path, info.Size(), 3, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "full parse")
+}
+
 func TestParseCodexSessionFrom_WaitCallRequiresFullParse(t *testing.T) {
 	t.Parallel()
 
 	childID := "019c9c96-6ee7-77c0-ba4c-380f844289d5"
-	notification := "<subagent_notification>\n" +
-		"{\"agent_id\":\"" + childID + "\",\"status\":{\"completed\":\"Finished successfully\"}}\n" +
-		"</subagent_notification>"
-	initial := testjsonl.JoinJSONL(
-		testjsonl.CodexSessionMetaJSON("inc-wait", "/tmp", "codex_cli_rs", tsEarly),
-		testjsonl.CodexMsgJSON("user", "run child", tsEarlyS1),
-		testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "call_spawn", map[string]any{
-			"agent_type": "awaiter",
-			"message":    "run it",
-		}, tsEarlyS5),
-		testjsonl.CodexFunctionCallOutputJSON("call_spawn", `{"agent_id":"`+childID+`","nickname":"Fennel"}`, tsLate),
-		testjsonl.CodexMsgJSON("user", notification, tsLateS5),
-	)
-	path := createTestFile(t, "codex-wait-inc.jsonl", initial)
+	for _, tt := range []struct {
+		name string
+		args string
+	}{
+		{"ids only", `{"ids":["` + childID + `"]}`},
+		{"cell and ids", `{"cell_id":"g1","ids":["` + childID + `"]}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			notification := "<subagent_notification>\n" +
+				"{\"agent_id\":\"" + childID + "\",\"status\":{\"completed\":\"Finished successfully\"}}\n" +
+				"</subagent_notification>"
+			initial := testjsonl.JoinJSONL(
+				testjsonl.CodexSessionMetaJSON("inc-wait", "/tmp", "codex_cli_rs", tsEarly),
+				testjsonl.CodexMsgJSON("user", "run child", tsEarlyS1),
+				testjsonl.CodexFunctionCallWithCallIDJSON("spawn_agent", "call_spawn", map[string]any{
+					"agent_type": "awaiter",
+					"message":    "run it",
+				}, tsEarlyS5),
+				testjsonl.CodexFunctionCallOutputJSON("call_spawn", `{"agent_id":"`+childID+`","nickname":"Fennel"}`, tsLate),
+				testjsonl.CodexMsgJSON("user", notification, tsLateS5),
+			)
+			path := createTestFile(t, "codex-wait-inc.jsonl", initial)
 
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	offset := info.Size()
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			offset := info.Size()
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
-	require.NoError(t, err)
-	_, err = f.WriteString(testjsonl.JoinJSONL(
-		testjsonl.CodexFunctionCallWithCallIDJSON("wait", "call_wait", map[string]any{
-			"ids": []string{childID},
-		}, "2024-01-01T10:01:06Z"),
-	))
-	require.NoError(t, err)
-	require.NoError(t, f.Close())
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+			require.NoError(t, err)
+			_, err = f.WriteString(testjsonl.JoinJSONL(
+				testjsonl.CodexFunctionCallWithCallIDJSON("wait", "call_wait", tt.args, "2024-01-01T10:01:06Z"),
+			))
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
 
-	_, _, _, err = parseCodexTestSessionFrom(t, path, offset, 4, false)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "full parse")
+			_, _, _, err = parseCodexTestSessionFrom(t, path, offset, 4, false)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "full parse")
+		})
+	}
 }
 
 func TestParseCodexSessionFrom_WaitAgentCallRequiresFullParse(t *testing.T) {
@@ -3963,4 +4159,63 @@ func TestParseCodexSession_ArrayOutputKeepsRawJSON(t *testing.T) {
 	require.Len(t, msgs[1].ToolCalls, 1)
 	require.Len(t, msgs[1].ToolCalls[0].ResultEvents, 1)
 	assert.Equal(t, output, msgs[1].ToolCalls[0].ResultEvents[0].Content)
+}
+
+func TestCodexServiceTierMessages(t *testing.T) {
+	settings := func(provider, tier string) string {
+		return `{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model_provider_id":"` + provider + `","service_tier":"` + tier + `"}}}`
+	}
+	turn := func(id string) string {
+		return `{"type":"turn_context","payload":{"turn_id":"` + id + `","model":"gpt-6.1-sol"}}`
+	}
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		want  []string
+	}{
+		{"tier changes", []string{
+			testjsonl.CodexSessionMetaJSON("tier-1", "/tmp", "user", tsEarly),
+			settings("openai", "priority"),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "answer", tsEarlyS5),
+			testjsonl.CodexFunctionCallJSON("shell", "run command", tsLate),
+			settings("openai", "ultrafast"),
+			testjsonl.CodexMsgJSON("assistant", "after tier change", tsLate),
+			settings("openai", "priority"),
+			testjsonl.CodexMsgJSON("assistant", "Fast again", tsLateS5),
+			settings("azure", "priority"),
+			testjsonl.CodexMsgJSON("assistant", "other provider", tsLateS5),
+			`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model_provider_id":"openai"}}}`,
+			testjsonl.CodexMsgJSON("assistant", "missing tier", tsLateS5),
+		}, []string{"", "openai-priority", "openai-priority", "", "openai-priority", "", ""}},
+		{"fork replay", []string{
+			`{"type":"session_meta","payload":{"id":"child","forked_from_id":"parent","cwd":"/workspace"}}`,
+			testjsonl.CodexSessionMetaJSON("parent", "/workspace", "user", tsEarly),
+			turn("parent-turn"), settings("openai", "priority"), turn("child-turn"),
+			testjsonl.CodexMsgJSON("assistant", "child answer", tsEarlyS5),
+		}, []string{"openai-priority"}},
+		{"image generation", []string{
+			testjsonl.CodexSessionMetaJSON("image-tier", "/workspace", "user", tsEarly),
+			settings("openai", "priority"),
+			testjsonl.CodexImageGenerationCallJSON(
+				"call-image", "draw an image",
+				testjsonl.SolidPNGBase64(1, 1, color.RGBA{A: 255}), tsEarlyS5,
+			),
+		}, []string{"openai-priority"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newCodexSessionBuilder(AgentCodex, false, func(string) (map[string]struct{}, bool) {
+				return map[string]struct{}{"parent-turn": {}}, true
+			}, NewCodexCollectingSink(0))
+			for _, line := range tc.lines {
+				_, err := b.processLine(t.Context(), line)
+				require.NoError(t, err)
+			}
+			var got []string
+			for _, message := range b.sink.Messages() {
+				got = append(got, message.ProviderID)
+			}
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

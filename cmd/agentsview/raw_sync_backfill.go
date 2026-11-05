@@ -25,10 +25,7 @@ import (
 	"go.kenn.io/agentsview/internal/rawwatch"
 )
 
-const (
-	defaultRawSyncBackfillBatch = 128
-	rawSyncBackfillExitCode     = 2
-)
+const defaultRawSyncBackfillBatch = 128
 
 type rawSyncBackfillConfig struct {
 	Server            string
@@ -224,7 +221,7 @@ func runRawSyncBackfill(
 	cfg rawSyncBackfillConfig,
 	credential string,
 ) error {
-	appCfg, err := config.LoadReadOnly()
+	appCfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 	if err != nil {
 		return errors.New("raw-sync backfill: configuration could not be loaded")
 	}

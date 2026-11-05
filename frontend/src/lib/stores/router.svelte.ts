@@ -12,6 +12,7 @@ export type Route =
   | "trends"
   | "recall"
   | "quality"
+  | "friction"
   | "pinned"
   | "trash"
   | "recent-edits"
@@ -26,6 +27,7 @@ const VALID_ROUTES: ReadonlySet<string> = new Set<Route>([
   "trends",
   "recall",
   "quality",
+  "friction",
   "pinned",
   "trash",
   "recent-edits",
@@ -231,6 +233,13 @@ export class RouterStore {
     this.sessionId = id;
     this.isRootPath = false;
     window.history.pushState(null, "", url);
+  }
+
+  replaceSession(id: string) {
+    const url = this.#buildUrl(sessionPath(id), this.params);
+    this.sessionId = id;
+    this.isRootPath = false;
+    window.history.replaceState(null, "", url);
   }
 
   navigateFromSession(params: Record<string, string> = {}) {

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -15,19 +16,6 @@ import (
 
 const pushComparisonBatchSize = 900
 
-type pushMessageAggregate struct {
-	Count int
-	Sum   int64
-	Max   int64
-	Min   int64
-	SysFP string
-}
-
-type pushToolCallAggregate struct {
-	Count int
-	Sum   int64
-}
-
 type pushFrictionComparison struct {
 	Count        int
 	RulesVersion string
@@ -35,13 +23,11 @@ type pushFrictionComparison struct {
 }
 
 type pushMessageComparison struct {
-	MessageAggregates       map[string]pushMessageAggregate
 	MessageContentHash      map[string]string
 	MessageRoleTime         map[string]string
 	MessageFlags            map[string]string
-	MessageSystemOrdinals   map[string]string
+	MessageDialogue         map[string]string
 	MessageTokenFingerprint map[string]string
-	ToolCallAggregates      map[string]pushToolCallAggregate
 	ToolCallFingerprint     map[string]string
 	ToolResultFingerprint   map[string]string
 	UsageEventFingerprint   map[string]string
@@ -62,6 +48,11 @@ type pushLocalMessageFingerprint struct {
 	ToolResultFP  string
 	TokenFP       string
 	UsageEventFP  string
+	// PlanUsageFP is the archive's session_plan_usage row as
+	// db.PlanUsageFingerprints renders it. It is omitted when empty so
+	// sessions without plan usage keep their stored fingerprints.
+	PlanUsageFP string `json:",omitzero"`
+	DialogueFP  string `json:",omitzero"`
 }
 
 func localSessionDependencyPushFingerprint(
@@ -124,6 +115,7 @@ type localPushDependencyState struct {
 	contentHashFP  map[string]string
 	roleTimeFP     map[string]string
 	flagsFP        map[string]string
+	dialogueFP     map[string]string
 	systemFP       map[string]string
 	tokenFP        map[string]string
 	toolCallCount  map[string]int
@@ -132,6 +124,7 @@ type localPushDependencyState struct {
 	toolResultFP   map[string]string
 	secretFindings map[string][]db.SecretFinding
 	pins           map[string][]db.PinnedMessage
+	planUsageFP    map[string]string
 }
 
 func readLocalPushDependencyState(
@@ -189,6 +182,12 @@ func readLocalPushDependencyState(
 	if st.pins, err = local.PinnedMessagesBySession(ctx, sessionIDs); err != nil {
 		return nil, fmt.Errorf("reading local pinned messages: %w", err)
 	}
+	if st.planUsageFP, err = local.PlanUsageFingerprints(ctx, sessionIDs); err != nil {
+		return nil, fmt.Errorf("computing local plan usage fingerprints: %w", err)
+	}
+	if st.dialogueFP, err = local.MessageDialogueFingerprints(ctx, sessionIDs); err != nil {
+		return nil, fmt.Errorf("computing local dialogue fingerprints: %w", err)
+	}
 	return st, nil
 }
 
@@ -217,6 +216,8 @@ func (st *localPushDependencyState) dependencyFingerprint(
 		ToolCallFP:    st.toolCallFP[sessionID],
 		ToolResultFP:  st.toolResultFP[sessionID],
 		TokenFP:       st.tokenFP[sessionID],
+		PlanUsageFP:   st.planUsageFP[sessionID],
+		DialogueFP:    st.dialogueFP[sessionID],
 	}
 	if usageKnown {
 		msgFP.UsageEventFP = usageEventFingerprint
@@ -282,6 +283,16 @@ func localPushMessageFingerprint(ctx context.Context,
 	if err != nil {
 		return fp, fmt.Errorf("computing local token fingerprint: %w", err)
 	}
+	planUsageFP, err := local.PlanUsageFingerprints(ctx, []string{sessionID})
+	if err != nil {
+		return fp, fmt.Errorf("computing local plan usage fingerprint: %w", err)
+	}
+	dialogueFP, err := local.MessageDialogueFingerprints(ctx, []string{sessionID})
+	if err != nil {
+		return fp, fmt.Errorf("computing local dialogue fingerprint: %w", err)
+	}
+	fp.DialogueFP = dialogueFP[sessionID]
+	fp.PlanUsageFP = planUsageFP[sessionID]
 	if usageKnown {
 		fp.UsageEventFP = usageEventFingerprint
 		return fp, nil
@@ -293,31 +304,18 @@ func localPushMessageFingerprint(ctx context.Context,
 	return fp, nil
 }
 
-func comparisonAggregates(
-	sessionID string,
-	comparisons *pushMessageComparison,
-) (pushMessageAggregate, pushToolCallAggregate, bool) {
-	if comparisons == nil {
-		return pushMessageAggregate{}, pushToolCallAggregate{}, false
-	}
-	return comparisons.MessageAggregates[sessionID],
-		comparisons.ToolCallAggregates[sessionID],
-		true
-}
-
 func readPushSessionMessageComparisons(
 	ctx context.Context,
 	tx *sql.Tx,
 	sessionIDs []string,
+	includeFriction bool,
 ) (*pushMessageComparison, error) {
 	comparisons := &pushMessageComparison{
-		MessageAggregates:       make(map[string]pushMessageAggregate, len(sessionIDs)),
 		MessageContentHash:      make(map[string]string, len(sessionIDs)),
 		MessageRoleTime:         make(map[string]string, len(sessionIDs)),
 		MessageFlags:            make(map[string]string, len(sessionIDs)),
-		MessageSystemOrdinals:   make(map[string]string, len(sessionIDs)),
+		MessageDialogue:         make(map[string]string, len(sessionIDs)),
 		MessageTokenFingerprint: make(map[string]string, len(sessionIDs)),
-		ToolCallAggregates:      make(map[string]pushToolCallAggregate, len(sessionIDs)),
 		ToolCallFingerprint:     make(map[string]string, len(sessionIDs)),
 		ToolResultFingerprint:   make(map[string]string, len(sessionIDs)),
 		UsageEventFingerprint:   make(map[string]string, len(sessionIDs)),
@@ -328,16 +326,28 @@ func readPushSessionMessageComparisons(
 		end := min(i+pushComparisonBatchSize, len(sessionIDs))
 		chunk := sessionIDs[i:end]
 
-		if err := loadPushFrictionComparisons(ctx, tx, chunk, comparisons.Friction); err != nil {
-			return nil, err
-		}
-		if err := loadPushMessageAggregates(ctx, tx, chunk, comparisons.MessageAggregates); err != nil {
-			return nil, err
+		if includeFriction {
+			if err := loadPushFrictionComparisons(ctx, tx, chunk, comparisons.Friction); err != nil {
+				return nil, err
+			}
 		}
 		if err := loadPushMessageContentHashFingerprints(
 			ctx, tx, chunk, comparisons.MessageContentHash,
 		); err != nil {
 			return nil, err
+		}
+		eligible := make([]string, 0, len(chunk))
+		for _, id := range chunk {
+			if comparisons.MessageContentHash[id] != "" {
+				eligible = append(eligible, id)
+			}
+		}
+		if err := loadPushUsageEventFingerprints(ctx, tx, chunk, comparisons.UsageEventFingerprint); err != nil {
+			return nil, err
+		}
+		chunk = eligible
+		if len(chunk) == 0 {
+			continue
 		}
 		if err := loadPushMessageRoleTimeFingerprints(
 			ctx, tx, chunk, comparisons.MessageRoleTime,
@@ -349,18 +359,11 @@ func readPushSessionMessageComparisons(
 		); err != nil {
 			return nil, err
 		}
-		if err := loadPushMessageSystemOrdinals(
-			ctx, tx, chunk, comparisons.MessageSystemOrdinals,
-		); err != nil {
+		if err := loadPushMessageDialogueFingerprints(ctx, tx, chunk, comparisons.MessageDialogue); err != nil {
 			return nil, err
 		}
 		if err := loadPushMessageTokenFingerprints(
 			ctx, tx, chunk, comparisons.MessageTokenFingerprint,
-		); err != nil {
-			return nil, err
-		}
-		if err := loadPushToolCallAggregates(
-			ctx, tx, chunk, comparisons.ToolCallAggregates,
 		); err != nil {
 			return nil, err
 		}
@@ -371,11 +374,6 @@ func readPushSessionMessageComparisons(
 		}
 		if err := loadPushToolResultEventFingerprints(
 			ctx, tx, chunk, comparisons.ToolResultFingerprint,
-		); err != nil {
-			return nil, err
-		}
-		if err := loadPushUsageEventFingerprints(
-			ctx, tx, chunk, comparisons.UsageEventFingerprint,
 		); err != nil {
 			return nil, err
 		}
@@ -426,41 +424,6 @@ func sessionFrictionUnchanged(
 	}), nil
 }
 
-func loadPushMessageAggregates(
-	ctx context.Context,
-	tx *sql.Tx,
-	sessionIDs []string,
-	out map[string]pushMessageAggregate,
-) error {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT session_id, COUNT(*), COALESCE(SUM(content_length), 0),
-			COALESCE(MAX(content_length), 0), COALESCE(MIN(content_length), 0),
-			COALESCE(STRING_AGG(ordinal::text, ',' ORDER BY ordinal)
-				FILTER (WHERE is_system), '')
-		FROM messages
-		WHERE session_id = ANY($1)
-		GROUP BY session_id
-	`, sessionIDs)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var sessionID string
-		var count int64
-		var agg pushMessageAggregate
-		if err := rows.Scan(
-			&sessionID, &count, &agg.Sum, &agg.Max, &agg.Min, &agg.SysFP,
-		); err != nil {
-			return err
-		}
-		agg.Count = int(count)
-		out[sessionID] = agg
-	}
-	return rows.Err()
-}
-
 func loadPushMessageContentHashFingerprints(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -468,7 +431,7 @@ func loadPushMessageContentHashFingerprints(
 	out map[string]string,
 ) error {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT session_id, ordinal, COALESCE(content, ''),
+		SELECT session_id, ordinal, sha256(convert_to(COALESCE(content, ''), 'UTF8')),
 			content_length
 		FROM messages
 		WHERE session_id = ANY($1)
@@ -483,17 +446,16 @@ func loadPushMessageContentHashFingerprints(
 	for rows.Next() {
 		var sessionID string
 		var ordinal, contentLength int
-		var content string
+		var content pushDigest
 		if err := rows.Scan(&sessionID, &ordinal, &content, &contentLength); err != nil {
 			return err
 		}
-		sum := sha256.Sum256([]byte(db.SanitizeUTF8(content)))
 		b := builders[sessionID]
 		if b == nil {
 			b = &strings.Builder{}
 			builders[sessionID] = b
 		}
-		fmt.Fprintf(b, "%d|%d|%x;", ordinal, contentLength, sum)
+		fmt.Fprintf(b, "%d|%d|%s;", ordinal, contentLength, content)
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -563,7 +525,7 @@ func loadPushMessageFlagFingerprints(
 ) error {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT session_id, ordinal, is_system, has_thinking, has_tool_use,
-			COALESCE(thinking_text, '')
+			sha256(convert_to(COALESCE(thinking_text, ''), 'UTF8'))
 		 FROM messages
 		WHERE session_id = ANY($1)
 		ORDER BY session_id, ordinal ASC
@@ -578,22 +540,21 @@ func loadPushMessageFlagFingerprints(
 		var sessionID string
 		var ordinal int
 		var isSystem, hasThinking, hasToolUse bool
-		var thinkingText string
+		var thinkingText pushDigest
 		if err := rows.Scan(
 			&sessionID, &ordinal, &isSystem, &hasThinking, &hasToolUse,
 			&thinkingText,
 		); err != nil {
 			return err
 		}
-		sum := sha256.Sum256([]byte(db.SanitizeUTF8(thinkingText)))
 		b := builders[sessionID]
 		if b == nil {
 			b = &strings.Builder{}
 			builders[sessionID] = b
 		}
 		fmt.Fprintf(
-			b, "%d|%t|%t|%t|%x;", ordinal, isSystem, hasThinking,
-			hasToolUse, sum,
+			b, "%d|%t|%t|%t|%s;", ordinal, isSystem, hasThinking,
+			hasToolUse, thinkingText,
 		)
 	}
 	if err := rows.Err(); err != nil {
@@ -603,39 +564,6 @@ func loadPushMessageFlagFingerprints(
 		out[sessionID] = b.String()
 	}
 	return nil
-}
-
-func loadPushMessageSystemOrdinals(
-	ctx context.Context,
-	tx *sql.Tx,
-	sessionIDs []string,
-	out map[string]string,
-) error {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT session_id,
-			COALESCE(
-				STRING_AGG(ordinal::text, ',' ORDER BY ordinal)
-					FILTER (WHERE is_system),
-				''
-			)
-		FROM messages
-		WHERE session_id = ANY($1)
-		GROUP BY session_id
-	`, sessionIDs)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var sessionID string
-		var systemOrdinals string
-		if err := rows.Scan(&sessionID, &systemOrdinals); err != nil {
-			return err
-		}
-		out[sessionID] = systemOrdinals
-	}
-	return rows.Err()
 }
 
 func loadPushMessageTokenFingerprints(
@@ -711,37 +639,6 @@ func loadPushMessageTokenFingerprints(
 	return nil
 }
 
-func loadPushToolCallAggregates(
-	ctx context.Context,
-	tx *sql.Tx,
-	sessionIDs []string,
-	out map[string]pushToolCallAggregate,
-) error {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT session_id,
-			COUNT(*), COALESCE(SUM(result_content_length), 0)
-		FROM tool_calls
-		WHERE session_id = ANY($1)
-		GROUP BY session_id
-	`, sessionIDs)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var sessionID string
-		var agg pushToolCallAggregate
-		var count int64
-		if err := rows.Scan(&sessionID, &count, &agg.Sum); err != nil {
-			return err
-		}
-		agg.Count = int(count)
-		out[sessionID] = agg
-	}
-	return rows.Err()
-}
-
 func loadPushToolCallFingerprints(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -750,11 +647,11 @@ func loadPushToolCallFingerprints(
 ) error {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT session_id, message_ordinal, call_index, tool_name, category,
-			tool_use_id, COALESCE(input_json, ''),
+			tool_use_id, sha256(convert_to(COALESCE(input_json, ''), 'UTF8')),
 			COALESCE(skill_name, ''), COALESCE(subagent_session_id, ''),
 			COALESCE(result_content_length, 0),
-			COALESCE(result_content, ''),
-			COALESCE(file_path, ''), COALESCE(observed_outcome, ''), COALESCE(observed_repeat, ''), COALESCE(sequence_ending, '')
+			sha256(convert_to(COALESCE(result_content, ''), 'UTF8')),
+			sha256(convert_to(COALESCE(file_path, ''), 'UTF8')), COALESCE(observed_outcome, ''), COALESCE(observed_repeat, ''), COALESCE(sequence_ending, '')
 		 FROM tool_calls
 		WHERE session_id = ANY($1)
 		ORDER BY session_id, message_ordinal ASC, call_index ASC
@@ -768,8 +665,9 @@ func loadPushToolCallFingerprints(
 	for rows.Next() {
 		var sessionID string
 		var messageOrdinal, callIndex, resultContentLength int
-		var toolName, category, toolUseID, inputJSON string
-		var skillName, subagentSessionID, resultContent, filePath string
+		var toolName, category, toolUseID string
+		var inputJSON, resultContent, filePath pushDigest
+		var skillName, subagentSessionID string
 		var observedOutcome, observedRepeat, sequenceEnding string
 		if err := rows.Scan(
 			&sessionID, &messageOrdinal, &callIndex, &toolName,
@@ -784,21 +682,22 @@ func loadPushToolCallFingerprints(
 			b = &strings.Builder{}
 			builders[sessionID] = b
 		}
-		fmt.Fprintf(
-			b,
-			"%d|%d|%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%d|%d:%s|%d:%s;",
-			messageOrdinal, callIndex,
-			len(toolName), toolName,
-			len(category), category,
-			len(toolUseID), toolUseID,
-			len(inputJSON), inputJSON,
-			len(skillName), skillName,
-			len(subagentSessionID), subagentSessionID,
-			resultContentLength,
-			len(resultContent), resultContent,
-			len(filePath), filePath,
-		)
-		fmt.Fprintf(b, "%d:%s|%d:%s|%d:%s;", len(observedOutcome), observedOutcome, len(observedRepeat), observedRepeat, len(sequenceEnding), sequenceEnding)
+		db.AppendToolCallFingerprintFields(b, db.ToolCallFingerprintFields{
+			MessageOrdinal:      messageOrdinal,
+			CallIndex:           callIndex,
+			ToolName:            toolName,
+			Category:            category,
+			ToolUseID:           toolUseID,
+			InputValue:          string(inputJSON),
+			SkillName:           skillName,
+			SubagentSessionID:   subagentSessionID,
+			ResultContentLength: resultContentLength,
+			ResultValue:         string(resultContent),
+			FilePathValue:       string(filePath),
+			ObservedOutcome:     observedOutcome,
+			ObservedRepeat:      observedRepeat,
+			SequenceEnding:      sequenceEnding,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -897,7 +796,7 @@ func loadPushToolResultEventFingerprints(
 		SELECT session_id, tool_call_message_ordinal, call_index, event_index,
 			COALESCE(tool_use_id, ''), COALESCE(agent_id, ''),
 			COALESCE(subagent_session_id, ''), source, status,
-			content, content_length, timestamp
+			sha256(convert_to(COALESCE(content, ''), 'UTF8')), content_length, timestamp
 		 FROM tool_result_events
 		WHERE session_id = ANY($1)
 		ORDER BY session_id, tool_call_message_ordinal ASC, call_index ASC, event_index ASC
@@ -912,7 +811,8 @@ func loadPushToolResultEventFingerprints(
 		var sessionID string
 		var messageOrdinal, callIndex, eventIndex, contentLength int
 		var toolUseID, agentID, subagentSessionID string
-		var source, status, content string
+		var source, status string
+		var content pushDigest
 		var timestamp sql.NullTime
 		if err := rows.Scan(
 			&sessionID, &messageOrdinal, &callIndex, &eventIndex,
@@ -935,11 +835,9 @@ func loadPushToolResultEventFingerprints(
 		subagentSessionID = db.SanitizeUTF8(subagentSessionID)
 		source = db.SanitizeUTF8(source)
 		status = db.SanitizeUTF8(status)
-		content = db.SanitizeUTF8(content)
-		contentSum := sha256.Sum256([]byte(content))
 		fmt.Fprintf(
 			b,
-			"%d|%d|%d|%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%d|%x|%d:%s;",
+			"%d|%d|%d|%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%d|%s|%d:%s;",
 			messageOrdinal, callIndex, eventIndex,
 			len(toolUseID), toolUseID,
 			len(agentID), agentID,
@@ -947,7 +845,7 @@ func loadPushToolResultEventFingerprints(
 			len(source), source,
 			len(status), status,
 			contentLength,
-			contentSum,
+			content,
 			len(timestampText), timestampText,
 		)
 	}
@@ -969,94 +867,6 @@ func localToolResultEventPGFingerprint(ctx context.Context,
 	)
 }
 
-func pgToolResultEventFingerprint(
-	ctx context.Context, tx *sql.Tx, sessionID string,
-) (string, error) {
-	rows, err := tx.QueryContext(ctx,
-		`SELECT tool_call_message_ordinal, call_index, event_index,
-			COALESCE(tool_use_id, ''), COALESCE(agent_id, ''),
-			COALESCE(subagent_session_id, ''), source, status,
-			content, content_length, timestamp
-		 FROM tool_result_events
-		 WHERE session_id = $1
-		 ORDER BY tool_call_message_ordinal ASC, call_index ASC, event_index ASC`,
-		sessionID,
-	)
-	if err != nil {
-		return "", err
-	}
-	defer rows.Close()
-
-	var b strings.Builder
-	for rows.Next() {
-		var messageOrdinal, callIndex, eventIndex, contentLength int
-		var toolUseID, agentID, subagentSessionID string
-		var source, status, content string
-		var timestamp sql.NullTime
-		if err := rows.Scan(
-			&messageOrdinal, &callIndex, &eventIndex,
-			&toolUseID, &agentID, &subagentSessionID,
-			&source, &status, &content, &contentLength, &timestamp,
-		); err != nil {
-			return "", err
-		}
-		timestampText := ""
-		if timestamp.Valid {
-			timestampText = FormatISO8601(timestamp.Time)
-		}
-		toolUseID = db.SanitizeUTF8(toolUseID)
-		agentID = db.SanitizeUTF8(agentID)
-		subagentSessionID = db.SanitizeUTF8(subagentSessionID)
-		source = db.SanitizeUTF8(source)
-		status = db.SanitizeUTF8(status)
-		content = db.SanitizeUTF8(content)
-		contentSum := sha256.Sum256([]byte(content))
-		fmt.Fprintf(&b,
-			"%d|%d|%d|%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%d|%x|%d:%s;",
-			messageOrdinal, callIndex, eventIndex,
-			len(toolUseID), toolUseID,
-			len(agentID), agentID,
-			len(subagentSessionID), subagentSessionID,
-			len(source), source,
-			len(status), status,
-			contentLength,
-			contentSum,
-			len(timestampText), timestampText,
-		)
-	}
-	return b.String(), rows.Err()
-}
-
-func shouldSkipSessionMessages(
-	sessionID string,
-	localCount int,
-	localFP pushLocalMessageFingerprint,
-	full bool,
-	comparisons *pushMessageComparison,
-) bool {
-	if full || localCount == 0 || comparisons == nil {
-		return false
-	}
-	pgAgg := comparisons.MessageAggregates[sessionID]
-	if pgAgg.Count != localCount || pgAgg.Count == 0 {
-		return false
-	}
-
-	return localFP.Sum == pgAgg.Sum &&
-		localFP.Max == pgAgg.Max &&
-		localFP.Min == pgAgg.Min &&
-		localFP.ContentHashFP == comparisons.MessageContentHash[sessionID] &&
-		localFP.RoleTimeFP == comparisons.MessageRoleTime[sessionID] &&
-		localFP.FlagsFP == comparisons.MessageFlags[sessionID] &&
-		localFP.SystemFP == comparisons.MessageSystemOrdinals[sessionID] &&
-		localFP.ToolCallCount == comparisons.ToolCallAggregates[sessionID].Count &&
-		localFP.ToolCallSum == comparisons.ToolCallAggregates[sessionID].Sum &&
-		localFP.ToolCallFP == comparisons.ToolCallFingerprint[sessionID] &&
-		localFP.ToolResultFP == comparisons.ToolResultFingerprint[sessionID] &&
-		localFP.TokenFP == comparisons.MessageTokenFingerprint[sessionID] &&
-		localFP.UsageEventFP == comparisons.UsageEventFingerprint[sessionID]
-}
-
 func localUsageEventPGFingerprint(ctx context.Context, local *db.DB, sessionID string) (string, error) {
 	fingerprints, err := local.SortedUsageEventFingerprints(
 		ctx, []string{sessionID}, pgUsageEventTimestampFingerprintText,
@@ -1076,4 +886,65 @@ func pgUsageEventTimestampFingerprintText(value string) string {
 		return value
 	}
 	return normalized
+}
+
+func loadPushMessageDialogueFingerprints(ctx context.Context, tx *sql.Tx, sessionIDs []string, out map[string]string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT session_id, ordinal, sha256(convert_to(dialogue_text, 'UTF8'))
+        FROM messages WHERE session_id = ANY($1) AND dialogue_text IS NOT NULL
+        ORDER BY session_id, ordinal`, sessionIDs)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	builders := make(map[string]*strings.Builder, len(sessionIDs))
+	for rows.Next() {
+		var id string
+		var dialogue pushDigest
+		var ordinal int
+		if err := rows.Scan(&id, &ordinal, &dialogue); err != nil {
+			return err
+		}
+		b := builders[id]
+		if b == nil {
+			b = &strings.Builder{}
+			builders[id] = b
+		}
+		fmt.Fprintf(b, "%d|%s;", ordinal, dialogue)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for id, b := range builders {
+		out[id] = b.String()
+	}
+	return nil
+}
+
+// pushDigest accepts PostgreSQL bytea and CockroachDB hexadecimal text.
+type pushDigest string
+
+func (d *pushDigest) Scan(value any) error {
+	switch value := value.(type) {
+	case []byte:
+		if len(value) != sha256.Size {
+			return fmt.Errorf("invalid binary SHA-256 length %d", len(value))
+		}
+		*d = pushDigest(hex.EncodeToString(value))
+	case string:
+		decoded, err := hex.DecodeString(value)
+		if err != nil || len(decoded) != sha256.Size {
+			return errors.New("invalid hexadecimal SHA-256 digest")
+		}
+		*d = pushDigest(hex.EncodeToString(decoded))
+	default:
+		return fmt.Errorf("unexpected SHA-256 type %T", value)
+	}
+	return nil
+}
+
+func (c *pushMessageComparison) messageFields(id string) db.MessageComparisonFields {
+	return db.MessageComparisonFields{
+		ContentHash: c.MessageContentHash[id], RoleTime: c.MessageRoleTime[id], Flags: c.MessageFlags[id], Dialogue: c.MessageDialogue[id],
+		Token: c.MessageTokenFingerprint[id], ToolCalls: c.ToolCallFingerprint[id], ToolResults: c.ToolResultFingerprint[id],
+	}
 }

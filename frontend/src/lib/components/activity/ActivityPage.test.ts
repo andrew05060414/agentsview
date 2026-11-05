@@ -1,4 +1,9 @@
 // @vitest-environment jsdom
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({
+  reportErrorShown: vi.fn(),
+  reportTelemetry: vi.fn(),
+}));
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { fireEvent, screen } from "@testing-library/svelte";
 import { mount, tick, unmount } from "svelte";
@@ -9,7 +14,6 @@ import { activity } from "../../stores/activity.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import { router } from "../../stores/router.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
-import source from "./ActivityPage.svelte?raw";
 // @ts-ignore
 import ActivityPage from "./ActivityPage.svelte";
 import type { Report } from "../../api/types.js";
@@ -110,6 +114,54 @@ async function selectFirstActivityRange() {
   await fireEvent.pointerDown(target, { button: 0 });
   await fireEvent.pointerUp(window);
 }
+
+it("reports the analytics kind for a displayed report failure", async () => {
+  const { ActivityService } = await import("../../api/generated/index.js");
+  vi.mocked(reportErrorShown).mockClear();
+  vi.spyOn(activity, "attach").mockReturnValue(() => {});
+  vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
+  vi.spyOn(ActivityService, "getApiV1ActivityReport").mockRejectedValueOnce(
+    new Error("Report failed"),
+  );
+  const previousPreset = activity.preset;
+  activity.report = null;
+  activity.preset = "day";
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await vi.waitFor(() =>
+      expect(document.querySelector(".status.error")?.textContent).toContain("Report failed"),
+    );
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics");
+  } finally {
+    await unmount(component);
+    activity.report = null;
+    activity.error = null;
+    activity.preset = previousPreset;
+    vi.restoreAllMocks();
+    document.body.innerHTML = "";
+  }
+});
+
+it("reloads empty machine choices when clearing a rejected selector", async () => {
+  stubActivityPageCollaborators();
+  activity.setMachine("unknown");
+  activity.machines = [];
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await flushEffects();
+    vi.mocked(activity.loadFilterOptions).mockClear();
+    await fireEvent.click(screen.getByTitle("Filter by machine"));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "All Machines" }));
+    expect(activity.machine).toBe("");
+    expect(activity.loadFilterOptions).toHaveBeenCalledTimes(1);
+  } finally {
+    unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.setMachine("");
+  }
+});
 
 it("shows machine labels without full IDs crowding the menu and filters by ID", async () => {
   stubActivityPageCollaborators();
@@ -544,40 +596,6 @@ describe("ActivityPage bucket drill-down", () => {
     await flushEffects();
 
     expect(screen.getByTitle("Clear time filter")).toBeTruthy();
-  });
-});
-
-describe("ActivityPage date yoke controls", () => {
-  it("updates shared yoke state from the unified range picker", () => {
-    expect(source).toContain("<RangePicker");
-    expect(source).toContain("seedActivityYoke");
-    expect(source).toContain("yokedDates.updateFromPanel");
-  });
-
-  it("yokes week and month selections using resolved period starts", () => {
-    expect(source).toContain("startOfIsoWeek(activity.date)");
-    expect(source).toContain("startOfMonth(activity.date)");
-    expect(source).not.toContain("panelDateState(activity.date, addDays(activity.date, 6)");
-    expect(source).not.toContain("panelDateState(activity.date, endOfMonth(activity.date)");
-  });
-
-  it("preserves relative range selections as rolling yoke state", () => {
-    const applyIndex = source.indexOf("function applyRange");
-    const helperIndex = source.indexOf("function yokeStateForSelection");
-    const applyBlock = source.slice(applyIndex, helperIndex);
-
-    expect(helperIndex).toBeGreaterThan(applyIndex);
-    expect(source).toContain('mode: "rolling"');
-    expect(source).toContain("windowDays: sel.days");
-    expect(applyBlock).toContain("yokeStateForSelection(sel, range)");
-    expect(applyBlock).toContain("lastActivityDateSignature = dateSignature");
-  });
-
-  it("preserves rolling window intent in activity URLs", () => {
-    expect(source).toContain("activity.rollingWindowDays");
-    expect(source).toContain("activity.setCustomRange");
-    expect(source).toContain("params.window_days");
-    expect(source).toContain('mode: "relative", days: activity.rollingWindowDays');
   });
 });
 

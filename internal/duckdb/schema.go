@@ -22,8 +22,10 @@ import (
 // serving bare ids that deduplicate across sessions.
 // v17 adds session groups to the rebuilt mirror. v18 adds per-call tool
 // observations for effectiveness rates. v19 adds session pull request links
-// and labels.
-const SchemaVersion = 19
+// and labels. v20 adds codex-cloud plan usage and capture coverage
+// (session_plan_usage).
+// v21 adds messages.dialogue_text.
+const SchemaVersion = 21
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -282,6 +284,7 @@ var mirrorTables = []tableSpec{
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
 			thinking_text TEXT NOT NULL DEFAULT '',
+			dialogue_text TEXT,
 			timestamp TIMESTAMP,
 			has_thinking BOOLEAN NOT NULL DEFAULT FALSE,
 			has_tool_use BOOLEAN NOT NULL DEFAULT FALSE,
@@ -313,6 +316,7 @@ var mirrorTables = []tableSpec{
 			{"role", "role TEXT NOT NULL DEFAULT ''"},
 			{"content", "content TEXT NOT NULL DEFAULT ''"},
 			{"thinking_text", "thinking_text TEXT NOT NULL DEFAULT ''"},
+			{"dialogue_text", "dialogue_text TEXT"},
 			{"timestamp", "timestamp TIMESTAMP"},
 			{"has_thinking", "has_thinking BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"has_tool_use", "has_tool_use BOOLEAN NOT NULL DEFAULT FALSE"},
@@ -384,6 +388,51 @@ var mirrorTables = []tableSpec{
 			"CREATE INDEX IF NOT EXISTS idx_usage_events_session ON usage_events(session_id)",
 			"CREATE INDEX IF NOT EXISTS idx_usage_events_occurred ON usage_events(occurred_at)",
 			"CREATE INDEX IF NOT EXISTS idx_usage_events_dedup ON usage_events(session_id, source, dedup_key)",
+		},
+	},
+	{
+		// One row per session. Times and groups stay the archive's text so
+		// every backend returns the same values. No primary key: a push
+		// deletes and reinserts the row in one transaction.
+		name: "session_plan_usage",
+		create: `CREATE TABLE IF NOT EXISTS session_plan_usage (
+			session_id TEXT NOT NULL,
+			has_plan_usage BOOLEAN NOT NULL DEFAULT FALSE,
+			data_as_of TEXT,
+			data_status TEXT NOT NULL DEFAULT '',
+			usage_source TEXT NOT NULL DEFAULT '',
+			weekly_percent DOUBLE,
+			five_hour_percent DOUBLE,
+			credits TEXT,
+			groups_json TEXT NOT NULL DEFAULT '[]',
+			is_final BOOLEAN NOT NULL DEFAULT FALSE,
+			outcome_kind TEXT NOT NULL DEFAULT '',
+			outcome_at TEXT,
+			counted_under TEXT NOT NULL DEFAULT '',
+			has_coverage BOOLEAN NOT NULL DEFAULT FALSE,
+			last_capture_at TEXT,
+			uncaptured_turns INTEGER NOT NULL DEFAULT 0
+		)`,
+		columns: []columnSpec{
+			{"session_id", "session_id TEXT NOT NULL DEFAULT ''"},
+			{"has_plan_usage", "has_plan_usage BOOLEAN NOT NULL DEFAULT FALSE"},
+			{"data_as_of", "data_as_of TEXT"},
+			{"data_status", "data_status TEXT NOT NULL DEFAULT ''"},
+			{"usage_source", "usage_source TEXT NOT NULL DEFAULT ''"},
+			{"weekly_percent", "weekly_percent DOUBLE"},
+			{"five_hour_percent", "five_hour_percent DOUBLE"},
+			{"credits", "credits TEXT"},
+			{"groups_json", "groups_json TEXT NOT NULL DEFAULT '[]'"},
+			{"is_final", "is_final BOOLEAN NOT NULL DEFAULT FALSE"},
+			{"outcome_kind", "outcome_kind TEXT NOT NULL DEFAULT ''"},
+			{"outcome_at", "outcome_at TEXT"},
+			{"counted_under", "counted_under TEXT NOT NULL DEFAULT ''"},
+			{"has_coverage", "has_coverage BOOLEAN NOT NULL DEFAULT FALSE"},
+			{"last_capture_at", "last_capture_at TEXT"},
+			{"uncaptured_turns", "uncaptured_turns INTEGER NOT NULL DEFAULT 0"},
+		},
+		indexes: []string{
+			"CREATE INDEX IF NOT EXISTS idx_session_plan_usage_session ON session_plan_usage(session_id)",
 		},
 	},
 	{
@@ -1051,7 +1100,7 @@ func checkSchemaShapeCompat(
 			)
 		}
 		return fmt.Errorf(
-			"duckdb schema incompatible; rebuild with 'agentsview duckdb push --full'; missing: %s",
+			"duckdb schema incompatible; rebuild with 'agentsview replica duckdb push --full'; missing: %s",
 			strings.Join(missing, ", "),
 		)
 	}
@@ -1088,7 +1137,7 @@ func checkSchemaShapeCompat(
 	if got != SchemaVersion {
 		return fmt.Errorf(
 			"mirror schema version %d does not match this build's %d; "+
-				"rebuild with 'agentsview duckdb push --full'",
+				"rebuild with 'agentsview replica duckdb push --full'",
 			got, SchemaVersion,
 		)
 	}

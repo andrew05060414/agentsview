@@ -28,6 +28,8 @@ type ProjectTotal struct {
 }
 
 // ModelTotal holds range-wide token and cost totals per model.
+// PlanOnlySessions counts the model's sessions billed as plan usage, which
+// the token and cost figures leave out.
 type ModelTotal struct {
 	Model               string      `json:"model"`
 	InputTokens         int         `json:"inputTokens"`
@@ -35,6 +37,7 @@ type ModelTotal struct {
 	CacheCreationTokens int         `json:"cacheCreationTokens"`
 	CacheReadTokens     int         `json:"cacheReadTokens"`
 	Cost                money.Money `json:"cost"`
+	PlanOnlySessions    int         `json:"planOnlySessions,omitempty"`
 }
 
 // AgentTotal holds range-wide token and cost totals per agent.
@@ -65,7 +68,7 @@ type UnsupportedUsage struct {
 // GET /api/v1/usage/summary while the handler delegates assembly to
 // the transport-neutral service layer.
 type UsageSummaryResponse struct {
-	SchemaVersion    int                               `json:"schema_version,omitempty"`
+	SchemaVersion    int                               `json:"schema_version,omitempty,omitzero"`
 	Pricing          *export.PricingBlock              `json:"pricing,omitempty"`
 	Projects         map[string]export.ProjectMapEntry `json:"projects"`
 	From             string                            `json:"from"`
@@ -79,25 +82,35 @@ type UsageSummaryResponse struct {
 	CacheStats       CacheStats                        `json:"cacheStats"`
 	UnsupportedUsage *UnsupportedUsage                 `json:"unsupportedUsage,omitempty"`
 	Comparison       *Comparison                       `json:"comparison,omitempty"`
+	ModelAliases     map[string]string                 `json:"model_aliases,omitempty"`
+	// PlanOnlySessions counts matching sessions billed as plan usage, which
+	// the token and cost figures leave out.
+	PlanOnlySessions int `json:"planOnlySessions,omitempty"`
+	// PartlyCapturedSessions counts matching sessions whose token counts
+	// miss turns live capture did not see.
+	PartlyCapturedSessions int `json:"partlyCapturedSessions,omitempty"`
 }
 
 func usageSummaryResponseFromService(
 	res *service.UsageSummaryResult,
 ) UsageSummaryResponse {
 	return UsageSummaryResponse{
-		SchemaVersion:    res.SchemaVersion,
-		Pricing:          res.Pricing,
-		Projects:         res.Projects,
-		From:             res.From,
-		To:               res.To,
-		Totals:           res.Totals,
-		Daily:            res.Daily,
-		ProjectTotals:    projectTotalsFromService(res.ProjectTotals),
-		ModelTotals:      modelTotalsFromService(res.ModelTotals),
-		AgentTotals:      agentTotalsFromService(res.AgentTotals),
-		SessionCounts:    res.SessionCounts,
-		CacheStats:       cacheStatsFromService(res.CacheStats),
-		UnsupportedUsage: unsupportedUsageFromService(res.UnsupportedUsage),
+		ModelAliases:           res.ModelAliases,
+		SchemaVersion:          res.SchemaVersion,
+		Pricing:                res.Pricing,
+		Projects:               res.Projects,
+		From:                   res.From,
+		To:                     res.To,
+		Totals:                 res.Totals,
+		Daily:                  res.Daily,
+		ProjectTotals:          projectTotalsFromService(res.ProjectTotals),
+		ModelTotals:            modelTotalsFromService(res.ModelTotals),
+		AgentTotals:            agentTotalsFromService(res.AgentTotals),
+		SessionCounts:          res.SessionCounts,
+		CacheStats:             cacheStatsFromService(res.CacheStats),
+		UnsupportedUsage:       unsupportedUsageFromService(res.UnsupportedUsage),
+		PlanOnlySessions:       res.PlanOnlySessions,
+		PartlyCapturedSessions: res.PartlyCapturedSessions,
 	}
 }
 
@@ -136,6 +149,7 @@ func modelTotalsFromService(in []service.ModelTotal) []ModelTotal {
 			CacheCreationTokens: total.CacheCreationTokens,
 			CacheReadTokens:     total.CacheReadTokens,
 			Cost:                total.Cost,
+			PlanOnlySessions:    total.PlanOnlySessions,
 		})
 	}
 	return out

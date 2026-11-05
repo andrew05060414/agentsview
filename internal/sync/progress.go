@@ -122,6 +122,11 @@ type SyncStats struct {
 	providerFailures       int // authoritative discoveries that did not complete
 	deferredRetryPaths     []string
 	deferredRetryOverflow  bool
+	deferredPreservedIDs   []string
+	// preservedRetryFailures counts the Failed entries that are preserved
+	// Antigravity CLI fallbacks, whose saved rows a rebuild restores.
+	preservedRetryFailures int
+	deferredRetryScheduled bool
 	// ArchiveRebuilt records a completed full-resync database swap. A rebuild
 	// can preserve/copy durable corpus rows while syncing zero session files,
 	// so downstream refresh consumers cannot infer it from Synced. It is not
@@ -143,6 +148,12 @@ type SyncStats struct {
 func (s *SyncStats) shouldEmitSync() bool {
 	return s.Tombstoned > 0 || s.LinksUpdated > 0 ||
 		(!s.Aborted && (s.hasSessionChanges() || s.ArchiveRebuilt))
+}
+
+// ChangedArchive reports whether the pass wrote session state to the archive,
+// including a pass that stopped early after some writes.
+func (s *SyncStats) ChangedArchive() bool {
+	return s.hasSessionChanges() || s.ArchiveRebuilt
 }
 
 func (s *SyncStats) hasSessionChanges() bool {
@@ -440,6 +451,25 @@ func (s *SyncStats) RecordFailed() {
 func (s *SyncStats) recordDeferred(path string) {
 	s.Deferred++
 	s.retainDeferredRetryPath(path)
+}
+
+// DeferredRetryBatch retains exact paths when possible and falls back to a
+// full reconciliation when the bounded path list overflowed.
+func (s *SyncStats) DeferredRetryBatch() WatchBatch {
+	if s.Deferred == 0 {
+		return WatchBatch{}
+	}
+	if s.deferredRetryOverflow || len(s.deferredRetryPaths) == 0 {
+		return WatchBatch{FullSync: true}
+	}
+	return WatchBatch{Paths: append([]string(nil), s.deferredRetryPaths...)}
+}
+
+// SetDeferredRetryBatch restores retry state received from a rebuild worker.
+func (s *SyncStats) SetDeferredRetryBatch(count int, batch WatchBatch) {
+	s.Deferred = count
+	s.deferredRetryPaths = append([]string(nil), batch.Paths...)
+	s.deferredRetryOverflow = batch.FullSync
 }
 
 func (s *SyncStats) retainDeferredRetryPath(path string) {

@@ -116,7 +116,7 @@
         {/if}
         {#if calls.length === 1}
           {@const soloCall = calls[0]!}
-          <ToolBlock
+          <ToolBlock sessionId={message.session_id} ordinal={message.ordinal}
             toolCall={soloCall}
             content=""
             label={displayToolName(soloCall)}
@@ -129,7 +129,7 @@
             searchScope={searchable ? { ordinal: message.ordinal, callIdx: 0 } : undefined}
           />
         {:else if calls.length >= 2}
-          <ParallelGroup
+          <ParallelGroup sessionId={message.session_id} ordinal={message.ordinal}
             toolCalls={calls}
             callTimingByID={callByToolUseID}
             isRunning={isRunningTurn(message)}
@@ -137,7 +137,7 @@
           />
         {:else}
           {#each enrichSegments(parseContent(message.content, message.has_tool_use, message.id, message.content_length), message.tool_calls).filter((s) => s.type === "tool") as seg, segIdx (`${message.id}-${segIdx}`)}
-            <ToolBlock
+            <ToolBlock sessionId={message.session_id} ordinal={message.ordinal}
               content={seg.content}
               label={seg.label}
               toolCall={seg.toolCall}
@@ -152,14 +152,14 @@
 
 <style>
   .tool-group {
-    border-left: 3px solid var(--accent-amber);
+    border-left: calc(var(--role-tool-bar-width) + 1px) var(--role-tool-bar-style) var(--role-tool-accent);
     background: var(--tool-bg);
     border-radius: 0 var(--radius-md) var(--radius-md) 0;
     padding: 8px 12px;
   }
   .tool-group-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-  .gear-icon { display: flex; align-items: center; flex-shrink: 0; color: var(--accent-amber); }
-  .group-label { font-size: 12px; font-weight: 600; color: var(--accent-amber); }
+  .gear-icon { display: flex; align-items: center; flex-shrink: 0; color: var(--role-tool-accent); }
+  .group-label { font-size: 12px; font-weight: 600; color: var(--role-tool-ink); }
   .group-timestamp { font-size: 12px; color: var(--text-muted); margin-left: auto; }
   .tool-group:hover :global(.kit-copy-btn) { opacity: 1; }
   .tool-group-body { display: flex; flex-direction: column; gap: 2px; }

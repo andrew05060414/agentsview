@@ -34,6 +34,14 @@ empty. `HasFTS()` is true (ILIKE). `HasSemantic()` is true once
 `clickhouse serve` finds a pushed embedding generation matching the local
 `[vector.embeddings]` fingerprint (see the vector decision below).
 
+Content search matches dialogue in `messages` and reasoning in `thinking` for
+substring and regex modes. Hybrid keyword hits use dialogue for matching and
+snippets; vector-only hits use rendered messages. A per-archive dialogue marker
+forces a full push after upgrading. That push re-sends every session in the
+configured mirror scope, including sessions without dialogue. Session
+fingerprints include nullable dialogue values so later dialogue-only changes
+trigger another write. The marker is set after a clean full push.
+
 ## Boundaries
 
 - SQLite is never deleted, dropped, truncated, or recreated for a ClickHouse
@@ -280,6 +288,20 @@ exchanges two empty scratch tables in the mirror database. When that fails, it
 does not create the view, drops one an earlier version created, and creates the
 first rebuild lock if none exists. Probe tables that a killed push left behind
 are dropped once they are an hour old.
+
+A failed probe logs an `UNSUPPORTED_METHOD` error on the server, and a push
+watch runs the schema step before every push. The answer depends on the
+filesystem under the server's metadata directory, which changes only across a
+restart. The schema step therefore records the answer, the server's
+`serverUUID()`, and the server time of the probe under
+`agentsview_table_exchange_probe` in `sync_metadata`. It probes again when the
+server started after that time, or when the record names another server. The
+start comes from `now() - uptime()`, which counts whole seconds, so a probe up
+to a second before the computed start still counts. `RESTORE` runs on a live
+server and can copy in another server's record that is newer than this server's
+start; the server check catches that case. The probe tables a killed push left
+behind are dropped at every schema step, because a stored answer skips the probe
+until the next restart.
 
 The lock table is what tells pushes to rebuild. A push without the view rebuilds
 only while a lock exists and the newest one is not retired. A database that can

@@ -150,7 +150,7 @@ func (p *positronProvider) parseSession(
 	}
 
 	// Reuse VSCode Copilot parsing logic since formats are identical.
-	sess, msgs, err := parseVSCodeCopilotData(data, path, project, machine)
+	sess, msgs, err := parseVSCodeCopilotData(data, path, project, machine, AgentPositron)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -406,7 +406,7 @@ func (s positronSourceSet) Fingerprint(
 			}
 		}
 	}
-	fingerprint.Hash, err = vscodeCopilotSourceHash(path, workspacePath)
+	fingerprint.Hash, err = vscodeCopilotSourceHash(ctx, path, workspacePath)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}

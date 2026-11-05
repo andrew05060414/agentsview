@@ -87,6 +87,10 @@ type SessionService interface {
 	Search(ctx context.Context, req SearchRequest) (*SessionSearchResult, error)
 	SearchContent(ctx context.Context, req ContentSearchRequest) (*ContentSearchResult, error)
 	UsageSummary(ctx context.Context, req UsageRequest) (*UsageSummaryResult, error)
+	// SessionUsage returns one session's token usage and cost with its
+	// full breakdown, or nil when the session does not exist. It reads the
+	// archive as stored and never refreshes source transcripts.
+	SessionUsage(ctx context.Context, req SessionUsageRequest) (*SessionUsageReport, error)
 	UsagePairwiseComparison(
 		ctx context.Context, req UsagePairwiseComparisonRequest,
 	) (*UsagePairwiseComparisonResponse, error)
@@ -174,7 +178,10 @@ type SessionSearchResult struct {
 
 // ContentSearchRequest is the transport-neutral content-search input.
 type ContentSearchRequest struct {
-	Pattern       string   `json:"pattern"`
+	Pattern string `json:"pattern"`
+	// Concepts runs one semantic search per concept and keeps only sessions
+	// with evidence for every one. See NormalizeContentSearchRequest.
+	Concepts      []string `json:"concepts,omitempty"`
 	Mode          string   `json:"mode,omitempty"` // substring|regex|fts|terms|semantic|hybrid
 	Sources       []string `json:"sources,omitempty"`
 	ExcludeSystem bool     `json:"exclude_system,omitempty"`
@@ -208,6 +215,10 @@ type ContentSearchResult struct {
 	NextCursor          int               `json:"next_cursor,omitempty"`
 	RevisionBound       bool              `json:"revision_bound"`
 	Coverage            MemoryCoverage    `json:"coverage"`
+	// CandidateTruncated reports that a multi-concept search may have missed
+	// sessions: a concept's candidate window filled, or more sessions matched
+	// every concept than the limit allowed.
+	CandidateTruncated bool `json:"candidate_truncated,omitempty"`
 }
 
 // RecallFilter mirrors GET /api/v1/recall/entries query parameters.
@@ -338,6 +349,13 @@ type SessionDetail struct {
 	// passes the field through and UnmarshalJSON restores it so the HTTP
 	// backend round-trips it rather than dropping it.
 	DecodeConfidence string `json:"decode_confidence,omitempty"`
+	// PlanUsage is the session's codex-cloud plan usage, nil when the
+	// session has none. It is separate from the token and cost fields,
+	// which stay empty for a session with only plan usage.
+	PlanUsage *db.PlanUsageView `json:"plan_usage,omitempty"`
+	// CaptureCoverage is the session's live token capture coverage, nil
+	// when no live capture saw the session.
+	CaptureCoverage *db.CaptureCoverageView `json:"capture_coverage,omitempty"`
 }
 
 // MarshalJSON preserves the grouped db.Session quality_signals field
@@ -349,16 +367,20 @@ func (d SessionDetail) MarshalJSON() ([]byte, error) {
 	type sessionAlias db.Session
 	return json.Marshal(struct {
 		sessionAlias     `json:",inline"`
-		QualitySignals   *db.QualitySignals `json:"quality_signals,omitempty"`
-		HealthScoreBasis []string           `json:"health_score_basis,omitempty"`
-		HealthPenalties  map[string]int     `json:"health_penalties,omitempty"`
-		DecodeConfidence string             `json:"decode_confidence,omitempty"`
+		QualitySignals   *db.QualitySignals      `json:"quality_signals,omitempty"`
+		HealthScoreBasis []string                `json:"health_score_basis,omitempty"`
+		HealthPenalties  map[string]int          `json:"health_penalties,omitempty"`
+		DecodeConfidence string                  `json:"decode_confidence,omitempty"`
+		PlanUsage        *db.PlanUsageView       `json:"plan_usage,omitempty"`
+		CaptureCoverage  *db.CaptureCoverageView `json:"capture_coverage,omitempty"`
 	}{
 		sessionAlias:     sessionAlias(d.Session),
 		QualitySignals:   d.StoredQualitySignals(),
 		HealthScoreBasis: d.HealthScoreBasis,
 		HealthPenalties:  d.HealthPenalties,
 		DecodeConfidence: d.DecodeConfidence,
+		PlanUsage:        d.PlanUsage,
+		CaptureCoverage:  d.CaptureCoverage,
 	})
 }
 
@@ -369,10 +391,12 @@ func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	type sessionAlias db.Session
 	var v struct {
 		sessionAlias     `json:",inline"`
-		QualitySignals   *db.QualitySignals `json:"quality_signals"`
-		HealthScoreBasis []string           `json:"health_score_basis"`
-		HealthPenalties  map[string]int     `json:"health_penalties"`
-		DecodeConfidence string             `json:"decode_confidence"`
+		QualitySignals   *db.QualitySignals      `json:"quality_signals"`
+		HealthScoreBasis []string                `json:"health_score_basis"`
+		HealthPenalties  map[string]int          `json:"health_penalties"`
+		DecodeConfidence string                  `json:"decode_confidence"`
+		PlanUsage        *db.PlanUsageView       `json:"plan_usage"`
+		CaptureCoverage  *db.CaptureCoverageView `json:"capture_coverage"`
 	}
 	if err := json.Unmarshal(data, &v); err != nil {
 		return err
@@ -382,6 +406,8 @@ func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	d.HealthScoreBasis = v.HealthScoreBasis
 	d.HealthPenalties = v.HealthPenalties
 	d.DecodeConfidence = v.DecodeConfidence
+	d.PlanUsage = v.PlanUsage
+	d.CaptureCoverage = v.CaptureCoverage
 	return nil
 }
 

@@ -1,6 +1,6 @@
 import type { DbMessage as Message } from "../api/generated/index.js";
 import { parseToolInput } from "../search/tool-input.js";
-import { extractToolParamMeta, generateFallbackContent } from "./tool-params.js";
+import { extractToolParamMeta, generateFallbackContent, toolCopyText } from "./tool-params.js";
 
 /**
  * Format a message for clipboard copy, including tool call content.
@@ -22,7 +22,12 @@ export function formatMessageForCopy(message: Message): string {
 
       parts.push(header);
 
-      const body = input.raw ?? generateFallbackContent(tc.tool_name, params);
+      // The display text shortens Pi edit operations; copy them whole.
+      const body =
+        input.raw ??
+        (Array.isArray(params.edits) ? toolCopyText(tc.tool_name, tc.category, params) : null) ??
+        (tc.category ? generateFallbackContent(tc.category, params) : null) ??
+        generateFallbackContent(tc.tool_name, params);
       if (body) parts.push(body);
 
       if (tc.result_content) parts.push(tc.result_content);

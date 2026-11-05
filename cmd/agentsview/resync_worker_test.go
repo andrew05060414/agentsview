@@ -12,6 +12,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/sync"
+	"go.kenn.io/kit/stacktest"
 )
 
 // TestForegroundResyncRunnerFallsBackInProcess verifies the resync seam: under a
@@ -55,6 +56,7 @@ func requireStartupMaintenanceReleased(t *testing.T, engine *sync.Engine) {
 	select {
 	case <-maintenanceRan:
 	case <-time.After(2 * time.Second):
+		stacktest.Dump(t)
 		require.FailNow(t, "startup maintenance still gated after the pass")
 	}
 	require.NoError(t, <-maintenanceDone)
@@ -166,7 +168,7 @@ func TestSyncAllReleasingStartupMaintenance(t *testing.T) {
 		syncAllReleasingStartupMaintenance(ctx, engine, nil)
 
 		maintenanceErr := make(chan error, 1)
-		blockedCtx, blockedCancel := context.WithTimeout( //nolint:kennlint // the deadline is the expected result; the closed gate keeps maintenance blocked until the context ends
+		blockedCtx, blockedCancel := context.WithTimeout( //nolint:kennlint // deadlinetest: the deadline is the expected result; the closed gate keeps maintenance blocked until the context ends
 			t.Context(), 100*time.Millisecond,
 		)
 		defer blockedCancel()

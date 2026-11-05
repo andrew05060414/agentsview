@@ -18,7 +18,7 @@ const (
 	ChatGPT  Platform = "chatgpt"
 )
 
-var ErrCompatibility = errors.New("Restart AgentsView if you upgraded it, run agentsview chrome setup, reload the extension at chrome://extensions, then Sync again.") //nolint:staticcheck // Recovery instructions appear directly in the UI.
+var ErrCompatibility = errors.New("Restart AgentsView if you upgraded it, run agentsview source chrome setup, reload the extension at chrome://extensions, then Sync again.") //nolint:staticcheck // Recovery instructions appear directly in the UI.
 
 func ReadFrame(reader io.Reader) ([]byte, error) {
 	var header [4]byte

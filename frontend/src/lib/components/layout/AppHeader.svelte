@@ -48,6 +48,7 @@
   import { reportTelemetry } from "../../utils/telemetry.js";
   import ProjectTypeahead from "./ProjectTypeahead.svelte";
   import ImportModal from "../import/ImportModal.svelte";
+  import { claudeAISync } from "../../stores/claudeAISync.svelte.js";
 
   const isMac = navigator.platform.toUpperCase().includes("MAC");
   const modKey = isMac ? "⌘" : "Ctrl";
@@ -90,10 +91,13 @@
     "recall",
     "pinned",
     "quality",
+    "friction",
     "trash",
     "recent-edits",
     "data",
   ] as const;
+
+  const frictionNavVisible = $derived(sync.serverVersion?.friction_readable === true);
 
   const tabs: TopBarTab[] = $derived([
     { id: "sessions", label: m.nav_sessions() },
@@ -103,6 +107,7 @@
     { id: "recall", label: m.nav_recall() },
     { id: "pinned", label: m.nav_pinned() },
     { id: "quality", label: m.nav_quality() },
+    ...(frictionNavVisible ? [{ id: "friction", label: m.nav_friction() }] : []),
     { id: "trash", label: m.nav_trash() },
     { id: "recent-edits", label: m.nav_recent_edits() },
     { id: "data", label: m.nav_data() },
@@ -672,10 +677,16 @@
         ? m.header_actions_import_archive_only()
         : sync.readOnly
         ? m.header_actions_import_unavailable()
+        : claudeAISync.running
+        ? m.header_actions_import_claude_syncing()
         : m.header_actions_import_conversations()}
-      aria-label={m.header_actions_import_conversations()}
+      aria-label={claudeAISync.running ? m.header_actions_import_claude_syncing() : m.header_actions_import_conversations()}
     >
-      <DownloadIcon size="12" strokeWidth="2" aria-hidden="true" />
+      {#if claudeAISync.running}
+        <span class="sync-spinner" aria-hidden="true"><Spinner size={12} /></span>
+      {:else}
+        <DownloadIcon size="12" strokeWidth="2" aria-hidden="true" />
+      {/if}
       <span class="import-label" class:collapsed={navCollapsed}>{m.header_actions_import()}</span>
     </button>
 

@@ -17,6 +17,7 @@ import (
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/poller"
 	agentsync "go.kenn.io/agentsview/internal/sync"
+	"go.kenn.io/kit/stacktest"
 )
 
 // Resync may spend up to five seconds draining SQLite connections before a
@@ -135,7 +136,7 @@ func TestPricingWritesWaitForResyncSwap(t *testing.T) {
 				swapDone <- engine.RunExclusive(func() error {
 					swapEntered <- nil
 					<-releaseSwap
-					if _, err := engine.SwapResyncDatabase(engine.ResyncTempPath()); err != nil {
+					if _, err := engine.SwapResyncDatabase(t.Context(), engine.ResyncTempPath()); err != nil {
 						return err
 					}
 					return engine.ResetCachesAfterSwap(t.Context())
@@ -148,7 +149,7 @@ func TestPricingWritesWaitForResyncSwap(t *testing.T) {
 			runDone := make(chan error, 1)
 			go func() {
 				if tc.seed {
-					seedPricing(database, engine)
+					seedPricing(t.Context(), database, engine)
 					runDone <- nil
 				} else {
 					job := pricingRefreshJob(database, engine)
@@ -175,6 +176,7 @@ func awaitPricingResult(t *testing.T, result <-chan error) {
 	case err := <-result:
 		require.NoError(t, err)
 	case <-time.After(pricingResyncTestTimeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "pricing operation did not finish")
 	}
 }

@@ -96,12 +96,15 @@
   "header_actions_import_archive_only": "僅封存模式下無法匯入",
   "header_actions_import_conversations": "匯入對話",
   "header_actions_import": "匯入",
+  "header_actions_import_claude_syncing": "Claude.ai 同步正在執行。開啟匯入可查看進度或停止同步。",
   "header_actions_toggle_theme": "切換主題",
   "header_actions_settings": "設定",
   "header_actions_keyboard_shortcuts": "鍵盤快捷鍵",
   "header_actions_keyboard_shortcuts_shortcut": "鍵盤快捷鍵 (?)",
   "status_bar_archive_stale": "封存資料結果可能已過時。",
   "status_bar_archive_rebuilding": "封存資料結果可能已過時。重建完成前，變更操作已暫停。",
+  "status_bar_archive_stale_rebuild": "封存資料結果可能已過時。按一下以重建。",
+  "status_bar_sync_failed": "同步失敗",
   "status_bar_sessions": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -154,8 +157,10 @@
   "command_palette_search_error": "搜尋無法使用",
   "command_palette_search_failed": "搜尋失敗。請再試一次。",
   "command_palette_semantic_setup_title": "語意搜尋尚未設定",
-  "command_palette_semantic_setup_config_step": "1. 在 config.toml 中新增 [vector] 區段，並依你的嵌入伺服器調整模型與端點（任何相容 OpenAI 的端點皆可，例如 Ollama）：",
-  "command_palette_semantic_setup_build_step": "2. 重新啟動常駐程式，然後建置索引：",
+  "command_palette_semantic_setup_config_step": "1. 將以下內容加入 config.toml：",
+  "command_palette_semantic_setup_local": "已在 Ollama 中使用 Nomic？切換至共用本機伺服器時，請使用完整設定範例以保留索引。",
+  "command_palette_semantic_setup_local_link": "伺服器設定",
+  "command_palette_semantic_setup_build_step": "2. 重新啟動守護程序，然後建立索引。CLI 會在首次下載前徵求許可：",
   "command_palette_semantic_copy_config": "複製設定片段",
   "command_palette_semantic_copy_command": "複製指令",
   "command_palette_semantic_copied": "已複製！",
@@ -373,9 +378,22 @@
       }
     }
   ],
+  "tool_block_image_alt": "工具輸出中的圖片",
+  "tool_block_image_open": "檢視原尺寸圖片",
+  "tool_block_image_close": "關閉原尺寸圖片",
   "thinking_block_label": "思考",
   "compact_boundary_title": "上下文窗口在此處被壓縮",
   "compact_boundary_label": "上下文已壓縮",
+  "transcript_empty_messages": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{count} 則空訊息"
+      }
+    }
+  ],
+  "transcript_empty_messages_title": "這些訊息沒有文字、思考內容或工具呼叫",
   "compact_boundary_show_full_summary": "顯示完整摘要",
   "sidebar_session_count": [
     {
@@ -429,6 +447,8 @@
   "sidebar_filters_no_match": "無匹配",
   "sidebar_filters_no_agents": "無 agents",
   "sidebar_filters_machine": "Machine",
+  "sidebar_filters_machine_loading": "正在載入機器...",
+  "sidebar_filters_machine_update_failed": "無法更新機器篩選條件。請重試。",
   "sidebar_filters_search_machines": "搜尋 machines...",
   "sidebar_filters_no_machines": "無 machines",
   "sidebar_filters_min_prompts": "最少提示數",
@@ -807,6 +827,10 @@
   "usage_tokens_attribution_title": "Token 歸因",
   "usage_attribution_treemap": "矩形樹圖",
   "usage_attribution_list": "列表",
+  "usage_label_scale_title": "標籤大小比例",
+  "usage_label_scale_linear": "線性",
+  "usage_label_scale_sqrt": "平方根",
+  "usage_label_scale_log": "對數",
   "usage_chart_style": "圖表樣式",
   "usage_chart_style_smooth": "平滑",
   "usage_chart_style_lines": "折線",
@@ -833,7 +857,7 @@
   "settings_search_empty": "沒有相符的設定",
   "settings_search_clear": "清除搜尋",
   "settings_search_result": "顯示：{category}",
-  "settings_search_keywords_appearance": "主題 對比度 版面配置 文字 字體 區塊 theme contrast layout text font blocks 縮放 zoom",
+  "settings_search_keywords_appearance": "主題 對比度 版面配置 文字 字體 區塊 theme contrast layout text font blocks 縮放 zoom 顏色 色盲 color",
   "settings_search_keywords_language": "語言 地區設定 翻譯 language locale translation",
   "settings_search_keywords_date_ranges": "日期 範圍 關聯 頁面 date range linked pages",
   "settings_search_keywords_terminal": "終端機 繼續 啟動 執行檔 參數 剪貼簿 terminal resume launch binary arguments clipboard",
@@ -1641,6 +1665,14 @@
   "insights_page_template_tool_reliability": "工具可靠度",
   "insights_page_template_model_cost": "模型與成本",
   "insights_page_template_instruction_opportunities": "指令最佳化機會",
+  "insights_page_template_friction_review": "摩擦檢討",
+  "friction_review_summary_title": "模型撰寫的摘要",
+  "friction_review_summary_notice": "由模型根據此日報的摘要與模式標題撰寫。不會修改發現項目、日報或議題。",
+  "friction_review_summary_empty": "此日報尚無摘要。",
+  "friction_review_summary_generate": "產生摘要",
+  "friction_review_summary_regenerate": "重新產生",
+  "friction_review_summary_generating": "正在產生：{phase}",
+  "friction_review_summary_unavailable": "此封存無法產生摘要。",
   "insights_page_scope_no_automated": "排除自動化",
   "insights_page_scope_both": "全部",
   "insights_page_scope_only_automated": "僅自動化",
@@ -1964,6 +1996,7 @@
   "appearance_chart_palette": "圖表配色",
   "appearance_chart_palette_agentsview": "Agentsview",
   "appearance_chart_palette_matplotlib": "Matplotlib",
+  "appearance_chart_palette_colorblind": "色盲友善",
   "appearance_message_layout": "訊息佈局",
   "appearance_block_visibility": "區塊可見性",
   "settings_github_token_saved": "GitHub token 已儲存。",
@@ -2516,8 +2549,8 @@
   "import_claude_stop": "停止",
   "import_claude_terminal": "終端機",
   "import_claude_copy_command": "複製指令",
-  "import_claude_setup_load": "接著開啟 {url}，啟用開發人員模式，選擇載入未封裝項目，再選取指令顯示的資料夾。",
-  "import_claude_open_chrome": "開啟 Chrome 以連線。",
+  "import_claude_setup_load": "接著重新啟動 AgentsView，開啟 {url}，啟用開發人員模式，選擇載入未封裝項目，再選取指令顯示的資料夾。",
+  "import_claude_open_chrome": "開啟 Chrome 並啟用 AgentsView 擴充功能。如果你在啟動 AgentsView 之後執行了設定，請重新啟動 AgentsView。",
   "import_claude_tab_note": "如果沒有開啟 claude.ai 分頁，同步會在背景開啟一個。同步後，該分頁會保持開啟。",
   "import_claude_signed_out": "請在安裝了 AgentsView 擴充功能的 Chrome 設定檔中登入 claude.ai。請僅在一個 Chrome 設定檔中啟用擴充功能。同步會使用最先連線的設定檔。",
   "import_chatgpt_tab_note": "如果沒有開啟 chatgpt.com 分頁，同步會在背景開啟一個。同步後，該分頁會保持開啟。",
@@ -2525,6 +2558,7 @@
   "import_claude_reload_extension": "接著在 {url} 中重新載入擴充功能。",
   "import_claude_update_app": "如果你升級了 AgentsView，請重新啟動它。",
   "import_claude_syncing": "同步中...",
+  "import_claude_sync_background": "關閉此對話框後，同步仍會繼續。",
   "import_claude_sync_failed": "同步失敗",
   "import_claude_sign_in_failed": "登入失敗",
   "import_claude_desktop_note": "登入使用電子郵件驗證碼。Google 帳戶請在 Chrome 中透過網頁介面同步。",
@@ -2755,5 +2789,276 @@
   "usage_all_projects": "所有專案",
   "usage_clear_selection": "清除選擇",
   "usage_open_project": "開啟",
-  "usage_loading": "正在載入..."
+  "usage_loading": "正在載入...",
+  "plan_usage_title": "方案用量",
+  "plan_usage_trigger_weekly": "方案用量：每週 {percent}%",
+  "plan_usage_as_of": "方案用量（截至 {time}）",
+  "plan_usage_not_checked": "方案用量：尚未檢查",
+  "plan_usage_still_updating": "方案用量：仍在更新（截至 {time}）",
+  "plan_usage_not_reported_yet": "方案用量：尚未回報（截至 {time}）",
+  "plan_usage_partial": "部分方案用量（截至 {time}）",
+  "plan_usage_not_reported": "OpenAI 未回報",
+  "plan_usage_too_many_subagents": "子代理聊天過多，OpenAI 用量報告無法納入",
+  "plan_usage_could_not_check": "AgentsView 無法檢查方案用量",
+  "plan_usage_account_unavailable": "此帳戶無法取得用量",
+  "plan_usage_counted_under": "計入聊天 {title}",
+  "plan_usage_stale": "此後：{reason}（{time}）。這些數字可能已過時。",
+  "plan_usage_left_out_later": "OpenAI 用量報告未納入此聊天",
+  "plan_usage_weekly_share": "Codex 每週上限的 {percent}%",
+  "plan_usage_five_hour_share": "Codex 五小時上限的 {percent}%",
+  "plan_usage_credits": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 點數"
+      }
+    }
+  ],
+  "plan_usage_credits_note": "點數依 OpenAI 用量報告提供的數值顯示。",
+  "plan_usage_col_split": "模型、推理強度、速度",
+  "plan_usage_col_weekly": "每週",
+  "plan_usage_col_five_hour": "5 小時",
+  "plan_usage_col_credits": "點數",
+  "capture_tokens_live": "即時擷取 token（截至 {time}）",
+  "capture_turns_not_captured": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 輪未擷取"
+      }
+    }
+  ],
+  "capture_turns_not_captured_covered": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input time",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 輪未擷取；{time} 之前的輪次已計入方案用量"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_waiting": "Codex Cloud：等待首次同步",
+  "status_bar_codex_cloud_importing_found": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud：匯入中，目前已找到 {countLabel} 個聊天"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_importing_progress": "Codex Cloud：正在匯入 {imported}/{total} 個聊天",
+  "status_bar_codex_cloud_up_to_date": "Codex Cloud：截至 {time} 已是最新",
+  "status_bar_codex_cloud_retrying": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud：{countLabel} 個聊天無法匯入"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_error": "Codex Cloud：錯誤",
+  "status_bar_codex_cloud_off": "Codex Cloud：已關閉",
+  "status_bar_codex_cloud_config_error": "Codex Cloud：設定錯誤",
+  "status_bar_codex_cloud_live_attention": "Codex Cloud：即時權杖需要處理",
+  "status_bar_codex_cloud_oldest_failure": "最早的失敗：{time}",
+  "status_bar_codex_cloud_last_success": "上次成功同步：{time}",
+  "status_bar_codex_cloud_homes": "Codex 主目錄：{homes}",
+  "appearance_message_colors": "訊息顏色",
+  "appearance_message_colors_description": "為每種訊息類型設定獨立的顏色。色盲友善預設使用在常見色覺缺陷下仍可區分的色調，並加入線條樣式，讓類型在形狀與顏色上都有區別。",
+  "appearance_message_colors_preset": "訊息顏色預設",
+  "appearance_message_colors_preset_default": "主題預設",
+  "appearance_message_colors_preset_colorblind": "色盲友善",
+  "appearance_message_colors_preset_custom": "自訂",
+  "appearance_message_colors_patterns": "除了顏色，也用線條樣式標示訊息類型",
+  "appearance_message_colors_reset_all": "恢復預設",
+  "appearance_message_colors_reset_role": "重設",
+  "appearance_message_colors_reset_role_label": "重設{role}的顏色",
+  "appearance_message_colors_role_label": "{role}的顏色",
+  "appearance_message_colors_picker": "開啟取色器",
+  "appearance_message_colors_hex": "十六進位顏色",
+  "appearance_message_colors_warning_text": "在{modes}下文字可能難以閱讀（{ratio}:1，需要 {required}:1）。",
+  "appearance_message_colors_warning_marker": "在{modes}下顏色標記可能難以看清（{ratio}:1，需要 {required}:1）。",
+  "appearance_message_colors_mode_light": "淺色模式",
+  "appearance_message_colors_mode_dark": "深色模式",
+  "appearance_message_colors_mode_high_contrast_light": "高對比淺色模式",
+  "appearance_message_colors_mode_high_contrast_dark": "高對比深色模式",
+  "appearance_message_colors_swatch_blue": "藍色",
+  "appearance_message_colors_swatch_vermillion": "朱紅色",
+  "appearance_message_colors_swatch_bluish_green": "藍綠色",
+  "appearance_message_colors_swatch_reddish_purple": "紫紅色",
+  "appearance_message_colors_swatch_dark_yellow": "暗黃色",
+  "appearance_message_colors_swatch_gray": "灰色",
+  "appearance_message_colors_preview": "預覽",
+  "appearance_message_colors_preview_user": "日期測試為什麼會失敗？",
+  "appearance_message_colors_preview_assistant": "測試夾具要求 UTC，我已更新。",
+  "nav_friction": "摩擦日誌",
+  "friction_page_help_docs": "摩擦日誌的運作方式",
+  "friction_page_refresh": "重新整理摩擦日誌",
+  "friction_date_label": "摘要日期",
+  "friction_date_previous": "上一份摘要",
+  "friction_date_next": "下一份摘要",
+  "friction_date_no_match": "沒有相符的日期",
+  "friction_build_now": "立即產生",
+  "friction_build_title": "為每個尚無摘要的完整日期產生摘要",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已產生 {countNumber} 份摘要" }
+    }
+  ],
+  "friction_build_nothing": "每個完整日期都已有摘要。",
+  "friction_build_failed": "產生失敗：{error}",
+  "friction_empty_title": "尚無摩擦摘要",
+  "friction_empty_hint": "每個本地日期結束後會自動產生摘要，每小時執行的工作會補上遺漏的日期。使用「立即產生」可馬上產生缺少的日期。",
+  "friction_empty_hint_remote": "每個本地日期結束後會自動產生摘要，每小時執行的工作會補上遺漏的日期。若要馬上產生缺少的日期，請在執行 AgentsView 的電腦上開啟此頁面，或在伺服器上啟用 require_auth。",
+  "friction_load_error": "無法載入摩擦日誌",
+  "friction_retry": "重試",
+  "friction_digest_heading": "摩擦日誌 — {date}",
+  "friction_digest_built": "產生於 {when}（{timezone}）",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "在 {countNumber} 個工作階段中失敗"
+      }
+    }
+  ],
+  "friction_clean_title": "未發現摩擦",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "掃描的 {countNumber} 個工作階段中沒有標記任何問題。"
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "這一天沒有活躍的工作階段。",
+  "friction_deferral_said": "推遲了工作：「{phrase}」",
+  "friction_pattern_retry_loop": "重試迴圈",
+  "friction_pattern_runaway_loop": "失控的工具迴圈",
+  "friction_pattern_edit_churn": "反覆編輯",
+  "friction_pattern_mid_task_compaction": "任務中途壓縮上下文",
+  "friction_pattern_context_pressure": "上下文壓力",
+  "friction_pattern_iteration_runaway": "長時間執行且無使用者輸入",
+  "friction_digest_missing": "{date} 沒有摘要。",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已掃描 {countNumber} 個對話" }
+    }
+  ],
+  "friction_headline_title": "需要關注",
+  "friction_p0_title": "在多個工作階段中失敗的工具",
+  "friction_patterns_new": "新模式",
+  "friction_patterns_recurring": "反覆出現的模式",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "出現 {countNumber} 次" }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 個對話" }
+    }
+  ],
+  "friction_pattern_first_seen": "首次出現於 {date}",
+  "friction_section_corrections": "糾正",
+  "friction_section_errors": "錯誤",
+  "friction_section_workarounds": "暫時解法",
+  "friction_section_deferrals": "延後事項",
+  "friction_section_patterns": "模式",
+  "friction_section_frustration": "挫折",
+  "friction_section_interruptions": "中斷",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "中斷 {countNumber} 次" }
+    }
+  ],
+  "friction_kind_correction": "糾正",
+  "friction_kind_error": "錯誤",
+  "friction_kind_workaround": "暫時解法",
+  "friction_kind_deferral": "延後事項",
+  "friction_kind_pattern": "模式",
+  "friction_kind_frustration": "挫折",
+  "friction_kind_interruption": "中斷",
+  "friction_disabled_title": "此伺服器已關閉摩擦日誌",
+  "friction_disabled_hint": "此伺服器不產生摘要。請在 config.toml 中設定 [friction] enabled = true 並重新啟動常駐程式。唯讀封存無法產生摘要。",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "顯示 Markdown",
+  "friction_markdown_copy": "複製 Markdown",
+  "friction_markdown_copied": "已複製 Markdown",
+  "friction_markdown_download": "下載 Markdown",
+  "friction_markdown_loading": "正在載入 Markdown…",
+  "friction_markdown_error": "無法載入 Markdown 摘要。",
+  "friction_open_session": "在第 {ordinal} 則訊息開啟 {session}",
+  "friction_open_session_start": "開啟 {session}",
+  "friction_quality_card_title": "摩擦日誌",
+  "friction_quality_card_body": "在你的對話中發現的糾正、工具錯誤、暫時解法、延後事項和反覆出現模式的每日摘要。",
+  "friction_quality_card_open": "開啟摩擦日誌",
+  "friction_session_title": "摩擦發現",
+  "friction_session_loading": "正在載入摩擦發現…",
+  "friction_session_error": "摩擦發現無法使用。",
+  "friction_session_empty": "此對話中沒有摩擦發現。",
+  "friction_session_jump": "訊息 {ordinal}",
+  "friction_session_jump_title": "跳至訊息 {ordinal}",
+  "docbank_subagent_open_session": "作為工作階段開啟後會顯示檔案比對結果。",
+  "docbank_checking": "正在查詢 Docbank…",
+  "docbank_current": "目前版本",
+  "docbank_prior": "先前版本",
+  "docbank_trash": "垃圾桶",
+  "docbank_not_found": "Docbank 中找不到",
+  "docbank_read_unavailable": "無法讀取工作階段檔案",
+  "docbank_unavailable": "Docbank 無法使用",
+  "docbank_limit_exceeded": "已達到 Docbank 查詢上限",
+  "docbank_bytes_not_kept": "未保留圖片位元組",
+  "docbank_file": "檔案 {n} · {mediaType} · {size}",
+  "docbank_file_without_size": "檔案 {n} · {mediaType}",
+  "docbank_more": "Docbank 中還有 {count} 項"
 }

@@ -62,7 +62,7 @@ func publishRawRevision(ctx context.Context, tx *sql.Tx, identityChanged bool, c
 
 // materializeGroup requires the caller to hold the group's row lock. It
 // returns the embedding changes for the caller to pass to publishRawRevision.
-func (s *RawProjectionStore) materializeGroup(ctx context.Context, tx *sql.Tx, group string) ([]rawEmbeddingChange, error) {
+func (s *RawProjectionStore) materializeGroup(ctx context.Context, tx *sql.Tx, group string, fresh map[string][]byte) ([]rawEmbeddingChange, error) {
 	if err := reconcileRawPrefixes(ctx, tx, group); err != nil {
 		return nil, err
 	}
@@ -121,7 +121,11 @@ func (s *RawProjectionStore) materializeGroup(ctx context.Context, tx *sql.Tx, g
 			action = "remove"
 		} else {
 			if !exists {
-				payload, err := loadRawPayload(ctx, tx, c.id)
+				// Prefix reconciliation may select a retained revision instead of
+				// the new capture. Reuse only the selected, freshly inserted row.
+				encoded := fresh[c.id]
+				delete(fresh, c.id)
+				payload, err := loadRawPayloadBytes(ctx, tx, c.id, encoded)
 				if err != nil {
 					return nil, err
 				}
@@ -185,6 +189,51 @@ func (s *RawProjectionStore) refreshStaleRawFriction(
 	return insertPGFrictionFindings(ctx, tx, id, p.Friction.Findings)
 }
 
+// syncRawDialogue runs under Project's group locks and lease fence. It keeps
+// retained and materialized dialogue current without changing content identity
+// or embeddings, and reports changes for corpus revision publication. One
+// statement compares in the database and writes only rows that differ, so an
+// unchanged reprojection neither reads dialogue back nor locks retained rows.
+func syncRawDialogue(ctx context.Context, tx *sql.Tx, id string, messages []db.Message) (bool, error) {
+	ordinals := make([]int, 0, len(messages))
+	dialogue := make([]string, 0, len(messages))
+	for _, m := range messages {
+		if m.DialogueText != nil {
+			ordinals = append(ordinals, m.Ordinal)
+			dialogue = append(dialogue, sanitizePG(*m.DialogueText))
+		}
+	}
+	var retained, materialized int
+	err := tx.QueryRowContext(ctx, `WITH input AS (
+ SELECT * FROM unnest($2::int[],$3::text[]) AS u(ordinal,dialogue)
+), upserted AS (
+ INSERT INTO raw_message_dialogue(session_id,ordinal,dialogue_text)
+ SELECT $1,i.ordinal,i.dialogue FROM input i
+ LEFT JOIN raw_message_dialogue r ON r.session_id=$1 AND r.ordinal=i.ordinal
+ WHERE r.dialogue_text IS DISTINCT FROM i.dialogue
+ ON CONFLICT(tenant_id,session_id,ordinal) DO UPDATE SET dialogue_text=EXCLUDED.dialogue_text
+ RETURNING 1
+), pruned AS (
+ DELETE FROM raw_message_dialogue WHERE session_id=$1 AND ordinal <> ALL($2::int[]) RETURNING 1
+), updated AS (
+ UPDATE messages AS m SET dialogue_text=i.dialogue
+ FROM messages cur LEFT JOIN input i ON i.ordinal=cur.ordinal
+ WHERE cur.session_id=$1 AND m.session_id=$1 AND m.ordinal=cur.ordinal
+  AND m.dialogue_text IS DISTINCT FROM i.dialogue
+ RETURNING 1
+), versioned AS (
+ UPDATE sessions SET data_version=$4
+ WHERE id=$1 AND data_version<$4 AND EXISTS(SELECT 1 FROM updated)
+)
+SELECT (SELECT count(*) FROM upserted)+(SELECT count(*) FROM pruned),
+ (SELECT count(*) FROM updated)`,
+		id, ordinals, dialogue, db.CurrentDataVersion()).Scan(&retained, &materialized)
+	if err != nil {
+		return false, err
+	}
+	return retained+materialized > 0, nil
+}
+
 func (s *RawProjectionStore) writePayload(ctx context.Context, tx *sql.Tx, id, group, revision string, p ingest.PreparedSession) error {
 	p.Session.ID = id
 	p.Session.FilePath = nil
@@ -223,6 +272,13 @@ func (s *RawProjectionStore) writePayload(ctx context.Context, tx *sql.Tx, id, g
 	}
 	if err := bulkInsertUsageEvents(ctx, tx, p.UsageEvents); err != nil {
 		return err
+	}
+	// counted_under keeps the source session ID; hosted reads map it to a
+	// public ID through the usage_root link that writeRawLinks records.
+	if p.PlanUsage != nil {
+		if err := insertPlanUsage(ctx, tx, id, p.PlanUsage); err != nil {
+			return err
+		}
 	}
 	if err := bulkInsertSecretFindings(ctx, tx, id, p.Findings); err != nil {
 		return err

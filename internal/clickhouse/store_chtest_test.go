@@ -11,12 +11,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/clickhouse/chtest"
 	"go.kenn.io/agentsview/internal/db"
 )
 
 func TestReadStatusHonorsProjectFilters(t *testing.T) {
+	t.Parallel()
 	_, syncer, local := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	archiveID, err := local.GetArchiveID(ctx)
 	require.NoError(t, err)
 
@@ -37,8 +39,9 @@ func TestReadStatusHonorsProjectFilters(t *testing.T) {
 }
 
 func TestStoreSessionsMessagesAndSearch(t *testing.T) {
+	t.Parallel()
 	store, _, _ := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("list_sessions_default_sort_and_cursor", func(t *testing.T) {
 		page, err := store.ListSessions(ctx, db.SessionFilter{Limit: 1})
@@ -261,6 +264,7 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 }
 
 func TestSearchContentExcludeActiveSince(t *testing.T) {
+	t.Parallel()
 	store, _, _ := newPushedStore(t)
 	for _, mode := range []string{"substring", "regex", "fts"} {
 		t.Run(mode, func(t *testing.T) {
@@ -293,8 +297,9 @@ func TestSearchContentExcludeActiveSince(t *testing.T) {
 }
 
 func TestSearchTreatsUnderscoreAsLiteral(t *testing.T) {
+	t.Parallel()
 	store, syncer, local := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	appendMessage(t, local, fixtureAlphaID, "hello_world unique token", "2026-01-10T00:04:00.000Z")
 	appendMessage(t, local, fixtureBetaID, "helloXworld unique token", "2026-01-11T00:04:00.000Z")
 	_, err := syncer.Push(ctx, false, nil)
@@ -308,8 +313,9 @@ func TestSearchTreatsUnderscoreAsLiteral(t *testing.T) {
 }
 
 func TestGetSessionFullReturnsFilePath(t *testing.T) {
+	t.Parallel()
 	store, _, local := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	want, err := local.GetSessionFull(ctx, fixtureAlphaID)
 	require.NoError(t, err)
 	require.NotNil(t, want)
@@ -330,7 +336,8 @@ func TestGetSessionFullReturnsFilePath(t *testing.T) {
 }
 
 func TestStoreGetSessionHidesTrash(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	store, syncer, local := newPushedStore(t)
 	require.NoError(t, local.SoftDeleteSession(t.Context(), fixtureBetaID))
 	_, err := syncer.Push(ctx, false, nil)
@@ -353,7 +360,8 @@ func TestStoreGetSessionHidesTrash(t *testing.T) {
 }
 
 func TestStoreGetSessionVersionChangesAfterPush(t *testing.T) {
-	ctx := context.Background()
+	t.Parallel()
+	ctx := t.Context()
 	store, syncer, local := newPushedStore(t)
 	count, version, ok := store.GetSessionVersion(t.Context(), fixtureAlphaID)
 	require.True(t, ok)
@@ -370,8 +378,9 @@ func TestStoreGetSessionVersionChangesAfterPush(t *testing.T) {
 }
 
 func TestStoreMessageWindowReportsRevisionWithRows(t *testing.T) {
+	t.Parallel()
 	store, _, _ := newPushedStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	from := 0
 	revision := ""
@@ -421,6 +430,7 @@ func (s *activityVectorSearcher) ResolveMessageUnits(_ context.Context, refs []d
 }
 
 func TestStoreSessionVersionTracksPushedAnnotations(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	store, syncer, local := newPushedStore(t)
 	for _, tt := range []struct {
@@ -449,4 +459,29 @@ func TestStoreSessionVersionTracksPushedAnnotations(t *testing.T) {
 			assert.NotEqual(t, before, after)
 		})
 	}
+}
+
+func TestMachineSelectorLookupIncludesUnmergedIdentity(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	dsn, database := chtest.FreshDatabase(t)
+	conn := chtest.Open(t, dsn, database)
+	require.NoError(t, EnsureSchemaOn(ctx, conn))
+	// Keep both versions in separate parts to exercise FINAL semantics.
+	for _, query := range []string{
+		`SYSTEM STOP MERGES sessions`,
+		`INSERT INTO sessions (id, machine, push_version) VALUES ('updated', 'retired-host', 1)`,
+	} {
+		_, err := conn.ExecContext(ctx, query)
+		require.NoError(t, err)
+	}
+	// Only the newest version owns the session identity.
+	_, err := conn.ExecContext(ctx, `INSERT INTO sessions (id, machine, push_version) VALUES ('updated', 'current-host', 2)`)
+	require.NoError(t, err)
+	ids, err := NewStoreFromDB(conn).GetMatchingMachineIDs(ctx, []string{"retired-host"})
+	require.NoError(t, err)
+	assert.Empty(t, ids)
+	ids, err = NewStoreFromDB(conn).GetMatchingMachineIDs(ctx, []string{"current-host"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"current-host"}, ids)
 }

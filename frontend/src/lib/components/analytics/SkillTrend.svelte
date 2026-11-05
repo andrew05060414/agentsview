@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Table } from "@kenn-io/kit-ui";
   import { Chart, Circle, Layer, Line, Spline } from "layerchart";
   import { scalePoint } from "d3-scale";
   import { analytics } from "../../stores/analytics.svelte.js";
@@ -12,6 +13,10 @@
   // Soft cap from the series-count ladder: past six skills the tail folds
   // into "Other" instead of generating more hues.
   const MAX_SERIES = 6;
+  const CHART_SERIES_COLORS = Array.from(
+    { length: MAX_SERIES },
+    (_, index) => `var(--chart-series-${index + 1})`,
+  );
   const OTHER_KEY = "__other__";
   const PLOT_HEIGHT = 120;
   const PLOT_TOP = 8;
@@ -104,7 +109,7 @@
   const colorMap = $derived(chartSeriesColorMap(
     allSeries.map((series) => series.key),
     settings.chartPalette,
-    (_key, index) => `var(--chart-series-${index + 1})`,
+    CHART_SERIES_COLORS,
     "var(--chart-series-other)",
   ));
 
@@ -386,27 +391,29 @@
           </LargeChartFrame>
         </Layer>
       </Chart>
-      <table id="skill-trend-data" class="kit-sr-only">
-        <caption>{m.analytics_skill_trend_title()}</caption>
-        <thead>
-          <tr>
-            <th scope="col">{m.analytics_skill_trend_date()}</th>
-            {#each allSeries as series (series.key)}
-              <th scope="col">{series.label}</th>
-            {/each}
-          </tr>
-        </thead>
-        <tbody>
-          {#each trendEntries as entry, index (entry.date)}
+      <div id="skill-trend-data" class="kit-sr-only">
+        <Table bare unsorted>
+          <caption>{m.analytics_skill_trend_title()}</caption>
+          <thead>
             <tr>
-              <th scope="row">{bucketDateLabel(entry.date)}</th>
+              <th scope="col">{m.analytics_skill_trend_date()}</th>
               {#each allSeries as series (series.key)}
-                <td>{(series.values[index] ?? 0).toLocaleString(getLocale())}</td>
+                <th scope="col">{series.label}</th>
               {/each}
             </tr>
-          {/each}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {#each trendEntries as entry, index (entry.date)}
+              <tr>
+                <th scope="row">{bucketDateLabel(entry.date)}</th>
+                {#each allSeries as series (series.key)}
+                  <td>{(series.values[index] ?? 0).toLocaleString(getLocale())}</td>
+                {/each}
+              </tr>
+            {/each}
+          </tbody>
+        </Table>
+      </div>
     </div>
 
     {#if hoverIndex !== null && tooltipPos}

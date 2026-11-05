@@ -62,8 +62,11 @@ type doctorSyncReport struct {
 
 func newDoctorCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:          "doctor",
-		Short:        "Collect support diagnostics",
+		Use:   "doctor",
+		Short: "Collect support diagnostics",
+		Long:  "Inspect configuration and archive health when sync or memory behavior is unexpected.",
+		Example: "  agentsview doctor sync\n" +
+			"  agentsview doctor memory --help",
 		GroupID:      groupMeta,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -83,7 +86,7 @@ func newDoctorSyncCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.LoadReadOnly()
+			cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 			if err != nil {
 				return err
 			}

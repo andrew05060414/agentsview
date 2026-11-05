@@ -23,6 +23,22 @@ lives primarily in `internal/sync/watcher.go`,
   force-verifies every discovered file under the same serialization,
   dispatch-floor, cancellation, and shutdown rules, so overflow bounds memory
   without losing same-stat source changes.
+- `Engine.clearWatcherOverflowCaches` (`internal/sync/engine.go`) keeps one
+  exception to that clear-and-force-verify rule: a whole Cursor IDE
+  `state.vscdb` container's skip-cache entry. The entry's key already bakes
+  in the container's filesystem-derived state hash and parser data version,
+  both recomputed from disk on every pass independent of which watcher
+  events were lost, so a stale key can never pass as current. Clearing it
+  anyway forced a full re-parse of these containers (observed multiple
+  minutes for one with hundreds of composers and a multi-gigabyte database)
+  on every overflow, which on Windows recurs every one to three hours.
+  `Engine.rehydrateReconciliationPage` pairs with this by not setting
+  `ForceParse` on the matching reconciliation candidate, so the retained
+  entry is actually consulted instead of bypassed, and a genuinely changed
+  container (a different hash, hence a different key) still falls straight
+  through to a full reparse and re-caches cleanly afterward. Composer-member
+  entries, and every other provider's entries, are still cleared and forced
+  exactly as before.
 - Shutdown discards pending paths and waits only for an already-running
   callback. Normal discovery on the next startup recovers discarded changes.
 

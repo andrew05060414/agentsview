@@ -9,7 +9,9 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"hash"
 	"reflect"
+	"slices"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/ingest"
@@ -18,12 +20,20 @@ import (
 )
 
 func rawDigest(parts ...string) string {
+	return hex.EncodeToString(newRawDigest(parts...).Sum(nil))
+}
+
+func newRawDigest(parts ...string) hash.Hash {
 	h := sha256.New()
 	for _, p := range parts {
-		fmt.Fprintf(h, "%d:", len(p))
+		writeRawDigestLength(h, int64(len(p)))
 		h.Write([]byte(p))
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	return h
+}
+
+func writeRawDigestLength(h hash.Hash, size int64) {
+	fmt.Fprintf(h, "%d:", size)
 }
 
 func rawSourceID(m rawsync.CanonicalManifest) string {
@@ -47,6 +57,11 @@ func rawBaseAlias(m rawsync.CanonicalManifest, s db.Session) string {
 }
 
 func encodeRawPayload(p ingest.PreparedSession) ([]byte, error) {
+	// Dialogue belongs to mutable derived state, outside immutable content.
+	p.Messages = slices.Clone(p.Messages)
+	for i := range p.Messages {
+		p.Messages[i].DialogueText = nil
+	}
 	var b bytes.Buffer
 	err := gob.NewEncoder(&b).Encode(p)
 	return b.Bytes(), err
@@ -104,7 +119,6 @@ func rawContentRevision(p ingest.PreparedSession) (string, error) {
 	p.Signals.Outcome, p.Signals.OutcomeConfidence = "", ""
 	p.Validation = db.ValidationStats{}
 	// Copy nested slices before removing transport IDs: callers retain their rows.
-	var err error
 	p.Messages = append([]db.Message(nil), p.Messages...)
 	for i := range p.Messages {
 		m := &p.Messages[i]
@@ -138,12 +152,20 @@ func rawContentRevision(p ingest.PreparedSession) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Keep the normalized-content-v1 representation stable across JSON APIs.
+	return rawJSONContentRevision(structure)
+}
+
+func rawJSONContentRevision(structure any) (string, error) {
+	// Keep normalized-content-v1 bytes unchanged, but hash the encoded bytes
+	// directly instead of copying the complete result through string and []byte.
 	encoded, err := json.Marshal(structure, json.Deterministic(true), jsontext.EscapeForHTML(true), jsontext.EscapeForJS(true), jsontext.AllowInvalidUTF8(true))
 	if err != nil {
 		return "", err
 	}
-	return rawDigest("normalized-content-v1", string(encoded)), nil
+	h := newRawDigest("normalized-content-v1")
+	writeRawDigestLength(h, int64(len(encoded)))
+	h.Write(encoded)
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 var (
@@ -192,11 +214,15 @@ func rawCanonicalValue(v reflect.Value, field string) (any, error) {
 		for i := range v.NumField() {
 			f := v.Type().Field(i)
 			// Projection bookkeeping and inherited trash scope add no content.
-			// Omit empty GroupKey values so existing revisions stay stable. Derived tool
+			// Omit empty GroupKey and PlanUsage values so existing revisions stay stable. Derived tool
 			// observation fields preserve the historical normalized-content-v1 representation.
+			// DialogueText is a derived search projection; reparses refresh it in place.
 			if !f.IsExported() || f.Name == "UsageAutomationProjected" || f.Name == "TrashIncludesCodexPages" ||
+				(v.Type() == reflect.TypeFor[db.Message]() && f.Name == "DialogueText") ||
+				(v.Type() == rawSessionType && f.Name == "SourceMachines") ||
 				f.Name == "ToolObservations" || f.Name == "ObservedOutcome" || f.Name == "ObservedRepeat" || f.Name == "SequenceEnding" ||
-				(v.Type() == reflect.TypeFor[db.Session]() && f.Name == "GroupKey" && v.Field(i).IsZero()) {
+				(v.Type() == reflect.TypeFor[db.Session]() && f.Name == "GroupKey" && v.Field(i).IsZero()) ||
+				(v.Type() == reflect.TypeFor[ingest.PreparedSession]() && f.Name == "PlanUsage" && v.Field(i).IsZero()) {
 				continue
 			}
 			// Session fields added after normalized-content-v1 was recorded

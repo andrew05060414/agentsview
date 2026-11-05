@@ -44,10 +44,10 @@ the underlying SSE events.
 
 ## Transport
 
-Detection uses kit daemon runtime records in `AGENTSVIEW_DATA_DIR` and the
-daemon ping endpoint. Runtime records include service and API metadata so
-incompatible or read-only daemons are not mistaken for a writable local archive
-owner.
+Detection uses kit daemon runtime records in `AGENTSVIEW_DATA_DIR` (its `run`
+subdirectory on Windows) and the daemon ping endpoint. Runtime records include
+service and API metadata so incompatible or read-only daemons are not mistaken
+for a writable local archive owner.
 
 - If `--server <url>` is set, supported commands proxy to that daemon over HTTP.
   `--server` and `--pg` are mutually exclusive. The local config `auth_token`
@@ -104,7 +104,7 @@ known.
 | `--json`                     | Alias for `--format json`.                                                                                                                                                                     |
 | `--server <url>`             | Explicit daemon URL for HTTP-backed operations.                                                                                                                                                |
 | `--server-token-file <path>` | Bearer token file for an explicit `--server` URL.                                                                                                                                              |
-| `--machine <value>`          | Filter bare Codebuff/Freebuff timestamp resolution to a single machine identity (`local`, a name, or `*`). Default `local`. `session get` only; canonical IDs and other agents are unaffected. |
+| `--machine <value>`          | Filter bare Codebuff/Freebuff timestamp resolution to one machine (`local`, ID, alias, name, or `*`). Default `local`. `session get` only; canonical IDs and other agents are unaffected.      |
 | `--pg`                       | Read from configured PostgreSQL instead of SQLite.                                                                                                                                             |
 
 ## Shared metadata endpoints
@@ -121,6 +121,13 @@ GET /api/v1/machines
 GET /api/v1/branches
 GET /api/v1/agents
 ```
+
+`GET /api/v1/machines` returns the picker catalog and applies the visibility
+flags in its `machines` array. With `?machine=Workstation`, the separate
+`resolved_machines` array contains the canonical selector IDs, even when those
+IDs have no visible or stored sessions. It is omitted without a selector. Visibility
+flags do not limit resolution. Unknown or ambiguous selectors return HTTP 400
+with known choices.
 
 `GET /api/v1/branches` returns distinct `(project, branch)` pairs plus an opaque
 `token` field:
@@ -254,6 +261,13 @@ reveals it. Human stdout stays unchanged, and the JSON catalog is additive, so
 redirecting or piping structured output remains safe. The JSON `total` continues
 to describe the filtered result, not the excluded sessions. Use the
 `--include-*` flags to opt back in.
+
+Machine filters accept exact IDs, aliases, comma-separated ID/alias lists, or a
+unique whole display label. Exact ID/alias lists take precedence over a
+same-spelled label. Otherwise, the complete input is matched against labels,
+including labels containing commas. A valid 32-character hexadecimal installation
+ID takes precedence over a same-text label even without stored sessions. Unknown or ambiguous selectors
+return HTTP 400 with code `invalid_machine_filter`.
 
 In JSON output, `sessions[].machine` keeps the machine key. Look it up in the
 top-level `machine_labels` map when a display name is needed. A key without a
@@ -598,7 +612,7 @@ sessions already present there.
   daemon-owned.
 - If the local archive needs a rebuild, `POST /api/v1/sessions/sync` returns
   HTTP 409 with `X-Agentsview-Resync-Required: true`. Wait for the rebuild or
-  run `agentsview sync --full`, then retry the session sync.
+  run `agentsview source sync --full`, then retry the session sync.
 - If a [`pg serve`](/docs/pg-sync/#agentsview-pg-serve) daemon is running
   (read-only), sync refuses with a clear error.
 - If `AGENTSVIEW_NO_DAEMON=1` is set, the CLI runs the sync in-process only
@@ -767,7 +781,7 @@ ______________________________________________________________________
 
 ### `agentsview session search`
 
-Substring, RE2 regex, or FTS5 search across message bodies, tool inputs, and
+Substring, RE2 regex, or FTS5 search across message bodies, thinking, tool inputs, and
 tool result content. Response shape matches `GET /api/v1/search/content`.
 
 ```bash
@@ -801,6 +815,50 @@ The content-search response includes `active_filter_applied`, which is true when
 `exclude_active_since` was applied before pagination. All current stores support
 this filter. Older servers may omit the field.
 
+On SQLite, PostgreSQL, DuckDB, and ClickHouse, the `messages` source searches dialogue from
+structured text blocks in Pi, OMP, OMO, Prime Agent, StepCode, iFlow, Claude Code,
+Cowork, iCodeMate CLI, Qoder, Cursor JSONL, Amp, OpenClaude, OpenClaw, QClaw, Devin,
+and OpenHands.
+Those projections exclude rendered tool calls and reasoning from snippets,
+while preserving literal marker text in dialogue. These parsers store reasoning
+blocks in `thinking_text`, including Cursor JSONL and OpenHands. Substring and
+regex searches on SQLite, PostgreSQL, DuckDB, and ClickHouse include `thinking` by default;
+use `--in messages` for dialogue alone or `--in thinking` for reasoning alone.
+FTS searches messages only. Terms, semantic, and hybrid reject `thinking` as a
+source. Semantic search continues to embed full message text; hybrid's keyword
+search uses dialogue.
+Ordinary session search and the command palette continue to search the full
+rendered transcript.
+
+Existing sessions from these providers are reparsed when their source files are
+available. Other providers and parser paths, sessions without source files,
+imported v4 artifacts, and unpaired OpenHands observations keep searching their
+stored content as `message` hits.
+The first writable open refreshes SQLite's full-text indexes once. Startup waits
+for this scan; later opens reuse the indexes. Every message indexes its full
+rendered text in `rendered` and `COALESCE(dialogue_text, content)` in `content`.
+Ordinary session search matches `rendered` unless the query names an FTS column;
+FTS content search and hybrid's keyword search match `content`. Session-search
+ordering may shift.
+DuckDB mirrors rebuild on their next push to fill dialogue. The first ClickHouse
+push after upgrading is a full push to fill dialogue.
+
+PostgreSQL schema setup adds the dialogue column and builds trigram indexes on
+dialogue and reasoning beside the existing `content` index. The dialogue index
+is close to the size of the `content` index, the reasoning index grows with
+stored reasoning, and both slow message writes. Building them on an existing
+mirror blocks writes to `messages` until each finishes. The first push after
+upgrading publishes every session in its scope once to fill existing rows. A
+restricted hosted runtime role needs `UPDATE(dialogue_text)` on `messages`. For
+hosted raw uploads, run `agentsview replica pg raw-reparse hosted --run-id <id>` after
+upgrading the server. Repeat the same run ID until the command reports
+`complete=true`. A change to dialogue derivation alone keeps session IDs,
+content revisions, and embeddings. A parser upgrade that changes other fields,
+such as Pi reasoning text, produces a new content revision and session ID.
+
+Artifact transport is a separate follow-up.
+Transcript display, block order, and artifact format v4 remain unchanged.
+
 One-shot, automated, and subagent sessions are excluded by default; opt back in
 with `--include-one-shot`, `--include-automated`, or `--include-children`.
 
@@ -812,7 +870,7 @@ with `--include-one-shot`, `--include-automated`, or `--include-children`.
 | `--hybrid`            | `mode=hybrid`          | Semantic + FTS reciprocal rank fusion; messages-only — see [Semantic Search](/docs/semantic-search/)                                                                              |
 | `--scope`             | `scope`                | `top`, `all` (default), or `subordinate` — semantic/hybrid only; supersedes `include_children` in those modes                                                                     |
 | `--context`           | `context`              | int — N messages of context before/after each match (max 10)                                                                                                                      |
-| `--in`                | `in`                   | Comma-separated: `messages,tool_input,tool_result` (default all)                                                                                                                  |
+| `--in`                | `in`                   | Comma-separated: `messages,thinking,tool_input,tool_result` (default all); `thinking` requires SQLite, PostgreSQL, DuckDB, or ClickHouse substring/regex                                                                                                                  |
 | `--exclude-system`    | `exclude_system`       | Drop system messages from the scan                                                                                                                                                |
 | `--reveal`            | `reveal`               | Show full secret values (localhost-only; warning to stderr)                                                                                                                       |
 | `--project`           | `project`              | string                                                                                                                                                                            |
@@ -841,6 +899,8 @@ substring (the default) and regex modes also walk `tool_calls.input_json`,
 (`--cursor` is rejected) — see [Semantic Search](/docs/semantic-search/) for
 setup, scoring, and limitations.
 
+On PostgreSQL, `--fts` matches each word or quoted phrase as a case-insensitive substring; a query that starts with a quote also honors `AND`, `OR`, `NOT`, and parentheses as SQLite does. `NEAR(...)` and prefix `*` are not supported there; `*` matches literally.
+
 Every match, in every mode, carries the conversation-unit citation described in
 [Hit shape](/docs/semantic-search/#hit-shape-ranges-and-anchors):
 `ordinal_range` — `[start, end]` of the conversation unit containing the match,
@@ -862,10 +922,92 @@ origin — `reveal=true` is only honored on a localhost-bound daemon.
 
 ______________________________________________________________________
 
+### `agentsview session usage-batch`
+
+Read usage for several sessions in one CLI process. Local and PostgreSQL modes
+select the backend and open the archive or connection once. With `--server`,
+the command still makes requests for each ID. IDs resolve as they do for
+`session usage`, including short IDs. Repeated IDs produce repeated results in
+input order.
+
+```bash
+agentsview session usage-batch <id>... [--format json] [--own-only] [--no-sync]
+```
+
+The command accepts the same `--server`, `--server-token-file`, and `--pg`
+options as `session usage`. Descendant usage and source refresh follow the
+single-session command's rules below.
+
+JSON always contains a `results` array, even for one ID. Each entry has
+`requested_id`, `exit_code`, and `usage` when available. `usage` has the same
+shape as `session usage --json`. Per-session failures include `error` text;
+missing sessions have code 2, and sessions without token data, cost, or plan
+usage figures have code 3. Code 0 means token data, cost, or Codex Cloud plan
+usage figures are available. Other lookup errors have code 1. The command
+continues after a per-session failure.
+
+```json
+{
+  "results": [
+    {
+      "requested_id": "missing-session",
+      "exit_code": 2,
+      "error": "session not found: missing-session"
+    }
+  ]
+}
+```
+
+Human output labels each requested ID and its exit code before its usage or
+error. The process exits 0 after completing the results, including per-session
+failures. Backend setup or output failures exit 1. The existing
+`session usage <id>` output and process exit codes remain unchanged.
+
+### `agentsview session diagnose`
+
+`agentsview session diagnose <id> --json` reports archived usage and evidence
+for investigating an expensive task. It uses the same pricing and linked
+subagent accounting and source refresh as `session usage`. Pass `--no-sync`
+to read archived usage without refreshing source transcripts. If refresh fails,
+human output warns that it is incomplete, and JSON sets
+`usage.refresh_incomplete`. Pass `--own-only` to exclude subagent usage; child
+links remain listed. Human output is the default; `--pg` and `--server` select
+the same read transports as other session commands.
+Missing sessions and read failures return exit 1.
+
+The versioned JSON includes the usage breakdown, totals of its normalized
+uncached input, cache-read, cache-write and output rows, context observations,
+compaction ordinals and inferred counts, the ten largest recorded tool-result
+lengths, and runs of
+three or more consecutive calls with identical recorded arguments. Tool and
+context evidence covers the named session only; child links are shown when
+recorded. Retry candidates use the same recorded-argument comparison as the
+`tool_retry_count` signal. Empty or placeholder arguments can form candidates;
+they do not prove that a provider retried a request. These observations can be
+incomplete: usage rows are not always requests, request counts and provider
+cache-miss reasons are unavailable, and result lengths are not billed tokens.
+Cost is reported or estimated according to the existing usage contract; no
+causal savings or invoice total is inferred. The report omits transcript content
+and tool arguments. Context, compaction, and tool evidence comes from a paged
+scan of all archived messages. Human output shows the latest ten context
+observations; JSON includes every observation. Usage is a separate read and can
+reflect a different archive revision if ingestion runs concurrently. Message
+pages share no snapshot, so a transcript rewritten during the scan can mix
+revisions; run the command again after the rewrite for a stable result.
+`schema_version` versions the output shape, not the archive snapshot.
+
+Compactions follow ingestion's detection rules. Explicit boundary markers appear
+in `compaction_ordinals`. When there are no explicit markers,
+`inferred_compaction_count` counts drops greater than 30% between successive
+reported assistant context measurements, including across message pages. Missing
+measurements are skipped. Explicit markers take precedence and leave the
+inferred count at zero.
+
 ### `agentsview session usage`
 
 Per-session token usage and cost estimate. Output shape is stable for the fields
-shown below; new fields may be added.
+shown below; new fields may be added. MCP clients read the same figures with the
+[`get_session_usage`](/docs/mcp/#session-details-reports-and-guides) tool.
 
 Totals cover the named session **and every subagent transcript spawned beneath
 it**. Claude Code writes each Task-tool subagent to its own file under
@@ -883,7 +1025,10 @@ request.
 
 - `?subagents=true` folds descendant usage into `cost`, `total_output_tokens`,
   `models`, `breakdown`, and `breakdown_count`, and adds `subagent_count`.
-  This is what the CLI requests.
+  For a Codex Cloud chat it also folds `capture_coverage`: `uncaptured_turns`
+  is the sum across the root and its sub-agents, and `last_capture_at` is the
+  newest of theirs. `plan_usage` stays the root's report, which already counts
+  its sub-agents. This is what the CLI requests.
 - `?rollup=true` keeps the totals own-session and reports the combined cost in
   the separate `rollup_*` fields below. The session detail header uses this
   form. When both `rollup=true` and `subagents=true` are passed, the handler
@@ -966,6 +1111,20 @@ agentsview session usage <id> [--format json] [--own-only] [--no-sync]
 | `rollup_cost`           | REST only, with `rollup=true`; integer microdollar object present only when `has_rollup_cost` is true, carrying the complete cost across the root and explicit subagent descendants                                                              |
 | `has_rollup_cost`       | REST only, with `rollup=true`; true only when at least one contributing row exists and every contributing row is priced                                                                                                                          |
 | `rollup_subagent_count` | REST only, with `rollup=true`; count of reachable explicit subagent descendants, including those without usage rows                                                                                                                              |
+| `plan_usage`            | Codex Cloud only; omitted for other agents and until AgentsView has stored a report or a check outcome for the chat. OpenAI's plan usage report for the chat: `data_as_of`, `data_status` (`available`, `partial`, or `unavailable`), `weekly_percent`, `five_hour_percent`, `credits` (a decimal string), per-model `groups`, `final`, and the newest `outcome_kind` and `outcome_at`. An outcome-only object, such as one with `outcome_kind` `account_unavailable`, has no figures. A sub-agent chat has `outcome_kind` `counted_under` and the root session ID in `counted_under`|
+| `capture_coverage`      | Codex Cloud only; omitted when live capture never saw the chat. `last_capture_at`, when AgentsView last received a token update for the chat, and `uncaptured_turns`, the number of finished turns live capture did not fully see: no token update covers them directly or through a later turn's running total |
+
+A Codex Cloud session that live capture never saw has `has_token_data` and
+`has_cost` set to `false` and carries its figures in `plan_usage` instead. The
+CLI's human output shows `n/a` for output and peak context, and "billed as plan
+usage" for cost when the session has plan usage figures. A `Plan usage:` line
+follows, and, when live capture saw the chat, a `Captured:` line. When a later
+check left the chat out or failed, the `Plan usage:` line says what that check
+found and that the figures may be out of date. For missed turns, the `Captured:`
+line says some of their tokens may be missing from the totals. When the newest
+report is complete and no later check failed, it adds that plan usage counts the
+turns that ran before the report's data time; AgentsView does not know whether
+each missed turn ran before that time, so it does not claim more.
 
 Claude Code echoes some parent turns into a subagent's sidechain transcript, so
 the same message can appear in two sessions. Every combined figure counts it
@@ -1019,9 +1178,39 @@ When some contributing models are unpriced, the cost line reads
 GET /api/v1/sessions/{id}/usage
 ```
 
+On `main` after v0.46.1, this endpoint accepts raw agent session IDs
+as well as canonical archive IDs. Exact matches take precedence. If an exact
+lookup misses or reports an ambiguous identity, an ID without a known agent
+prefix or `~` host namespace is matched literally against stored IDs ending in
+`:` or `~` followed by that ID. Trashed sessions do not count toward these
+matches.
+A unique match returns `200` with the canonical archive ID in `session_id`.
+This applies to plain requests and all `subagents`, `rollup`, and `breakdown`
+combinations.
+Explicit canonical IDs that are missing still return `404`.
+
+Multiple matches return `409` with `error.code = "ambiguous_session_id"`:
+
+```json
+{
+  "error": {
+    "code": "ambiguous_session_id",
+    "message": "multiple sessions match; retry with a canonical candidate ID",
+    "candidates": ["archive-a~codex:thread-id", "archive-b~codex:thread-id"]
+  }
+}
+```
+
+Retry with one of the canonical IDs in `error.candidates`. The list contains
+at most five candidates and may omit additional matches. No match returns the
+same `404` described below. Lookup failures return the same `500` as usage-query
+failures. This fallback is specific to the usage endpoint; other session routes
+keep their existing lookup behavior. The GET reads archived data without
+refreshing or syncing source files.
+
 The response uses the same JSON fields shown above and is available from both
 local SQLite-backed `agentsview serve` and read-only
-[`agentsview pg serve`](/docs/pg-sync/#agentsview-pg-serve). HTTP responses set
+[`agentsview replica pg serve`](/docs/pg-sync/#agentsview-pg-serve). HTTP responses set
 `server_running: true`. As of 0.37.1, pass `?breakdown=true` to include the
 per-step `breakdown` rows; without it `breakdown` is `[]` while
 `breakdown_count` still reports the row count. The CLI requests the breakdown on
@@ -1048,16 +1237,18 @@ Unexpected usage-query failures return `500` with
 
 **Exit codes**:
 
-| Code | Meaning                                            |
-| ---- | -------------------------------------------------- |
-| `0`  | Token data or cost present and reported            |
+| Code | Meaning                                                                        |
+| ---- | ------------------------------------------------------------------------------ |
+| `0`  | Token data, cost, or Codex Cloud plan usage figures present                    |
 | `1`  | Query error or session unavailable during startup ingestion or archive rebuild |
 | `2`  | Session missing after startup or rebuild, or from an archive-only/direct lookup |
-| `3`  | Session exists but has neither token data nor cost |
+| `3`  | Session exists but has no token data, cost, or plan usage figures              |
 
 The codes classify the reported document, so a session whose only token data
 lives in its subagents exits `0`, not `3`. With `--own-only` it exits `3`, as it
-did before.
+did before. A Codex Cloud session with plan usage figures but no captured tokens
+exits `0`. A sub-agent chat counted under its root, or a session whose plan
+usage has not been reported, exits `3`.
 
 Combined usage refreshes a known session and nearby Claude subagent transcripts
 without waiting for startup ingestion. The CLI requests this with
@@ -1097,7 +1288,7 @@ usage from the shared PostgreSQL store.
 
 Pricing comes from the same `model_pricing` table and
 [custom pricing overrides](/docs/token-usage/#custom-model-pricing) that back
-`agentsview usage daily`. Replaces the older
+`agentsview report usage daily`. Replaces the older
 [`agentsview token-use`](/docs/commands/#agentsview-token-use), which remains as
 a deprecated alias.
 
@@ -1106,7 +1297,7 @@ ______________________________________________________________________
 ## Activity Report
 
 The Activity report endpoint powers the top-level [Activity](/docs/activity/)
-page and the `agentsview activity report` CLI command. It returns one resolved
+page and the `agentsview report activity` CLI command. It returns one resolved
 range with concurrency buckets, summary totals, breakdowns, and contributing
 sessions.
 
@@ -1124,7 +1315,7 @@ Activity includes one-shot sessions by default. Automated sessions are also
 included by default and can be filtered with the `automation` query parameter.
 
 The JSON response shares the same `schema_version`, `pricing`, and `projects`
-metadata contract as `agentsview activity report --json`.
+metadata contract as `agentsview report activity --json`.
 
 The report route negotiates its response with `Accept`. Ordinary clients receive
 plain JSON. Clients requesting `text/event-stream` receive throttled `progress`
@@ -1142,7 +1333,7 @@ route and are not subject to the ordinary 30-second operation timeout.
 | `project`    | Filter by project                                          |
 | `git_branch` | Filter by opaque branch token from `GET /api/v1/branches`  |
 | `agent`      | Filter by agent                                            |
-| `machine`    | Filter by machine                                          |
+| `machine`    | Exact ID, alias, ID/alias list, or unique whole display label; unknown or ambiguous values return HTTP 400 |
 | `automation` | `all`, `interactive`, or `automated`; default `all`        |
 
 Project, branch, agent, and machine filters are limited to 1,024 UTF-8 bytes

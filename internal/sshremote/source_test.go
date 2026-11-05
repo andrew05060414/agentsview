@@ -19,6 +19,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/remotesync"
+	"go.kenn.io/agentsview/internal/shellquote"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
@@ -28,7 +29,7 @@ const sourceTestHost = "devbox"
 const sourceTestDestination = "user@devbox.example.test"
 
 // sourceEnv is a fake remote reached through the fake ssh, whose remote
-// agentsview is this test binary.
+// agentsview is a shell wrapper that execs this test binary.
 type sourceEnv struct {
 	ssh         fakeSSH
 	build       LocalBuild
@@ -48,9 +49,11 @@ func newSourceEnv(t *testing.T) sourceEnv {
 	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "archive.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	executable := writeExecutable(t, t.TempDir(), "agentsview",
+		"#!/bin/sh\nexec "+shellquote.POSIX(os.Args[0])+" \"$@\"\n")
 	return sourceEnv{
 		ssh:         ssh,
-		build:       LocalBuild{Version: "dev", Executable: os.Args[0]},
+		build:       LocalBuild{Version: "dev", Executable: executable},
 		sessionPath: sessionPath,
 		database:    database,
 		dataDir:     t.TempDir(),
@@ -132,7 +135,7 @@ func (e sourceEnv) mirroredSessionFiles(t *testing.T) []string {
 	return found
 }
 
-// installTestBinary places the test binary in the fake remote's cache as
+// installTestBinary places the shell wrapper in the fake remote's cache as
 // build, so Ensure finds it without an upload.
 func installTestBinary(t *testing.T, home string, build LocalBuild) {
 	t.Helper()
@@ -193,6 +196,22 @@ func TestSSHSourceSyncsRemoteHome(t *testing.T) {
 	require.NotNil(t, session.FilePath)
 	assert.Equal(t, sourceTestHost+":"+env.sessionPath, *session.FilePath)
 	assert.Equal(t, []string{sourceTestDestination}, uniqueLines(t, env.ssh.Log))
+}
+
+// Remote sync reads only local archive settings, so an invalid section the
+// remote host's server would reject must not stop collection from it.
+func TestSSHSourceSyncsRemoteWithInvalidUnusedConfig(t *testing.T) {
+	env := newSourceEnv(t)
+	installTestBinary(t, env.ssh.Home, env.build)
+	configDir := filepath.Join(env.ssh.Home, ".agentsview")
+	require.NoError(t, os.MkdirAll(configDir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(configDir, "config.toml"),
+		[]byte("[insights]\nendpoint = 'http://models.example/v1'\nmodel = 'remote'\n"), 0o600))
+
+	stats, err := env.run(t, env.source())
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.SessionsSynced)
 }
 
 func TestSSHSourceSyncsAppendedSessionAsDelta(t *testing.T) {

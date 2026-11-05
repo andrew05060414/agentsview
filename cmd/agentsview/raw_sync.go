@@ -58,6 +58,7 @@ func newRawSyncCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "raw-sync",
 		Short:        "Capture and upload provider-owned raw session sources",
+		Long:         "Capture and upload provider-owned source artifacts to the configured raw-sync server, keeping durable local progress.",
 		GroupID:      groupData,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -127,7 +128,7 @@ func runRawSyncWatch(ctx context.Context, watchCfg rawSyncWatchConfig) error {
 	if err := validateRawSyncWatchConfig(watchCfg, credential); err != nil {
 		return err
 	}
-	appCfg, err := config.LoadReadOnly()
+	appCfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 	if err != nil {
 		return err
 	}
@@ -490,7 +491,7 @@ func rawSyncConfiguredRootForPath(configuredRoots []string, watchPath string) st
 }
 
 func runRawSyncStatus(ctx context.Context, out io.Writer) error {
-	cfg, err := config.LoadReadOnly()
+	cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 	if err != nil {
 		return err
 	}

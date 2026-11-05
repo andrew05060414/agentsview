@@ -97,6 +97,8 @@ const (
 
 const AgentDeepSeekHarness AgentType = "deepseek-harness"
 
+const AgentCodexCloud AgentType = "codex-cloud"
+
 // AgentDef describes a supported coding agent's filesystem
 // layout, configuration keys, and session ID conventions.
 type AgentDef struct {
@@ -132,6 +134,17 @@ type AgentDef struct {
 	// with secrets or state that cannot be copied safely; each artifact
 	// seam checks it so exclusion fails closed.
 	RemoteSyncExcluded bool
+
+	// RemoteHostSyncExcluded keeps the agent's roots out of remote host
+	// sync only. Raw capture may still ship them to a hub. Set for roots
+	// that hold local state files beside transcripts that are safe to
+	// capture one file at a time.
+	RemoteHostSyncExcluded bool
+
+	// DataDirRoot is the agent's only root, relative to the AgentsView
+	// data directory in slash form, for sources AgentsView writes itself. Such an agent
+	// has no user-configurable directories.
+	DataDirRoot string
 
 	// WatchRootsFunc resolves the directories to watch for live
 	// updates under a configured root, for agents whose watch
@@ -657,6 +670,14 @@ var Registry = []AgentDef{
 		DefaultDirs:       []string{".dsh/sessions"},
 		IDPrefix:          "deepseek-harness:",
 		FileBased:         true,
+	},
+	{
+		Type:                   AgentCodexCloud,
+		DisplayName:            "Codex Cloud",
+		IDPrefix:               "codex-cloud:",
+		FileBased:              true,
+		DataDirRoot:            "sources/codex-cloud",
+		RemoteHostSyncExcluded: true,
 	},
 	{
 		Type:        AgentOpenClaw,
@@ -1219,7 +1240,13 @@ func AgentByType(t AgentType) (AgentDef, bool) {
 // stay out of every remote sync artifact. Unknown agents are not excluded.
 func RemoteSyncExcludedAgent(agent AgentType) bool {
 	def, ok := AgentByType(agent)
-	return ok && def.RemoteSyncExcluded
+	return ok && def.RemoteHostSyncBlocked()
+}
+
+// RemoteHostSyncBlocked reports whether remote host sync must leave the
+// agent's roots behind.
+func (d AgentDef) RemoteHostSyncBlocked() bool {
+	return d.RemoteSyncExcluded || d.RemoteHostSyncExcluded
 }
 
 // AgentHasPostAnswerToolWork reports whether the agent may continue calling
@@ -1490,9 +1517,11 @@ type ParsedSession struct {
 	FirstMessage            string
 	SessionName             string
 	// SessionNamePresent distinguishes an explicitly present provider title
-	// (including a blank title) from no title signal. Codex and Antigravity
-	// keep titles outside the transcript, so a missing or unreadable title
-	// source keeps the stored title while an explicit blank clears it.
+	// (including a blank title) from no title signal. Codex, Antigravity,
+	// and Qoder keep titles outside the transcript, so a missing or
+	// unreadable title source keeps the stored title while an explicit
+	// blank clears it. Qoder's app database leaves a blank title unset, so
+	// it keeps the stored title too.
 	SessionNamePresent bool
 	// PRLinks lists the pull or merge requests the source associated with
 	// this session, deduplicated by URL in first-appearance order.
@@ -1532,6 +1561,16 @@ type ParsedSession struct {
 	// (e.g. VSCode Copilot). The sync engine forwards these into
 	// the usage_events table for catalog-based cost pricing.
 	UsageEvents []ParsedUsageEvent
+
+	// CaptureCoverage reports how much of a live-captured session's token
+	// usage was seen. Only Codex cloud sessions with token records set it.
+	CaptureCoverage *ParsedCaptureCoverage
+
+	// PlanUsage is the session's latest plan usage report and outcome.
+	// Only Codex cloud sessions set it. It is empty, meaning plan usage is
+	// not checked yet, for a session with neither plan usage records nor
+	// token records.
+	PlanUsage *ParsedPlanUsage
 
 	// CountsAuthoritative marks parsers that own MessageCount and
 	// UserMessageCount even when they intentionally emit no transcript rows.
@@ -1632,6 +1671,7 @@ type ParsedMessage struct {
 	Ordinal       int
 	Role          RoleType
 	Content       string
+	DialogueText  *string
 	ThinkingText  string // concatenated text of all thinking blocks; "" if none
 	Timestamp     time.Time
 	HasThinking   bool
@@ -1643,8 +1683,8 @@ type ParsedMessage struct {
 
 	Model           string
 	ReasoningEffort string
-	// ProviderID identifies the billing provider for this response, such as
-	// Posit Assistant's "positai" managed service or BYO "anthropic".
+	// ProviderID carries the billing identity for this response, including Codex
+	// service tiers, Posit Assistant's "positai" service, or BYO "anthropic".
 	ProviderID       string
 	TokenUsage       jsontext.Value
 	ContextTokens    int
@@ -1674,6 +1714,9 @@ type ParsedMessage struct {
 	IsSidechain       bool
 	IsCompactBoundary bool
 
+	// claudeChannelOrigin limits preview unwrapping to channel entries.
+	claudeChannelOrigin bool
+
 	// StopReason is the reason the assistant stopped generating
 	// (Claude: "end_turn", "tool_use", "max_tokens", "stop_sequence";
 	// other agents may use their own vocabulary or leave it empty).
@@ -1684,6 +1727,47 @@ type ParsedMessage struct {
 	// tokenPresenceKnown marks per-message token coverage as
 	// parser-owned and authoritative.
 	tokenPresenceKnown bool
+}
+
+// ParsedCaptureCoverage summarizes live token capture for one session:
+// when the newest token record was observed and how many finished turns
+// no token record covers.
+type ParsedCaptureCoverage struct {
+	LastCaptureAt   *time.Time
+	UncapturedTurns int
+}
+
+// ParsedPlanUsage is a session's plan usage: OpenAI's latest report of
+// the thread's share of the plan's limits and its credits, and the newest
+// outcome record written after that report. The report fields are empty
+// when no row exists or a newer "counted under" outcome cleared them.
+// Credits stay decimal strings as OpenAI sent them.
+type ParsedPlanUsage struct {
+	DataAsOf        *time.Time
+	DataStatus      string
+	UsageSource     string
+	WeeklyPercent   *float64
+	FiveHourPercent *float64
+	Credits         *string
+	Groups          []ParsedPlanUsageGroup
+	Final           bool
+	OutcomeKind     string
+	OutcomeAt       *time.Time
+	// CountedUnder is the usage root's session ID when this thread is a
+	// descendant whose usage counts toward the root.
+	CountedUnder string
+}
+
+// ParsedPlanUsageGroup is a plan usage row's figures for one model,
+// reasoning effort, and speed.
+type ParsedPlanUsageGroup struct {
+	Model             string
+	ReasoningEffort   string
+	Speed             string
+	ProductExperience string
+	WeeklyPercent     *float64
+	FiveHourPercent   *float64
+	Credits           *string
 }
 
 // ParsedUsageEvent records session-level usage emitted by parsers

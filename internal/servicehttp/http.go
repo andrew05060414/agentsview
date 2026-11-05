@@ -17,6 +17,7 @@ import (
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/requestsign"
 	"go.kenn.io/agentsview/internal/service"
 )
@@ -83,9 +84,12 @@ type httpBackend struct {
 	client            *http.Client
 	longRunningClient *http.Client
 	readOnly          bool
+	signed            bool
 	recallQueries     bool
+	docbankEnabled    bool
 	// apiVersion is the probed server API version, or 0 when unknown.
 	apiVersion int
+	friction   bool
 	token      string
 }
 
@@ -97,6 +101,9 @@ type HTTPServerCapabilities struct {
 	ReadOnly           bool `json:"read_only"`
 	APIVersion         int  `json:"api_version"`
 	NonRecordingRecall bool
+	// FrictionReadable is set when the server's store serves friction reads.
+	FrictionReadable bool
+	DocbankEnabled   bool `json:"docbank_enabled"`
 }
 
 // NewHTTPBackend constructs a SessionService that proxies to a
@@ -108,6 +115,7 @@ type HTTPServerCapabilities struct {
 // an empty value uses baseURL.
 func NewHTTPBackend(baseURL, token string, readOnly bool, browserURL string) service.SessionService {
 	b := newHTTPBackend(baseURL, token, readOnly, !readOnly)
+	b.friction = true
 	if browserURL != "" {
 		b.browserURL = browserURL
 	}
@@ -127,15 +135,16 @@ func NewHTTPBackendForServer(
 			capabilities.APIVersion >= recallNonRecordingAPIVersion,
 	)
 	b.apiVersion = capabilities.APIVersion
+	b.friction = capabilities.FrictionReadable
+	b.docbankEnabled = capabilities.DocbankEnabled
 	return b
 }
 
 func newHTTPBackend(
 	baseURL, token string, readOnly, recallQueries bool,
 ) *httpBackend {
-	browserURL := baseURL
-	if requestsign.SignsFromEnvironment(baseURL) {
-		// Signed machine listeners serve no browser UI, so omit session links.
+	signed, browserURL := requestsign.SignsFromEnvironment(baseURL), baseURL
+	if signed {
 		browserURL = ""
 	}
 	return &httpBackend{
@@ -144,10 +153,13 @@ func newHTTPBackend(
 		client:            &http.Client{Timeout: 30 * time.Second},
 		longRunningClient: &http.Client{Timeout: 0},
 		readOnly:          readOnly,
+		signed:            signed,
 		recallQueries:     recallQueries,
 		token:             token,
 	}
 }
+
+func (b *httpBackend) SupportsFileReferences() bool { return !b.signed && b.docbankEnabled }
 
 // ProbeHTTPServerCapabilities reads the metadata needed to expose tools safely
 // for an explicit daemon URL. Such callers do not have a local runtime record.
@@ -172,7 +184,7 @@ func probeHTTPServerCapabilities(ctx context.Context, api *apiclient.Client) (HT
 		return HTTPServerCapabilities{},
 			fmt.Errorf("probing server capabilities: %w", err)
 	}
-	return HTTPServerCapabilities{ReadOnly: response.JSON200.ReadOnly != nil && *response.JSON200.ReadOnly, APIVersion: int(response.JSON200.APIVersion), NonRecordingRecall: response.HTTPResponse.Header.Get("X-Agentsview-Recall-Queries") == "non-recording"}, nil
+	return HTTPServerCapabilities{DocbankEnabled: response.JSON200.DocbankEnabled != nil && *response.JSON200.DocbankEnabled, ReadOnly: response.JSON200.ReadOnly != nil && *response.JSON200.ReadOnly, APIVersion: int(response.JSON200.APIVersion), NonRecordingRecall: response.HTTPResponse.Header.Get("X-Agentsview-Recall-Queries") == "non-recording", FrictionReadable: response.JSON200.FrictionReadable != nil && *response.JSON200.FrictionReadable}, nil
 }
 
 func (b *httpBackend) SupportsRecallQueries() bool { return b.recallQueries }
@@ -810,7 +822,10 @@ func (b *httpBackend) SearchContent(
 	ctx context.Context, req service.ContentSearchRequest,
 ) (*service.ContentSearchResult, error) {
 	q := &apiclient.GetAPIV1SearchContentQuery{}
-	q.Pattern = req.Pattern
+	if req.Pattern != "" {
+		q.Pattern = new(req.Pattern)
+	}
+	q.Concepts = req.Concepts
 	if req.Mode != "" {
 		q.Mode = new(apiclient.GetAPIV1SearchContentQueryMode(req.Mode))
 	}
@@ -909,7 +924,7 @@ func (b *httpBackend) SearchContent(
 		q.Context = new(int64(req.Context))
 	}
 	var editors []runtime.RequestEditorFn
-	if req.Mode == "semantic" || req.Mode == "hybrid" {
+	if req.Mode == "semantic" || req.Mode == "hybrid" || len(req.Concepts) > 0 {
 		editors = append(editors, func(_ context.Context, r *http.Request) error {
 			r.Header.Set(service.SemanticSearchIntentHeader, service.SemanticSearchIntentValue)
 			return nil
@@ -981,6 +996,9 @@ func (b *httpBackend) UsageSummary(
 	ctx context.Context, req service.UsageRequest,
 ) (*service.UsageSummaryResult, error) {
 	q := &apiclient.GetAPIV1UsageSummaryQuery{}
+	if req.GroupModels {
+		q.GroupModels = new(true)
+	}
 	if req.From != "" {
 		parsedFrom, err := time.Parse(time.DateOnly, req.From)
 		if err != nil {
@@ -1083,9 +1101,80 @@ func (b *httpBackend) UsageSummary(
 		ModelTotals: wire.ModelTotals, AgentTotals: wire.AgentTotals,
 		SessionCounts: wire.SessionCounts, CacheStats: wire.CacheStats,
 		UnsupportedUsage: wire.UnsupportedUsage,
+		ModelAliases:     wire.ModelAliases,
+	}
+	if wire.PlanOnlySessions != nil {
+		out.PlanOnlySessions = int(*wire.PlanOnlySessions)
+	}
+	if wire.PartlyCapturedSessions != nil {
+		out.PartlyCapturedSessions = int(*wire.PartlyCapturedSessions)
 	}
 	if wire.SchemaVersion != nil {
 		out.SchemaVersion = int(*wire.SchemaVersion)
+	}
+	return out, nil
+}
+
+// subagentUsageAPIVersion mirrors server.SubagentUsageAPIVersion, the first
+// daemon API that folds subagent usage into a session's usage response.
+const subagentUsageAPIVersion = 6
+
+// SessionUsage reads the daemon's usage document for one stored session ID,
+// with the full breakdown and the same subagent scope as the direct backend.
+// A missing session returns nil.
+func (b *httpBackend) SessionUsage(
+	ctx context.Context, req service.SessionUsageRequest,
+) (*service.SessionUsageReport, error) {
+	if !req.OwnOnly && b.apiVersion > 0 && b.apiVersion < subagentUsageAPIVersion {
+		return nil, fmt.Errorf(
+			"server API version %d does not support combined subagent usage; "+
+				"upgrade or restart the server, or request own-session usage",
+			b.apiVersion,
+		)
+	}
+	api, err := b.apiClient(b.client)
+	if err != nil {
+		return nil, err
+	}
+	q := &apiclient.GetAPIV1SessionsIDUsageQuery{Breakdown: new(true)}
+	if !req.OwnOnly {
+		q.Subagents = new(true)
+	}
+	response, err := api.GetAPIV1SessionsIDUsageWithResponse(ctx, &apiclient.GetAPIV1SessionsIDUsageRequestOptions{
+		PathParams: &apiclient.GetAPIV1SessionsIDUsagePath{ID: url.PathEscape(req.ID)},
+		Query:      q,
+	})
+	if response == nil {
+		return nil, err
+	}
+	err = serviceResponseError(response.HTTPResponse, response.Body, err)
+	if errors.Is(err, errHTTPNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	wire := response.JSON200
+	if wire == nil {
+		return nil, errors.New("session usage: empty response")
+	}
+	out := &service.SessionUsageReport{
+		SessionID: wire.SessionID, Agent: wire.Agent, Project: wire.Project,
+		TotalOutputTokens: int(wire.TotalOutputTokens), PeakContextTokens: int(wire.PeakContextTokens),
+		HasTokenData: wire.HasTokenData, Cost: wire.Cost, HasCost: wire.HasCost, CostUSD: wire.CostUsd,
+		Models: wire.Models, UnpricedModels: wire.UnpricedModels,
+		BreakdownCount: int(wire.BreakdownCount), Breakdown: wire.Breakdown,
+		Plan:     wire.PlanUsage,
+		Coverage: wire.CaptureCoverage,
+	}
+	if wire.CostSource != nil {
+		out.CostSource = export.CostSource(*wire.CostSource)
+	}
+	if wire.AiCredits != nil {
+		out.AICredits = *wire.AiCredits
+	}
+	if wire.SubagentCount != nil {
+		out.SubagentCount = int(*wire.SubagentCount)
 	}
 	return out, nil
 }
@@ -1094,6 +1183,9 @@ func (b *httpBackend) UsagePairwiseComparison(
 	ctx context.Context, req service.UsagePairwiseComparisonRequest,
 ) (*service.UsagePairwiseComparisonResponse, error) {
 	q := &apiclient.GetAPIV1UsagePairwiseComparisonQuery{}
+	if req.GroupModels {
+		q.GroupModels = new(true)
+	}
 	if req.FallbackToDefault {
 		q.FallbackToDefault = new(true)
 	}
@@ -1600,6 +1692,23 @@ func parseScanStream(
 
 func (b *httpBackend) apiClient(client *http.Client) (*apiclient.Client, error) {
 	return apiclient.NewHTTPClient(b.baseURL, b.token, client)
+}
+
+// HTTPErrorDetails exposes response status and its readable error field for
+// CLI presentation. It does not change the original error or its cause. Raw
+// bodies and request paths are deliberately excluded from the message.
+func HTTPErrorDetails(err error) (status int, message string, ok bool) {
+	statusErr, ok := errors.AsType[*httpStatusError](err)
+	if !ok {
+		return 0, "", false
+	}
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(statusErr.body, &payload) == nil {
+		message = payload.Error
+	}
+	return statusErr.statusCode, message, true
 }
 
 // IsRequestRejected reports whether err is a daemon's 4xx answer to a request.

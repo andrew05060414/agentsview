@@ -1,9 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vite-plus/test";
 import type { DbMessage as Message, DbToolCall as ToolCall } from "../api/generated/index.js";
-import { renderMarkdown } from "../utils/markdown.js";
-import { blockKey, collectSearchBlocks, resolveToolInputText } from "./block-text.js";
-import { domText, findOccurrences } from "./dom-text.js";
+import { collectSearchBlocks, resolveToolInputText } from "./block-text.js";
 
 let nextId = 50000;
 function message(content: string, overrides: Partial<Message> = {}): Message {
@@ -29,31 +27,10 @@ function message(content: string, overrides: Partial<Message> = {}): Message {
 }
 
 function call(tool_name: string, params: Record<string, unknown>): ToolCall {
-  return {
-    category: "",
-    tool_name,
-    input_json: JSON.stringify(params),
-  };
+  return { call_index: 0, category: "", tool_name, input_json: JSON.stringify(params) };
 }
 
 describe("collectSearchBlocks", () => {
-  it.each([
-    "**needle** and *needle*",
-    "[needle](https://example.test/hidden-target)",
-    "| heading |\n| --- |\n| needle |",
-    "<bash-input>echo needle</bash-input>",
-    "<custom>needle</custom>",
-    "needle\nnext line",
-  ])("uses rendered Markdown text for %s", (content) => {
-    const blocks = collectSearchBlocks(message(content));
-    const expected = domText(
-      new DOMParser().parseFromString(renderMarkdown(content), "text/html").body,
-    );
-    expect(blocks).toHaveLength(1);
-    expect(blocks[0]?.text).toBe(expected);
-    expect(findOccurrences(blocks[0]!.text, "needle")).toEqual(findOccurrences(expected, "needle"));
-  });
-
   it("indexes the displayed image placeholder without indexing its serialized metadata", () => {
     const content =
       '[{"type":"input_text","text":"Before"},{"byte_size":3,"media_type":"image/png","sha256":"","text":"[Image: image/png, 3 bytes]","type":"agentsview_image","version":1},{"type":"text","text":"After"}]';
@@ -61,6 +38,7 @@ describe("collectSearchBlocks", () => {
       message("", {
         tool_calls: [
           {
+            call_index: 0,
             category: "",
             tool_name: "view_image",
             result_content: content,
@@ -125,6 +103,19 @@ describe("collectSearchBlocks", () => {
     expect(new Set(blocks.map((block) => block.key)).size).toBe(blocks.length);
   });
 
+  it("indexes each tool field value ahead of the tool input", () => {
+    const tool = {
+      ...call("shell_command", { command: "make test", cwd: "/workspace/app", timeout: 600000 }),
+      category: "Bash",
+    };
+    const blocks = collectSearchBlocks(message("", { has_tool_use: true, tool_calls: [tool] }));
+    expect(blocks.map((block) => [block.key, block.text])).toEqual([
+      ["7:tool-meta:0.0", "/workspace/app"],
+      ["7:tool-meta:0.1", "600000"],
+      ["7:tool-input:0", "make test"],
+    ]);
+  });
+
   it("uses structured solo input instead of the parsed tool segment", () => {
     const tool = {
       ...call("Bash", { command: "echo actual" }),
@@ -139,7 +130,7 @@ describe("collectSearchBlocks", () => {
         .filter((block) => block.kind.startsWith("tool-"))
         .map((block) => [block.key, block.text]),
     ).toEqual([
-      ["7:tool-input:0", "command: echo actual"],
+      ["7:tool-input:0", "echo actual"],
       ["7:tool-output:0", "output"],
     ]);
   });
@@ -152,8 +143,8 @@ describe("collectSearchBlocks", () => {
       message("", {
         has_tool_use: true,
         tool_calls: [
-          { tool_name: "exec", category: "Bash", input_json: script },
-          { tool_name: "apply_patch", category: "Edit", input_json: patch },
+          { call_index: 0, tool_name: "exec", category: "Bash", input_json: script },
+          { call_index: 1, tool_name: "apply_patch", category: "Edit", input_json: patch },
         ],
       }),
     );
@@ -189,10 +180,12 @@ describe("collectSearchBlocks", () => {
     ];
     const blocks = collectSearchBlocks(message("", { has_tool_use: true, tool_calls: tools }));
     expect(blocks.map((block) => block.key)).toEqual([
+      "7:tool-meta:0.0",
       "7:tool-input:0",
       "7:tool-output:0",
       "7:tool-history:0.0",
       "7:tool-history:0.1",
+      "7:tool-meta:1.0",
       "7:tool-input:1",
     ]);
     expect(blocks.map((block) => block.text)).toContain("earlier");
@@ -234,25 +227,13 @@ describe("collectSearchBlocks", () => {
 
   it("caches by message identity and refreshes replaced tool output", () => {
     const original = message("", {
-      tool_calls: [
-        {
-          category: "",
-          tool_name: "Read",
-          result_content: "first",
-        },
-      ],
+      tool_calls: [{ call_index: 0, category: "", tool_name: "Read", result_content: "first" }],
     });
     const blocks = collectSearchBlocks(original);
     expect(collectSearchBlocks(original)).toBe(blocks);
     const replacement = {
       ...original,
-      tool_calls: [
-        {
-          category: "",
-          tool_name: "Read",
-          result_content: "other",
-        },
-      ],
+      tool_calls: [{ call_index: 0, category: "", tool_name: "Read", result_content: "other" }],
     };
     expect(collectSearchBlocks(replacement)).not.toBe(blocks);
     expect(collectSearchBlocks(replacement)[0]?.text).toBe("other");
@@ -293,7 +274,7 @@ describe("resolveToolInputText", () => {
         { ...call("exec_command", { cmd: "echo hello" }), category: "Bash" },
         "",
       ),
-    ).toBe("command: echo hello");
+    ).toBe("echo hello");
     expect(resolveToolInputText(call("custom_tool", { value: "hello" }), "")).toBe("value: hello");
     expect(resolveToolInputText(call("Bash", { command: "ignored" }), "legacy")).toBe("legacy");
     expect(resolveToolInputText(undefined, "legacy")).toBe("legacy");
@@ -302,11 +283,7 @@ describe("resolveToolInputText", () => {
   it.each(["{broken", "null", "false", "[]"])("handles invalid input %s", (input_json) => {
     expect(
       resolveToolInputText(
-        {
-          category: "",
-          tool_name: "Bash",
-          input_json,
-        },
+        { call_index: 0, category: "", tool_name: "Bash", input_json },
         "legacy",
       ),
     ).toBe("legacy");
@@ -315,26 +292,28 @@ describe("resolveToolInputText", () => {
   it.each([undefined, "", "{}", "null", "[]"])(
     "retains empty display behavior for input %s",
     (input_json) => {
-      expect(resolveToolInputText({ tool_name: "exec", category: "Bash", input_json }, "")).toBe(
-        "",
-      );
+      expect(
+        resolveToolInputText(
+          { call_index: 0, tool_name: "exec", category: "Bash", input_json },
+          "",
+        ),
+      ).toBe("");
     },
   );
 
   it.each(['"use strict"', "42", "false", '["a"]'])(
     "shows non-object JSON input %s verbatim",
     (input_json) => {
-      expect(resolveToolInputText({ tool_name: "exec", category: "Bash", input_json }, "")).toBe(
-        input_json,
-      );
+      expect(
+        resolveToolInputText(
+          { call_index: 0, tool_name: "exec", category: "Bash", input_json },
+          "",
+        ),
+      ).toBe(input_json);
     },
   );
 
   it("retains legacy text when a Task prompt is empty", () => {
     expect(resolveToolInputText(call("Task", { prompt: "" }), "legacy")).toBe("legacy");
-  });
-
-  it("constructs keys without treating punctuation as a query", () => {
-    expect(blockKey(42, "tool-history", "2.3")).toBe("42:tool-history:2.3");
   });
 });

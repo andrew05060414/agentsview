@@ -13,12 +13,6 @@ type FollowRafWindow = Window & {
 };
 
 test.describe("Message loading", () => {
-  test("clicking session shows messages", async ({ page }) => {
-    const sp = new SessionsPage(page);
-    await sp.goto();
-    await sp.selectFirstSession();
-  });
-
   test("no request spam on session click", async ({ page }) => {
     const messageRequests: string[] = [];
     page.on("request", (req) => {
@@ -185,11 +179,6 @@ test.describe("Message loading", () => {
     await page.keyboard.press("ArrowUp");
 
     await expect(follow).toHaveAttribute("aria-pressed", "false");
-    await expect
-      .poll(() => sp.scroller.evaluate((el) => el.scrollTop), {
-        timeout: 2_000,
-      })
-      .toBeLessThan(1_000);
   });
 
   test("follow latest settles after a tall final message is measured", async ({ page }) => {

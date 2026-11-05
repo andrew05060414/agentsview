@@ -45,17 +45,23 @@ func (s *Sync) snapshotFingerprint(snapshot *db.SessionMirrorSnapshot) (string, 
 	payload := struct {
 		SessionFields  []any
 		Messages       []db.Message
+		Dialogue       []*string `json:",omitzero"`
 		Usage          string
 		ToolCalls      string
 		SecretFindings []db.SecretFinding
 		Pins           []db.PinnedMessage
+		// Omitted when nil so sessions without plan usage keep the
+		// fingerprints they had before the table existed.
+		PlanUsage *db.SessionPlanUsage `json:",omitzero"`
 	}{
 		SessionFields:  sessionFingerprintFields(sess, db.MirroredSessionMachine(sess, s.machine)),
 		Messages:       snapshot.Messages,
+		Dialogue:       db.DialogueFingerprintValues(snapshot.Messages),
 		Usage:          snapshot.UsageFingerprint,
 		ToolCalls:      snapshot.ToolCallFingerprint,
 		SecretFindings: snapshot.Findings,
 		Pins:           snapshot.Pins,
+		PlanUsage:      snapshot.PlanUsage,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {

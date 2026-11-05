@@ -11,7 +11,7 @@ import (
 // at all). Backends with more specific context wrap this classification with
 // SemanticUnavailableError.
 var ErrSemanticUnavailable = errors.New(
-	"semantic search not available: enable [vector] in config.toml and run 'agentsview embeddings build'")
+	"semantic search not available: enable [vector] in config.toml and run 'agentsview index embeddings build'")
 
 // SemanticUnavailableError carries a backend-specific reason while retaining
 // ErrSemanticUnavailable as its machine-readable classification. Its rendered
@@ -104,6 +104,7 @@ type VectorSearchPage func(context.Context, int) ([]VectorHit, bool, error)
 
 // SemanticReadiness is a bounded, read-only snapshot of the semantic search
 // index. It deliberately contains no filesystem paths or provider secrets.
+// Producers set Generation only when Embedded and Missing are measured counts.
 type SemanticReadiness struct {
 	State      string
 	Reason     string

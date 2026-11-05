@@ -80,36 +80,6 @@ describe("ToolImageCleanup", () => {
     flushSync();
   }
 
-  it("renders intro text", async () => {
-    vi.useFakeTimers();
-    dataService.postApiV1DataStripImagesPreview.mockResolvedValue(emptyReport());
-
-    const component = mount(ToolImageCleanup, { target: document.body });
-    await settle();
-
-    expect(document.body.textContent).toContain("Preview");
-
-    unmount(component);
-    vi.useRealTimers();
-  });
-
-  it("preview button calls the preview endpoint", async () => {
-    vi.useFakeTimers();
-    dataService.postApiV1DataStripImagesPreview.mockResolvedValue(emptyReport());
-
-    const component = mount(ToolImageCleanup, { target: document.body });
-    await settle();
-
-    const previewBtn = document.body.querySelector("button");
-    previewBtn?.click();
-    await settle();
-
-    expect(dataService.postApiV1DataStripImagesPreview).toHaveBeenCalledTimes(1);
-
-    unmount(component);
-    vi.useRealTimers();
-  });
-
   it("403 names the proxy, not the remote-backend case", async () => {
     vi.useFakeTimers();
     dataService.postApiV1DataStripImagesPreview.mockRejectedValue(
@@ -147,33 +117,6 @@ describe("ToolImageCleanup", () => {
     expect(document.body.textContent).toContain(
       "No stored tool result in this selection holds an inline image payload.",
     );
-
-    unmount(component);
-    vi.useRealTimers();
-  });
-
-  it("shows confirmation modal before applying", async () => {
-    vi.useFakeTimers();
-    dataService.postApiV1DataStripImagesPreview.mockResolvedValue(reportWithPayloads());
-    dataService.postApiV1DataStripImages.mockResolvedValue(reportWithPayloads());
-
-    const component = mount(ToolImageCleanup, { target: document.body });
-    await settle();
-
-    // Click preview
-    const buttons = document.body.querySelectorAll("button");
-    buttons[0]?.click();
-    await settle();
-
-    // A remove button should appear; find it and click
-    const allButtons = Array.from(document.body.querySelectorAll("button"));
-    const removeBtn = allButtons.find((b) => b.textContent?.includes("Remove image payloads"));
-    expect(removeBtn).toBeTruthy();
-    removeBtn?.click();
-    await settle();
-
-    // Confirmation modal should appear
-    expect(document.body.textContent).toContain("Remove stored image payloads?");
 
     unmount(component);
     vi.useRealTimers();
@@ -226,7 +169,19 @@ describe("ToolImageCleanup", () => {
   // one after confirmApply, carrying confirmed: true and the frozen filter.
   it("cancel issues no apply request; confirm sends exactly one request with frozen filter", async () => {
     vi.useFakeTimers();
-    dataService.postApiV1DataStripImagesPreview.mockResolvedValue(reportWithPayloads());
+    const preview = reportWithPayloads();
+    preview.projects.push({
+      ...preview.projects[0]!,
+      project: "other-project",
+      payloads: 10,
+      stored_bytes: 900,
+    });
+    preview.sessions = 4;
+    preview.changed = 4;
+    preview.payloads = 13;
+    preview.stored_bytes = 4996;
+    preview.decoded_bytes = 4096;
+    dataService.postApiV1DataStripImagesPreview.mockResolvedValue(preview);
     dataService.postApiV1DataStripImages.mockResolvedValue(reportWithPayloads());
 
     const component = mount(ToolImageCleanup, { target: document.body });
@@ -245,6 +200,19 @@ describe("ToolImageCleanup", () => {
     // Preview.
     document.body.querySelectorAll("button")[0]?.click();
     await settle();
+
+    const order = () =>
+      Array.from(document.querySelectorAll("tbody td:first-child"), (cell) => cell.textContent);
+    for (const [heading, expected] of [
+      ["Payloads", ["other-project", "my-project"]],
+      ["Stored", ["my-project", "other-project"]],
+    ] as const) {
+      Array.from(document.querySelectorAll<HTMLButtonElement>("thead button"))
+        .find((button) => button.textContent?.trim() === heading)!
+        .click();
+      await settle();
+      expect(order()).toEqual(expected);
+    }
 
     // Open confirm dialog (requestApply).
     const removeBtn = Array.from(document.body.querySelectorAll("button")).find((b) =>

@@ -15,6 +15,7 @@ const virtualizerMock = vi.hoisted(() => ({
   getTotalSize: vi.fn(() => 1000),
   measureElement: vi.fn(),
   scrollToIndex: vi.fn(),
+  cancelScroll: vi.fn(),
   scrollToOffset: vi.fn(),
   getOffsetForIndex: vi.fn((index: number) => [index * 120, "start"]),
 }));
@@ -76,13 +77,7 @@ beforeEach(() => {
     message(1, "[Thinking]\nneedle\n[/Thinking]", { has_thinking: true }),
     message(2, "", {
       has_tool_use: true,
-      tool_calls: [
-        {
-          category: "",
-          tool_name: "Read",
-          result_content: "needle",
-        },
-      ],
+      tool_calls: [{ call_index: 0, category: "", tool_name: "Read", result_content: "needle" }],
     }),
   ];
   messages.messageCount = 3;

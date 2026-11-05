@@ -153,6 +153,12 @@ actions:
       x-go-type-import:
         path: go.kenn.io/agentsview/internal/vector
         name: vector
+  - target: $.components.schemas.KataStatus
+    update:
+      x-go-type: kata.Status
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/kata
+        name: kata
   - target: $.components.schemas.VectorGenerationInfo
     update:
       x-go-type: vector.GenerationInfo
@@ -174,6 +180,18 @@ actions:
   - target: $.components.schemas.DbDailyUsageEntry
     update:
       x-go-type: db.DailyUsageEntry
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbPlanUsageView
+    update:
+      x-go-type: db.PlanUsageView
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbCaptureCoverageView
+    update:
+      x-go-type: db.CaptureCoverageView
       x-go-type-import:
         path: go.kenn.io/agentsview/internal/db
         name: db
@@ -249,3 +267,9 @@ actions:
       x-go-type-import:
         path: go.kenn.io/agentsview/internal/rawsync
         name: rawsync
+  - target: $.components.schemas.ServiceFileReferencesResult
+    update:
+      x-go-type: service.FileReferencesResult
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/service
+        name: service

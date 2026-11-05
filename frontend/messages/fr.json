@@ -72,7 +72,7 @@
   "header_transcript_blocks_system": "Limites système",
   "header_actions_follow_latest": "Suivre les derniers messages",
   "header_actions_toggle_sort": "Inverser l'ordre de tri (o)",
-  "header_actions_cycle_layout": "Changer de disposition : {layout} (l)",
+  "header_actions_cycle_layout": "Changer de disposition\u202f: {layout} (l)",
   "header_actions_cycle_layout_label": "Changer la disposition des messages",
   "header_actions_export_options": "Options d'export de la session",
   "header_actions_export_session": "Exporter la session",
@@ -85,7 +85,7 @@
   "header_actions_publish_public": "Publier un Gist public",
   "header_actions_publish_secret": "Publier un Gist secret",
   "header_actions_more_actions": "Plus d'actions",
-  "header_actions_layout": "Disposition : {layout}",
+  "header_actions_layout": "Disposition\u202f: {layout}",
   "header_actions_refresh_data": "Actualiser les données",
   "header_actions_refresh_data_shortcut": "Actualiser les données (r)",
   "header_actions_sync_sessions": "Synchroniser les sessions",
@@ -96,12 +96,15 @@
   "header_actions_import_archive_only": "Import indisponible en mode archive seule",
   "header_actions_import_conversations": "Importer des conversations",
   "header_actions_import": "Importer",
+  "header_actions_import_claude_syncing": "La synchronisation Claude.ai est en cours. Ouvrez Importer pour suivre la progression ou l'arrêter.",
   "header_actions_toggle_theme": "Changer de thème",
   "header_actions_settings": "Paramètres",
   "header_actions_keyboard_shortcuts": "Raccourcis clavier",
   "header_actions_keyboard_shortcuts_shortcut": "Raccourcis clavier (?)",
   "status_bar_archive_stale": "Les résultats des archives peuvent être obsolètes.",
   "status_bar_archive_rebuilding": "Les résultats des archives peuvent être obsolètes. Les modifications sont suspendues jusqu'à la fin de la reconstruction.",
+  "status_bar_archive_stale_rebuild": "Les résultats des archives peuvent être obsolètes. Cliquez pour reconstruire.",
+  "status_bar_sync_failed": "Échec de la synchronisation",
   "status_bar_sessions": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -140,7 +143,7 @@
   "status_bar_zoom_out": "Zoom arrière ({shortcut} -)",
   "status_bar_reset_zoom": "Réinitialiser le zoom ({shortcut} 0)",
   "status_bar_zoom_in": "Zoom avant ({shortcut} +)",
-  "status_bar_update_available_title": "Une nouvelle version est disponible : {version}",
+  "status_bar_update_available_title": "Une nouvelle version est disponible\u202f: {version}",
   "status_bar_update_available": "mise à jour disponible",
   "status_bar_version_mismatch_title": "Les versions du frontend et du backend diffèrent. Cliquez pour recharger.",
   "status_bar_version_mismatch": "versions incompatibles — recharger",
@@ -148,7 +151,7 @@
   "status_bar_syncing_percent": "Synchronisation {percent}% ({done}/{total})",
   "status_bar_syncing": "Synchronisation...",
   "status_bar_synced_ago": "synchronisé {time}",
-  "status_bar_build": "Build : {commit}",
+  "status_bar_build": "Build\u202f: {commit}",
   "command_palette_placeholder": "Rechercher dans les sessions et les messages...",
   "command_palette_search_mode_label": "Mode de recherche",
   "command_palette_mode_fulltext": "Texte intégral",
@@ -157,8 +160,10 @@
   "command_palette_search_error": "Recherche indisponible",
   "command_palette_search_failed": "La recherche a échoué. Veuillez réessayer.",
   "command_palette_semantic_setup_title": "La recherche sémantique n'est pas configurée",
-  "command_palette_semantic_setup_config_step": "1. Ajoutez une section [vector] à config.toml, en adaptant le modèle et l'endpoint à votre serveur d'embeddings (tout endpoint compatible OpenAI convient, p. ex. Ollama) :",
-  "command_palette_semantic_setup_build_step": "2. Redémarrez le démon, puis construisez l'index :",
+  "command_palette_semantic_setup_config_step": "1. Ajoutez ceci à config.toml :",
+  "command_palette_semantic_setup_local": "Vous utilisez déjà Nomic avec Ollama ? Suivez la configuration complète pour conserver votre index en passant au serveur local partagé.",
+  "command_palette_semantic_setup_local_link": "Paramètres du serveur",
+  "command_palette_semantic_setup_build_step": "2. Redémarrez le démon, puis créez l'index. La CLI demande votre accord avant le premier téléchargement :",
   "command_palette_semantic_copy_config": "Copier l'extrait de configuration",
   "command_palette_semantic_copy_command": "Copier la commande",
   "command_palette_semantic_copied": "Copié !",
@@ -191,7 +196,7 @@
   "session_breadcrumb_copy_directory_path": "Copier le chemin du répertoire",
   "session_breadcrumb_open_in": "Ouvrir dans",
   "session_breadcrumb_copy_session_id": "Copier l'ID de la session",
-  "session_breadcrumb_copy_session_id_value": "Copier l'ID de la session : {id}",
+  "session_breadcrumb_copy_session_id_value": "Copier l'ID de la session\u202f: {id}",
   "session_breadcrumb_copied": "Copié !",
   "session_breadcrumb_estimated_session_cost": "Coût estimé de la session",
   "session_breadcrumb_total_cost": "Total",
@@ -361,7 +366,7 @@
   "shared_failed_to_load": "Échec du chargement",
   "subagent_inline_loading": "Chargement...",
   "subagent_inline_no_messages": "Aucun message",
-  "skill_block_label": "Skill : {name}",
+  "skill_block_label": "Skill\u202f: {name}",
   "tool_block_copy_input": "Copier l'entrée",
   "tool_block_copied_input": "Entrée copiée",
   "tool_block_copy_output": "Copier la sortie",
@@ -371,9 +376,9 @@
   "tool_block_formatted": "Formaté",
   "tool_block_output_mode": "Format de sortie",
   "tool_block_history": "historique",
-  "tool_block_status_label": "état :",
-  "tool_block_source_label": "source :",
-  "tool_block_agent_label": "agent :",
+  "tool_block_status_label": "état\u202f:",
+  "tool_block_source_label": "source\u202f:",
+  "tool_block_agent_label": "agent\u202f:",
   "tool_block_show_less": "afficher moins",
   "tool_block_show_all_lines": [
     {
@@ -385,9 +390,23 @@
       }
     }
   ],
+  "tool_block_image_alt": "Image issue de la sortie de l'outil",
+  "tool_block_image_open": "Afficher l'image en taille réelle",
+  "tool_block_image_close": "Fermer l'image en taille réelle",
   "thinking_block_label": "Réflexion",
   "compact_boundary_title": "Fenêtre de contexte compactée à ce stade",
   "compact_boundary_label": "Contexte compacté",
+  "transcript_empty_messages": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{count} message vide",
+        "countPlural=other": "{count} messages vides"
+      }
+    }
+  ],
+  "transcript_empty_messages_title": "Ces messages ne contiennent ni texte, ni réflexion, ni appel d’outil",
   "compact_boundary_show_full_summary": "Afficher le résumé complet",
   "sidebar_session_count": [
     {
@@ -406,7 +425,7 @@
   "sidebar_clear_selection": "Effacer la sélection",
   "sidebar_batch_clear": "Effacer",
   "sidebar_batch_all": "Tout",
-  "sidebar_selected_count": "Sélection : {countLabel}",
+  "sidebar_selected_count": "Sélection\u202f: {countLabel}",
   "sidebar_move_selected_to_trash": "Déplacer les sessions sélectionnées vers la corbeille",
   "sidebar_deleting": "Suppression...",
   "sidebar_delete": "Supprimer",
@@ -442,6 +461,8 @@
   "sidebar_filters_no_match": "Aucun résultat",
   "sidebar_filters_no_agents": "Aucun agent",
   "sidebar_filters_machine": "Machine",
+  "sidebar_filters_machine_loading": "Chargement des machines...",
+  "sidebar_filters_machine_update_failed": "Impossible de mettre à jour le filtre des machines. Réessayez.",
   "sidebar_filters_search_machines": "Rechercher des machines...",
   "sidebar_filters_no_machines": "Aucune machine",
   "sidebar_filters_min_prompts": "Prompts min.",
@@ -466,7 +487,7 @@
   "shared_project_filter_placeholder": "Filtrer les projets...",
   "shared_select_project": "Sélectionner un projet",
   "shared_no_matching_projects": "Aucun projet correspondant",
-  "shared_active_filters_label": "Filtres :",
+  "shared_active_filters_label": "Filtres\u202f:",
   "shared_active_filters_clear_project": "Effacer le filtre de projet",
   "shared_active_filters_remove_machine": "Retirer le filtre {machine}",
   "shared_active_filters_remove_agent": "Retirer le filtre {agent}",
@@ -585,7 +606,7 @@
   "analytics_status_unclean": "Interrompue",
   "analytics_filters_clear_date": "Effacer le filtre de date",
   "analytics_filters_remove_status": "Retirer {status} du filtre d'état",
-  "analytics_filters_status": "État : {status}",
+  "analytics_filters_status": "État\u202f: {status}",
   "analytics_filters_only_automated": "Automatisées uniquement",
   "analytics_filters_clear_time": "Effacer le filtre horaire",
   "analytics_agent_comparison_title": "Comparaison des agents",
@@ -664,8 +685,8 @@
   ],
   "analytics_total_count": "{countLabel} au total",
   "analytics_projects_empty": "Aucune donnée de projet",
-  "analytics_activity_timeline_tooltip_value": "{label} : {value} {metric}",
-  "analytics_activity_timeline_tooltip_messages": "utilisateur : {user} / assistant : {assistant} / autre : {other}",
+  "analytics_activity_timeline_tooltip_value": "{label}\u202f: {value} {metric}",
+  "analytics_activity_timeline_tooltip_messages": "utilisateur\u202f: {user} / assistant\u202f: {assistant} / autre\u202f: {other}",
   "analytics_activity_timeline_mode_absolute": "Absolu",
   "analytics_activity_timeline_mode_percent": "Pourcentage",
   "analytics_metric_messages": "Messages",
@@ -717,7 +738,7 @@
   "analytics_velocity_no_breakdown": "Aucune donnée de répartition",
   "analytics_grade_distribution_title": "Répartition des notes",
   "analytics_outcome_distribution_title": "Répartition des issues",
-  "analytics_outcome_count": "{outcome} : {count}",
+  "analytics_outcome_count": "{outcome}\u202f: {count}",
   "analytics_health_trend_title": "Tendance de santé",
   "analytics_health_trend_no_scored_sessions": "aucune session notée",
   "analytics_health_trend_caption": "Score de santé moyen par jour · couleur de la barre = note",
@@ -746,8 +767,8 @@
       ],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "{skill} : {countLabel} appel ({pct} %)",
-        "countPlural=other": "{skill} : {countLabel} appels ({pct} %)"
+        "countPlural=one": "{skill}\u202f: {countLabel} appel ({pct} %)",
+        "countPlural=other": "{skill}\u202f: {countLabel} appels ({pct} %)"
       }
     }
   ],
@@ -772,7 +793,7 @@
   ],
   "analytics_top_skills_agent_breakdown": "Répartition par agent",
   "analytics_top_skills_agents": "Agents",
-  "analytics_top_skills_projects": "Projets : {projects}",
+  "analytics_top_skills_projects": "Projets\u202f: {projects}",
   "analytics_top_skills_empty": "Aucune donnée d'utilisation des skills",
   "analytics_skill_trend_title": "Utilisation des skills dans le temps",
   "analytics_skill_trend_other": "Autre",
@@ -787,9 +808,9 @@
   "usage_mode_cost": "Coût",
   "usage_mode_tokens": "Tokens",
   "usage_token_types_label": "Types de tokens",
-  "usage_token_types_all": "Types de tokens : Tous",
-  "usage_token_types_single": "Types de tokens : {tokenType}",
-  "usage_token_types_multiple": "Types de tokens : {countLabel} sélectionnés",
+  "usage_token_types_all": "Types de tokens\u202f: Tous",
+  "usage_token_types_single": "Types de tokens\u202f: {tokenType}",
+  "usage_token_types_multiple": "Types de tokens\u202f: {countLabel} sélectionnés",
   "usage_token_type_input": "Entrée",
   "usage_token_type_cache_write": "Écritures de cache",
   "usage_token_type_cache_read": "Lecture en cache",
@@ -811,10 +832,10 @@
   "usage_summary_vs_prior": "{value} vs précédent",
   "usage_summary_cached_tokens": "{value} en cache",
   "usage_summary_avg_day": "moy./jour",
-  "usage_filter_all": "{label} : tout",
-  "usage_filter_selected": "{label} : {countLabel} sélectionné(s)",
-  "usage_filter_none": "{label} : aucun",
-  "usage_filter_hidden": "{label} : {countLabel} masqué(s)",
+  "usage_filter_all": "{label}\u202f: tout",
+  "usage_filter_selected": "{label}\u202f: {countLabel} sélectionné(s)",
+  "usage_filter_none": "{label}\u202f: aucun",
+  "usage_filter_hidden": "{label}\u202f: {countLabel} masqué(s)",
   "usage_filter_search": "Rechercher...",
   "usage_filter_select_all": "Tout sélectionner",
   "usage_filter_deselect_all": "Tout désélectionner",
@@ -823,8 +844,8 @@
       "declarations": ["input label", "input count", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "Tout : {label}",
-        "countPlural=other": "Tout : {label}"
+        "countPlural=one": "Tout\u202f: {label}",
+        "countPlural=other": "Tout\u202f: {label}"
       }
     }
   ],
@@ -834,11 +855,15 @@
   "usage_tokens_attribution_title": "Répartition des tokens",
   "usage_attribution_treemap": "Treemap",
   "usage_attribution_list": "Liste",
+  "usage_label_scale_title": "Échelle de taille des libellés",
+  "usage_label_scale_linear": "Linéaire",
+  "usage_label_scale_sqrt": "Racine",
+  "usage_label_scale_log": "Log",
   "usage_chart_style": "Style du graphique",
   "usage_chart_style_smooth": "Lissé",
   "usage_chart_style_lines": "Lignes",
   "usage_chart_style_bars": "Barres",
-  "usage_chart_day_label": "{date} : {value}",
+  "usage_chart_day_label": "{date}\u202f: {value}",
   "usage_cache_efficiency_title": "Efficacité du cache",
   "usage_cache_reads": "Lectures de cache",
   "usage_cache_writes": "Écritures de cache",
@@ -860,7 +885,7 @@
   "settings_search_empty": "Aucun paramètre correspondant",
   "settings_search_clear": "Effacer la recherche",
   "settings_search_result": "Affichage de {category}",
-  "settings_search_keywords_appearance": "thème contraste disposition texte police blocs theme contrast layout text font blocks zoom",
+  "settings_search_keywords_appearance": "thème contraste disposition texte police blocs theme contrast layout text font blocks zoom couleur daltonisme color",
   "settings_search_keywords_language": "langue paramètres régionaux traduction language locale translation",
   "settings_search_keywords_date_ranges": "date plage pages liées date range linked pages",
   "settings_search_keywords_terminal": "terminal reprise lancement exécutable arguments presse-papiers terminal resume launch binary clipboard",
@@ -1067,7 +1092,7 @@
   "data_no_matches": "Aucun projet ne correspond au filtre",
   "data_unknown_project_key": "Le projet lié est introuvable dans l'archive. Affichage de tous les projets.",
   "data_project_unclassified": "Non classé",
-  "data_reclassify_original": "Projet actuel : {project}",
+  "data_reclassify_original": "Projet actuel\u202f: {project}",
   "data_reclassify_candidates_loading": "Recherche des dossiers de session…",
   "data_reclassify_candidates_failed": "Impossible de trouver les dossiers de session",
   "data_reclassify_no_candidates": "Aucun dossier de session trouvé pour ce projet.",
@@ -1294,7 +1319,7 @@
   "activity_peak_at": "pic {count} à {time}",
   "activity_all_sessions_overlay": "Superposition globale",
   "activity_class_split": "int {int} / sous-agents {sub} / auto {auto}",
-  "activity_message_bucket_label": "{range}, {metric} : {count}. Filtrer les sessions de cette période.",
+  "activity_message_bucket_label": "{range}, {metric}\u202f: {count}. Filtrer les sessions de cette période.",
   "activity_timeline_metric": "Mesure de la chronologie",
   "activity_user_messages": "Messages utilisateur",
   "activity_assistant_messages": "Messages assistant",
@@ -1311,7 +1336,7 @@
   "activity_window": "Fenêtre",
   "activity_sessions": "Sessions",
   "activity_clear_time_filter": "Effacer le filtre horaire",
-  "activity_active_filter": "Actif : {label}",
+  "activity_active_filter": "Actif\u202f: {label}",
   "activity_total_count": "{count} au total",
   "activity_session": "Session",
   "activity_automated_session": "Session automatisée",
@@ -1353,7 +1378,7 @@
   "analytics_weekday_fri": "Ven",
   "analytics_weekday_sat": "Sam",
   "analytics_weekday_sun": "Dim",
-  "active_filters_label": "Filtres :",
+  "active_filters_label": "Filtres\u202f:",
   "active_filters_clear_date": "Effacer le filtre de date",
   "active_filters_clear_project": "Effacer le filtre de projet",
   "active_filters_remove_filter": "Retirer le filtre {name}",
@@ -1362,7 +1387,7 @@
   "active_filters_clear_recently_active": "Effacer le filtre d'activité récente",
   "active_filters_active24h": "Actives 24 h",
   "active_filters_remove_status": "Retirer {status} du filtre d'état",
-  "active_filters_status_prefix": "État : {status}",
+  "active_filters_status_prefix": "État\u202f: {status}",
   "active_filters_clear_single_turn": "Effacer le filtre à un tour",
   "active_filters_single_turn_hidden": "Un seul tour masqué",
   "active_filters_clear_automated": "Effacer le filtre des sessions automatisées",
@@ -1373,7 +1398,7 @@
   "active_filters_clear_all": "Tout effacer",
   "analytics_messages": "Messages",
   "analytics_sessions": "Sessions",
-  "analytics_user_assistant_split": "utilisateur : {user} / assistant : {assistant}",
+  "analytics_user_assistant_split": "utilisateur\u202f: {user} / assistant\u202f: {assistant}",
   "analytics_day": "Jour",
   "analytics_week": "Semaine",
   "analytics_month": "Mois",
@@ -1438,7 +1463,7 @@
   "analytics_skills_count": "{count} skills",
   "analytics_agent_breakdown": "Répartition par agent",
   "analytics_agents": "Agents",
-  "analytics_projects_breakdown": "Projets : {breakdown}",
+  "analytics_projects_breakdown": "Projets\u202f: {breakdown}",
   "analytics_no_skill_data": "Aucune donnée d'utilisation des skills",
   "analytics_velocity": "Vélocité",
   "analytics_overview": "Vue d'ensemble",
@@ -1545,7 +1570,7 @@
   "recall_page_review_archive_message": "Archiver « {title} » comme rejetée ? Elle restera exclue du corpus Recall servi.",
   "recall_page_review_cancel": "Annuler",
   "recall_page_review_close": "Fermer la confirmation d’archivage",
-  "recall_page_review_error": "Impossible de vérifier cette entrée Recall : {error}",
+  "recall_page_review_error": "Impossible de vérifier cette entrée Recall\u202f: {error}",
   "recall_page_table_label": "Entrées de rappel",
   "recall_page_fact_column": "Fait",
   "recall_page_project_column": "Projet",
@@ -1559,7 +1584,7 @@
   "recall_page_load_more": "Afficher plus",
   "recall_page_loading_more": "Chargement…",
   "recall_page_ranked_result_cap": "La recherche classée est limitée aux {countLabel} premiers résultats.",
-  "recall_page_entries_shown": "Entrées affichées : {countLabel}",
+  "recall_page_entries_shown": "Entrées affichées\u202f: {countLabel}",
   "recall_page_extraction_title": "État de l’extraction",
   "recall_page_extraction_unconfigured": "L’extraction du rappel n’est pas configurée.",
   "recall_page_extraction_error": "Impossible de charger l’état de l’extraction.",
@@ -1597,7 +1622,7 @@
   "recall_page_generation_close": "Fermer la confirmation de génération",
   "recall_page_generation_activate_message": "Activer {model} ({fingerprint}) ? Ses entrées automatiques remplaceront le corpus distillé actuellement servi.",
   "recall_page_generation_retire_message": "Retirer {model} ({fingerprint}) ? Ses entrées automatiques resteront archivées.",
-  "recall_page_generation_action_error": "Impossible de mettre à jour la génération d’extraction : {error}",
+  "recall_page_generation_action_error": "Impossible de mettre à jour la génération d’extraction\u202f: {error}",
   "session_vitals_title": "Analyse",
   "session_vitals_close": "Fermer l'analyse de la session",
   "session_vitals_resize": "Redimensionner le panneau d'analyse de la session",
@@ -1669,14 +1694,14 @@
   "signal_panel_not_enough_activity": "Activité insuffisante pour analyser cette session.",
   "signal_panel_health_grade": "Note de santé {grade}",
   "signal_panel_outcome_confidence": "{outcome} (confiance {confidence})",
-  "signal_panel_based_on": "Basé sur :",
+  "signal_panel_based_on": "Basé sur\u202f:",
   "signal_panel_basis_title": "{factor} pris en compte dans le score",
   "signal_panel_compaction_interrupted": "{mid} sur {total} ont interrompu un travail en cours",
   "signal_panel_compaction_title": "Compactions du contexte dans cette session",
   "signal_panel_compaction_count": "{count} compactions",
   "signal_panel_mid_task": "{count} en pleine tâche",
   "signal_panel_no_penalties": "Aucune pénalité",
-  "signal_panel_penalties": "Pénalités :",
+  "signal_panel_penalties": "Pénalités\u202f:",
   "signal_panel_penalty_title": "{label} a retiré {value} au score",
   "subagent_inline_subagent_session": "Session de sous-agent",
   "thinking_block_thinking": "Réflexion",
@@ -1719,6 +1744,14 @@
   "insights_page_template_tool_reliability": "Fiabilité des outils",
   "insights_page_template_model_cost": "Modèle et coût",
   "insights_page_template_instruction_opportunities": "Opportunités d'instruction",
+  "insights_page_template_friction_review": "Revue des frictions",
+  "friction_review_summary_title": "Résumé rédigé par un modèle",
+  "friction_review_summary_notice": "Rédigé par un modèle à partir du résumé et des titres de motifs de ce rapport. Il ne modifie ni les constats, ni les rapports, ni les tickets.",
+  "friction_review_summary_empty": "Aucun résumé pour ce rapport pour l'instant.",
+  "friction_review_summary_generate": "Générer le résumé",
+  "friction_review_summary_regenerate": "Régénérer",
+  "friction_review_summary_generating": "Génération : {phase}",
+  "friction_review_summary_unavailable": "La génération de résumés n'est pas disponible pour cette archive.",
   "insights_page_scope_no_automated": "Sans les automatisées",
   "insights_page_scope_both": "Les deux",
   "insights_page_scope_only_automated": "Automatisées uniquement",
@@ -1766,7 +1799,7 @@
   "insights_page_retry": "Réessayer",
   "insights_page_no_scored_data": "Aucune donnée de qualité notée pour cette plage.",
   "insights_page_no_scored_data_hint": "Synchronisez ou réalimentez les sessions avec les signaux de qualité de la phase 3 pour alimenter les motifs de prompt, de contexte, de workflow et d'outils.",
-  "insights_page_cached_warning": "Affichage des données déterministes en cache. La dernière actualisation a échoué : {error}",
+  "insights_page_cached_warning": "Affichage des données déterministes en cache. La dernière actualisation a échoué\u202f: {error}",
   "insights_page_average_score": "Score moyen",
   "insights_page_no_scored_sessions": "Aucune session notée",
   "insights_page_scored_sessions": "Sessions notées",
@@ -1916,7 +1949,7 @@
   "breadcrumb_copy_command": "Copier la commande",
   "breadcrumb_copy_directory_path": "Copier le chemin du répertoire",
   "breadcrumb_open_in": "Ouvrir dans",
-  "breadcrumb_copy_session_id_value": "Copier l'ID de la session : {id}",
+  "breadcrumb_copy_session_id_value": "Copier l'ID de la session\u202f: {id}",
   "breadcrumb_copy_session_id": "Copier l'ID de la session",
   "breadcrumb_copied": "Copié !",
   "breadcrumb_estimated_cost": "Coût estimé de la session",
@@ -1965,8 +1998,8 @@
   "resync_start": "Lancer la resynchronisation complète",
   "resync_syncing_progress": "Synchronisation de {done} / {total} sessions...",
   "resync_preparing": "Préparation...",
-  "resync_sessions_synced": "Sessions synchronisées : {count}",
-  "resync_failed": "Échecs : {count}",
+  "resync_sessions_synced": "Sessions synchronisées\u202f: {count}",
+  "resync_failed": "Échecs\u202f: {count}",
   "resync_close_btn": "Fermer",
   "resync_retry": "Réessayer",
   "resync_error_read_only": "La resynchronisation complète est indisponible sur un backend en lecture seule.",
@@ -1996,7 +2029,7 @@
   "shortcuts_close": "Fermer les raccourcis",
   "update_title": "Mise à jour du logiciel",
   "update_close": "Fermer la fenêtre de mise à jour",
-  "update_available": "Une nouvelle version est disponible : {version}",
+  "update_available": "Une nouvelle version est disponible\u202f: {version}",
   "update_current": "Vous utilisez la version {version}.",
   "update_instructions": "Exécutez {cmd} en ligne de commande pour l'installer.",
   "update_latest": "Vous utilisez la dernière version ({version}).",
@@ -2045,6 +2078,7 @@
   "appearance_chart_palette": "Couleurs des graphiques",
   "appearance_chart_palette_agentsview": "Agentsview",
   "appearance_chart_palette_matplotlib": "Matplotlib",
+  "appearance_chart_palette_colorblind": "Adapté au daltonisme",
   "appearance_message_layout": "Disposition des messages",
   "appearance_block_visibility": "Visibilité des blocs",
   "settings_github_token_saved": "Token GitHub enregistré.",
@@ -2123,8 +2157,8 @@
   "settings_remote_require_auth": "Exiger un token d'authentification",
   "settings_remote_enabled": "Activé",
   "settings_remote_disabled": "Désactivé",
-  "settings_remote_restart_note": "Remarque : la modification de l'authentification nécessite un redémarrage du serveur pour prendre effet.",
-  "settings_remote_security_warning": "Avertissement : les connexions distantes utilisent du HTTP non chiffré. Utilisez un tunnel sécurisé (Tailscale, tunnel SSH, ou un reverse proxy avec TLS) pour protéger vos données en transit.",
+  "settings_remote_restart_note": "Remarque\u202f: la modification de l'authentification nécessite un redémarrage du serveur pour prendre effet.",
+  "settings_remote_security_warning": "Avertissement\u202f: les connexions distantes utilisent du HTTP non chiffré. Utilisez un tunnel sécurisé (Tailscale, tunnel SSH, ou un reverse proxy avec TLS) pour protéger vos données en transit.",
   "settings_remote_auth_token": "Token d'authentification",
   "settings_remote_copied": "Copié",
   "settings_remote_copy": "Copier",
@@ -2196,7 +2230,7 @@
   "system_boundary_task_notification": "Notification de tâche",
   "system_boundary_stop_hook": "Retour du hook d'arrêt",
   "system_boundary_peer_message": "Message d'une autre session",
-  "system_boundary_title": "Limite système : {subtype}",
+  "system_boundary_title": "Limite système\u202f: {subtype}",
   "system_boundary_show_content": "Afficher le contenu",
   "trash_loading": "Chargement de la corbeille...",
   "trash_empty": "La corbeille est vide",
@@ -2253,7 +2287,7 @@
   "filter_dropdown_search": "Rechercher...",
   "filter_dropdown_select_all": "Tout sélectionner",
   "filter_dropdown_deselect_all": "Tout désélectionner",
-  "filter_dropdown_all_items": "Tout : {label}",
+  "filter_dropdown_all_items": "Tout\u202f: {label}",
   "filter_dropdown_no_matches": "Aucune correspondance",
   "usage_retry": "Réessayer",
   "usage_no_sessions_range": "Aucune session dans cette plage",
@@ -2278,7 +2312,7 @@
   "usage_pairwise_not_enough_data": "Il faut au moins deux ensembles de modèles ou de projets dans cette plage pour les comparer.",
   "usage_pairwise_metric": "Métrique",
   "usage_pairwise_delta": "Delta",
-  "usage_pairwise_side_heading": "{dimension} : {value}",
+  "usage_pairwise_side_heading": "{dimension}\u202f: {value}",
   "usage_pairwise_cost_per_session": "Coût / session",
   "usage_pairwise_total_tokens": "Total des tokens",
   "usage_pairwise_tokens_per_session": "Tokens / session",
@@ -2419,8 +2453,8 @@
   "analytics_outcome_loading": "Lecture de l'historique git...",
   "analytics_outcome_empty": "Aucune activité git sur cette période.",
   "analytics_outcome_filters_unsupported": "Supprimez les filtres de machine, modèle, fin de session, nombre minimal de messages, activité récente et heure pour afficher les totaux des résultats.",
-  "analytics_outcome_partial": "Non comptabilisé :",
-  "analytics_outcome_partial_entry": "{repo} ({op}) : {reason}",
+  "analytics_outcome_partial": "Non comptabilisé\u202f:",
+  "analytics_outcome_partial_entry": "{repo} ({op})\u202f: {reason}",
   "session_breadcrumb_session_health_and_tool_sequences": "État de la session et séquences d’outils",
   "tool_sequences_title": "Séquences d’outils observées",
   "tool_sequences_loading": "Chargement des séquences d’outils…",
@@ -2514,7 +2548,7 @@
   "tool_sequences_legend": "Couleurs des issues",
   "tool_sequences_message": "Message {ordinal}",
   "tool_sequences_messages_range": "Messages {first}–{last}",
-  "tool_sequences_jump_label": "Message {ordinal} : ouvrir l’appel {tool} dans la transcription",
+  "tool_sequences_jump_label": "Message {ordinal}\u202f: ouvrir l’appel {tool} dans la transcription",
   "tool_sequences_more_calls": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -2612,8 +2646,8 @@
   "import_claude_stop": "Arrêter",
   "import_claude_terminal": "Terminal",
   "import_claude_copy_command": "Copier la commande",
-  "import_claude_setup_load": "Ouvrez ensuite {url}, activez le Mode développeur, choisissez Charger l’extension non empaquetée et sélectionnez le dossier indiqué.",
-  "import_claude_open_chrome": "Ouvrez Chrome pour vous connecter.",
+  "import_claude_setup_load": "Redémarrez ensuite AgentsView, ouvrez {url}, activez le Mode développeur, choisissez Charger l’extension non empaquetée et sélectionnez le dossier indiqué.",
+  "import_claude_open_chrome": "Ouvrez Chrome avec l’extension AgentsView activée. Si vous avez lancé la configuration après avoir démarré AgentsView, redémarrez AgentsView.",
   "import_claude_tab_note": "La synchronisation ouvre un onglet claude.ai en arrière-plan si aucun n'est ouvert. L'onglet reste ouvert après la synchronisation.",
   "import_claude_signed_out": "Connectez-vous à claude.ai dans le profil Chrome avec l'extension AgentsView. Activez l'extension dans un seul profil Chrome. La synchronisation utilise le premier profil qui se connecte.",
   "import_chatgpt_tab_note": "La synchronisation ouvre un onglet chatgpt.com en arrière-plan si aucun n'est ouvert. L'onglet reste ouvert après la synchronisation.",
@@ -2621,6 +2655,7 @@
   "import_claude_reload_extension": "Rechargez ensuite l’extension dans {url}.",
   "import_claude_update_app": "Redémarrez AgentsView si vous l'avez mis à jour.",
   "import_claude_syncing": "Synchronisation...",
+  "import_claude_sync_background": "La synchronisation continue si vous fermez cette boîte de dialogue.",
   "import_claude_sync_failed": "Échec de la synchronisation",
   "import_claude_sign_in_failed": "Échec de la connexion",
   "import_claude_desktop_note": "La connexion utilise un code reçu par e-mail. Pour les comptes Google, synchronisez depuis l’interface web dans Chrome.",
@@ -2716,15 +2751,15 @@
       ],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "La session a changé après ce rapport : le modèle a évalué {countLabel} appel et la session en compte maintenant {currentLabel}.",
-        "countPlural=other": "La session a changé après ce rapport : le modèle a évalué {countLabel} appels et la session en compte maintenant {currentLabel}.",
-        "countPlural=many": "La session a changé après ce rapport : le modèle a évalué {countLabel} appels et la session en compte maintenant {currentLabel}."
+        "countPlural=one": "La session a changé après ce rapport\u202f: le modèle a évalué {countLabel} appel et la session en compte maintenant {currentLabel}.",
+        "countPlural=other": "La session a changé après ce rapport\u202f: le modèle a évalué {countLabel} appels et la session en compte maintenant {currentLabel}.",
+        "countPlural=many": "La session a changé après ce rapport\u202f: le modèle a évalué {countLabel} appels et la session en compte maintenant {currentLabel}."
       }
     }
   ],
-  "tool_effectiveness_session_revised": "La session a changé après la génération de ce rapport : les faits ci-dessous peuvent donc différer de ce que le modèle a évalué.",
+  "tool_effectiveness_session_revised": "La session a changé après la génération de ce rapport\u202f: les faits ci-dessous peuvent donc différer de ce que le modèle a évalué.",
   "tool_sequences_message_call": "Message {ordinal}, appel {callNumber}",
-  "tool_sequences_jump_call_label": "Message {ordinal}, appel {callNumber} : ouvrir l’appel {tool} dans la transcription",
+  "tool_sequences_jump_call_label": "Message {ordinal}, appel {callNumber}\u202f: ouvrir l’appel {tool} dans la transcription",
   "tool_effectiveness_calls_judged": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -2843,7 +2878,7 @@
   "analytics_tool_more_sessions": "Plus de sessions",
   "analytics_tool_empty_explanation": "{count}/{total} résultats vides parmi les résultats connus.",
   "analytics_tool_repeat_explanation": "{count}/{total} appels de suivi identiques ou presque parmi les appels analysés.",
-  "analytics_tool_recovery_explanation": "{count}/{total} séquences récupérées. Ouvertes : {open}. Inconnues : {unknown}.",
+  "analytics_tool_recovery_explanation": "{count}/{total} séquences récupérées. Ouvertes\u202f: {open}. Inconnues\u202f: {unknown}.",
   "analytics_tool_coverage_explanation": "Appels analysés / tous les appels. Les recalculs en attente et les anciennes sessions sans calcul ont une couverture incomplète.",
   "analytics_tool_recovery_note": "La récupération signifie qu’un appel ultérieur a renvoyé du contenu. Le taux appartient à l’outil qui a commencé la séquence.",
   "analytics_tool_evidence_count": [
@@ -2857,11 +2892,304 @@
     }
   ],
   "analytics_tool_history_note": "Les taux excluent les appels des sessions en cours de recalcul ou enregistrées sans résultats d'outils.",
-  "analytics_tool_rate_button_label": "{tool} – {rate} : {value}",
-  "analytics_tool_latest_matching_call": "Dernier appel correspondant : {date}",
-  "analytics_tool_matching_calls": "Appels correspondants : {count}",
+  "analytics_tool_rate_button_label": "{tool} – {rate}\u202f: {value}",
+  "analytics_tool_latest_matching_call": "Dernier appel correspondant\u202f: {date}",
+  "analytics_tool_matching_calls": "Appels correspondants\u202f: {count}",
   "usage_all_projects": "Tous les projets",
   "usage_clear_selection": "Effacer la sélection",
   "usage_open_project": "Ouvrir",
-  "usage_loading": "Chargement..."
+  "usage_loading": "Chargement...",
+  "plan_usage_title": "Utilisation du forfait",
+  "plan_usage_trigger_weekly": "Utilisation du forfait\u202f: {percent} % par semaine",
+  "plan_usage_as_of": "Utilisation du forfait, au {time}",
+  "plan_usage_not_checked": "Utilisation du forfait\u202f: pas encore vérifiée",
+  "plan_usage_still_updating": "Utilisation du forfait\u202f: mise à jour en cours, au {time}",
+  "plan_usage_not_reported_yet": "Utilisation du forfait\u202f: pas encore communiquée, au {time}",
+  "plan_usage_partial": "Utilisation du forfait partielle, au {time}",
+  "plan_usage_not_reported": "Non communiquée par OpenAI",
+  "plan_usage_too_many_subagents": "Trop de conversations de sous-agents pour le rapport d'utilisation d'OpenAI",
+  "plan_usage_could_not_check": "AgentsView n'a pas pu vérifier l'utilisation du forfait",
+  "plan_usage_account_unavailable": "L'utilisation n'est pas disponible pour ce compte",
+  "plan_usage_counted_under": "Comptée dans la conversation {title}",
+  "plan_usage_stale": "Depuis lors\u202f: {reason} ({time}). Ces chiffres ne sont peut-être plus à jour.",
+  "plan_usage_left_out_later": "Le rapport d'utilisation d'OpenAI a omis cette conversation",
+  "plan_usage_weekly_share": "{percent} % de la limite hebdomadaire de Codex",
+  "plan_usage_five_hour_share": "{percent} % de la limite de cinq heures de Codex",
+  "plan_usage_credits": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} crédit",
+        "countPlural=other": "{countLabel} crédits"
+      }
+    }
+  ],
+  "plan_usage_credits_note": "Les crédits sont affichés tels que le rapport d'utilisation d'OpenAI les fournit.",
+  "plan_usage_col_split": "Modèle, effort, vitesse",
+  "plan_usage_col_weekly": "Semaine",
+  "plan_usage_col_five_hour": "5 heures",
+  "plan_usage_col_credits": "Crédits",
+  "capture_tokens_live": "Tokens capturés en direct, au {time}",
+  "capture_turns_not_captured": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} tour non capturé",
+        "countPlural=other": "{countLabel} tours non capturés"
+      }
+    }
+  ],
+  "capture_turns_not_captured_covered": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input time",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} tour non capturé ; l'utilisation du forfait le compte s'il a eu lieu avant {time}",
+        "countPlural=other": "{countLabel} tours non capturés ; l'utilisation du forfait compte ceux qui ont eu lieu avant {time}"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_waiting": "Codex Cloud\u202f: en attente de la première synchronisation",
+  "status_bar_codex_cloud_importing_found": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Codex Cloud\u202f: importation, {countLabel} conversation trouvée pour l'instant",
+        "countPlural=other": "Codex Cloud\u202f: importation, {countLabel} conversations trouvées pour l'instant"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_importing_progress": "Codex Cloud\u202f: importation de {imported} conversations sur {total}",
+  "status_bar_codex_cloud_up_to_date": "Codex Cloud\u202f: à jour au {time}",
+  "status_bar_codex_cloud_retrying": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Codex Cloud\u202f: {countLabel} conversation n'a pas pu être importée",
+        "countPlural=other": "Codex Cloud\u202f: {countLabel} conversations n'ont pas pu être importées"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_error": "Codex Cloud\u202f: erreur",
+  "status_bar_codex_cloud_off": "Codex Cloud\u202f: désactivé",
+  "status_bar_codex_cloud_config_error": "Codex Cloud\u202f: erreur de réglages",
+  "status_bar_codex_cloud_live_attention": "Codex Cloud\u202f: les jetons en direct demandent votre attention",
+  "status_bar_codex_cloud_oldest_failure": "Plus ancien échec\u202f: {time}",
+  "status_bar_codex_cloud_last_success": "Dernière synchronisation réussie\u202f: {time}",
+  "status_bar_codex_cloud_homes": "Dossiers Codex\u202f: {homes}",
+  "appearance_message_colors": "Couleurs des messages",
+  "appearance_message_colors_description": "Attribuez une couleur à chaque type de message. Le préréglage daltonisme utilise des teintes qui restent distinctes avec les déficiences de la vision des couleurs les plus courantes et ajoute des motifs de ligne, pour distinguer les types par la forme autant que par la couleur.",
+  "appearance_message_colors_preset": "Préréglage des couleurs de message",
+  "appearance_message_colors_preset_default": "Thème par défaut",
+  "appearance_message_colors_preset_colorblind": "Adapté au daltonisme",
+  "appearance_message_colors_preset_custom": "Personnalisé",
+  "appearance_message_colors_patterns": "Distinguer les types de message par des motifs de ligne en plus de la couleur",
+  "appearance_message_colors_reset_all": "Rétablir les valeurs par défaut",
+  "appearance_message_colors_reset_role": "Réinitialiser",
+  "appearance_message_colors_reset_role_label": "Réinitialiser la couleur : {role}",
+  "appearance_message_colors_role_label": "Couleur : {role}",
+  "appearance_message_colors_picker": "Ouvrir le sélecteur de couleur",
+  "appearance_message_colors_hex": "Couleur hexadécimale",
+  "appearance_message_colors_warning_text": "Le texte risque d’être difficile à lire en {modes} ({ratio}:1, minimum {required}:1).",
+  "appearance_message_colors_warning_marker": "Le repère de couleur risque d’être peu visible en {modes} ({ratio}:1, minimum {required}:1).",
+  "appearance_message_colors_mode_light": "mode clair",
+  "appearance_message_colors_mode_dark": "mode sombre",
+  "appearance_message_colors_mode_high_contrast_light": "mode clair à contraste élevé",
+  "appearance_message_colors_mode_high_contrast_dark": "mode sombre à contraste élevé",
+  "appearance_message_colors_swatch_blue": "Bleu",
+  "appearance_message_colors_swatch_vermillion": "Vermillon",
+  "appearance_message_colors_swatch_bluish_green": "Vert bleuté",
+  "appearance_message_colors_swatch_reddish_purple": "Pourpre rougeâtre",
+  "appearance_message_colors_swatch_dark_yellow": "Jaune foncé",
+  "appearance_message_colors_swatch_gray": "Gris",
+  "appearance_message_colors_preview": "Aperçu",
+  "appearance_message_colors_preview_user": "Pourquoi le test de date échoue-t-il ?",
+  "appearance_message_colors_preview_assistant": "Le jeu de test attend l’UTC. Je l’ai corrigé.",
+  "nav_friction": "Journal des frictions",
+  "friction_page_help_docs": "Fonctionnement du journal des frictions",
+  "friction_page_refresh": "Actualiser le journal des frictions",
+  "friction_date_label": "Date du résumé",
+  "friction_date_previous": "Résumé précédent",
+  "friction_date_next": "Résumé suivant",
+  "friction_date_no_match": "Aucune date correspondante",
+  "friction_build_now": "Générer maintenant",
+  "friction_build_title": "Génère un résumé pour chaque journée complète qui n'en a pas encore",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} résumé généré",
+        "countPlural=other": "{countNumber} résumés générés"
+      }
+    }
+  ],
+  "friction_build_nothing": "Chaque journée complète a déjà un résumé.",
+  "friction_build_failed": "Échec de la génération : {error}",
+  "friction_empty_title": "Aucun résumé de frictions pour l'instant",
+  "friction_empty_hint": "Un résumé est généré automatiquement une fois chaque journée locale terminée, et la tâche horaire rattrape toute journée manquée. Utilisez Générer maintenant pour générer tout de suite les journées manquantes.",
+  "friction_empty_hint_remote": "Un résumé est généré automatiquement une fois chaque journée locale terminée, et la tâche horaire rattrape toute journée manquée. Pour générer tout de suite les journées manquantes, ouvrez cette page sur la machine qui exécute AgentsView, ou activez require_auth sur le serveur.",
+  "friction_load_error": "Impossible de charger le journal des frictions",
+  "friction_retry": "Réessayer",
+  "friction_digest_heading": "Journal des frictions — {date}",
+  "friction_digest_built": "Généré le {when} ({timezone})",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "a échoué dans {countNumber} session",
+        "countPlural=other": "a échoué dans {countNumber} sessions"
+      }
+    }
+  ],
+  "friction_clean_title": "Aucune friction trouvée",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Rien n’a été signalé dans la {countNumber} session analysée.",
+        "countPlural=other": "Rien n’a été signalé dans les {countNumber} sessions analysées."
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "Aucune session n’a été active ce jour-là.",
+  "friction_deferral_said": "Travail reporté : « {phrase} »",
+  "friction_pattern_retry_loop": "Boucle de nouvelles tentatives",
+  "friction_pattern_runaway_loop": "Boucle d’outils incontrôlée",
+  "friction_pattern_edit_churn": "Modifications répétées",
+  "friction_pattern_mid_task_compaction": "Compaction en cours de tâche",
+  "friction_pattern_context_pressure": "Pression sur le contexte",
+  "friction_pattern_iteration_runaway": "Longue exécution sans message de l’utilisateur",
+  "friction_digest_missing": "Aucun résumé n'existe pour le {date}.",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} session analysée",
+        "countPlural=other": "{countNumber} sessions analysées"
+      }
+    }
+  ],
+  "friction_headline_title": "À examiner",
+  "friction_p0_title": "Outils en échec dans plusieurs sessions",
+  "friction_patterns_new": "Nouveaux motifs",
+  "friction_patterns_recurring": "Motifs récurrents",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} occurrence",
+        "countPlural=other": "{countNumber} occurrences"
+      }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} session",
+        "countPlural=other": "{countNumber} sessions"
+      }
+    }
+  ],
+  "friction_pattern_first_seen": "Vu pour la première fois le {date}",
+  "friction_section_corrections": "Corrections",
+  "friction_section_errors": "Erreurs",
+  "friction_section_workarounds": "Contournements",
+  "friction_section_deferrals": "Reports",
+  "friction_section_patterns": "Motifs",
+  "friction_section_frustration": "Frustration",
+  "friction_section_interruptions": "Interruptions",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} interruption",
+        "countPlural=other": "{countNumber} interruptions"
+      }
+    }
+  ],
+  "friction_kind_correction": "Correction",
+  "friction_kind_error": "Erreur",
+  "friction_kind_workaround": "Contournement",
+  "friction_kind_deferral": "Report",
+  "friction_kind_pattern": "Motif",
+  "friction_kind_frustration": "Frustration",
+  "friction_kind_interruption": "Interruption",
+  "friction_disabled_title": "Le journal des frictions est désactivé sur ce serveur",
+  "friction_disabled_hint": "Ce serveur ne génère pas de résumés. Définissez [friction] enabled = true dans config.toml, puis redémarrez le démon. Une archive en lecture seule ne peut pas générer de résumés.",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "Afficher le Markdown",
+  "friction_markdown_copy": "Copier le Markdown",
+  "friction_markdown_copied": "Markdown copié",
+  "friction_markdown_download": "Télécharger le Markdown",
+  "friction_markdown_loading": "Chargement du Markdown…",
+  "friction_markdown_error": "Impossible de charger le résumé Markdown.",
+  "friction_open_session": "Ouvrir {session} au message {ordinal}",
+  "friction_open_session_start": "Ouvrir {session}",
+  "friction_quality_card_title": "Journal des frictions",
+  "friction_quality_card_body": "Résumés quotidiens des corrections, erreurs d'outils, contournements, reports et motifs récurrents trouvés dans vos sessions.",
+  "friction_quality_card_open": "Ouvrir le journal des frictions",
+  "friction_session_title": "Constats de friction",
+  "friction_session_loading": "Chargement des constats de friction…",
+  "friction_session_error": "Les constats de friction ne sont pas disponibles.",
+  "friction_session_empty": "Aucun constat de friction dans cette session.",
+  "friction_session_jump": "Message {ordinal}",
+  "friction_session_jump_title": "Aller au message {ordinal}",
+  "docbank_subagent_open_session": "Les fichiers correspondants apparaissent à l’ouverture en tant que session.",
+  "docbank_checking": "Recherche dans Docbank…",
+  "docbank_current": "Version actuelle",
+  "docbank_prior": "Version antérieure",
+  "docbank_trash": "Corbeille",
+  "docbank_not_found": "Absent de Docbank",
+  "docbank_read_unavailable": "Fichiers de session indisponibles",
+  "docbank_unavailable": "Docbank indisponible",
+  "docbank_limit_exceeded": "Limite de recherche Docbank atteinte",
+  "docbank_bytes_not_kept": "Octets de l'image non conservés",
+  "docbank_file": "Fichier {n} · {mediaType} · {size}",
+  "docbank_file_without_size": "Fichier {n} · {mediaType}",
+  "docbank_more": "+{count} dans Docbank"
 }

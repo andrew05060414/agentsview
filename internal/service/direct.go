@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/integrations/docbank"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/sessionwatch"
@@ -36,6 +37,8 @@ import (
 // interface (GetSessionFilePath, Reader). Structural nil checks
 // on local+engine replace runtime type assertions.
 type directBackend struct {
+	docbank        *docbank.Client
+	modelGroups    ModelGroups
 	db             db.Store
 	local          *db.DB
 	engine         *sync.Engine
@@ -50,15 +53,31 @@ type directBackend struct {
 // engine is nil, Sync returns db.ErrReadOnly but reads still
 // work. Use NewReadOnlyBackend for stores that are not *db.DB
 // (e.g. a PostgreSQL reader).
-func NewDirectBackend(d *db.DB, engine *sync.Engine) SessionService {
-	return &directBackend{db: d, local: d, engine: engine, evidenceSource: newEvidenceSource()}
+func NewDirectBackend(d *db.DB, engine *sync.Engine, opts ...DirectBackendOption) SessionService {
+	b := &directBackend{db: d, local: d, engine: engine, evidenceSource: newEvidenceSource()}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 // NewReadOnlyBackend returns a read-only SessionService over any
 // db.Store (e.g. a PostgreSQL reader used by `pg serve`). Sync
 // returns db.ErrReadOnly unconditionally.
-func NewReadOnlyBackend(d db.Store) SessionService {
-	return &directBackend{db: d, evidenceSource: newEvidenceSource()}
+func NewReadOnlyBackend(d db.Store, opts ...DirectBackendOption) SessionService {
+	b := &directBackend{db: d, evidenceSource: newEvidenceSource()}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
+}
+
+// DirectBackendOption configures a direct or read-only backend.
+type DirectBackendOption func(*directBackend)
+
+// WithModelGroups configures model filters and optional display grouping.
+func WithModelGroups(groups ModelGroups) DirectBackendOption {
+	return func(b *directBackend) { b.modelGroups = groups }
 }
 
 // newEvidenceSource returns a random ID for this backend instance, so a
@@ -150,12 +169,39 @@ func (b *directBackend) MachineLabels(
 func (b *directBackend) Get(
 	ctx context.Context, id string,
 ) (*SessionDetail, error) {
-	s, err := b.db.GetSession(ctx, id)
+	// Plan usage is keyed by the same exact ID, so a networked store loads
+	// it alongside the session. A missing or failed session read still wins
+	// over its result.
+	var planUsage *db.SessionPlanUsage
+	var planErr error
+	loadPlan := func() { planUsage, planErr = b.db.GetSessionPlanUsage(ctx, id) }
+	var s *db.Session
+	var err error
+	if readsOverlap(b.db) {
+		planDone := make(chan struct{})
+		go func() {
+			defer close(planDone)
+			loadPlan()
+		}()
+		s, err = b.db.GetSession(ctx, id)
+		<-planDone
+	} else {
+		s, err = b.db.GetSession(ctx, id)
+		if err == nil && s != nil {
+			loadPlan()
+		}
+	}
 	if err != nil || s == nil {
 		return nil, err
 	}
+	if planErr != nil {
+		return nil, planErr
+	}
 	hideStaleSecretCount(s, secrets.ActiveRulesVersions())
-	return buildSessionDetail(s), nil
+	detail := buildSessionDetail(s)
+	detail.PlanUsage = planUsage.PlanUsageView()
+	detail.CaptureCoverage = planUsage.CaptureCoverageView()
+	return detail, nil
 }
 
 func (b *directBackend) FindSessionIDsByPartial(
@@ -619,7 +665,7 @@ func (b *directBackend) Sync(
 			}
 			return b.Get(ctx, in.ID)
 		}
-		if _, _, ok := parser.SplitWindsurfVirtualPath(storedPath); ok {
+		if _, _, ok := parser.SplitWindsurfVirtualPath(storedPath); ok || strings.HasPrefix(storedPath, "archive://") {
 			if err := b.engine.SyncSingleSessionContext(
 				ctx, in.ID,
 			); err != nil {
@@ -630,7 +676,7 @@ func (b *directBackend) Sync(
 		path = parser.ResolveSourceFilePath(storedPath)
 	}
 
-	b.engine.SyncPaths([]string{path})
+	_ = b.engine.SyncPathsContext(ctx, []string{path})
 
 	id := in.ID
 	if id == "" {
@@ -926,17 +972,44 @@ func (b *directBackend) UsageSummary(
 	if err != nil {
 		return nil, err
 	}
-	f, err := BuildUsageFilter(req)
+	f, err := BuildUsageFilter(req, b.modelGroups)
 	if err != nil {
 		return nil, err
 	}
-	result, err := b.db.GetDailyUsage(ctx, f)
+	planFilter := f
+	if req.GroupModels {
+		planFilter.ModelAliases = b.modelGroups.Aliases()
+	}
+	// Both aggregates read the same filter and neither needs the other.
+	var result db.DailyUsageResult
+	var planUsage db.PlanUsageSessionCounts
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		var readErr error
+		result, readErr = b.db.GetDailyUsage(groupCtx, f)
+		return readErr
+	})
+	group.Go(func() error {
+		var readErr error
+		planUsage, readErr = b.db.GetPlanUsageSessionCounts(groupCtx, planFilter)
+		return readErr
+	})
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	if req.GroupModels && b.modelGroups.Configured() {
+		if err := b.modelGroups.GroupDaily(result.Daily); err != nil {
+			return nil, err
+		}
+		result.SchemaVersion = 0
+		result.Pricing = nil
+	}
+	summary, err := buildUsageSummary(f, result, planUsage)
 	if err != nil {
 		return nil, err
 	}
-	summary, err := buildUsageSummary(f, result)
-	if err != nil {
-		return nil, err
+	if req.GroupModels {
+		summary.ModelAliases = b.modelGroups.Aliases()
 	}
 	if parser.AgentFilterLacksPerMessageTokenData(f.Agent) &&
 		db.NoTokenData(result.Totals) {
@@ -953,6 +1026,14 @@ func (b *directBackend) UsageSummary(
 	return summary, nil
 }
 
+// SessionUsage reads one session's usage through LoadSessionUsage, the
+// path `session usage` uses for direct and PostgreSQL reads.
+func (b *directBackend) SessionUsage(
+	ctx context.Context, req SessionUsageRequest,
+) (*SessionUsageReport, error) {
+	return LoadSessionUsage(ctx, b.db, req)
+}
+
 func (b *directBackend) UsagePairwiseComparison(
 	ctx context.Context, req UsagePairwiseComparisonRequest,
 ) (*UsagePairwiseComparisonResponse, error) {
@@ -965,7 +1046,7 @@ func (b *directBackend) UsagePairwiseComparison(
 	if err != nil {
 		return nil, err
 	}
-	base, err := BuildUsageFilter(req.UsageRequest)
+	base, err := BuildUsageFilter(req.UsageRequest, b.modelGroups)
 	if err != nil {
 		return nil, err
 	}
@@ -979,6 +1060,13 @@ func (b *directBackend) UsagePairwiseComparison(
 		}
 	}
 	if useDefault || req.FallbackToDefault {
+		left, right := req.LeftValue, req.RightValue
+		if req.LeftDimension == "model" {
+			left = b.modelGroups.Expand(left)
+		}
+		if req.RightDimension == "model" {
+			right = b.modelGroups.Expand(right)
+		}
 		rankingFilter := base
 		rankingFilter.Breakdowns = true
 		rankingFilter.SkipSessionCounts = true
@@ -986,11 +1074,25 @@ func (b *directBackend) UsagePairwiseComparison(
 		if err != nil {
 			return nil, err
 		}
-		summary, err := buildUsageSummary(rankingFilter, rankingResult)
+		rankingPlanUsage, err := b.db.GetPlanUsageSessionCounts(ctx, rankingFilter)
 		if err != nil {
 			return nil, err
 		}
-		if useDefault || !usagePairwiseSideInRanking(summary, req.LeftDimension, req.LeftValue) || !usagePairwiseSideInRanking(summary, req.RightDimension, req.RightValue) {
+		summary, err := buildUsageSummary(rankingFilter, rankingResult, rankingPlanUsage)
+		if err != nil {
+			return nil, err
+		}
+		useDefault = useDefault || !usagePairwiseSideInRanking(summary, req.LeftDimension, left, b.modelGroups.Configured()) || !usagePairwiseSideInRanking(summary, req.RightDimension, right, b.modelGroups.Configured())
+		if useDefault {
+			if req.GroupModels && b.modelGroups.Configured() {
+				if err := b.modelGroups.GroupDaily(rankingResult.Daily); err != nil {
+					return nil, err
+				}
+				summary.ModelTotals, err = foldModelTotals(rankingResult.Daily, nil)
+				if err != nil {
+					return nil, err
+				}
+			}
 			req.LeftDimension, req.LeftValue, req.RightDimension, req.RightValue = defaultUsagePairwiseSelection(summary)
 		}
 		if req.LeftDimension == "" {
@@ -1006,7 +1108,14 @@ func (b *directBackend) UsagePairwiseComparison(
 	if err != nil {
 		return nil, err
 	}
-	leftFilter, leftEmpty, rightFilter, rightEmpty, err := buildUsagePairwiseFilters(req, base)
+	query := req
+	if query.LeftDimension == "model" {
+		query.LeftValue = b.modelGroups.Expand(query.LeftValue)
+	}
+	if query.RightDimension == "model" {
+		query.RightValue = b.modelGroups.Expand(query.RightValue)
+	}
+	leftFilter, leftEmpty, rightFilter, rightEmpty, err := buildUsagePairwiseFilters(query, base)
 	if err != nil {
 		return nil, err
 	}
@@ -1059,9 +1168,12 @@ const maxContentSearchContext = 10
 func (b *directBackend) SearchContent(
 	ctx context.Context, req ContentSearchRequest,
 ) (*ContentSearchResult, error) {
+	req, err := NormalizeContentSearchRequest(req)
+	if err != nil {
+		return nil, err
+	}
 	var excludeActiveSince time.Time
 	if req.ExcludeActiveSince != "" {
-		var err error
 		excludeActiveSince, err = time.Parse(time.RFC3339, req.ExcludeActiveSince)
 		if err != nil || excludeActiveSince.IsZero() {
 			return nil, &db.SearchInputError{Msg: "search: invalid exclude_active_since: use RFC3339"}
@@ -1094,7 +1206,7 @@ func (b *directBackend) SearchContent(
 	if err != nil {
 		return nil, err
 	}
-	page, err := b.db.SearchContent(ctx, db.ContentSearchFilter{
+	filter := db.ContentSearchFilter{
 		Pattern:            req.Pattern,
 		Mode:               req.Mode,
 		Sources:            req.Sources,
@@ -1123,13 +1235,20 @@ func (b *directBackend) SearchContent(
 		RevealSecrets: req.Reveal,
 		Limit:         req.Limit,
 		Cursor:        req.Cursor,
-	})
+	}
+	var page db.ContentSearchPage
+	candidateTruncated := false
+	if len(req.Concepts) > 0 {
+		page, candidateTruncated, err = b.searchContentConcepts(ctx, filter, req.Concepts)
+	} else {
+		page, err = b.db.SearchContent(ctx, filter)
+	}
 	if err != nil {
 		return nil, err
 	}
 	revisionBound := true
 	for i := range page.Matches {
-		if page.Matches[i].TranscriptRevision == "" {
+		if !matchRevisionBound(page.Matches[i]) {
 			revisionBound = false
 			break
 		}
@@ -1158,7 +1277,23 @@ func (b *directBackend) SearchContent(
 		NextCursor:          page.NextCursor,
 		RevisionBound:       revisionBound,
 		Coverage:            coverage,
+		CandidateTruncated:  candidateTruncated,
 	}, nil
+}
+
+// contentContextConcurrency bounds the context-window reads one content
+// search page starts at once on a networked store.
+const contentContextConcurrency = 8
+
+// readsOverlap reports whether independent reads on store should run at
+// the same time. Each read on a networked store such as PostgreSQL waits on
+// a round trip, so overlapping them saves that wait. The local SQLite
+// archive answers in-process, and its small concurrent reads are slower
+// than the same reads in order: on a 12,600-session archive, 50 context
+// windows took 11 ms in order and 19 ms four at a time.
+func readsOverlap(store db.Store) bool {
+	_, local := store.(*db.DB)
+	return !local
 }
 
 // enrichContentContext populates ContextBefore/ContextAfter on each match
@@ -1192,36 +1327,49 @@ func (b *directBackend) SearchContent(
 func (b *directBackend) enrichContentContext(
 	ctx context.Context, matches []db.ContentMatch, n int, reveal bool,
 ) (bool, error) {
-	bound := true
+	// Each match reads its own window, so on a networked store the reads
+	// run concurrently. Every goroutine writes only its own match and its
+	// own stale flag.
+	stale := make([]bool, len(matches))
+	group, groupCtx := errgroup.WithContext(ctx)
+	if readsOverlap(b.db) {
+		group.SetLimit(contentContextConcurrency)
+	} else {
+		group.SetLimit(1)
+	}
 	for i := range matches {
 		m := &matches[i]
 		if m.Ordinal < 0 {
 			continue
 		}
-		anchor := m.Ordinal
-		revision := ""
-		msgs, err := b.db.GetMessagesWindow(ctx, m.SessionID, db.MessageWindow{
-			Around: &anchor, Before: n, After: n, ObservedRevision: &revision,
+		group.Go(func() error {
+			anchor := m.Ordinal
+			revision := ""
+			msgs, err := b.db.GetMessagesWindow(groupCtx, m.SessionID, db.MessageWindow{
+				Around: &anchor, Before: n, After: n, ObservedRevision: &revision,
+			})
+			if err != nil {
+				return fmt.Errorf("content search context: %w", err)
+			}
+			stale[i] = revision != m.TranscriptRevision
+			for _, msg := range msgs {
+				if !reveal {
+					msg = redactMessageSecrets(msg)
+				}
+				switch {
+				case msg.Ordinal < anchor:
+					m.ContextBefore = append(m.ContextBefore, msg)
+				case msg.Ordinal > anchor:
+					m.ContextAfter = append(m.ContextAfter, msg)
+				}
+			}
+			return nil
 		})
-		if err != nil {
-			return false, fmt.Errorf("content search context: %w", err)
-		}
-		if revision != m.TranscriptRevision {
-			bound = false
-		}
-		for _, msg := range msgs {
-			if !reveal {
-				msg = redactMessageSecrets(msg)
-			}
-			switch {
-			case msg.Ordinal < anchor:
-				m.ContextBefore = append(m.ContextBefore, msg)
-			case msg.Ordinal > anchor:
-				m.ContextAfter = append(m.ContextAfter, msg)
-			}
-		}
 	}
-	return bound, nil
+	if err := group.Wait(); err != nil {
+		return false, err
+	}
+	return !slices.Contains(stale, true), nil
 }
 
 // redactMessageSecrets returns a copy of m with every secret-shaped span

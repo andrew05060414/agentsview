@@ -55,14 +55,18 @@ func defaultDaemonLaunchWaitDeps() daemonLaunchWaitDeps {
 		acquireLaunchLock:  acquireBackgroundLaunchLockWithError,
 		loadReadOnlyConfig: config.LoadReadOnly,
 		writableRecords:    writableDaemonRecords,
-		confirmed:          stopTargetConfirmed,
-		probe:              daemonRecordPingConfirmed,
-		isStarting:         IsDaemonStarting,
-		readStartupState:   readStartupState,
-		now:                time.Now,
-		sleep:              time.Sleep,
-		timeout:            backgroundServeReadyTimeout,
-		tick:               startProbeTick(),
+		// Discovery may reuse a reachable daemon in another PID namespace.
+		// Only signaling requires a confirmed local process identity.
+		confirmed: func(rec daemon.RuntimeRecord, authToken string) bool {
+			return daemonRecordPingConfirmed(rec, authToken) || processIdentityConfirmed(rec)
+		},
+		probe:            daemonRecordPingConfirmed,
+		isStarting:       IsDaemonStarting,
+		readStartupState: readStartupState,
+		now:              time.Now,
+		sleep:            time.Sleep,
+		timeout:          backgroundServeReadyTimeout,
+		tick:             startProbeTick(),
 	}
 }
 
@@ -117,10 +121,30 @@ func defaultDaemonCommandDeps() daemonCommandDeps {
 }
 
 func newDaemonCommand() *cobra.Command {
-	return newDaemonCommandWithDeps(defaultDaemonCommandDeps())
+	deps := defaultDaemonCommandDeps()
+	clientDeps := deps
+	clientDeps.loadConfig = func() (config.Config, error) {
+		cfg, err := config.LoadMinimalFor(config.ScopeLocal)
+		if err == nil {
+			err = cfg.ApplyDeploymentAuth()
+		}
+		return cfg, err
+	}
+	clientDeps.loadReadOnlyConfig = func() (config.Config, error) {
+		cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
+		if err == nil {
+			err = cfg.ApplyDeploymentAuth()
+		}
+		return cfg, err
+	}
+	return newDaemonCommandWithClientDeps(deps, clientDeps)
 }
 
 func newDaemonCommandWithDeps(deps daemonCommandDeps) *cobra.Command {
+	return newDaemonCommandWithClientDeps(deps, deps)
+}
+
+func newDaemonCommandWithClientDeps(deps, clientDeps daemonCommandDeps) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "Manage the background server",
@@ -130,7 +154,9 @@ func newDaemonCommandWithDeps(deps daemonCommandDeps) *cobra.Command {
 			"`daemon start` runs it in the background without opening a browser.\n" +
 			"Stopping it also stops the web UI and sync. These commands also manage\n" +
 			"a writable server started by `serve` or automatically by a CLI command.\n\n" +
-			"Read-only `pg serve` and `duckdb serve` processes are managed separately.",
+			"Read-only `replica pg serve` and `replica duckdb serve` processes are managed separately.",
+		Example: "  agentsview daemon status\n" +
+			"  agentsview daemon start",
 		GroupID:      groupCore,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -138,6 +164,10 @@ func newDaemonCommandWithDeps(deps daemonCommandDeps) *cobra.Command {
 	cmd.AddCommand(
 		&cobra.Command{
 			Use: "start", Short: "Start the background server",
+			Long: "Start the writable server in the background using saved configuration, without opening a browser. " +
+				"A compatible running daemon is reused. " +
+				"This is also the explicit startup step when automatic startup is disabled.",
+			Example:      "  agentsview daemon start",
 			SilenceUsage: true, Args: cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				ctx, stop := signal.NotifyContext(
@@ -149,20 +179,30 @@ func newDaemonCommandWithDeps(deps daemonCommandDeps) *cobra.Command {
 		},
 		&cobra.Command{
 			Use: "status", Short: "Show background server status",
+			Long: "Print the writable daemon's status and URL for this data directory. " +
+				"No running daemon is a successful status query with human output, not a failing health check. " +
+				"This command has no --json flag.",
+			Example:      "  agentsview daemon status",
 			SilenceUsage: true, Args: cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				return runDaemonStatus(cmd.OutOrStdout(), deps)
+				return runDaemonStatus(cmd.OutOrStdout(), clientDeps)
 			},
 		},
 		&cobra.Command{
 			Use: "stop", Short: "Stop the background server",
+			Long: "Stop only the writable daemon, including its web UI, source sync, and file watchers. " +
+				"Read-only PostgreSQL and DuckDB servers are left running.",
+			Example:      "  agentsview daemon stop",
 			SilenceUsage: true, Args: cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
-				return runDaemonStop(cmd.OutOrStdout(), deps)
+				return runDaemonStop(cmd.OutOrStdout(), clientDeps)
 			},
 		},
 		&cobra.Command{
 			Use: "restart", Short: "Restart the background server",
+			Long: "Restart the writable background server using the saved configuration. " +
+				"Use this after changing settings or when a running daemon needs replacement; read-only mirror servers are separate.",
+			Example:      "  agentsview daemon restart",
 			SilenceUsage: true, Args: cobra.NoArgs,
 			RunE: func(cmd *cobra.Command, _ []string) error {
 				ctx, stop := signal.NotifyContext(
@@ -231,7 +271,7 @@ func runDaemonStart(ctx context.Context, w io.Writer, deps daemonCommandDeps) er
 		cfg, []string{"serve"}, serveReplacementOptions{},
 		backgroundLaunchPolicy{
 			ConfigOnly: true, Operation: "daemon start",
-			Context: ctx, Attached: true,
+			Attached: true,
 			OnLaunch: progress.launch, OnProgress: progress.progress,
 		},
 	)
@@ -687,8 +727,8 @@ func runDaemonStop(w io.Writer, deps daemonCommandDeps) error {
 	})
 }
 
-func runDaemonRestart(w io.Writer, deps daemonCommandDeps) error {
-	return runDaemonRestartWithPolicy(context.Background(), w, deps, false)
+func runDaemonRestart(ctx context.Context, w io.Writer, deps daemonCommandDeps) error {
+	return runDaemonRestartWithPolicy(ctx, w, deps, false)
 }
 
 func runDaemonRestartAttached(
@@ -766,7 +806,6 @@ func runDaemonRestartWithPolicy(
 	}
 	if attached {
 		progress := &daemonLaunchProgressWriter{w: w}
-		policy.Context = ctx
 		policy.Attached = true
 		policy.OnLaunch = progress.launch
 		policy.OnProgress = progress.progress
@@ -838,7 +877,7 @@ func daemonStatusRecords(
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
-		if !daemon.ProcessAlive(rec.PID) {
+		if !daemon.RuntimeProcessAlive(rec) {
 			continue
 		}
 		state := runtimeRecordIdentityState(rec)

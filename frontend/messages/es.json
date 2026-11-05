@@ -98,12 +98,15 @@
   "header_actions_import_archive_only": "Importación no disponible en modo de solo archivo",
   "header_actions_import_conversations": "Importar conversaciones",
   "header_actions_import": "Importar",
+  "header_actions_import_claude_syncing": "La sincronización de Claude.ai está en curso. Abre Importar para ver el progreso o detenerla.",
   "header_actions_toggle_theme": "Cambiar el tema",
   "header_actions_settings": "Configuración",
   "header_actions_keyboard_shortcuts": "Atajos de teclado",
   "header_actions_keyboard_shortcuts_shortcut": "Atajos de teclado (?)",
   "status_bar_archive_stale": "Los resultados del archivo pueden estar desactualizados.",
   "status_bar_archive_rebuilding": "Los resultados del archivo pueden estar desactualizados. Los cambios están pausados hasta que termine la reconstrucción.",
+  "status_bar_archive_stale_rebuild": "Los resultados del archivo pueden estar desactualizados. Haz clic para reconstruir.",
+  "status_bar_sync_failed": "La sincronización falló",
   "status_bar_sessions": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -159,8 +162,10 @@
   "command_palette_search_error": "Búsqueda no disponible",
   "command_palette_search_failed": "La búsqueda falló. Inténtalo de nuevo.",
   "command_palette_semantic_setup_title": "La búsqueda semántica no está configurada",
-  "command_palette_semantic_setup_config_step": "1. Agrega una sección [vector] a config.toml, ajustando el modelo y el endpoint a tu servidor de embeddings (sirve cualquier endpoint compatible con OpenAI, p. ej. Ollama):",
-  "command_palette_semantic_setup_build_step": "2. Reinicia el daemon y luego construye el índice:",
+  "command_palette_semantic_setup_config_step": "1. Añade esto a config.toml:",
+  "command_palette_semantic_setup_local": "¿Ya usas Nomic con Ollama? Sigue la configuración completa para conservar tu índice al cambiar al servidor local compartido.",
+  "command_palette_semantic_setup_local_link": "Configuración del servidor",
+  "command_palette_semantic_setup_build_step": "2. Reinicia el daemon y crea el índice. La CLI pide permiso antes de la primera descarga:",
   "command_palette_semantic_copy_config": "Copiar el fragmento de configuración",
   "command_palette_semantic_copy_command": "Copiar el comando",
   "command_palette_semantic_copied": "¡Copiado!",
@@ -387,9 +392,23 @@
       }
     }
   ],
+  "tool_block_image_alt": "Imagen de la salida de la herramienta",
+  "tool_block_image_open": "Ver la imagen a tamaño completo",
+  "tool_block_image_close": "Cerrar la imagen a tamaño completo",
   "thinking_block_label": "Razonamiento",
   "compact_boundary_title": "Ventana de contexto compactada en este punto",
   "compact_boundary_label": "Contexto compactado",
+  "transcript_empty_messages": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{count} mensaje vacío",
+        "countPlural=other": "{count} mensajes vacíos"
+      }
+    }
+  ],
+  "transcript_empty_messages_title": "Estos mensajes no tienen texto, razonamiento ni llamadas a herramientas",
   "compact_boundary_show_full_summary": "Mostrar resumen completo",
   "sidebar_session_count": [
     {
@@ -444,6 +463,8 @@
   "sidebar_filters_no_match": "Sin coincidencias",
   "sidebar_filters_no_agents": "Sin agentes",
   "sidebar_filters_machine": "Máquina",
+  "sidebar_filters_machine_loading": "Cargando máquinas...",
+  "sidebar_filters_machine_update_failed": "No se pudo actualizar el filtro de máquinas. Inténtalo de nuevo.",
   "sidebar_filters_search_machines": "Buscar máquinas...",
   "sidebar_filters_no_machines": "Sin máquinas",
   "sidebar_filters_min_prompts": "Prompts mín.",
@@ -836,6 +857,10 @@
   "usage_tokens_attribution_title": "Atribución de tokens",
   "usage_attribution_treemap": "Treemap",
   "usage_attribution_list": "Lista",
+  "usage_label_scale_title": "Escala del tamaño de etiquetas",
+  "usage_label_scale_linear": "Lineal",
+  "usage_label_scale_sqrt": "Raíz",
+  "usage_label_scale_log": "Log",
   "usage_chart_style": "Estilo del gráfico",
   "usage_chart_style_smooth": "Suave",
   "usage_chart_style_lines": "Líneas",
@@ -862,7 +887,7 @@
   "settings_search_empty": "Ninguna configuración coincide",
   "settings_search_clear": "Borrar búsqueda",
   "settings_search_result": "Mostrando {category}",
-  "settings_search_keywords_appearance": "tema contraste diseño texto fuente bloques zoom theme contrast layout text font blocks",
+  "settings_search_keywords_appearance": "tema contraste diseño texto fuente bloques zoom theme contrast layout text font blocks color daltonismo",
   "settings_search_keywords_language": "idioma región traducción language locale translation",
   "settings_search_keywords_date_ranges": "fecha rango páginas vinculadas date range linked pages",
   "settings_search_keywords_terminal": "terminal reanudar lanzar binario argumentos portapapeles resume launch binary arguments clipboard",
@@ -1722,6 +1747,14 @@
   "insights_page_template_tool_reliability": "Confiabilidad de las herramientas",
   "insights_page_template_model_cost": "Modelo y costo",
   "insights_page_template_instruction_opportunities": "Oportunidades de instrucción",
+  "insights_page_template_friction_review": "Revisión de fricción",
+  "friction_review_summary_title": "Resumen escrito por un modelo",
+  "friction_review_summary_notice": "Escrito por un modelo a partir del resumen y los títulos de patrones de este informe. No modifica hallazgos, informes ni incidencias.",
+  "friction_review_summary_empty": "Todavía no hay resumen para este informe.",
+  "friction_review_summary_generate": "Generar resumen",
+  "friction_review_summary_regenerate": "Regenerar",
+  "friction_review_summary_generating": "Generando: {phase}",
+  "friction_review_summary_unavailable": "La generación de resúmenes no está disponible para este archivo.",
   "insights_page_scope_no_automated": "Sin automatizadas",
   "insights_page_scope_both": "Ambas",
   "insights_page_scope_only_automated": "Solo automatizadas",
@@ -2048,6 +2081,7 @@
   "appearance_chart_palette": "Colores de gráficos",
   "appearance_chart_palette_agentsview": "Agentsview",
   "appearance_chart_palette_matplotlib": "Matplotlib",
+  "appearance_chart_palette_colorblind": "Apto para daltonismo",
   "appearance_message_layout": "Diseño de mensajes",
   "appearance_block_visibility": "Visibilidad de bloques",
   "settings_github_token_saved": "Token de GitHub guardado.",
@@ -2615,8 +2649,8 @@
   "import_claude_stop": "Detener",
   "import_claude_terminal": "Terminal",
   "import_claude_copy_command": "Copiar comando",
-  "import_claude_setup_load": "Después, abre {url}, activa el Modo de desarrollador, elige Cargar descomprimida y selecciona la carpeta indicada.",
-  "import_claude_open_chrome": "Abre Chrome para conectarte.",
+  "import_claude_setup_load": "Después, reinicia AgentsView, abre {url}, activa el Modo de desarrollador, elige Cargar descomprimida y selecciona la carpeta indicada.",
+  "import_claude_open_chrome": "Abre Chrome con la extensión de AgentsView activada. Si ejecutaste la configuración después de iniciar AgentsView, reinicia AgentsView.",
   "import_claude_tab_note": "La sincronización abre una pestaña de claude.ai en segundo plano si no hay ninguna abierta. La pestaña permanece abierta después de la sincronización.",
   "import_claude_signed_out": "Inicia sesión en claude.ai en el perfil de Chrome con la extensión AgentsView. Activa la extensión en un solo perfil de Chrome. La sincronización usa el primer perfil que se conecta.",
   "import_chatgpt_tab_note": "La sincronización abre una pestaña de chatgpt.com en segundo plano si no hay ninguna abierta. La pestaña permanece abierta después de la sincronización.",
@@ -2624,6 +2658,7 @@
   "import_claude_reload_extension": "Después, vuelve a cargar la extensión en {url}.",
   "import_claude_update_app": "Reinicia AgentsView si lo has actualizado.",
   "import_claude_syncing": "Sincronizando...",
+  "import_claude_sync_background": "La sincronización continúa si cierras este cuadro de diálogo.",
   "import_claude_sync_failed": "Error de sincronización",
   "import_claude_sign_in_failed": "Error al iniciar sesión",
   "import_claude_desktop_note": "El inicio de sesión usa un código enviado por correo. Para cuentas de Google, sincroniza desde la interfaz web en Chrome.",
@@ -2863,5 +2898,298 @@
   "usage_all_projects": "Todos los proyectos",
   "usage_clear_selection": "Borrar selección",
   "usage_open_project": "Abrir",
-  "usage_loading": "Cargando..."
+  "usage_loading": "Cargando...",
+  "plan_usage_title": "Uso del plan",
+  "plan_usage_trigger_weekly": "Uso del plan: {percent}% semanal",
+  "plan_usage_as_of": "Uso del plan, a {time}",
+  "plan_usage_not_checked": "Uso del plan: aún no comprobado",
+  "plan_usage_still_updating": "Uso del plan: aún actualizándose, a {time}",
+  "plan_usage_not_reported_yet": "Uso del plan: aún no informado, a {time}",
+  "plan_usage_partial": "Uso del plan parcial, a {time}",
+  "plan_usage_not_reported": "OpenAI no lo informó",
+  "plan_usage_too_many_subagents": "Demasiados chats de subagentes para el informe de uso de OpenAI",
+  "plan_usage_could_not_check": "AgentsView no pudo comprobar el uso del plan",
+  "plan_usage_account_unavailable": "El uso no está disponible para esta cuenta",
+  "plan_usage_counted_under": "Contado en el chat {title}",
+  "plan_usage_stale": "Desde entonces: {reason} ({time}). Estas cifras pueden estar desactualizadas.",
+  "plan_usage_left_out_later": "El informe de uso de OpenAI omitió este chat",
+  "plan_usage_weekly_share": "{percent}% del límite semanal de Codex",
+  "plan_usage_five_hour_share": "{percent}% del límite de cinco horas de Codex",
+  "plan_usage_credits": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} crédito",
+        "countPlural=other": "{countLabel} créditos"
+      }
+    }
+  ],
+  "plan_usage_credits_note": "Los créditos se muestran tal como los da el informe de uso de OpenAI.",
+  "plan_usage_col_split": "Modelo, esfuerzo, velocidad",
+  "plan_usage_col_weekly": "Semanal",
+  "plan_usage_col_five_hour": "5 horas",
+  "plan_usage_col_credits": "Créditos",
+  "capture_tokens_live": "Tokens capturados en vivo, a {time}",
+  "capture_turns_not_captured": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} turno sin capturar",
+        "countPlural=other": "{countLabel} turnos sin capturar"
+      }
+    }
+  ],
+  "capture_turns_not_captured_covered": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input time",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} turno sin capturar; el uso del plan lo cuenta si ocurrió antes de {time}",
+        "countPlural=other": "{countLabel} turnos sin capturar; el uso del plan cuenta los que ocurrieron antes de {time}"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_waiting": "Codex Cloud: esperando la primera sincronización",
+  "status_bar_codex_cloud_importing_found": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Codex Cloud: importando, {countLabel} chat encontrado hasta ahora",
+        "countPlural=other": "Codex Cloud: importando, {countLabel} chats encontrados hasta ahora"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_importing_progress": "Codex Cloud: importando {imported} de {total} chats",
+  "status_bar_codex_cloud_up_to_date": "Codex Cloud: al día a {time}",
+  "status_bar_codex_cloud_retrying": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Codex Cloud: {countLabel} chat no se pudo importar",
+        "countPlural=other": "Codex Cloud: {countLabel} chats no se pudieron importar"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_error": "Codex Cloud: error",
+  "status_bar_codex_cloud_off": "Codex Cloud: desactivado",
+  "status_bar_codex_cloud_config_error": "Codex Cloud: error de configuración",
+  "status_bar_codex_cloud_live_attention": "Codex Cloud: los tokens en vivo requieren atención",
+  "status_bar_codex_cloud_oldest_failure": "Fallo más antiguo: {time}",
+  "status_bar_codex_cloud_last_success": "Última sincronización correcta: {time}",
+  "status_bar_codex_cloud_homes": "Carpetas de Codex: {homes}",
+  "appearance_message_colors": "Colores de los mensajes",
+  "appearance_message_colors_description": "Asigna a cada tipo de mensaje su propio color. El ajuste para daltonismo usa tonos que se distinguen con las deficiencias de visión del color más comunes y añade patrones de línea, para que los tipos se diferencien por la forma además del color.",
+  "appearance_message_colors_preset": "Ajuste de colores de mensajes",
+  "appearance_message_colors_preset_default": "Predeterminado del tema",
+  "appearance_message_colors_preset_colorblind": "Apto para daltonismo",
+  "appearance_message_colors_preset_custom": "Personalizado",
+  "appearance_message_colors_patterns": "Marcar los tipos de mensaje con patrones de línea además del color",
+  "appearance_message_colors_reset_all": "Restablecer valores predeterminados",
+  "appearance_message_colors_reset_role": "Restablecer",
+  "appearance_message_colors_reset_role_label": "Restablecer el color de {role}",
+  "appearance_message_colors_role_label": "Color de {role}",
+  "appearance_message_colors_picker": "Abrir selector de color",
+  "appearance_message_colors_hex": "Color hexadecimal",
+  "appearance_message_colors_warning_text": "El texto puede ser difícil de leer en {modes} ({ratio}:1, se necesita {required}:1).",
+  "appearance_message_colors_warning_marker": "El marcador de color puede ser difícil de ver en {modes} ({ratio}:1, se necesita {required}:1).",
+  "appearance_message_colors_mode_light": "modo claro",
+  "appearance_message_colors_mode_dark": "modo oscuro",
+  "appearance_message_colors_mode_high_contrast_light": "modo claro de alto contraste",
+  "appearance_message_colors_mode_high_contrast_dark": "modo oscuro de alto contraste",
+  "appearance_message_colors_swatch_blue": "Azul",
+  "appearance_message_colors_swatch_vermillion": "Bermellón",
+  "appearance_message_colors_swatch_bluish_green": "Verde azulado",
+  "appearance_message_colors_swatch_reddish_purple": "Púrpura rojizo",
+  "appearance_message_colors_swatch_dark_yellow": "Amarillo oscuro",
+  "appearance_message_colors_swatch_gray": "Gris",
+  "appearance_message_colors_preview": "Vista previa",
+  "appearance_message_colors_preview_user": "¿Por qué falla la prueba de fechas?",
+  "appearance_message_colors_preview_assistant": "El fixture espera UTC. Lo actualicé.",
+  "nav_friction": "Registro de fricción",
+  "friction_page_help_docs": "Cómo funciona el registro de fricción",
+  "friction_page_refresh": "Actualizar registro de fricción",
+  "friction_date_label": "Fecha del resumen",
+  "friction_date_previous": "Resumen anterior",
+  "friction_date_next": "Resumen siguiente",
+  "friction_date_no_match": "No hay fechas coincidentes",
+  "friction_build_now": "Generar ahora",
+  "friction_build_title": "Genera un resumen para cada día completo que aún no tenga uno",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Se generó {countNumber} resumen",
+        "countPlural=other": "Se generaron {countNumber} resúmenes"
+      }
+    }
+  ],
+  "friction_build_nothing": "Todos los días completos ya tienen un resumen.",
+  "friction_build_failed": "La generación falló: {error}",
+  "friction_empty_title": "Todavía no hay resúmenes de fricción",
+  "friction_empty_hint": "Se genera un resumen automáticamente cuando termina cada día local, y el trabajo horario recupera cualquier día que falte. Usa Generar ahora para crear los días que faltan de inmediato.",
+  "friction_empty_hint_remote": "Se genera un resumen automáticamente cuando termina cada día local, y el trabajo horario recupera cualquier día que falte. Para crear de inmediato los días que faltan, abre esta página en el equipo que ejecuta AgentsView o activa require_auth en el servidor.",
+  "friction_load_error": "No se pudo cargar el registro de fricción",
+  "friction_retry": "Reintentar",
+  "friction_digest_heading": "Registro de fricción — {date}",
+  "friction_digest_built": "Generado el {when} ({timezone})",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "falló en {countNumber} sesión",
+        "countPlural=other": "falló en {countNumber} sesiones"
+      }
+    }
+  ],
+  "friction_clean_title": "No se encontró fricción",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "No se marcó nada en la {countNumber} sesión analizada.",
+        "countPlural=other": "No se marcó nada en las {countNumber} sesiones analizadas."
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "No hubo sesiones activas este día.",
+  "friction_deferral_said": "Trabajo pospuesto: «{phrase}»",
+  "friction_pattern_retry_loop": "Bucle de reintentos",
+  "friction_pattern_runaway_loop": "Bucle de herramientas descontrolado",
+  "friction_pattern_edit_churn": "Ediciones repetidas",
+  "friction_pattern_mid_task_compaction": "Compactación a mitad de tarea",
+  "friction_pattern_context_pressure": "Presión de contexto",
+  "friction_pattern_iteration_runaway": "Ejecución larga sin mensajes del usuario",
+  "friction_digest_missing": "No existe un resumen para {date}.",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} sesión analizada",
+        "countPlural=other": "{countNumber} sesiones analizadas"
+      }
+    }
+  ],
+  "friction_headline_title": "Requiere atención",
+  "friction_p0_title": "Herramientas que fallan en varias sesiones",
+  "friction_patterns_new": "Patrones nuevos",
+  "friction_patterns_recurring": "Patrones recurrentes",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} aparición",
+        "countPlural=other": "{countNumber} apariciones"
+      }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} sesión",
+        "countPlural=other": "{countNumber} sesiones"
+      }
+    }
+  ],
+  "friction_pattern_first_seen": "Visto por primera vez el {date}",
+  "friction_section_corrections": "Correcciones",
+  "friction_section_errors": "Errores",
+  "friction_section_workarounds": "Soluciones provisionales",
+  "friction_section_deferrals": "Aplazamientos",
+  "friction_section_patterns": "Patrones",
+  "friction_section_frustration": "Frustración",
+  "friction_section_interruptions": "Interrupciones",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} interrupción",
+        "countPlural=other": "{countNumber} interrupciones"
+      }
+    }
+  ],
+  "friction_kind_correction": "Corrección",
+  "friction_kind_error": "Error",
+  "friction_kind_workaround": "Solución provisional",
+  "friction_kind_deferral": "Aplazamiento",
+  "friction_kind_pattern": "Patrón",
+  "friction_kind_frustration": "Frustración",
+  "friction_kind_interruption": "Interrupción",
+  "friction_disabled_title": "El registro de fricción está desactivado en este servidor",
+  "friction_disabled_hint": "Este servidor no genera resúmenes. Configura [friction] enabled = true en config.toml y reinicia el daemon. Un archivo de solo lectura no puede generar resúmenes.",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "Mostrar Markdown",
+  "friction_markdown_copy": "Copiar Markdown",
+  "friction_markdown_copied": "Markdown copiado",
+  "friction_markdown_download": "Descargar Markdown",
+  "friction_markdown_loading": "Cargando Markdown…",
+  "friction_markdown_error": "No se pudo cargar el resumen en Markdown.",
+  "friction_open_session": "Abrir {session} en el mensaje {ordinal}",
+  "friction_open_session_start": "Abrir {session}",
+  "friction_quality_card_title": "Registro de fricción",
+  "friction_quality_card_body": "Resúmenes diarios de correcciones, errores de herramientas, soluciones provisionales, aplazamientos y patrones recurrentes encontrados en tus sesiones.",
+  "friction_quality_card_open": "Abrir el registro de fricción",
+  "friction_session_title": "Hallazgos de fricción",
+  "friction_session_loading": "Cargando hallazgos de fricción…",
+  "friction_session_error": "Los hallazgos de fricción no están disponibles.",
+  "friction_session_empty": "No hay hallazgos de fricción en esta sesión.",
+  "friction_session_jump": "Mensaje {ordinal}",
+  "friction_session_jump_title": "Ir al mensaje {ordinal}",
+  "docbank_subagent_open_session": "Las coincidencias de archivos aparecen al abrir como sesión.",
+  "docbank_checking": "Buscando en Docbank…",
+  "docbank_current": "Versión actual",
+  "docbank_prior": "Versión anterior",
+  "docbank_trash": "Papelera",
+  "docbank_not_found": "No está en Docbank",
+  "docbank_read_unavailable": "Archivos de sesión no disponibles",
+  "docbank_unavailable": "Docbank no disponible",
+  "docbank_limit_exceeded": "Se alcanzó el límite de búsquedas en Docbank",
+  "docbank_bytes_not_kept": "No se conservaron los bytes de la imagen",
+  "docbank_file": "Archivo {n} · {mediaType} · {size}",
+  "docbank_file_without_size": "Archivo {n} · {mediaType}",
+  "docbank_more": "+{count} más en Docbank"
 }

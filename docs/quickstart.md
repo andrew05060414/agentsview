@@ -3,6 +3,9 @@ title: Quick Start
 description: Get AgentsView running in under a minute
 ---
 
+CLI examples follow `main`. For older releases, use the legacy spellings in
+the [command migration](commands.md#command-migration).
+
 ## Install
 
 ### Desktop App
@@ -95,9 +98,9 @@ The installer detects your OS and architecture, downloads the latest release
 from GitHub Releases, verifies the SHA-256 checksum, and installs the binary.
 
 On macOS and Linux, it installs to `/usr/local/bin` when that directory is
-writable, or `~/.local/bin` otherwise. Follow the installer's `PATH` instructions
-and run `command -v agentsview` to check which binary your shell uses. When
-the standalone CLI and bundled CLI use different directories, put the
+writable, or `~/.local/bin` otherwise. Follow the installer's `PATH`
+instructions and run `command -v agentsview` to check which binary your shell
+uses. When the standalone CLI and bundled CLI use different directories, put the
 standalone install directory first in `PATH` to select it.
 
 !!! note
@@ -109,7 +112,7 @@ standalone install directory first in `PATH` to select it.
 
 ### Build from source
 
-Requires Go 1.27.2+ with CGO and Node.js 24.11+:
+Requires Go 1.27.3+ with CGO and Node.js 24.22.1+:
 
 ```bash
 git clone https://github.com/kenn-io/agentsview.git
@@ -202,6 +205,11 @@ docker run --rm -p 127.0.0.1:8080:8080 \
   ghcr.io/kenn-io/agentsview:latest
 ```
 
+To ingest and publish sessions from the same container, enable the commented
+PostgreSQL and push-watch block in `docker-compose.prod.yaml` and set your
+database URL. That file mounts the session roots and `/data` and gives the
+container 40 seconds to finish its final push.
+
 ## Run
 
 The desktop app handles startup automatically: it attaches to an existing local
@@ -217,7 +225,8 @@ agentsview serve
 ```
 
 Bare `agentsview serve` runs in the foreground until you press `Ctrl+C`. If a
-compatible server is already running, it reports that server's URL and exits.
+compatible server is already running, it reports that server's URL and exits
+with an error (status 1).
 
 This will:
 
@@ -262,7 +271,7 @@ archive directly in read-only mode. Commands that need fresh data or need to
 write, including `sync`, `usage`, `token-use`, `pg push`, and `duckdb push`,
 auto-start the detached daemon when needed. The server remains running after
 these commands finish. For scripts or CI jobs that must leave no background
-server, stop the daemon first, then run `AGENTSVIEW_NO_DAEMON=1 agentsview sync`.
+server, stop the daemon first, then run `AGENTSVIEW_NO_DAEMON=1 agentsview source sync`.
 That setting disables auto-start; it does not stop a running daemon or bypass
 its archive lock.
 

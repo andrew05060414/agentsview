@@ -67,6 +67,7 @@ type Store interface {
 	GetActiveProjectLabels(ctx context.Context) ([]string, error)
 	GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]AgentInfo, error)
 	GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error)
+	GetMatchingMachineIDs(ctx context.Context, candidates []string) ([]string, error)
 	GetMachineLabels(ctx context.Context) (map[string]string, error)
 	GetMachineAliases(ctx context.Context) (map[string]string, error)
 	GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]BranchInfo, error)
@@ -102,7 +103,9 @@ type Store interface {
 	GetTopSessionsByCost(ctx context.Context, f UsageFilter, limit int) ([]TopSessionEntry, error)
 	GetUsageSessionCounts(ctx context.Context, f UsageFilter) (UsageSessionCounts, error)
 	GetUsageMatchingSessionCount(ctx context.Context, f UsageFilter) (int, error)
+	GetPlanUsageSessionCounts(ctx context.Context, f UsageFilter) (PlanUsageSessionCounts, error)
 	GetSessionUsage(ctx context.Context, sessionID string, includeBreakdown bool) (*SessionUsage, error)
+	GetSessionPlanUsage(ctx context.Context, sessionID string) (*SessionPlanUsage, error)
 
 	// Stars.
 	StarSession(ctx context.Context, sessionID string) (bool, error)

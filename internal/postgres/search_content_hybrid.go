@@ -145,19 +145,22 @@ func (s *Store) hybridKeywordLegPG(
 func (s *Store) fetchHybridKeywordBatchPG(
 	ctx context.Context, f db.ContentSearchFilter, k, offset int,
 ) ([]pgHybridDisplay, error) {
-	scopeWhere, scopeArgs := buildPGSessionBaseFilter(db.SemanticContentSessionFilter(f))
+	scopeWhere, scopeArgs := buildPGSessionBaseFilter(db.SemanticContentSessionFilter(f), s.sessionDialect())
 	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
 		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 	pb := &paramBuilder{n: len(scopeArgs), args: append([]any{}, scopeArgs...)}
 
 	kf := f
 	kf.Mode = "fts"
-	contentPred := pgContentSearchPredicate("m.content", kf, escapeLike(f.Pattern), pb)
+	contentPred, err := pgContentSearchPredicate("COALESCE(m.dialogue_text, m.content)", kf, escapeLike(f.Pattern), pb)
+	if err != nil {
+		return nil, err
+	}
 	limitP := pb.add(k)
 	offsetP := pb.add(offset)
 
 	query := fmt.Sprintf(`
-		SELECT m.session_id, m.ordinal, m.content
+		SELECT m.session_id, m.ordinal, COALESCE(m.dialogue_text, m.content)
 		FROM messages m
 		JOIN sessions s ON s.id = m.session_id
 		WHERE %s
@@ -197,9 +200,10 @@ func (s *Store) fetchHybridKeywordBatchPG(
 // pgSubstringSnippet), rune-snapped via db.SnippetBounds. Centering on the raw
 // pattern would fall back to the message start for quoted phrases or multi-term
 // queries whose pattern is not a literal substring; FTSSnippetRange instead
-// locates the de-quoted phrase, then the first matched term, then the start. The
-// result is the raw, unredacted centering text SemanticSnippet later locates in
-// the full content; redaction always runs on the full content, not this window.
+// locates the de-quoted phrase, then the operand that satisfied the Boolean
+// query, then the start. The result is the raw, unredacted centering text
+// SemanticSnippet later locates in the full content; redaction always runs on
+// the full content, not this window.
 func pgKeywordApproxSnippet(content, pattern string) string {
 	start, end := db.FTSSnippetRange(pattern, content)
 	lo, hi := db.SnippetBounds(content, start, end, db.ContentSnippetRadius)
@@ -344,6 +348,10 @@ func (s *Store) enrichHybridMatchesPG(
 		if !ok {
 			continue
 		}
+		content := info.content
+		if _, keyword := kwDisplay[m.Unit.Key]; keyword {
+			content = info.dialogueContent
+		}
 		score := m.Score
 		out = append(out, db.ContentMatch{
 			SessionID:          d.sessionID,
@@ -361,7 +369,7 @@ func (s *Store) enrichHybridMatchesPG(
 			ParentSessionID:    info.parentSessionID,
 			Sidechain:          info.isSidechain,
 			Timestamp:          info.timestamp,
-			Snippet:            f.SemanticSnippet(info.content, d.snippet),
+			Snippet:            f.SemanticSnippet(content, d.snippet),
 			Score:              &score,
 		})
 	}

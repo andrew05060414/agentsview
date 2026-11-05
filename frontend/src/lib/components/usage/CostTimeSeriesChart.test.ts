@@ -9,7 +9,7 @@ import { testMoney } from "../../test/money.js";
 import type { Money } from "../../money.js";
 import { settings } from "../../stores/settings.svelte.js";
 import type { DbDailyUsageEntry, UsageSummaryResponse } from "../../api/generated/index";
-import { usageChartColorMaps } from "../../utils/usageChartColors.js";
+import { usageChartStyleMaps } from "../../utils/usageChartStyles.js";
 import { setLocale } from "../../i18n/index.js";
 
 const OBSERVED_WIDTH = 1648;
@@ -144,7 +144,7 @@ function mountChart() {
   return mount(CostTimeSeriesChart, {
     target: document.body,
     props: {
-      colorMap: usageChartColorMaps(usage.summary, settings.chartPalette)[groupBy],
+      styleMap: usageChartStyleMaps(usage.summary, settings.chartPalette)[groupBy],
     },
   });
 }
@@ -467,6 +467,31 @@ describe("CostTimeSeriesChart", () => {
     expect(document.querySelectorAll(".legend-item")).toHaveLength(2);
     unmount(component);
   });
+
+  it.each(["constructor", "toString", "__proto__"])(
+    "stacks a model named %s with numeric costs",
+    async (modelName) => {
+      usage.toggles.timeSeries.groupBy = "model";
+      usage.summary = usageSummary([
+        modelDailyEntry(0, [
+          { modelName, cost: testMoney(6) },
+          { modelName: "regular-model", cost: testMoney(4) },
+        ]),
+      ]);
+
+      const component = mountChart();
+      await tick();
+
+      const bars = Array.from(document.querySelectorAll<SVGRectElement>("rect.cost-seg"));
+      expect(bars).toHaveLength(2);
+      expect(bars.map((bar) => Number(bar.getAttribute("height")))).toEqual([96, 64]);
+      const labels = Array.from(document.querySelectorAll(".legend-item")).map((item) =>
+        item.textContent?.trim(),
+      );
+      expect(labels).toEqual([modelName, "regular-model"]);
+      unmount(component);
+    },
+  );
 
   it("uses distinct active model colors for paths and legend dots", async () => {
     usage.toggles.timeSeries.groupBy = "model";

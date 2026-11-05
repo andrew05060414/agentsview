@@ -14,22 +14,35 @@ inputs:
   artifact_dir:
     description: Bundle output directory
     required: true
+  frontend_prebuilt:
+    description: Use frontend assets supplied by the caller
+    required: false
+    default: 'false'
 runs:
   using: composite
   steps:
-    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+    - name: Prepare Windows Go paths
+      uses: $/.github/actions/windows-go-paths
+
+    - uses: actions/setup-go@v7.0.0
       with:
         go-version-file: go.mod
+        cache: false
 
-    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+    - name: Restore Go caches
+      uses: $/.github/actions/go-cache-restore
       with:
-        node-version: "24"
+        group: test-${{ runner.os }}-${{ runner.arch }}
+
+    - uses: actions/setup-node@v7.1.0
+      with:
+        node-version: "26.12.1"
         cache: npm
         cache-dependency-path: |
           desktop/package-lock.json
           frontend/package-lock.json
 
-    - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+    - uses: dtolnay/rust-toolchain@stable
       id: rust-toolchain
       continue-on-error: true
 
@@ -40,28 +53,32 @@ runs:
 
     - name: Retry Rust setup
       if: steps.rust-toolchain.outcome == 'failure'
-      uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable
+      uses: dtolnay/rust-toolchain@stable
 
     - name: Cache Rust dependencies
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+      uses: step-security/rust-cache@v2.9.2
       with:
         workspaces: desktop/src-tauri -> target
+        # Pull requests restore main's build without saving their own copy.
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Setup MinGW (Windows)
       if: runner.os == 'Windows'
-      uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+      uses: msys2/setup-msys2@v2.33.0
       with:
         msystem: MINGW64
         update: false
         install: mingw-w64-x86_64-gcc
         path-type: inherit
 
+    - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.5
+
     - name: Install Linux system dependencies
       if: runner.os == 'Linux'
       shell: bash
       run: |
-        sudo apt-get update -q
-        sudo apt-get install -y \
+        kit-retry 3 5 sudo apt-get -o APT::Update::Error-Mode=any update -q
+        kit-retry 3 5 sudo apt-get install -y \
           libwebkit2gtk-4.1-dev libgtk-3-dev \
           libappindicator3-dev librsvg2-dev \
           patchelf squashfs-tools xdg-utils
@@ -72,12 +89,12 @@ runs:
         AGENTSVIEW_TARGET_TRIPLE: ${{ inputs.target_triple }}
       run: |
         if [ -n "$AGENTSVIEW_TARGET_TRIPLE" ]; then
-          rustup target add "$AGENTSVIEW_TARGET_TRIPLE"
+          kit-retry 3 5 rustup target add "$AGENTSVIEW_TARGET_TRIPLE"
         fi
 
     - name: Install desktop dependencies
       shell: bash
-      run: npm ci
+      run: kit-retry 3 5 npm ci
       working-directory: desktop
 
     - name: Desktop sidecar smoke tests
@@ -87,6 +104,8 @@ runs:
     - name: Build desktop bundle
       shell: bash
       env:
+        DOWNLOAD_RETRY: kit-retry 3 5
+        AGENTSVIEW_FRONTEND_PREBUILT: ${{ inputs.frontend_prebuilt }}
         AGENTSVIEW_TARGET_TRIPLE: ${{ inputs.target_triple }}
         ARTIFACT_DIR: ${{ inputs.artifact_dir }}
         BUNDLE: ${{ inputs.bundle }}
@@ -100,11 +119,7 @@ runs:
         fi
         build_cmd+=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
 
-        if ! "${build_cmd[@]}"; then
-          echo "::warning::Desktop bundle failed; retrying once"
-          sleep 10
-          "${build_cmd[@]}"
-        fi
+        kit-retry 2 10 "${build_cmd[@]}"
         if [ "$BUNDLE" = "appimage" ]; then
           bash scripts/repair-appimage-diricon.sh \
             "../${ARTIFACT_DIR}"/*.AppImage
@@ -159,7 +174,15 @@ runs:
           exit 1
         fi
 
-    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+    # The test job covers Linux x64, Windows x64 and macOS ARM64; desktop builds
+    # own the caches of the platforms it does not run on.
+    - name: Save Go caches
+      if: >-
+        (runner.os == 'Linux' && runner.arch == 'ARM64')
+        || (runner.os == 'macOS' && runner.arch == 'X64')
+      uses: $/.github/actions/go-cache-save
+
+    - uses: actions/upload-artifact@v7.0.2
       with:
         name: ${{ inputs.artifact_name }}
         path: ${{ inputs.artifact_dir }}

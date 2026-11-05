@@ -351,7 +351,7 @@ func TestPrepareHTTPSyncReportsManifestComparisonBeforeTransfer(t *testing.T) {
 
 	assert.Equal(t, []string{
 		"Resolving agent directories on devbox",
-		"Fetching session manifest from devbox",
+		"Fetching and comparing session manifest from devbox",
 		"Compared session manifest from devbox: 1 total, 1 changed, 0 deleted",
 		"Downloading session archive from devbox",
 		"Extracting session archive from devbox",
@@ -1285,11 +1285,16 @@ func TestHTTPUnchangedMirrorBackfillsAntigravityTitles(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, SyncStats{}, idle)
 			case "unreadable titles":
-				conn, err := sql.Open("sqlite3", store)
+				mirrorStore, err := safeRemappedRemotePath(MirrorDir(hs.DataDir, hs.Host), store)
 				require.NoError(t, err)
-				_, err = conn.ExecContext(t.Context(), "ALTER TABLE conversation_summaries RENAME TO unreadable_summaries")
+				savedStore, err := os.ReadFile(mirrorStore)
 				require.NoError(t, err)
-				require.NoError(t, conn.Close())
+				info, err := os.Stat(mirrorStore)
+				require.NoError(t, err)
+				// Keep manifest markers so the import reads the damaged mirror without fetching a replacement.
+				require.NoError(t, os.WriteFile(mirrorStore, bytes.Repeat([]byte("x"), len(savedStore)), 0o600))
+				require.NoError(t, os.Chtimes(mirrorStore, info.ModTime(), info.ModTime()))
+				require.NoError(t, os.Remove(sidecar))
 				unreadable, err := hs.Run(t.Context())
 				require.ErrorContains(t, err, "remote import processing incomplete")
 				assert.Equal(t, 1, unreadable.Failed)
@@ -1302,15 +1307,7 @@ func TestHTTPUnchangedMirrorBackfillsAntigravityTitles(t *testing.T) {
 				assert.Positive(t, journalWrites)
 				assert.Len(t, remote.archiveRequests, requests)
 				require.NoError(t, database.RefreshNativeSessionName(t.Context(), sessionID, nil))
-				mirrorStore, err := safeRemappedRemotePath(MirrorDir(hs.DataDir, hs.Host), store)
-				require.NoError(t, err)
-				info, err := os.Stat(mirrorStore)
-				require.NoError(t, err)
-				conn, err = sql.Open("sqlite3", mirrorStore)
-				require.NoError(t, err)
-				_, err = conn.ExecContext(t.Context(), "ALTER TABLE unreadable_summaries RENAME TO conversation_summaries")
-				require.NoError(t, err)
-				require.NoError(t, conn.Close())
+				require.NoError(t, os.WriteFile(mirrorStore, savedStore, 0o600))
 				require.NoError(t, os.Chtimes(mirrorStore, info.ModTime(), info.ModTime()))
 				retried, err := hs.Run(t.Context())
 				require.NoError(t, err)
@@ -1369,7 +1366,9 @@ func TestHTTPAntigravityAppliedStatesCoverMultipleRoots(t *testing.T) {
 		require.NoError(t, err)
 		conns = append(conns, conn)
 		require.NoError(t, conn.Raw(func(raw any) error {
-			raw.(*sqlite3.SQLiteConn).RegisterAuthorizer(func(op int, table, column, _ string) int {
+			raw.(interface {
+				RegisterAuthorizer(func(int, string, string, string) int)
+			}).RegisterAuthorizer(func(op int, table, column, _ string) int {
 				if op == sqlite3.SQLITE_READ && table == "sessions" && column == "session_name" {
 					archiveTitleReads.Add(1)
 				}
@@ -1451,8 +1450,8 @@ func TestHTTPUnchangedMirrorImportsIntoNewDatabaseGeneration(t *testing.T) {
 	replacement, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "replacement.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, replacement.Close()) })
-	require.NoError(t, replacement.CopySyncStateFrom(database.Path()))
-	require.NoError(t, replacement.CopySessionMetadataFrom(database.Path()))
+	require.NoError(t, replacement.CopySyncStateFrom(t.Context(), database.Path()))
+	require.NoError(t, replacement.CopySessionMetadataFrom(t.Context(), database.Path()))
 	hs.DB = replacement
 
 	second, err := hs.Run(t.Context())
@@ -2182,7 +2181,7 @@ func TestHTTPDeltaProgressSeparatesTransferPendingAndImportScope(t *testing.T) {
 	assert.NotContains(t, joined, changed)
 	assert.NotContains(t, logs.String(), changed)
 	for _, field := range []string{
-		"phase=targets", "phase=manifest", "phase=compare",
+		"phase=targets", "phase=manifest",
 		"download_duration=", "extract_duration=", "wire_bytes=",
 	} {
 		assert.Contains(t, logs.String(), field)
@@ -2540,6 +2539,29 @@ func TestHTTPSyncRejectsNonJSONManifest(t *testing.T) {
 	assert.Empty(t, remote.archiveRequests)
 }
 
+func TestHTTPSyncReportsAMirrorFailureAsLocal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows reports listing a file as a directory as not found, " +
+			"so the mirror walk sees an empty mirror instead of failing")
+	}
+	remote := newMirrorTestRemote(t)
+	remote.writeSession(t, "a.jsonl",
+		time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "session a")
+	dataDir := t.TempDir()
+	_, hs := newMirrorSync(t, remote, dataDir)
+	// A file where the mirror directory belongs makes the mirror walk fail.
+	mirrorRoot := MirrorDir(dataDir, hs.Host)
+	require.NoError(t, os.MkdirAll(filepath.Dir(mirrorRoot), 0o755))
+	require.NoError(t, os.WriteFile(mirrorRoot, nil, 0o644))
+
+	_, err := hs.Run(t.Context())
+
+	require.ErrorContains(t, err, "compare with local mirror")
+	assert.NotContains(t, err.Error(), "decode remote manifest")
+	assert.Equal(t, "remote sync failed: could not read the local mirror "+
+		"for this host; check the data directory permissions", FailureSummary(err))
+}
+
 func TestHTTPSyncFallsBackToFullWhenDeltaRejected(t *testing.T) {
 	remote := newMirrorTestRemote(t)
 	base := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
@@ -2806,6 +2828,49 @@ func TestHTTPSyncDisarmedFullReplayDefersFileScopedRefresh(t *testing.T) {
 	}
 }
 
+func TestHTTPSyncDisarmedFullReplayKeepsALargeFileScopedSnapshot(t *testing.T) {
+	remote := newMirrorTestRemote(t)
+	stateDB := remote.addWindsurfFileScopedAgent(t)
+	dataDir := t.TempDir()
+	database, hs := newMirrorSync(t, remote, dataDir)
+	mirrorRoot := MirrorDir(dataDir, hs.Host)
+	journalPath := mirrorJournalPath(mirrorRoot)
+	require.NoError(t, replaceMirrorChangeJournal(journalPath, MirrorChangeJournal{
+		Version:          mirrorJournalVersion,
+		FullImport:       true,
+		FullImportReason: FullImportJournalRecovery,
+		InvalidateAll:    true,
+	}))
+	first, err := hs.Prepare(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, first.Close())
+	// A parser failure skipped on an earlier sync.
+	skipped := map[string]int64{filepath.Join(remote.dir, "broken.jsonl"): 1}
+	require.NoError(t, database.ReplaceRemoteSkippedFiles(t.Context(), hs.Host, skipped))
+	// The manifest never lists file-scoped exports, so each of these looks
+	// deleted. There are more than the journal holds as entries.
+	mirroredStateDB, err := safeRemappedRemotePath(mirrorRoot, stateDB)
+	require.NoError(t, err)
+	exports := filepath.Join(filepath.Dir(mirroredStateDB), "exports")
+	require.NoError(t, os.MkdirAll(exports, 0o755))
+	for i := range mirrorJournalMaxEntries + 1 {
+		require.NoError(t, os.WriteFile(
+			filepath.Join(exports, fmt.Sprintf("%05d", i)), nil, 0o644,
+		))
+	}
+
+	second, err := hs.Prepare(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, second.Close()) })
+
+	cache, err := database.LoadRemoteSkippedFiles(t.Context(), hs.Host)
+	require.NoError(t, err)
+	assert.Equal(t, skipped, cache,
+		"protected exports must not clear saved parser-failure skips")
+	assert.FileExists(t, filepath.Join(exports, "00000"))
+	assert.FileExists(t, mirroredStateDB)
+}
+
 func TestHTTPSyncDisarmedFullReplayKeepsRemovedFileScopedTarget(t *testing.T) {
 	remote := newMirrorTestRemote(t)
 	stateDB := remote.addWindsurfFileScopedAgent(t)
@@ -3004,7 +3069,7 @@ func TestHTTPSyncHoldsMirrorLockDuringManifestFetch(t *testing.T) {
 	remote.onManifest = func() {
 		// assert, not require: this runs on the server goroutine, where
 		// FailNow must not be called.
-		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the sync holds the mirror lock, so only the context ends the acquire
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond) //nolint:kennlint // deadlinetest: the deadline is the expected result; the sync holds the mirror lock, so only the context ends the acquire
 		defer cancel()
 		lock, err := AcquireMirrorLock(ctx, mirrorRoot)
 		if lock != nil {
@@ -4554,7 +4619,7 @@ func setPortableTempDir(t *testing.T, dir string) {
 
 func assertMirrorLocked(t *testing.T, mirrorRoot string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the caller holds the mirror lock, so only the context ends the acquire
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond) //nolint:kennlint // deadlinetest: the deadline is the expected result; the caller holds the mirror lock, so only the context ends the acquire
 	defer cancel()
 	lock, err := AcquireMirrorLock(ctx, mirrorRoot)
 	if lock != nil {

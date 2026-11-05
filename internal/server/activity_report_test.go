@@ -20,29 +20,29 @@ import (
 	"go.kenn.io/agentsview/internal/pricing"
 )
 
-// TestActivityProjectReclassificationCandidatesRouteRemoved confirms the
-// legacy candidates route is no longer part of the API surface. A plain GET
-// against the removed path cannot assert 404: any unregistered /api/ path
-// falls through the stdlib ServeMux to the SPA catch-all handler and
-// returns 200 with index.html (see server.go's handleSPA), which is true of
-// every never-registered path and would not distinguish a removed route
-// from a typo'd one. Asserting against the OpenAPI document instead proves
-// the operation itself is gone.
-func TestActivityProjectReclassificationCandidatesRouteRemoved(t *testing.T) {
-	te := setup(t)
-	w := te.get(t, "/api/openapi.json")
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	var spec struct {
-		Paths map[string]map[string]any `json:"paths"`
-	}
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &spec))
-	assert.NotContains(t, spec.Paths,
-		"/api/v1/activity/project-reclassification/candidates")
-}
-
 // activityDate is a fixed past calendar day so the activity report is
 // deterministic and complete (non-partial) regardless of wall clock.
 const activityDate = "2025-06-02"
+
+func TestActivityReportValidatesSizeBeforeResolvingMachine(t *testing.T) {
+	te := setup(t)
+	for _, tt := range []struct {
+		name, message string
+		filters       url.Values
+	}{
+		{"machine", "activity machine filter exceeds 1024 bytes", url.Values{"machine": {strings.Repeat("x", 1025)}}},
+		{"total", "activity filters exceed 3072 bytes total", url.Values{
+			"project": {strings.Repeat("p", 1024)}, "agent": {strings.Repeat("a", 1024)},
+			"git_branch": {strings.Repeat("b", 1024)}, "machine": {"missing"},
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := te.get(t, "/api/v1/activity/report?"+tt.filters.Encode())
+			assertStatus(t, w, http.StatusBadRequest)
+			assert.Contains(t, w.Body.String(), tt.message)
+		})
+	}
+}
 
 func TestActivityReportRejectsFilterWhoseSignedIDExceedsLimit(t *testing.T) {
 	te := setup(t)
@@ -52,7 +52,7 @@ func TestActivityReportRejectsFilterWhoseSignedIDExceedsLimit(t *testing.T) {
 		"timezone":   {"UTC"},
 		"project":    {strings.Repeat("\"", 1024)},
 		"agent":      {strings.Repeat("\"", 1024)},
-		"machine":    {strings.Repeat("\"", 1024)},
+		"git_branch": {strings.Repeat("\"", 1024)},
 		"automation": {"all"},
 	}
 

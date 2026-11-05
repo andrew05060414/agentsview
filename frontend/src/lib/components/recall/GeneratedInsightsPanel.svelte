@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { onDestroy, onMount } from "svelte";
   import {
     Button,
@@ -233,6 +234,8 @@
         return m.insights_page_template_model_cost();
       case "instruction_opportunity_review":
         return m.insights_page_template_instruction_opportunities();
+      case "friction_review":
+        return m.insights_page_template_friction_review();
       default:
         return m.insights_page_generated_recommendation();
     }
@@ -420,7 +423,7 @@
                   : m.insights_page_generating()}
               </span>
               {#if insights.selectedTask.status === "error"}
-                <div class="generated-actions">
+                <div class="generated-actions" {@attach errorTelemetry("insight", insights.selectedTaskId)}>
                   <Button
                     size="sm"
                     label={m.insights_page_retry()}

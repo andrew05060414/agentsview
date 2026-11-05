@@ -20,7 +20,7 @@ describe("Treemap", () => {
             id: "alpha",
             label: "Alpha",
             value: 42,
-            color: "#1f77b4",
+            style: { color: "#1f77b4", fill: "solid" as const },
             meta: "Meta",
           },
         ],
@@ -51,8 +51,20 @@ describe("Treemap", () => {
     const onSelect = vi.fn();
     const onOpen = vi.fn();
     const items = [
-      { id: "alpha", label: "Alpha", value: 42, color: "#1f77b4", selected: true },
-      { id: "beta", label: "Beta", value: 21, color: "#ff7f0e", dimmed: true },
+      {
+        id: "alpha",
+        label: "Alpha",
+        value: 42,
+        style: { color: "#1f77b4", fill: "solid" as const },
+        selected: true,
+      },
+      {
+        id: "beta",
+        label: "Beta",
+        value: 21,
+        style: { color: "#ff7f0e", fill: "solid" as const },
+        dimmed: true,
+      },
     ];
     const component = mount(Treemap, { target: document.body, props: { items, onSelect } });
     await tick();
@@ -79,5 +91,38 @@ describe("Treemap", () => {
     expect(onOpen).toHaveBeenCalledWith("alpha");
     expect(onSelect.mock.calls).toEqual([["beta"], ["alpha"], ["alpha"]]);
     await unmount(project);
+  });
+  it("sizes labels by tile share on the chosen scale", async () => {
+    const items = [
+      {
+        id: "big",
+        label: "Big",
+        value: 80,
+        style: { color: "#1f77b4", fill: "solid" as const },
+      },
+      {
+        id: "small",
+        label: "Small",
+        value: 20,
+        style: { color: "#ff7f0e", fill: "solid" as const },
+      },
+    ];
+    const labelSizes = () =>
+      [...document.querySelectorAll<SVGTextElement>(".tile-label")].map((label) =>
+        parseFloat(label.style.fontSize),
+      );
+
+    const linear = mount(Treemap, {
+      target: document.body,
+      props: { items, labelScale: "linear" },
+    });
+    await tick();
+    expect(labelSizes()).toEqual([17, 12]);
+    unmount(linear);
+
+    const log = mount(Treemap, { target: document.body, props: { items, labelScale: "log" } });
+    await tick();
+    expect(labelSizes()).toEqual([18, 16]);
+    unmount(log);
   });
 });

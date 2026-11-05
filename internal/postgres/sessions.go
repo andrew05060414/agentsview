@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.kenn.io/agentsview/internal/config"
@@ -23,12 +24,23 @@ import (
 type Store struct {
 	readbase.ReadOnlyStubs
 	hostedRelations bool
-	pg              *sql.DB
-	cursorMu        sync.RWMutex
-	cursorSecret    []byte
+	pg              storeExecutor
+	ownedDB         *sql.DB
+	readTx          *sql.Tx
+	pricingSnapshot *pricingSnapshot
+	runtimeOnce     sync.Once
+	runtime         *storeRuntime
+}
+
+// storeRuntime is shared by the owning store and its borrowed read views.
+// Views never copy locks or start detached work with their transaction.
+type storeRuntime struct {
+	cursorMu     sync.RWMutex
+	cursorSecret []byte
 
 	insightCapabilityMu        sync.RWMutex
 	insightGenerationAvailable bool
+	frictionAvailable          atomic.Bool
 
 	pricingMu     sync.Mutex
 	pricingLoadMu sync.Mutex
@@ -253,19 +265,19 @@ const pgRootSessionFilter = `message_count > 0
 	AND deleted_at IS NULL`
 
 func buildPGSessionBaseFilter(
-	f db.SessionFilter,
+	f db.SessionFilter, dialect db.QueryDialect,
 ) (string, []any) {
-	return db.BuildSessionBaseFilterSQL(f, db.PostgresQueryDialect())
+	return db.BuildSessionBaseFilterSQL(f, dialect)
 }
 
 // EncodeCursor returns a base64-encoded, HMAC-signed cursor.
 func (s *Store) EncodeCursor(c db.SessionCursor) string {
 	data, _ := json.Marshal(c)
 
-	s.cursorMu.RLock()
-	secret := make([]byte, len(s.cursorSecret))
-	copy(secret, s.cursorSecret)
-	s.cursorMu.RUnlock()
+	s.runtimeState().cursorMu.RLock()
+	secret := make([]byte, len(s.runtimeState().cursorSecret))
+	copy(secret, s.runtimeState().cursorSecret)
+	s.runtimeState().cursorMu.RUnlock()
 
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(data)
@@ -321,10 +333,10 @@ func (s *Store) DecodeCursor(
 				db.ErrInvalidCursor, err)
 	}
 
-	s.cursorMu.RLock()
-	secret := make([]byte, len(s.cursorSecret))
-	copy(secret, s.cursorSecret)
-	s.cursorMu.RUnlock()
+	s.runtimeState().cursorMu.RLock()
+	secret := make([]byte, len(s.runtimeState().cursorSecret))
+	copy(secret, s.runtimeState().cursorSecret)
+	s.runtimeState().cursorMu.RUnlock()
 
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(data)
@@ -500,14 +512,32 @@ func (s *Store) getSidebarSessionIndexPage(
 	ctx context.Context, f db.SessionFilter,
 ) (db.SidebarSessionIndex, error) {
 	f.Limit = db.NormalizeSessionLimit(f.Limit)
+	dialect := s.sessionDialect()
+	recursivePrefix := "WITH RECURSIVE "
+	countPrefix := ""
+	treeFrom := "FROM sessions s JOIN tree t ON " + dialect.ParentRelation("s", "t")
+	if s.hostedRelations {
+		parentEdges := hostedSidebarParentEdgesSQL()
+		recursivePrefix += parentEdges + ", "
+		countPrefix = "WITH " + parentEdges + " "
+		dialect = dialect.WithParentRelation(func(child, parent string) string {
+			return "EXISTS (SELECT 1 FROM sidebar_parent_edges pe WHERE pe.child_id=" + child + ".id AND pe.parent_id=" + parent + ".id)"
+		})
+		dialect = dialect.WithOrphanPredicate(func(sessionAlias, _ string) string {
+			return "NOT EXISTS (SELECT 1 FROM sidebar_parent_edges pe WHERE pe.child_id=" + sessionAlias + ".id)"
+		})
+		treeFrom = `FROM tree t
+			JOIN sidebar_parent_edges pe ON pe.parent_id=t.id
+			JOIN sessions s ON s.id=pe.child_id`
+	}
 
 	rootFilter := f
 	rootFilter.IncludeChildren = false
 	rootFilter.Cursor = ""
 	rootFilter.Starred = false
-	rootWhere, rootArgs := db.BuildSessionBaseFilterSQL(rootFilter, s.sessionDialect())
-	canonicalRootWhere := db.BuildCanonicalRootWhere(s.sessionDialect(), "sessions", f.IncludeOrphans)
-	treeMemberWhere := db.SessionTreeMemberPredicate(f, s.sessionDialect(), "s")
+	rootWhere, rootArgs := db.BuildSessionBaseFilterSQL(rootFilter, dialect)
+	canonicalRootWhere := db.BuildCanonicalRootWhere(dialect, "sessions", f.IncludeOrphans)
+	treeMemberWhere := db.SessionTreeMemberPredicate(f, dialect, "s")
 
 	var total int
 	var cur db.SessionCursor
@@ -519,10 +549,10 @@ func (s *Store) getSidebarSessionIndexPage(
 		}
 		total = cur.Total
 	}
+	countQuery := ""
 	if total <= 0 {
 		if f.Starred {
-			countQuery := `
-				WITH RECURSIVE root_candidates(id) AS (
+			countQuery = recursivePrefix + `root_candidates(id) AS (
 					SELECT id
 					FROM sessions
 					WHERE ` + rootWhere + `
@@ -532,8 +562,7 @@ func (s *Store) getSidebarSessionIndexPage(
 					SELECT id, id FROM root_candidates
 					UNION
 					SELECT t.root_id, s.id
-					FROM sessions s
-					JOIN tree t ON ` + s.sessionDialect().ParentRelation("s", "t") + `
+					` + treeFrom + `
 					WHERE ` + treeMemberWhere + `
 				),
 				eligible_roots(id) AS (
@@ -542,35 +571,20 @@ func (s *Store) getSidebarSessionIndexPage(
 					JOIN starred_sessions ss ON ss.session_id = t.id
 				)
 				SELECT COUNT(*) FROM eligible_roots`
-			if err := s.pg.QueryRowContext(
-				ctx, countQuery, rootArgs...,
-			).Scan(&total); err != nil {
-				return db.SidebarSessionIndex{},
-					fmt.Errorf("counting sidebar roots: %w", err)
-			}
 		} else {
-			countQuery := "SELECT COUNT(*) FROM sessions WHERE " +
+			countQuery = countPrefix + "SELECT COUNT(*) FROM sessions WHERE " +
 				rootWhere + " AND " + canonicalRootWhere
-			if err := s.pg.QueryRowContext(
-				ctx, countQuery, rootArgs...,
-			).Scan(&total); err != nil {
-				return db.SidebarSessionIndex{},
-					fmt.Errorf("counting sidebar roots: %w", err)
-			}
 		}
 	}
 
-	pageBuilder := db.NewQueryBuilder(
-		db.PostgresQueryDialect(), len(rootArgs),
-	)
+	pageBuilder := db.NewQueryBuilder(db.PostgresQueryDialect(), len(rootArgs))
 	cursorWhere := ""
 	if f.Cursor != "" {
 		cursorWhere = "WHERE (activity, id) < (" +
 			pageBuilder.Add(cur.EndedAt) + "::timestamptz, " +
 			pageBuilder.Add(cur.ID) + ")"
 	}
-	rootQuery := `
-		WITH RECURSIVE root_candidates(id) AS (
+	rootQuery := recursivePrefix + `root_candidates(id) AS (
 			SELECT id
 			FROM sessions
 			WHERE ` + rootWhere + `
@@ -580,8 +594,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			SELECT id, id FROM root_candidates
 			UNION
 			SELECT t.root_id, s.id
-			FROM sessions s
-			JOIN tree t ON ` + s.sessionDialect().ParentRelation("s", "t") + `
+			` + treeFrom + `
 			WHERE ` + treeMemberWhere + `
 		)
 		` + pgSidebarStarredRootCTE(f.Starred) + `,
@@ -600,29 +613,50 @@ func (s *Store) getSidebarSessionIndexPage(
 	rootQueryArgs := append([]any{}, rootArgs...)
 	rootQueryArgs = append(rootQueryArgs, pageBuilder.Args()...)
 
-	rows, err := s.pg.QueryContext(ctx, rootQuery, rootQueryArgs...)
-	if err != nil {
-		return db.SidebarSessionIndex{},
-			fmt.Errorf("querying sidebar root page: %w", err)
-	}
-	defer rows.Close()
-
 	type rootRow struct {
 		id       string
 		activity time.Time
 	}
-	roots := []rootRow{}
-	for rows.Next() {
-		var row rootRow
-		if err := rows.Scan(&row.id, &row.activity); err != nil {
-			return db.SidebarSessionIndex{},
-				fmt.Errorf("scanning sidebar root page: %w", err)
+	readRoots := func() ([]rootRow, error) {
+		rows, err := s.pg.QueryContext(ctx, rootQuery, rootQueryArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("querying sidebar root page: %w", err)
 		}
-		roots = append(roots, row)
+		defer rows.Close()
+		roots := []rootRow{}
+		for rows.Next() {
+			var row rootRow
+			if err := rows.Scan(&row.id, &row.activity); err != nil {
+				return nil, fmt.Errorf("scanning sidebar root page: %w", err)
+			}
+			roots = append(roots, row)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterating sidebar root page: %w", err)
+		}
+		return roots, nil
 	}
-	if err := rows.Err(); err != nil {
-		return db.SidebarSessionIndex{},
-			fmt.Errorf("iterating sidebar root page: %w", err)
+
+	// The root count and the root page are independent reads.
+	var roots []rootRow
+	var countErr, rootsErr error
+	reads := make([]func(), 0, 2)
+	if countQuery != "" {
+		reads = append(reads, func() {
+			if err := s.pg.QueryRowContext(
+				ctx, countQuery, rootArgs...,
+			).Scan(&total); err != nil {
+				countErr = fmt.Errorf("counting sidebar roots: %w", err)
+			}
+		})
+	}
+	reads = append(reads, func() { roots, rootsErr = readRoots() })
+	s.runIndependentReads(reads...)
+	if countErr != nil {
+		return db.SidebarSessionIndex{}, countErr
+	}
+	if rootsErr != nil {
+		return db.SidebarSessionIndex{}, rootsErr
 	}
 
 	index := db.SidebarSessionIndex{
@@ -659,16 +693,14 @@ func (s *Store) getSidebarSessionIndexPage(
 	}
 	treeArgs = append(treeArgs, page.Args()...)
 
-	treeQuery := `
-		WITH RECURSIVE root_page(id, ord) AS (
+	treeQuery := recursivePrefix + `root_page(id, ord) AS (
 			` + strings.Join(cteParts, "\n") + `
 		),
 		tree(id, ord) AS (
 			SELECT id, ord FROM root_page
 			UNION
 			SELECT s.id, t.ord
-			FROM sessions s
-			JOIN tree t ON ` + s.sessionDialect().ParentRelation("s", "t") + `
+			` + treeFrom + `
 			WHERE ` + treeMemberWhere + `
 		),
 		ranked_tree(id, ord) AS (
@@ -704,7 +736,7 @@ func (s *Store) getSidebarSessionIndexPage(
 			` + pgSidebarActivityExprS + ` DESC,
 			s.id DESC`
 
-	rows, err = s.pg.QueryContext(ctx, treeQuery, treeArgs...)
+	rows, err := s.pg.QueryContext(ctx, treeQuery, treeArgs...)
 	if err != nil {
 		return db.SidebarSessionIndex{},
 			fmt.Errorf("querying sidebar tree page: %w", err)
@@ -911,6 +943,18 @@ func (s *Store) GetStats(
 		COUNT(DISTINCT project), COUNT(DISTINCT machine),
 		MIN(COALESCE(started_at, created_at))
 		FROM sessions WHERE ` + filter
+	if s.hostedRelations {
+		query = `WITH filtered_sessions AS MATERIALIZED (
+			SELECT id,tenant_id,project,machine,provenance_kind,
+			       message_count,started_at,created_at
+			FROM sessions WHERE ` + filter + `
+		)` + hostedFilteredMachinesCTESQL + `
+		SELECT COUNT(*), COALESCE(SUM(message_count), 0),
+		       COUNT(DISTINCT project),
+		       (SELECT COUNT(DISTINCT machine) FROM filtered_source_machines),
+		       MIN(COALESCE(started_at, created_at))
+		FROM filtered_sessions`
+	}
 
 	var st db.Stats
 	var earliest *time.Time
@@ -1042,6 +1086,21 @@ func (s *Store) GetAgents(
 	return agents, rows.Err()
 }
 
+func machineVisibilitySQL(prefix string, excludeOneShot, excludeAutomated bool) string {
+	var clauses string
+	if excludeOneShot {
+		if excludeAutomated {
+			clauses += " AND " + prefix + "user_message_count > 1"
+		} else {
+			clauses += " AND (" + prefix + "user_message_count > 1 OR " + prefix + "is_automated = TRUE)"
+		}
+	}
+	if excludeAutomated {
+		clauses += " AND " + prefix + "is_automated = FALSE"
+	}
+	return clauses
+}
+
 // GetMachines returns distinct machine names.
 func (s *Store) GetMachines(
 	ctx context.Context,
@@ -1049,16 +1108,7 @@ func (s *Store) GetMachines(
 ) ([]string, error) {
 	q := `SELECT DISTINCT machine FROM sessions
 		WHERE deleted_at IS NULL`
-	if excludeOneShot {
-		if !excludeAutomated {
-			q += " AND (user_message_count > 1 OR is_automated = TRUE)"
-		} else {
-			q += " AND user_message_count > 1"
-		}
-	}
-	if excludeAutomated {
-		q += " AND is_automated = FALSE"
-	}
+	q += machineVisibilitySQL("", excludeOneShot, excludeAutomated)
 	q += " ORDER BY machine"
 	rows, err := s.pg.QueryContext(ctx, q)
 	if err != nil {
@@ -1114,4 +1164,8 @@ func (s *Store) GetBranches(
 		branches = append(branches, bi)
 	}
 	return branches, rows.Err()
+}
+
+func (s *Store) GetMatchingMachineIDs(ctx context.Context, candidates []string) ([]string, error) {
+	return db.MatchingMachineIDs(ctx, s.pg, db.PostgresQueryDialect(), candidates)
 }

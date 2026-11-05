@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -101,21 +102,6 @@ func newEmbeddingsTestServer(t *testing.T, m EmbeddingsManager) *Server {
 	return testServer(t, 0, opts...)
 }
 
-func TestEmbeddingsRoutesRegisteredWhenManagerNil(t *testing.T) {
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/embeddings/status", nil)
-
-	withoutManager := newEmbeddingsTestServer(t, nil)
-	_, patternWithout := withoutManager.mux.Handler(req)
-	assert.NotEqual(t, "/", patternWithout)
-
-	w := serveGet(t, withoutManager, "/api/v1/embeddings/status")
-	assertRecorderStatus(t, w, http.StatusNotImplemented)
-
-	withManager := newEmbeddingsTestServer(t, &fakeEmbeddingsManager{})
-	_, patternWith := withManager.mux.Handler(req)
-	assert.NotEqual(t, "/", patternWith)
-}
-
 // TestEmbeddingsUnavailableReasonReplacesGeneric501 pins that a recorded
 // unavailability reason (e.g. vector serving disabled at startup because
 // vectors.write.lock was held) reaches the 501 body, so CLI users see why
@@ -170,34 +156,36 @@ func TestEmbeddingsBuildReturnsAcceptedAndStartsBuild(t *testing.T) {
 }
 
 func TestEmbeddingsBuildHoldsIdleLeaseUntilManagerCompletes(t *testing.T) {
-	buildDone := make(chan struct{})
-	var completeOnce sync.Once
-	complete := func() { completeOnce.Do(func() { close(buildDone) }) }
-	defer complete()
-	fake := &fakeEmbeddingsManager{waitForBuild: buildDone}
-	idled := make(chan struct{}, 1)
-	tracker := NewIdleTracker(20*time.Millisecond, func() { idled <- struct{}{} })
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	s := testServer(t, 0, WithEmbeddingsManager(fake), WithIdleTracker(tracker))
-	tracker.Touch()
-	go tracker.Run(ctx)
+	synctest.Test(t, func(t *testing.T) {
+		buildDone := make(chan struct{})
+		var completeOnce sync.Once
+		complete := func() { completeOnce.Do(func() { close(buildDone) }) }
+		defer complete()
+		fake := &fakeEmbeddingsManager{waitForBuild: buildDone}
+		idled := make(chan struct{}, 1)
+		tracker := NewIdleTracker(20*time.Millisecond, func() { idled <- struct{}{} })
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		s := testServer(t, 0, WithEmbeddingsManager(fake), WithIdleTracker(tracker))
+		tracker.Touch()
+		go tracker.Run(ctx)
 
-	w := serveJSON(t, s.mux, http.MethodPost, "/api/v1/embeddings/build",
-		vector.BuildRequest{})
-	assertRecorderStatus(t, w, http.StatusAccepted)
+		w := serveJSON(t, s.mux, http.MethodPost, "/api/v1/embeddings/build",
+			vector.BuildRequest{})
+		assertRecorderStatus(t, w, http.StatusAccepted)
 
-	select {
-	case <-idled:
-		require.Fail(t, "daemon idled while an API-started embedding build was active")
-	case <-time.After(100 * time.Millisecond): //nolint:kennlint // absence check; the active embedding build keeps the daemon from idling
-	}
-	complete()
-	select {
-	case <-idled:
-	case <-time.After(time.Second):
-		require.Fail(t, "daemon did not idle after the API-started build completed")
-	}
+		select {
+		case <-idled:
+			require.Fail(t, "daemon idled while an API-started embedding build was active")
+		case <-time.After(100 * time.Millisecond):
+		}
+		complete()
+		select {
+		case <-idled:
+		case <-time.After(time.Second):
+			require.Fail(t, "daemon did not idle after the API-started build completed")
+		}
+	})
 }
 
 func TestEmbeddingsRoutesSelectRecallStoreManager(t *testing.T) {

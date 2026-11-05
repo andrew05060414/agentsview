@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"github.com/tidwall/gjson"
 	"go.kenn.io/agentsview/internal/ctxio"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/pricing"
 )
 
 // Codex JSONL entry types.
@@ -68,7 +70,6 @@ type codexSessionBuilder struct {
 	// implementation keeps the slice-based behavior, the streaming one
 	// batches into a scratch store.
 	sink                        CodexSessionSink
-	projectContext              context.Context
 	resolveParentTurns          codexParentTurnResolver
 	parentTurnIDs               map[string]struct{}
 	firstMessage                string
@@ -232,7 +233,6 @@ type codexPendingEvent struct {
 }
 
 func newCodexSessionBuilder(
-	ctx context.Context,
 	agent AgentType,
 	_ bool,
 	resolveParentTurns codexParentTurnResolver,
@@ -241,7 +241,6 @@ func newCodexSessionBuilder(
 	return &codexSessionBuilder{
 		agent:              agent,
 		sink:               sink,
-		projectContext:     ctx,
 		resolveParentTurns: resolveParentTurns,
 		project:            "unknown",
 		callNames:          make(map[string]string),
@@ -398,7 +397,7 @@ func (b *codexSessionBuilder) processLine(ctx context.Context,
 			// too — the fork's own meta came first and wins.
 			return false, nil
 		}
-		return b.handleSessionMeta(payload, ts), nil
+		return b.handleSessionMeta(ctx, payload, ts), nil
 	case codexTypeTurnContext:
 		if b.suppresses(codexTypeTurnContext, payload) {
 			return false, nil
@@ -411,6 +410,10 @@ func (b *codexSessionBuilder) processLine(ctx context.Context,
 		}
 		b.handleResponseItem(ctx, payload, ts)
 	case codexTypeEventMsg:
+		if payload.Get("type").Str == "thread_settings_applied" {
+			b.applyThreadSettings(payload)
+			return false, nil
+		}
 		if b.suppresses(codexTypeEventMsg, payload) {
 			return false, nil
 		}
@@ -437,7 +440,7 @@ func codexAcceptSessionMetaID(sessionID *string, id string) bool {
 }
 
 func (b *codexSessionBuilder) handleSessionMeta(
-	payload gjson.Result, envelopeTS time.Time,
+	ctx context.Context, payload gjson.Result, envelopeTS time.Time,
 ) (skip bool) {
 	// Legacy forks copy foreign metadata without explicit lineage fields.
 	if !codexAcceptSessionMetaID(&b.sessionID, payload.Get("id").Str) {
@@ -457,6 +460,11 @@ func (b *codexSessionBuilder) handleSessionMeta(
 	if b.parentSessionID != "" {
 		b.parentSessionID = codexSubagentSessionID(b.parentSessionID)
 		b.relationshipType = RelSubagent
+	} else if b.forkedFromID != "" {
+		// An ordinary fork names the thread it was forked from. Revert pages
+		// replace this with their continuation parent after parsing.
+		b.parentSessionID = codexSubagentSessionID(b.forkedFromID)
+		b.relationshipType = RelFork
 	}
 	if payload.Get("originator").Str == codexOriginatorExec && b.sessionKind != SessionKindRoborev {
 		b.sessionKind = SessionKindNonInteractive
@@ -475,7 +483,7 @@ func (b *codexSessionBuilder) handleSessionMeta(
 			b.gitRemote = export.SanitizeGitRemoteForStorage(git.Get("repository_url").Str)
 		}
 		if proj := ExtractProjectFromCwdWithBranchContext(
-			b.projectContext, cwd, branch,
+			ctx, cwd, branch,
 		); proj != "" {
 			b.project = proj
 		} else {
@@ -493,13 +501,16 @@ func (b *codexSessionBuilder) handleResponseItem(ctx context.Context,
 ) {
 	switch payload.Get("type").Str {
 	case "function_call", "custom_tool_call":
-		b.handleFunctionCall(payload, ts)
+		b.handleFunctionCall(ctx, payload, ts)
 		return
 	case "function_call_output", "custom_tool_call_output":
 		b.handleFunctionCallOutput(ctx, payload, ts)
 		return
 	case "agent_message":
 		b.handleAgentMessage(payload, ts)
+		return
+	case "image_generation_call":
+		b.handleImageGenerationCall(ctx, payload, ts)
 		return
 	}
 
@@ -545,12 +556,14 @@ func (b *codexSessionBuilder) handleResponseItem(ctx context.Context,
 	msg := ParsedMessage{
 		Role:          RoleType(role),
 		Content:       content,
+		DialogueText:  new(content),
 		Timestamp:     ts,
 		ContentLength: len(content),
 		Model:         b.model,
 	}
 	if role == string(RoleAssistant) {
 		msg.ReasoningEffort = b.reasoningEffort
+		msg.ProviderID = b.serviceTierProviderID
 	}
 	b.sink.AppendMessage(msg)
 }
@@ -576,10 +589,18 @@ func (b *codexSessionBuilder) handleAgentMessage(
 	b.sink.AppendMessage(ParsedMessage{
 		Role:          RoleUser,
 		Content:       content,
+		DialogueText:  new(content),
 		Timestamp:     ts,
 		ContentLength: len(content),
 		Model:         b.model,
 	})
+}
+
+func (b *codexSessionBuilder) applyThreadSettings(payload gjson.Result) {
+	b.serviceTierProviderID = ""
+	if payload.Get("thread_settings.model_provider_id").Str == "openai" && payload.Get("thread_settings.service_tier").Str == "priority" {
+		b.serviceTierProviderID = pricing.OpenAIPriorityProviderID
+	}
 }
 
 func (b *codexSessionBuilder) handleEventMsg(payload gjson.Result) {
@@ -725,24 +746,30 @@ func (b *codexSessionBuilder) handleSubagentActivity(
 }
 
 func (b *codexSessionBuilder) handleFunctionCall(
-	payload gjson.Result, ts time.Time,
+	ctx context.Context, payload gjson.Result, ts time.Time,
 ) {
 	name := payload.Get("name").Str
 	if name == "" {
 		return
 	}
 	callID := payload.Get("call_id").Str
-	if callID != "" {
-		b.callNames[callID] = name
-	}
 
 	content := formatCodexFunctionCall(name, payload)
 	inputJSON := extractCodexInputJSON(payload)
-	skillName := inferCodexSkillNameWithBase(b.projectContext, name, inputJSON, b.cwd)
+	skillName := inferCodexSkillNameWithBase(ctx, name, inputJSON, b.cwd)
 	waitAgentIDs := []string(nil)
+	outputName := name
 	if isCodexWaitAgentCall(name) && callID != "" {
 		args, _ := parseCodexFunctionArgs(payload)
 		waitAgentIDs = codexWaitAgentIDs(args)
+		if name == "wait" && strings.TrimSpace(args.Get("cell_id").Str) != "" &&
+			!args.Get("ids").Exists() && !args.Get("targets").Exists() {
+			// Keep the display name, but route code-mode polls as ordinary results.
+			outputName = "code_mode_wait"
+		}
+	}
+	if callID != "" {
+		b.callNames[callID] = outputName
 	}
 
 	call := ParsedToolCall{
@@ -770,11 +797,13 @@ func (b *codexSessionBuilder) handleFunctionCall(
 	messageOrdinal := b.sink.AppendMessage(ParsedMessage{
 		Role:            RoleAssistant,
 		Content:         content,
+		DialogueText:    new(""),
 		Timestamp:       ts,
 		HasToolUse:      true,
 		ContentLength:   len(content),
 		Model:           b.model,
 		ReasoningEffort: b.reasoningEffort,
+		ProviderID:      b.serviceTierProviderID,
 		ToolCalls:       toolCalls,
 	})
 	if callID != "" {
@@ -782,7 +811,7 @@ func (b *codexSessionBuilder) handleFunctionCall(
 			MessageOrdinal: messageOrdinal,
 			CallIndex:      0,
 		}
-		if !b.rememberToolCall(callID, name, position) {
+		if !b.rememberToolCall(callID, outputName, position) {
 			b.checkpointUnsafe = true
 		}
 	}
@@ -790,9 +819,65 @@ func (b *codexSessionBuilder) handleFunctionCall(
 	if isCodexWaitAgentCall(name) && callID != "" {
 		for _, agentID := range waitAgentIDs {
 			b.agentWaitCalls[agentID] = callID
-			b.claimPendingAgentEvents(callID, agentID)
+			// Its only error is cancellation, which processLine's caller
+			// observes on the next line or flush.
+			_ = b.claimPendingAgentEventsContext(ctx, callID, agentID)
 		}
 	}
+}
+
+// handleImageGenerationCall records a generated image as a call whose result
+// holds the image. The response item carries both the call and its outcome;
+// the image_generation_end event that follows repeats them and is not read.
+func (b *codexSessionBuilder) handleImageGenerationCall(ctx context.Context,
+	payload gjson.Result, ts time.Time,
+) {
+	// The id is a slice of the whole line, image included; a copy keeps the
+	// stored call from holding the payload in memory.
+	callID := strings.Clone(payload.Get("id").Str)
+	inputJSON := payload.Raw
+	image, hasImage := generatedImageResult(payload.Get("result").Str)
+	// A result attaches to its call by id, so an item without one keeps the
+	// image in its input.
+	if hasImage && callID != "" {
+		input, ok := jsonWithoutField(jsontext.Value(payload.Raw), "result")
+		hasImage = ok
+		if ok {
+			inputJSON = input
+		}
+	}
+	// The viewer hides tool markers, so the call shows once, as its block.
+	content := formatToolHeader("Tool", generatedImageCallName)
+	messageOrdinal := b.sink.AppendMessage(ParsedMessage{
+		Role:            RoleAssistant,
+		Content:         content,
+		DialogueText:    new(""),
+		Timestamp:       ts,
+		HasToolUse:      true,
+		ContentLength:   len(content),
+		Model:           b.model,
+		ProviderID:      b.serviceTierProviderID,
+		ReasoningEffort: b.reasoningEffort,
+		ToolCalls: []ParsedToolCall{{
+			ToolUseID: callID,
+			ToolName:  generatedImageCallName,
+			Category:  "Tool",
+			InputJSON: inputJSON,
+			Rendering: content,
+		}},
+	})
+	if !hasImage || callID == "" {
+		return
+	}
+	b.sink.AppendToolResultEvent(ctx, callID, &ParsedToolCallPosition{
+		MessageOrdinal: messageOrdinal,
+	}, ParsedToolResultEvent{
+		ToolUseID: callID,
+		Source:    "image_generation_call",
+		Status:    "completed",
+		Content:   image,
+		Timestamp: ts,
+	})
 }
 
 func (b *codexSessionBuilder) handleFunctionCallOutput(ctx context.Context,
@@ -919,14 +1004,6 @@ func (b *codexSessionBuilder) handleSubagentNotification(ctx context.Context,
 	return true
 }
 
-func (b *codexSessionBuilder) claimPendingAgentEvents(
-	callID, agentID string,
-) {
-	_ = b.claimPendingAgentEventsContext(
-		context.Background(), callID, agentID,
-	)
-}
-
 func (b *codexSessionBuilder) claimPendingAgentEventsContext(
 	ctx context.Context, callID, agentID string,
 ) error {
@@ -949,10 +1026,6 @@ func (b *codexSessionBuilder) claimPendingAgentEventsContext(
 	}
 	delete(b.pendingAgentEvents, agentID)
 	return ctx.Err()
-}
-
-func (b *codexSessionBuilder) flushPendingAgentResults() {
-	_ = b.flushPendingAgentResultsContext(context.Background())
 }
 
 func (b *codexSessionBuilder) flushPendingAgentResultsContext(
@@ -997,6 +1070,7 @@ func (b *codexSessionBuilder) flushPendingAgentResultsContext(
 					Ordinal:       ev.ordinal,
 					Role:          RoleUser,
 					Content:       ev.text,
+					DialogueText:  new(""),
 					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ev.timestamp,
 					Model:         b.model,
@@ -1494,6 +1568,12 @@ func isCodexWaitAgentCall(name string) bool {
 	return name == "wait" || name == "wait_agent"
 }
 
+// Code-mode wait resumes an exec cell and binds no agents.
+func isCodexExecCellWait(name string, args gjson.Result) bool {
+	return name == "wait" && args.Get("cell_id").Str != "" &&
+		len(codexWaitAgentIDs(args)) == 0
+}
+
 func parseCodexSubagentNotification(
 	content string,
 ) (agentID, statusName, text string) {
@@ -1747,6 +1827,7 @@ func (p *codexProvider) parseSessionWithCursor(
 func (p *codexProvider) parentTurnResolver(
 	ctx context.Context, childPath string,
 ) codexParentTurnResolver {
+	ctx = p.parentInventoryContext(ctx)
 	return func(parentID string) (map[string]struct{}, bool) {
 		var paths []string
 		hasOriginal := false
@@ -1804,6 +1885,13 @@ func (p *codexProvider) parentTurnResolver(
 		p.parentTurnCache.Put(files, turnIDs)
 		return turnIDs, true
 	}
+}
+
+func (p *codexProvider) parentInventoryContext(ctx context.Context) context.Context {
+	if !p.Config.StableSourceSnapshots {
+		return ctx
+	}
+	return context.WithValue(ctx, codexThreadInventoryContextKey{}, &codexThreadInventoryBatch{stable: true})
 }
 
 // CodexReplayParentID returns the explicit parent only when the rollout has a
@@ -1981,7 +2069,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 	lr := newLineReaderContext(ctx, tee, maxLineSize)
 	defer releaseLineReader(lr)
 	b := newCodexSessionBuilder(
-		ctx, p.spec.agent, includeExec, p.parentTurnResolver(ctx, path), sink,
+		p.spec.agent, includeExec, p.parentTurnResolver(ctx, path), sink,
 	)
 	malformedLines := 0
 
@@ -2406,9 +2494,9 @@ func seedCodexIncrementalStateFromReader(ctx context.Context, agent AgentType,
 ) (codexIncrementalSeed, error) {
 	sink := newCodexSeedSink()
 	b := newCodexSessionBuilder(
-		ctx, agent, false, resolveParentTurns, sink,
+		agent, false, resolveParentTurns, sink,
 	)
-	lr := newLineReader(r, maxLineSize)
+	lr := newLineReaderContext(ctx, r, maxLineSize)
 	defer releaseLineReader(lr)
 	for {
 		line, ok := lr.next()
@@ -2425,7 +2513,9 @@ func seedCodexIncrementalStateFromReader(ctx context.Context, agent AgentType,
 	if err := lr.Err(); err != nil {
 		return codexIncrementalSeed{}, err
 	}
-	b.flushPendingAgentResults()
+	if err := b.flushPendingAgentResultsContext(ctx); err != nil {
+		return codexIncrementalSeed{}, err
+	}
 	if b.checkpointUnsafe {
 		return codexIncrementalSeed{}, errCodexIncrementalNeedsFullParse
 	}
@@ -2501,20 +2591,9 @@ func readCodexJSONLFromContext(
 	return readCodexJSONLSectionContext(ctx, snapshot.File, offset, snapshot.Source.Size(), fn)
 }
 
-// readCodexJSONLSection applies the conservative Codex JSONL rules to the
-// exact byte range [offset, limit). A SectionReader makes the captured limit a
-// real EOF even if the underlying descriptor has since grown.
-func readCodexJSONLSection(
-	f *os.File,
-	offset int64,
-	limit int64,
-	fn func(line string),
-) (consumed int64, err error) {
-	return readCodexJSONLSectionContext(
-		context.Background(), f, offset, limit, fn,
-	)
-}
-
+// readCodexJSONLSectionContext applies the conservative Codex JSONL rules to
+// the exact byte range [offset, limit). A SectionReader makes the captured
+// limit a real EOF even if the underlying descriptor has since grown.
 func readCodexJSONLSectionContext(
 	ctx context.Context,
 	f *os.File,
@@ -2656,7 +2735,7 @@ func (p *codexProvider) parseSessionFromSnapshot(ctx context.Context,
 		includeExec,
 		info,
 		func(fn func(string)) (int64, error) {
-			return readCodexJSONLSection(f, offset, limit, fn)
+			return readCodexJSONLSectionContext(ctx, f, offset, limit, fn)
 		},
 		func() (codexIncrementalSeed, error) {
 			return seedCodexIncrementalStateFromReader(ctx, p.spec.agent,
@@ -2689,7 +2768,7 @@ func (p *codexProvider) parseSessionFromCheckpoint(ctx context.Context,
 		includeExec,
 		info,
 		func(fn func(string)) (int64, error) {
-			return readCodexJSONLSection(f, offset, limit, fn)
+			return readCodexJSONLSectionContext(ctx, f, offset, limit, fn)
 		},
 		func() (codexIncrementalSeed, error) {
 			return codexIncrementalSeed{codexCursorState: seed}, nil
@@ -2770,7 +2849,7 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
 	}
 
 	b := newCodexSessionBuilder(
-		ctx, p.spec.agent, includeExec,
+		p.spec.agent, includeExec,
 		p.parentTurnResolver(ctx, path),
 		NewCodexCollectingSink(startOrdinal),
 	)
@@ -2820,7 +2899,9 @@ func (p *codexProvider) parseSessionFromWithSources(ctx context.Context,
 		return codexIncrementalParseResult{}, fallbackErr
 	}
 
-	b.flushPendingAgentResults()
+	if err := b.flushPendingAgentResultsContext(ctx); err != nil {
+		return codexIncrementalParseResult{}, err
+	}
 	if b.checkpointUnsafe {
 		return codexIncrementalParseResult{}, errCodexIncrementalNeedsFullParse
 	}
@@ -2858,7 +2939,9 @@ func (p *codexProvider) parseSessionFrom(ctx context.Context,
 		offset,
 		startOrdinal,
 		includeExec,
-		readJSONLFrom,
+		func(path string, offset int64, fn func(string)) (int64, error) {
+			return readJSONLFrom(ctx, path, offset, fn)
+		},
 	)
 	if err != nil {
 		return nil, time.Time{}, 0, err
@@ -2976,7 +3059,7 @@ func isCodexSubagentNotification(content string) bool {
 
 func codexIncrementalNeedsFullParse(line string) bool {
 	b := newCodexSessionBuilder(
-		context.Background(), AgentCodex, false, nil,
+		AgentCodex, false, nil,
 		NewCodexCollectingSink(0),
 	)
 	return b.codexIncrementalNeedsFullParse(line)
@@ -3007,7 +3090,12 @@ func (b *codexSessionBuilder) codexIncrementalNeedsFullParse(
 func (b *codexSessionBuilder) codexResponseItemNeedsFullParse(payload gjson.Result) bool {
 	switch payload.Get("type").Str {
 	case "function_call", "custom_tool_call":
-		return isCodexWaitAgentCall(payload.Get("name").Str)
+		name := payload.Get("name").Str
+		if !isCodexWaitAgentCall(name) {
+			return false
+		}
+		args, _ := parseCodexFunctionArgs(payload)
+		return !isCodexExecCellWait(name, args)
 	case "function_call_output", "custom_tool_call_output":
 		output, raw := parseCodexFunctionOutput(payload, b.agent)
 		if isCodexSubagentFunctionOutput(output) {
@@ -3018,7 +3106,7 @@ func (b *codexSessionBuilder) codexResponseItemNeedsFullParse(payload gjson.Resu
 		}
 		name := b.toolCallNameForOutput(payload.Get("call_id").Str)
 		return name == "" || name == "spawn_agent" ||
-			isCodexWaitAgentCall(name)
+			(isCodexWaitAgentCall(name) && output.Get("status").IsObject())
 	default:
 		role := payload.Get("role").Str
 		if role != "user" {

@@ -25,23 +25,28 @@ import (
 // Tool names. The same constant is used to register a tool and to refer
 // to it in tests.
 const (
-	ToolSearchSessions     = "search_sessions"
-	ToolQueryRecall        = "query_recall"
-	ToolListSessions       = "list_sessions"
-	ToolGetSessionOverview = "get_session_overview"
-	ToolGetMessages        = "get_messages"
-	ToolSearchContent      = "search_content"
-	ToolGetMemoryStatus    = "get_memory_status"
-	ToolGetUsageSummary    = "get_usage_summary"
-	ToolGetToolCalls       = "get_tool_calls"
-	ToolGetRecentEdits     = "get_recent_edits"
-	ToolGetChildSessions   = "get_child_sessions"
-	ToolCompareUsage       = "compare_usage"
-	ToolGetActivityReport  = "get_activity_report"
-	ToolGetToolUsage       = "get_tool_usage"
-	ToolGetQualitySignals  = "get_quality_signals"
-	ToolSearchDocs         = "search_docs"
+	ToolSearchSessions       = "search_sessions"
+	ToolQueryRecall          = "query_recall"
+	ToolListSessions         = "list_sessions"
+	ToolGetSessionOverview   = "get_session_overview"
+	ToolGetMessages          = "get_messages"
+	ToolSearchContent        = "search_content"
+	ToolGetMemoryStatus      = "get_memory_status"
+	ToolGetUsageSummary      = "get_usage_summary"
+	ToolGetSessionUsage      = "get_session_usage"
+	ToolGetToolCalls         = "get_tool_calls"
+	ToolGetRecentEdits       = "get_recent_edits"
+	ToolGetChildSessions     = "get_child_sessions"
+	ToolCompareUsage         = "compare_usage"
+	ToolGetActivityReport    = "get_activity_report"
+	ToolGetToolUsage         = "get_tool_usage"
+	ToolGetQualitySignals    = "get_quality_signals"
+	ToolSearchDocs           = "search_docs"
+	ToolGetFrictionDigest    = "get_friction_digest"
+	ToolListFrictionPatterns = "list_friction_patterns"
 )
+
+const ToolGetSessionFileReferences = "get_session_file_references"
 
 // Profile selects the tools advertised by an MCP server while keeping their
 // implementations and schemas shared.
@@ -97,9 +102,15 @@ func newServer(opts ServeOptions) *mcp.Server {
 		version = "dev"
 	}
 	s := mcp.NewServer(&mcp.Implementation{
-		Name:    "agentsview",
-		Title:   "agentsview session history",
-		Version: version,
+		Name:       "agentsview",
+		Title:      "agentsview session history",
+		Version:    version,
+		WebsiteURL: "https://agentsview.io",
+		Icons: []mcp.Icon{{
+			Source:   serverIconSource,
+			MIMEType: "image/png",
+			Sizes:    []string{"256x256"},
+		}},
 	}, &mcp.ServerOptions{Instructions: "Use returned web_url values when linking to recorded sessions."})
 
 	s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
@@ -121,6 +132,7 @@ func newServer(opts ServeOptions) *mcp.Server {
 	memoryOnly := opts.Profile == ProfileMemory
 
 	if !memoryOnly {
+		addFileReferencesTool(s, t, readOnly)
 		mcp.AddTool(s, &mcp.Tool{
 			Name: ToolSearchSessions,
 			Description: "Full-text search across all recorded AI agent sessions (Claude Code, Codex, Gemini, " +
@@ -189,11 +201,12 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolSearchContent,
-		Description: "Search raw session text, including tool inputs and results. When a vector search index is " +
+		Description: "Search raw session text, including thinking, tool inputs, and results. When a vector search index is " +
 			"configured, prefer mode hybrid (semantic similarity plus keywords) or semantic for finding " +
 			"prior work and answering contextual questions, especially when the exact wording is unknown. " +
 			"If these modes report not available, use terms when every literal term must occur within one " +
 			"user/assistant exchange, or substring/regex for exact error messages, identifiers, and code fragments. " +
+			"Use concepts with two to five semantic ideas to keep only sessions with evidence for every idea. " +
 			"The default mode remains substring. Set context to include N messages of " +
 			"surrounding conversation with each match. Matches from the last 10 minutes (including the " +
 			"current conversation) are excluded unless include_active is set; current_session_id replaces " +
@@ -206,9 +219,22 @@ func newServer(opts ServeOptions) *mcp.Server {
 		mcp.AddTool(s, &mcp.Tool{
 			Name: ToolGetUsageSummary,
 			Description: "Aggregate token usage and cost across all agents: totals plus per-day breakdown, " +
-				"filterable by project, agent, machine, and date range.",
+				"filterable by project, agent, machine, and date range. Use get_session_usage for one " +
+				"session's breakdown.",
 			Annotations: readOnly,
 		}, t.usageSummary)
+
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolGetSessionUsage,
+			Description: "Explain one session's token usage and cost, the same report as `agentsview session " +
+				"usage`. Call it after get_activity_report with sessions_sort cost finds an expensive " +
+				"session. Returns total output and peak context tokens, cost and its " +
+				"source, models with no known price, input, output, and cache read and write tokens and " +
+				"cost per model, and a page of per-request rows (breakdown_sort cost puts the most " +
+				"expensive requests first). Totals include subagent sessions unless own_only is set. " +
+				"Reads the archive as stored without refreshing source files.",
+			Annotations: readOnly,
+		}, t.sessionUsage)
 
 		mcp.AddTool(s, &mcp.Tool{
 			Name: ToolGetToolCalls,
@@ -242,7 +268,8 @@ func newServer(opts ServeOptions) *mcp.Server {
 			Name: ToolGetActivityReport,
 			Description: "Report agent time, sessions, and cost for a day, week, month, or custom range: " +
 				"totals, the busiest moment, breakdowns by project, model, and agent, and a page of the " +
-				"sessions in the range. Page through the sessions with sessions_cursor.",
+				"sessions in the range. Page through the sessions with sessions_cursor. Call " +
+				"get_session_usage on a session to see where its cost came from.",
 			Annotations: readOnly,
 		}, t.activityReport)
 
@@ -269,7 +296,33 @@ func newServer(opts ServeOptions) *mcp.Server {
 		}, searchDocs)
 	}
 
+	if !memoryOnly && service.SupportsFriction(opts.Service) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolGetFrictionDigest,
+			Description: "Read one dated Friction Log digest: heuristic findings (user corrections, " +
+				"tool errors, workarounds, deferrals, health patterns, frustration, interruptions) and P0 " +
+				"alerts for one local day. " +
+				"format markdown returns the rendered digest; summary returns the counts-only object. " +
+				"Findings are deterministic heuristics, not ground truth.",
+			Annotations: readOnly,
+		}, t.frictionDigest)
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolListFrictionPatterns,
+			Description: "List recurring friction patterns ranked by occurrences across digests, with " +
+				"first/last seen dates, distinct session counts, and a web_url for the latest occurrence. " +
+				"Filter by kind or since (YYYY-MM-DD).",
+			Annotations: readOnly,
+		}, t.listFrictionPatterns)
+	}
+
 	return s
+}
+
+// addFileReferencesTool advertises the Docbank lookup only when the backend has Docbank configured.
+func addFileReferencesTool(s *mcp.Server, t *toolset, readOnly *mcp.ToolAnnotations) {
+	if service.SupportsFileReferences(t.svc) {
+		mcp.AddTool(s, &mcp.Tool{Name: ToolGetSessionFileReferences, Description: "Find exact bytes of session files and images in Docbank by SHA-256. Returns current, prior, and trashed versions, or explicit unavailable evidence.", Annotations: readOnly}, t.fileReferences)
+	}
 }
 
 // newHTTPHandler builds the StreamableHTTP handler with its protections.
@@ -377,7 +430,7 @@ func ServeHTTP(ctx context.Context, opts ServeOptions, addr string) (result erro
 		// Graceful shutdown with a short bound; in-flight tool calls
 		// usually finish in milliseconds, so 10s is plenty.
 		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 10*time.Second)
+			context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
 		return ctx.Err()

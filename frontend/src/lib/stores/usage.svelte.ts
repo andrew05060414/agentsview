@@ -1,3 +1,4 @@
+import { excludedModelGroups, groupedModelCsv, toggleGroupedModel } from "../utils/model-groups.js";
 import { m } from "../i18n/index.js";
 import { queryStepFrom, type QueryStep } from "../utils/refresh.js";
 import { LiveQuery } from "../utils/liveQuery.svelte.js";
@@ -13,6 +14,10 @@ import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
 import { rollingRange, today } from "../utils/dates.js";
 import { ALL_TOKEN_TYPES, canonicalTokenTypes, type UsageTokenType } from "./usageTokenTypes.js";
+import {
+  isTreemapLabelScale,
+  type TreemapLabelScale,
+} from "../components/usage/treemapLabelSize.js";
 
 type UsageParams = NonNullable<Parameters<typeof UsageService.getApiV1UsageSummary>[0]>;
 type UsagePairwiseParams = Parameters<typeof UsageService.getApiV1UsagePairwiseComparison>[0];
@@ -64,7 +69,7 @@ export type AttributionView = "treemap" | "list" | "bars";
 
 interface Toggles {
   timeSeries: { groupBy: GroupBy; view: TimeSeriesView };
-  attribution: { groupBy: GroupBy; view: AttributionView };
+  attribution: { groupBy: GroupBy; view: AttributionView; labelScale: TreemapLabelScale };
 }
 
 const TOGGLES_KEY = "usage-toggles";
@@ -72,7 +77,7 @@ const TOGGLES_KEY = "usage-toggles";
 function defaultToggles(): Toggles {
   return {
     timeSeries: { groupBy: "project", view: "smooth" },
-    attribution: { groupBy: "project", view: "treemap" },
+    attribution: { groupBy: "project", view: "treemap", labelScale: "sqrt" },
   };
 }
 
@@ -112,6 +117,9 @@ function loadToggles(): Toggles {
         attribution: {
           groupBy: sharedGroupBy,
           view: parsed.attribution?.view ?? defaults.attribution.view,
+          labelScale: isTreemapLabelScale(parsed.attribution?.labelScale)
+            ? parsed.attribution.labelScale
+            : defaults.attribution.labelScale,
         },
       };
     }
@@ -288,6 +296,24 @@ function summaryForDateRange(
       total.cost.microdollars += item.cost.microdollars;
       agentTotals.set(item.agent, total);
     }
+  }
+
+  // Plan-only sessions have no usage events, so daily entries cannot place
+  // them in the range; keep each model's count from the source summary so
+  // its row still reads "Plan usage" instead of zero until the range's own
+  // summary arrives.
+  for (const source of summary.modelTotals) {
+    if (!source.planOnlySessions) continue;
+    const total = modelTotals.get(source.model) ?? {
+      model: source.model,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      cost: { microdollars: 0 },
+    };
+    total.planOnlySessions = source.planOnlySessions;
+    modelTotals.set(source.model, total);
   }
 
   const byCost = <T extends { cost: { microdollars: number } }>(a: T, b: T) =>
@@ -683,7 +709,9 @@ class UsageStore {
   isSelected(by: GroupBy, id: string): boolean {
     return by === "agent"
       ? sessions.isAgentSelected(id)
-      : (by === "project" ? this.selectedProjectKey : this.selectedModel) === id;
+      : (by === "project"
+          ? this.selectedProjectKey
+          : groupedModelCsv(this.selectedModel, this.modelAliases)) === id;
   }
 
   hasSelection(by: GroupBy): boolean {
@@ -735,7 +763,12 @@ class UsageStore {
       this.selectedProjectKey = "";
       this.backToProjects();
     }
-    if (this.selectedModel && this.isModelExcluded(this.selectedModel)) this.selectedModel = "";
+    if (
+      this.selectedModel &&
+      (this.isModelExcluded(this.selectedModel) ||
+        this.isModelExcluded(groupedModelCsv(this.selectedModel, this.modelAliases)))
+    )
+      this.selectedModel = "";
   }
 
   // Toggle an item's exclusion. Clicking an included item
@@ -770,10 +803,22 @@ class UsageStore {
     });
   }
 
+  get modelAliases(): Record<string, string> {
+    return this.summary?.model_aliases ?? {};
+  }
+
+  get displayedModels(): string {
+    return excludedModelGroups(this.excludedModels, this.modelAliases).csv;
+  }
+
+  get partlyExcludedModelCount(): number {
+    return excludedModelGroups(this.excludedModels, this.modelAliases).partial;
+  }
+
   toggleModel(name: string, options: { preserveTimeRange?: boolean } = {}): void {
     const previous = this.excludedModels;
     const hadSelectedTimeRange = options.preserveTimeRange && this.selectedTimeRange !== null;
-    this.excludedModels = this.toggleCsv(this.excludedModels, name);
+    this.excludedModels = toggleGroupedModel(this.excludedModels, name, this.modelAliases, true);
     const changed = this.excludedModels;
     void this.fetchAllWithResult(options).then((result) => {
       if (result !== "error" || !hadSelectedTimeRange || this.excludedModels !== changed) return;
@@ -931,6 +976,11 @@ class UsageStore {
 
   setAttributionView(v: AttributionView) {
     this.toggles.attribution.view = v;
+    saveToggles(this.toggles);
+  }
+
+  setAttributionLabelScale(scale: TreemapLabelScale) {
+    this.toggles.attribution.labelScale = scale;
     saveToggles(this.toggles);
   }
 
@@ -1094,6 +1144,8 @@ class UsageStore {
     const v = ++this.versions.summary;
     this.abortPanel("comparison");
     const signal = this.nextAbortSignal("summary");
+    const getSummary = (params: UsageParams) =>
+      UsageService.getApiV1UsageSummary({ ...params, group_models: true }, { signal });
     // Only show the skeleton when we don't already have data to
     // display. Refetches triggered by live events or filter changes
     // replace data in place instead of flashing to loading state.
@@ -1127,15 +1179,13 @@ class UsageStore {
       let attributionData: UsageSummaryResponse | null = null;
       let referenceData: UsageSummaryResponse | null = null;
       if (!contextParams && !attributionParams) {
-        data = await UsageService.getApiV1UsageSummary(params, { signal });
+        data = await getSummary(params);
       } else {
         [data, contextData, attributionData, referenceData] = await Promise.all([
-          UsageService.getApiV1UsageSummary(params, { signal }),
-          contextParams ? UsageService.getApiV1UsageSummary(contextParams, { signal }) : null,
-          attributionParams
-            ? UsageService.getApiV1UsageSummary(attributionParams, { signal })
-            : null,
-          referenceParams ? UsageService.getApiV1UsageSummary(referenceParams, { signal }) : null,
+          getSummary(params),
+          contextParams ? getSummary(contextParams) : null,
+          attributionParams ? getSummary(attributionParams) : null,
+          referenceParams ? getSummary(referenceParams) : null,
         ]);
       }
       if (this.versions.summary === v) {
@@ -1228,8 +1278,16 @@ class UsageStore {
         return loaded === null ? null : { ...loaded, projectScopeRecovered: true };
       }
       if (this.versions.summary === v) {
-        // Restore the parent window when the provisional brushed summary fails.
-        if (
+        // Rejected machine filters invalidate every cached scope.
+        if (e instanceof ApiError && e.code === "invalid_machine_filter") {
+          this.summary = null;
+          this.attributionSummary = null;
+          this.referenceSummary = null;
+          this.timeSeriesContextSummary = null;
+          this.isTimeRangeSummaryProvisional = false;
+          this.topSessions = null;
+          this.errors.summary = e.message;
+        } else if (
           this.isTimeRangeSummaryProvisional &&
           this.selectedTimeRange !== null &&
           this.timeSeriesContextSummary !== null
@@ -1246,10 +1304,7 @@ class UsageStore {
             : this.attributionParams();
           if (restoredAttributionParams) {
             try {
-              const restoredAttribution = await UsageService.getApiV1UsageSummary(
-                restoredAttributionParams,
-                { signal },
-              );
+              const restoredAttribution = await getSummary(restoredAttributionParams);
               if (this.versions.summary === v) {
                 this.attributionSummary = restoredAttribution;
                 this.referenceSummary = restoredAttribution;
@@ -1375,9 +1430,10 @@ class UsageStore {
     const liveStep = this.liveQuery.start("pairwise", started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const comparison = await UsageService.getApiV1UsagePairwiseComparison(request ?? params, {
-        signal,
-      });
+      const comparison = await UsageService.getApiV1UsagePairwiseComparison(
+        { ...(request ?? params), group_models: true },
+        { signal },
+      );
       if (this.versions.pairwise === pairwiseVersion) {
         if (
           (comparison.left.dimension === "model" || comparison.left.dimension === "project") &&
@@ -1403,6 +1459,8 @@ class UsageStore {
       }
       status = "error";
       if (this.versions.pairwise === pairwiseVersion) {
+        if (e instanceof ApiError && e.code === "invalid_machine_filter")
+          this.pairwiseComparison = null;
         if (this.pairwiseComparison === null) {
           this.errors.pairwise = e instanceof Error ? e.message : m.shared_failed_to_load();
         } else {
@@ -1497,7 +1555,11 @@ class UsageStore {
     } catch (error) {
       status = isAbortError(error) ? "aborted" : "error";
       if (status === "error" && this.versions[panel] === version) {
-        if ((panel === "zoom" ? this.zoomRows : this.topSessions) === null) {
+        if (error instanceof ApiError && error.code === "invalid_machine_filter") {
+          if (panel === "zoom") this.zoomRows = null;
+          else this.topSessions = null;
+          this.errors[panel] = error.message;
+        } else if ((panel === "zoom" ? this.zoomRows : this.topSessions) === null) {
           this.errors[panel] = error instanceof Error ? error.message : m.shared_failed_to_load();
         } else console.warn(`usage.${panel} refetch failed:`, error);
       }

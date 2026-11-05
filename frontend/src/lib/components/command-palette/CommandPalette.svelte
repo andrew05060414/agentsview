@@ -45,10 +45,10 @@
   // mechanism). This ensures stale results and in-flight requests are always
   // cancelled even when the caller bypasses close().
   onDestroy(() => {
+    searchStore.endSession();
     searchStore.clear();
     searchStore.resetSort();
     searchStore.resetRange();
-    searchStore.reportedModes.clear();
   });
 
   // Most Chinese, Japanese, and Korean words are one or two characters long,
@@ -323,6 +323,9 @@
           >{m.command_palette_recency()}</button>
         </div>
       {/if}
+      {#if searchStore.mode !== "fulltext" && !searchStore.error}
+        <a class="palette-server-settings" href="https://agentsview.io/docs/semantic-search/#named-embeddings-servers" target="_blank" rel="noreferrer">{m.command_palette_semantic_setup_local_link()}</a>
+      {/if}
     </div>
 
     <div class="palette-results">
@@ -580,6 +583,11 @@
     display: flex;
     justify-content: center;
     margin-top: 8px;
+  }
+
+  .palette-server-settings {
+    font-size: 11px;
+    color: var(--text-secondary);
   }
 
   .palette-sort {

@@ -96,12 +96,15 @@
   "header_actions_import_archive_only": "仅归档模式下无法导入",
   "header_actions_import_conversations": "导入对话",
   "header_actions_import": "导入",
+  "header_actions_import_claude_syncing": "Claude.ai 同步正在运行。打开导入可查看进度或停止同步。",
   "header_actions_toggle_theme": "切换主题",
   "header_actions_settings": "设置",
   "header_actions_keyboard_shortcuts": "键盘快捷键",
   "header_actions_keyboard_shortcuts_shortcut": "键盘快捷键 (?)",
   "status_bar_archive_stale": "存档结果可能已过时。",
   "status_bar_archive_rebuilding": "存档结果可能已过时。重建完成前，修改操作已暂停。",
+  "status_bar_archive_stale_rebuild": "存档结果可能已过时。点击以重建。",
+  "status_bar_sync_failed": "同步失败",
   "status_bar_sessions": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -154,8 +157,10 @@
   "command_palette_search_error": "搜索不可用",
   "command_palette_search_failed": "搜索失败。请重试。",
   "command_palette_semantic_setup_title": "语义搜索尚未设置",
-  "command_palette_semantic_setup_config_step": "1. 在 config.toml 中添加 [vector] 部分，并根据你的嵌入服务器调整模型和端点（任何兼容 OpenAI 的端点均可，例如 Ollama）：",
-  "command_palette_semantic_setup_build_step": "2. 重启守护进程，然后构建索引：",
+  "command_palette_semantic_setup_config_step": "1. 将以下内容添加到 config.toml：",
+  "command_palette_semantic_setup_local": "已在 Ollama 中使用 Nomic？切换到共享本地服务器时，请使用完整配置示例以保留索引。",
+  "command_palette_semantic_setup_local_link": "服务器设置",
+  "command_palette_semantic_setup_build_step": "2. 重启守护进程，然后构建索引。CLI 会在首次下载前征求许可：",
   "command_palette_semantic_copy_config": "复制配置片段",
   "command_palette_semantic_copy_command": "复制命令",
   "command_palette_semantic_copied": "已复制！",
@@ -373,9 +378,22 @@
       }
     }
   ],
+  "tool_block_image_alt": "工具输出中的图片",
+  "tool_block_image_open": "查看原尺寸图片",
+  "tool_block_image_close": "关闭原尺寸图片",
   "thinking_block_label": "思考",
   "compact_boundary_title": "上下文窗口在此处被压缩",
   "compact_boundary_label": "上下文已压缩",
+  "transcript_empty_messages": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{count} 条空消息"
+      }
+    }
+  ],
+  "transcript_empty_messages_title": "这些消息没有文本、思考内容或工具调用",
   "compact_boundary_show_full_summary": "显示完整摘要",
   "sidebar_session_count": [
     {
@@ -429,6 +447,8 @@
   "sidebar_filters_no_match": "无匹配",
   "sidebar_filters_no_agents": "无 agents",
   "sidebar_filters_machine": "Machine",
+  "sidebar_filters_machine_loading": "正在加载机器...",
+  "sidebar_filters_machine_update_failed": "无法更新机器筛选条件。请重试。",
   "sidebar_filters_search_machines": "搜索 machines...",
   "sidebar_filters_no_machines": "无 machines",
   "sidebar_filters_min_prompts": "最少提示数",
@@ -807,6 +827,10 @@
   "usage_tokens_attribution_title": "Token 归因",
   "usage_attribution_treemap": "矩形树图",
   "usage_attribution_list": "列表",
+  "usage_label_scale_title": "标签大小比例",
+  "usage_label_scale_linear": "线性",
+  "usage_label_scale_sqrt": "平方根",
+  "usage_label_scale_log": "对数",
   "usage_chart_style": "图表样式",
   "usage_chart_style_smooth": "平滑",
   "usage_chart_style_lines": "折线",
@@ -833,7 +857,7 @@
   "settings_search_empty": "没有匹配的设置",
   "settings_search_clear": "清除搜索",
   "settings_search_result": "显示：{category}",
-  "settings_search_keywords_appearance": "主题 对比度 布局 文本 字体 区块 theme contrast layout text font blocks 缩放 zoom",
+  "settings_search_keywords_appearance": "主题 对比度 布局 文本 字体 区块 theme contrast layout text font blocks 缩放 zoom 颜色 色盲 color",
   "settings_search_keywords_language": "语言 区域设置 翻译 language locale translation",
   "settings_search_keywords_date_ranges": "日期 范围 关联 页面 date range linked pages",
   "settings_search_keywords_terminal": "终端 恢复 启动 可执行文件 参数 剪贴板 terminal resume launch binary arguments clipboard",
@@ -1641,6 +1665,14 @@
   "insights_page_template_tool_reliability": "工具可靠性",
   "insights_page_template_model_cost": "模型与成本",
   "insights_page_template_instruction_opportunities": "指令优化机会",
+  "insights_page_template_friction_review": "摩擦复盘",
+  "friction_review_summary_title": "模型撰写的摘要",
+  "friction_review_summary_notice": "由模型根据此日报的摘要和模式标题撰写。不会修改发现项、日报或问题。",
+  "friction_review_summary_empty": "此日报尚无摘要。",
+  "friction_review_summary_generate": "生成摘要",
+  "friction_review_summary_regenerate": "重新生成",
+  "friction_review_summary_generating": "正在生成：{phase}",
+  "friction_review_summary_unavailable": "此归档无法生成摘要。",
   "insights_page_scope_no_automated": "排除自动化",
   "insights_page_scope_both": "全部",
   "insights_page_scope_only_automated": "仅自动化",
@@ -1964,6 +1996,7 @@
   "appearance_chart_palette": "图表配色",
   "appearance_chart_palette_agentsview": "Agentsview",
   "appearance_chart_palette_matplotlib": "Matplotlib",
+  "appearance_chart_palette_colorblind": "色盲友好",
   "appearance_message_layout": "消息布局",
   "appearance_block_visibility": "块可见性",
   "settings_github_token_saved": "GitHub 令牌已保存。",
@@ -2513,8 +2546,8 @@
   "import_claude_stop": "停止",
   "import_claude_terminal": "终端",
   "import_claude_copy_command": "复制命令",
-  "import_claude_setup_load": "然后打开 {url}，开启开发者模式，选择加载已解压的扩展程序，再选择命令显示的文件夹。",
-  "import_claude_open_chrome": "打开 Chrome 以连接。",
+  "import_claude_setup_load": "然后重启 AgentsView，打开 {url}，开启开发者模式，选择加载已解压的扩展程序，再选择命令显示的文件夹。",
+  "import_claude_open_chrome": "打开 Chrome 并启用 AgentsView 扩展程序。如果你在启动 AgentsView 之后运行了设置，请重启 AgentsView。",
   "import_claude_tab_note": "如果没有打开 claude.ai 标签页，同步会在后台打开一个。同步后，该标签页会保持打开。",
   "import_claude_signed_out": "请在安装了 AgentsView 扩展程序的 Chrome 个人资料中登录 claude.ai。请仅在一个 Chrome 个人资料中启用扩展程序。同步会使用最先连接的个人资料。",
   "import_chatgpt_tab_note": "如果没有打开 chatgpt.com 标签页，同步会在后台打开一个。同步后，该标签页会保持打开。",
@@ -2522,6 +2555,7 @@
   "import_claude_reload_extension": "然后在 {url} 中重新加载扩展程序。",
   "import_claude_update_app": "如果你升级了 AgentsView，请重启它。",
   "import_claude_syncing": "正在同步...",
+  "import_claude_sync_background": "关闭此对话框后，同步仍会继续。",
   "import_claude_sync_failed": "同步失败",
   "import_claude_sign_in_failed": "登录失败",
   "import_claude_desktop_note": "登录使用电子邮件验证码。Google 账号请在 Chrome 中通过网页界面同步。",
@@ -2752,5 +2786,276 @@
   "usage_all_projects": "所有项目",
   "usage_clear_selection": "清除选择",
   "usage_open_project": "打开",
-  "usage_loading": "正在加载..."
+  "usage_loading": "正在加载...",
+  "plan_usage_title": "套餐用量",
+  "plan_usage_trigger_weekly": "套餐用量：每周 {percent}%",
+  "plan_usage_as_of": "套餐用量（截至 {time}）",
+  "plan_usage_not_checked": "套餐用量：尚未检查",
+  "plan_usage_still_updating": "套餐用量：仍在更新（截至 {time}）",
+  "plan_usage_not_reported_yet": "套餐用量：尚未报告（截至 {time}）",
+  "plan_usage_partial": "部分套餐用量（截至 {time}）",
+  "plan_usage_not_reported": "OpenAI 未报告",
+  "plan_usage_too_many_subagents": "子代理聊天过多，OpenAI 用量报告无法包含",
+  "plan_usage_could_not_check": "AgentsView 无法检查套餐用量",
+  "plan_usage_account_unavailable": "此账户无法获取用量",
+  "plan_usage_counted_under": "计入聊天 {title}",
+  "plan_usage_stale": "此后：{reason}（{time}）。这些数字可能已过时。",
+  "plan_usage_left_out_later": "OpenAI 用量报告未包含此聊天",
+  "plan_usage_weekly_share": "Codex 每周上限的 {percent}%",
+  "plan_usage_five_hour_share": "Codex 五小时上限的 {percent}%",
+  "plan_usage_credits": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 积分"
+      }
+    }
+  ],
+  "plan_usage_credits_note": "积分按 OpenAI 用量报告提供的数值显示。",
+  "plan_usage_col_split": "模型、推理强度、速度",
+  "plan_usage_col_weekly": "每周",
+  "plan_usage_col_five_hour": "5 小时",
+  "plan_usage_col_credits": "积分",
+  "capture_tokens_live": "实时采集 token（截至 {time}）",
+  "capture_turns_not_captured": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 轮未采集"
+      }
+    }
+  ],
+  "capture_turns_not_captured_covered": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input time",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} 轮未采集；{time} 之前的轮次已计入套餐用量"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_waiting": "Codex Cloud：等待首次同步",
+  "status_bar_codex_cloud_importing_found": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud：正在导入，目前已发现 {countLabel} 个聊天"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_importing_progress": "Codex Cloud：正在导入 {imported}/{total} 个聊天",
+  "status_bar_codex_cloud_up_to_date": "Codex Cloud：截至 {time} 已是最新",
+  "status_bar_codex_cloud_retrying": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud：{countLabel} 个聊天无法导入"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_error": "Codex Cloud：错误",
+  "status_bar_codex_cloud_off": "Codex Cloud：已关闭",
+  "status_bar_codex_cloud_config_error": "Codex Cloud：设置错误",
+  "status_bar_codex_cloud_live_attention": "Codex Cloud：实时令牌需要处理",
+  "status_bar_codex_cloud_oldest_failure": "最早的失败：{time}",
+  "status_bar_codex_cloud_last_success": "上次成功同步：{time}",
+  "status_bar_codex_cloud_homes": "Codex 主目录：{homes}",
+  "appearance_message_colors": "消息颜色",
+  "appearance_message_colors_description": "为每种消息类型设置独立的颜色。色盲友好预设使用在常见色觉缺陷下仍可区分的色调，并添加线条样式，使类型在形状和颜色上都有区别。",
+  "appearance_message_colors_preset": "消息颜色预设",
+  "appearance_message_colors_preset_default": "主题默认",
+  "appearance_message_colors_preset_colorblind": "色盲友好",
+  "appearance_message_colors_preset_custom": "自定义",
+  "appearance_message_colors_patterns": "除颜色外，还用线条样式标记消息类型",
+  "appearance_message_colors_reset_all": "恢复默认",
+  "appearance_message_colors_reset_role": "重置",
+  "appearance_message_colors_reset_role_label": "重置{role}的颜色",
+  "appearance_message_colors_role_label": "{role}的颜色",
+  "appearance_message_colors_picker": "打开取色器",
+  "appearance_message_colors_hex": "十六进制颜色",
+  "appearance_message_colors_warning_text": "在{modes}下文字可能难以阅读（{ratio}:1，需要 {required}:1）。",
+  "appearance_message_colors_warning_marker": "在{modes}下颜色标记可能难以看清（{ratio}:1，需要 {required}:1）。",
+  "appearance_message_colors_mode_light": "浅色模式",
+  "appearance_message_colors_mode_dark": "深色模式",
+  "appearance_message_colors_mode_high_contrast_light": "高对比度浅色模式",
+  "appearance_message_colors_mode_high_contrast_dark": "高对比度深色模式",
+  "appearance_message_colors_swatch_blue": "蓝色",
+  "appearance_message_colors_swatch_vermillion": "朱红色",
+  "appearance_message_colors_swatch_bluish_green": "蓝绿色",
+  "appearance_message_colors_swatch_reddish_purple": "紫红色",
+  "appearance_message_colors_swatch_dark_yellow": "暗黄色",
+  "appearance_message_colors_swatch_gray": "灰色",
+  "appearance_message_colors_preview": "预览",
+  "appearance_message_colors_preview_user": "日期测试为什么会失败？",
+  "appearance_message_colors_preview_assistant": "测试夹具要求 UTC，我已更新。",
+  "nav_friction": "摩擦日志",
+  "friction_page_help_docs": "摩擦日志的工作原理",
+  "friction_page_refresh": "刷新摩擦日志",
+  "friction_date_label": "摘要日期",
+  "friction_date_previous": "上一份摘要",
+  "friction_date_next": "下一份摘要",
+  "friction_date_no_match": "没有匹配的日期",
+  "friction_build_now": "立即生成",
+  "friction_build_title": "为每个尚无摘要的完整日期生成摘要",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已生成 {countNumber} 份摘要" }
+    }
+  ],
+  "friction_build_nothing": "每个完整日期都已有摘要。",
+  "friction_build_failed": "生成失败：{error}",
+  "friction_empty_title": "还没有摩擦摘要",
+  "friction_empty_hint": "每个本地日期结束后会自动生成摘要，每小时运行的任务会补上遗漏的日期。使用“立即生成”可马上生成缺少的日期。",
+  "friction_empty_hint_remote": "每个本地日期结束后会自动生成摘要，每小时运行的任务会补上遗漏的日期。要马上生成缺少的日期，请在运行 AgentsView 的机器上打开此页面，或在服务器上启用 require_auth。",
+  "friction_load_error": "无法加载摩擦日志",
+  "friction_retry": "重试",
+  "friction_digest_heading": "摩擦日志 — {date}",
+  "friction_digest_built": "生成于 {when}（{timezone}）",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "在 {countNumber} 个会话中失败"
+      }
+    }
+  ],
+  "friction_clean_title": "未发现摩擦",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "扫描的 {countNumber} 个会话中没有标记任何问题。"
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "这一天没有活跃的会话。",
+  "friction_deferral_said": "推迟了工作：“{phrase}”",
+  "friction_pattern_retry_loop": "重试循环",
+  "friction_pattern_runaway_loop": "失控的工具循环",
+  "friction_pattern_edit_churn": "反复编辑",
+  "friction_pattern_mid_task_compaction": "任务中途压缩上下文",
+  "friction_pattern_context_pressure": "上下文压力",
+  "friction_pattern_iteration_runaway": "长时间运行且无用户输入",
+  "friction_digest_missing": "{date} 没有摘要。",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "已扫描 {countNumber} 个会话" }
+    }
+  ],
+  "friction_headline_title": "需要关注",
+  "friction_p0_title": "在多个会话中失败的工具",
+  "friction_patterns_new": "新模式",
+  "friction_patterns_recurring": "反复出现的模式",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "出现 {countNumber} 次" }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 个会话" }
+    }
+  ],
+  "friction_pattern_first_seen": "首次出现于 {date}",
+  "friction_section_corrections": "纠正",
+  "friction_section_errors": "错误",
+  "friction_section_workarounds": "临时方案",
+  "friction_section_deferrals": "推迟事项",
+  "friction_section_patterns": "模式",
+  "friction_section_frustration": "挫败",
+  "friction_section_interruptions": "中断",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "中断 {countNumber} 次" }
+    }
+  ],
+  "friction_kind_correction": "纠正",
+  "friction_kind_error": "错误",
+  "friction_kind_workaround": "临时方案",
+  "friction_kind_deferral": "推迟事项",
+  "friction_kind_pattern": "模式",
+  "friction_kind_frustration": "挫败",
+  "friction_kind_interruption": "中断",
+  "friction_disabled_title": "此服务器已关闭摩擦日志",
+  "friction_disabled_hint": "此服务器不生成摘要。请在 config.toml 中设置 [friction] enabled = true 并重启守护进程。只读归档无法生成摘要。",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "显示 Markdown",
+  "friction_markdown_copy": "复制 Markdown",
+  "friction_markdown_copied": "已复制 Markdown",
+  "friction_markdown_download": "下载 Markdown",
+  "friction_markdown_loading": "正在加载 Markdown…",
+  "friction_markdown_error": "无法加载 Markdown 摘要。",
+  "friction_open_session": "在第 {ordinal} 条消息处打开 {session}",
+  "friction_open_session_start": "打开 {session}",
+  "friction_quality_card_title": "摩擦日志",
+  "friction_quality_card_body": "在你的会话中发现的纠正、工具错误、临时方案、推迟事项和反复出现模式的每日摘要。",
+  "friction_quality_card_open": "打开摩擦日志",
+  "friction_session_title": "摩擦发现",
+  "friction_session_loading": "正在加载摩擦发现…",
+  "friction_session_error": "摩擦发现不可用。",
+  "friction_session_empty": "此会话中没有摩擦发现。",
+  "friction_session_jump": "消息 {ordinal}",
+  "friction_session_jump_title": "跳转到消息 {ordinal}",
+  "docbank_subagent_open_session": "作为会话打开后会显示文件匹配。",
+  "docbank_checking": "正在查询 Docbank…",
+  "docbank_current": "当前版本",
+  "docbank_prior": "历史版本",
+  "docbank_trash": "回收站",
+  "docbank_not_found": "Docbank 中未找到",
+  "docbank_read_unavailable": "无法读取会话文件",
+  "docbank_unavailable": "Docbank 不可用",
+  "docbank_limit_exceeded": "已达到 Docbank 查询上限",
+  "docbank_bytes_not_kept": "未保留图片字节",
+  "docbank_file": "文件 {n} · {mediaType} · {size}",
+  "docbank_file_without_size": "文件 {n} · {mediaType}",
+  "docbank_more": "Docbank 中还有 {count} 项"
 }

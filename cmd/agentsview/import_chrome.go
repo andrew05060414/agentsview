@@ -18,11 +18,11 @@ func syncChrome(ctx context.Context, importType string) error {
 	if importType == "chatgpt" {
 		label = "ChatGPT"
 	}
-	cfg, err := config.LoadMinimal()
+	cfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
 		return err
 	}
-	transport, err := detectTransportContext(ctx, cfg.DataDir, cfg.AuthToken, startupWaitTimeout)
+	transport, err := detectClientTransportContext(ctx, &cfg, startupWaitTimeout)
 	if err != nil {
 		return err
 	}

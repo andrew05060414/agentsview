@@ -3,8 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -30,33 +31,34 @@ type updateDaemonStopResult struct {
 	NoSync           bool
 }
 
-func runUpdate(ctx context.Context, cfg UpdateConfig) {
+func runUpdate(ctx context.Context, cfg UpdateConfig, out io.Writer) {
 	dataDir, err := config.ResolveDataDir()
 	if err != nil {
-		log.Fatalf("resolving data dir: %v", err)
+		fatal("resolving data dir: %v", err)
 	}
 
 	info, err := update.CheckForUpdate(ctx,
 		version, cfg.Force, dataDir,
 	)
 	if err != nil {
-		log.Fatalf("checking for updates: %v", err)
+		fatal("checking for updates: %v", err)
 	}
 
 	if info == nil {
-		fmt.Printf(
+		fmt.Fprintf(out,
 			"agentsview %s is up to date.\n", version,
 		)
 		return
 	}
 
 	if info.IsDevBuild {
-		fmt.Printf(
+		fmt.Fprintf(out,
 			"Running dev build (%s). "+
 				"Latest release: %s\n",
 			info.CurrentVersion, info.LatestVersion,
 		)
 		if cfg.Check {
+			printPackageUpdateGuidance(out, distribution)
 			return
 		}
 		// Cache-only results lack download metadata; re-fetch.
@@ -65,36 +67,37 @@ func runUpdate(ctx context.Context, cfg UpdateConfig) {
 				version, true, dataDir,
 			)
 			if err != nil {
-				log.Fatalf("checking for updates: %v", err)
+				fatal("checking for updates: %v", err)
 			}
 			if info == nil {
-				fmt.Println("Up to date.")
+				fmt.Fprintln(out, "Up to date.")
 				return
 			}
 		}
 	} else {
-		fmt.Printf(
+		fmt.Fprintf(out,
 			"Update available: %s -> %s",
 			info.CurrentVersion, info.LatestVersion,
 		)
 		if info.Size > 0 {
-			fmt.Printf(
+			fmt.Fprintf(out,
 				" (%s)", update.FormatSize(info.Size),
 			)
 		}
-		fmt.Println()
+		fmt.Fprintln(out)
 		if cfg.Check {
+			printPackageUpdateGuidance(out, distribution)
 			return
 		}
 	}
 
 	if !cfg.Yes {
-		fmt.Print("Install update? [y/N] ")
+		fmt.Fprint(out, "Install update? [y/N] ")
 		reader := bufio.NewReader(os.Stdin)
 		answer, _ := reader.ReadString('\n')
 		answer = strings.TrimSpace(strings.ToLower(answer))
 		if answer != "y" && answer != "yes" {
-			fmt.Println("Update cancelled.")
+			fmt.Fprintln(out, "Update cancelled.")
 			return
 		}
 	}
@@ -102,7 +105,7 @@ func runUpdate(ctx context.Context, cfg UpdateConfig) {
 	progressFn := func(downloaded, total int64) {
 		if total > 0 {
 			pct := float64(downloaded) / float64(total) * 100
-			fmt.Printf(
+			fmt.Fprintf(out,
 				"\r  %s / %s (%.0f%%)",
 				update.FormatSize(downloaded),
 				update.FormatSize(total),
@@ -119,8 +122,40 @@ func runUpdate(ctx context.Context, cfg UpdateConfig) {
 		update.PerformUpdate,
 		restartDaemonAfterUpdate,
 	); err != nil {
-		fmt.Println()
-		log.Fatal(err)
+		fmt.Fprintln(out)
+		fatal("%v", err)
+	}
+}
+
+// directDownloadDistribution marks official direct-download release builds.
+// They own their own updates, like builds with no distribution.
+const directDownloadDistribution = "kenn"
+
+// packageManaged reports whether a package manager owns this binary, in
+// which case the package manager, not agentsview, installs updates.
+func packageManaged(distribution string) bool {
+	return distribution != "" && distribution != directDownloadDistribution
+}
+
+// packageUpgradeHint tells the user of a package-managed binary how to
+// upgrade it through the package manager that owns it.
+func packageUpgradeHint(distribution string) string {
+	if distribution == "homebrew" {
+		return "Homebrew manages this installation; run `brew upgrade agentsview` instead"
+	}
+	return distribution +
+		" manages this installation; upgrade agentsview through it instead"
+}
+
+// managedUpdateError refuses a self-update of a package-managed binary so
+// the package manager stays the owner of its files.
+func managedUpdateError(distribution string) error {
+	return errors.New(packageUpgradeHint(distribution))
+}
+
+func printPackageUpdateGuidance(out io.Writer, distribution string) {
+	if packageManaged(distribution) {
+		fmt.Fprintln(out, packageUpgradeHint(distribution))
 	}
 }
 
@@ -171,8 +206,11 @@ func performUpdateWithDaemonLifecycle(ctx context.Context,
 }
 
 func loadDaemonConfigForUpdate() (config.Config, error) {
-	cfg, err := config.LoadReadOnly()
+	cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 	if err == nil {
+		if err := cfg.ApplyDeploymentAuth(); err != nil {
+			return cfg, err
+		}
 		return cfg, nil
 	}
 	dataDir, dirErr := config.ResolveDataDir()

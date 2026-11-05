@@ -30,7 +30,7 @@ const (
 type ContentSearchFilter struct {
 	Pattern       string
 	Mode          string   // "substring" (default) | "regex" | "fts" | "terms" | "semantic" | "hybrid"
-	Sources       []string // subset of {"messages","tool_input","tool_result"}
+	Sources       []string // subset of {"messages","thinking","tool_input","tool_result"}
 	ExcludeSystem bool
 
 	Project, ExcludeProject, Machine, Agent           string
@@ -62,6 +62,22 @@ type ContentSearchFilter struct {
 
 	Limit  int
 	Cursor int
+
+	// Candidates, when set, makes mode "semantic" and "hybrid" keep
+	// fetching vector candidates while fewer than Limit units pass the
+	// filters, until the vector index runs out or the candidate cap stops
+	// the search. It records which of the two happened. Multi-concept
+	// search sets it on each concept's search to tell a complete short
+	// result from a truncated one.
+	Candidates *VectorCandidates
+}
+
+// VectorCandidates reports how a semantic search's vector candidate fetch
+// ended.
+type VectorCandidates struct {
+	// Exhausted is true when the vector index had no candidates beyond the
+	// ones fetched, so every eligible unit was considered.
+	Exhausted bool
 }
 
 // ContentMatch is one matching message or tool call. Snippet is built from the
@@ -70,18 +86,19 @@ type ContentSearchFilter struct {
 // window). The CLI sanitizes it for terminal display.
 type ContentMatch struct {
 	// WebURL is a client-derived browser link, never persisted.
-	WebURL      string  `json:"web_url,omitempty"`
-	SessionID   string  `json:"session_id"`
-	Project     string  `json:"project"`
-	Agent       string  `json:"agent"`
-	Machine     string  `json:"machine"`
-	DisplayName *string `json:"display_name"`
-	Location    string  `json:"location"` // message | tool_input | tool_result
-	Role        string  `json:"role"`
-	ToolName    string  `json:"tool_name,omitempty"`
-	Ordinal     int     `json:"ordinal"`
-	Timestamp   string  `json:"timestamp"`
-	Snippet     string  `json:"snippet"`
+	WebURL         string   `json:"web_url,omitempty"`
+	SessionID      string   `json:"session_id"`
+	Project        string   `json:"project"`
+	Agent          string   `json:"agent"`
+	Machine        string   `json:"machine"`
+	SourceMachines []string `json:"source_machines,omitempty" doc:"Contributing hosted device machine IDs; omitted for sessions without hosted provenance."`
+	DisplayName    *string  `json:"display_name"`
+	Location       string   `json:"location" doc:"Where the match occurred: message, thinking, tool_input, or tool_result."`
+	Role           string   `json:"role"`
+	ToolName       string   `json:"tool_name,omitempty"`
+	Ordinal        int      `json:"ordinal"`
+	Timestamp      string   `json:"timestamp"`
+	Snippet        string   `json:"snippet"`
 	// Score is the searcher's relevance score for "semantic"/"hybrid" modes,
 	// nil for the other modes which have no comparable ranking signal.
 	Score *float64 `json:"score,omitempty"`
@@ -110,6 +127,23 @@ type ContentMatch struct {
 	// TranscriptRevision identifies the exact stored transcript observed by
 	// the storage query that produced this evidence. An empty value means the
 	// backend cannot provide revision-bound evidence for this result.
+	TranscriptRevision string `json:"transcript_revision,omitempty"`
+	// ConceptEvidence holds each requested concept's strongest match in this
+	// session, in request order. It is set only by multi-concept searches.
+	ConceptEvidence []ConceptEvidence `json:"concept_evidence,omitempty"`
+}
+
+// ConceptEvidence is one concept's strongest semantic match in a session
+// returned by a multi-concept search.
+type ConceptEvidence struct {
+	Concept      string  `json:"concept"`
+	Ordinal      int     `json:"ordinal"`
+	OrdinalRange [2]int  `json:"ordinal_range"`
+	Snippet      string  `json:"snippet"`
+	Score        float64 `json:"score"`
+	// TranscriptRevision is the revision this concept's search observed. Each
+	// concept is a separate query, so it can differ from the match's revision
+	// when the session changed between them.
 	TranscriptRevision string `json:"transcript_revision,omitempty"`
 }
 
@@ -276,9 +310,12 @@ func (db *DB) SearchContent(
 
 	if len(f.Sources) == 0 {
 		f.Sources = []string{"messages", "tool_input", "tool_result"}
+		if f.Mode == "" || f.Mode == "substring" || f.Mode == "regex" {
+			f.Sources = append(f.Sources, "thinking")
+		}
 	}
 	for _, s := range f.Sources {
-		if s != "messages" && s != "tool_input" && s != "tool_result" {
+		if s != "messages" && s != "thinking" && s != "tool_input" && s != "tool_result" {
 			return ContentSearchPage{}, searchInputErrorf("search: unknown source %q", s)
 		}
 	}
@@ -325,12 +362,12 @@ func (db *DB) searchContentSubstring(
 	// the Limit+1 returned rows ship a full body.
 	snippetExpr := func(col string) string { return col }
 
+	sysPred := "1=1"
+	if f.ExcludeSystem {
+		sysPred = "m.is_system = 0 AND " +
+			SystemPrefixSQL("m.content", "m.role")
+	}
 	if hasSource(f, "messages") {
-		sysPred := "1=1"
-		if f.ExcludeSystem {
-			sysPred = "m.is_system = 0 AND " +
-				SystemPrefixSQL("m.content", "m.role")
-		}
 		branches = append(branches, fmt.Sprintf(`
 			SELECT m.session_id, s.project, s.agent,
 				COALESCE(s.transcript_revision,'') AS transcript_revision,
@@ -339,10 +376,27 @@ func (db *DB) searchContentSubstring(
 				COALESCE(m.timestamp,'') AS ts, %s AS snippet,
 				COALESCE(s.ended_at, s.started_at, '') AS sort_ts,
 				0 AS src, m.id AS row_id
-			FROM messages m JOIN sessions s ON s.id = m.session_id
-			WHERE m.content LIKE ? ESCAPE '\' AND %s AND m.%s`,
-			snippetExpr("m.content"), sysPred, scope))
+			FROM messages m
+			JOIN sessions s ON s.id = m.session_id
+			WHERE %s LIKE ? ESCAPE '\' AND %s AND m.%s`,
+			snippetExpr("COALESCE(m.dialogue_text, m.content)"), "COALESCE(m.dialogue_text, m.content)",
+			sysPred, scope))
 		args = append(args, like)
+		args = append(args, scopeArgs...)
+	}
+	if hasSource(f, "thinking") {
+		branches = append(branches, fmt.Sprintf(`
+			SELECT m.session_id, s.project, s.agent,
+				COALESCE(s.transcript_revision,'') AS transcript_revision,
+				'thinking' AS location,
+				m.role AS role, '' AS tool_name, m.ordinal,
+				COALESCE(m.timestamp,'') AS ts, %s AS snippet,
+				COALESCE(s.ended_at, s.started_at, '') AS sort_ts,
+				4 AS src, m.id AS row_id
+			FROM messages m JOIN sessions s ON s.id = m.session_id
+			WHERE (%t OR m.dialogue_text IS NOT NULL OR m.content NOT LIKE ? ESCAPE '\') AND m.thinking_text LIKE ? ESCAPE '\' AND %s AND m.%s`,
+			snippetExpr("m.thinking_text"), !hasSource(f, "messages"), sysPred, scope))
+		args = append(args, like, like)
 		args = append(args, scopeArgs...)
 	}
 	if hasSource(f, "tool_input") {
@@ -413,24 +467,28 @@ func (db *DB) searchContentSubstring(
 	}
 
 	query := "SELECT session_id, project, agent, transcript_revision, location, role, tool_name, " +
-		"ordinal, ts, snippet FROM (" +
+		"ordinal, ts, snippet, '' FROM (" +
 		strings.Join(branches, " UNION ALL ") +
 		") ORDER BY julianday(sort_ts) DESC, session_id ASC, ordinal ASC, src ASC, row_id ASC " +
 		"LIMIT ? OFFSET ?"
 	args = append(args, f.Limit+1, f.Cursor)
 
-	return db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, f.substringSnippet)
+	return db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, func(body, _ string) string {
+		return f.substringSnippet(body)
+	})
 }
 
 // scanContentMatches runs query and assembles a ContentSearchPage, treating
 // the (Limit+1)-th row as the cursor sentinel. The body column is the full
 // source field; makeSnippet derives the (windowed, redacted) snippet from it
-// so redaction sees whole secrets rather than a pre-truncated window. The
-// returned page then gets its derived unit ranges and lineage assigned by
-// the shared deriveLexicalUnits pass (post-truncation, O(page)).
+// so redaction sees whole secrets rather than a pre-truncated window. A final
+// text column passes FTS per-term hits to makeSnippet; other queries select an
+// empty string for it. The returned page then gets its derived unit ranges and
+// lineage assigned by the shared deriveLexicalUnits pass (post-truncation,
+// O(page)).
 func (db *DB) scanContentMatches(
 	ctx context.Context, query string, args []any, limit, cursor int,
-	makeSnippet func(body string) string,
+	makeSnippet func(body, termHits string) string,
 ) (ContentSearchPage, error) {
 	rows, err := db.getReader().QueryContext(ctx, query, args...)
 	if err != nil {
@@ -440,14 +498,14 @@ func (db *DB) scanContentMatches(
 	out := make([]ContentMatch, 0)
 	for rows.Next() {
 		var m ContentMatch
-		var body string
+		var body, termHits string
 		if err := rows.Scan(&m.SessionID, &m.Project, &m.Agent,
 			&m.TranscriptRevision,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
-			&m.Timestamp, &body); err != nil {
+			&m.Timestamp, &body, &termHits); err != nil {
 			return ContentSearchPage{}, fmt.Errorf("scan match: %w", err)
 		}
-		m.Snippet = makeSnippet(body)
+		m.Snippet = makeSnippet(body, termHits)
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -505,6 +563,23 @@ func (db *DB) searchContentTerms(
 		func() string { return timestamp })
 }
 
+// LegacyThinkingDedupe suppresses legacy thinking already matched as a message.
+// Feed confirmed matches in message-before-thinking order, before paging.
+// The zero value is ready to use.
+type LegacyThinkingDedupe struct {
+	lastMessage MessageRef
+}
+
+// Suppress records message matches and reports whether m is legacy thinking
+// for the most recent message match.
+func (d *LegacyThinkingDedupe) Suppress(m ContentMatch, legacyThinking bool) bool {
+	ref := MessageRef{SessionID: m.SessionID, Ordinal: m.Ordinal}
+	if m.Location == "message" {
+		d.lastMessage = ref
+	}
+	return m.Location == "thinking" && legacyThinking && d.lastMessage == ref
+}
+
 // searchContentRegex compiles the pattern, narrows candidate rows with a
 // LIKE prefilter on any required literal substring (full scan when none),
 // streams candidates, and keeps RE2 matches. Snippets are built in Go.
@@ -522,8 +597,8 @@ func (db *DB) searchContentRegex(
 		}
 		defer release()
 	}
-	lit := LiteralPrefix(f.Pattern)
 
+	lit := LiteralPrefix(f.Pattern)
 	rows, err := db.regexCandidateRows(ctx, f, lit)
 	if err != nil {
 		return ContentSearchPage{}, err
@@ -531,6 +606,7 @@ func (db *DB) searchContentRegex(
 	defer rows.Close()
 
 	out := make([]ContentMatch, 0)
+	var dedupe LegacyThinkingDedupe
 	// Regex paging has no SQL OFFSET: each page re-fetches and re-matches
 	// candidates from the start, discarding the first f.Cursor confirmed
 	// matches. Ordering is deterministic so paging stays correct; deep pages
@@ -539,14 +615,21 @@ func (db *DB) searchContentRegex(
 	for rows.Next() {
 		var m ContentMatch
 		var body string
+		var rowID int64
+		var legacyThinking bool
 		if err := rows.Scan(&m.SessionID, &m.Project, &m.Agent,
 			&m.TranscriptRevision,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
-			&m.Timestamp, &body); err != nil {
+			&m.Timestamp, &body, &rowID, &legacyThinking); err != nil {
 			return ContentSearchPage{}, fmt.Errorf("scan candidate: %w", err)
 		}
 		loc := re.FindStringIndex(body)
 		if loc == nil {
+			continue
+		}
+		// Message candidates sort before thinking for the same row. Record
+		// matches before cursor filtering so later pages dedupe them too.
+		if dedupe.Suppress(m, legacyThinking) {
 			continue
 		}
 		if seen < f.Cursor {
@@ -579,7 +662,8 @@ func (db *DB) searchContentRegex(
 // regexCandidateRows returns full-body rows for the selected sources,
 // LIKE-prefiltered by lit when non-empty, ordered for stable paging.
 // Each branch selects: session_id, project, agent, transcript_revision,
-// location, role, tool_name, ordinal, ts AS ts, body, sort_ts, src, row_id.
+// location, role, tool_name, ordinal, ts AS ts, body, sort_ts, src, row_id,
+// legacy_thinking.
 func (db *DB) regexCandidateRows(
 	ctx context.Context, f ContentSearchFilter, lit string,
 ) (*sql.Rows, error) {
@@ -597,13 +681,13 @@ func (db *DB) regexCandidateRows(
 		return col + " LIKE ? ESCAPE '\\'"
 	}
 
+	sysPred := "1=1"
+	if f.ExcludeSystem {
+		sysPred = "m.is_system = 0 AND " +
+			SystemPrefixSQL("m.content", "m.role")
+	}
 	if hasSource(f, "messages") {
-		sysPred := "1=1"
-		if f.ExcludeSystem {
-			sysPred = "m.is_system = 0 AND " +
-				SystemPrefixSQL("m.content", "m.role")
-		}
-		w := prefilterClause("m.content")
+		w := prefilterClause("COALESCE(m.dialogue_text, m.content)")
 		branches = append(branches, fmt.Sprintf(`
 			SELECT m.session_id AS session_id, s.project AS project,
 				s.agent AS agent,
@@ -611,11 +695,29 @@ func (db *DB) regexCandidateRows(
 				'message' AS location,
 				m.role AS role, '' AS tool_name,
 				m.ordinal AS ordinal, COALESCE(m.timestamp,'') AS ts,
-				m.content AS body,
+				%s AS body,
 				COALESCE(s.ended_at, s.started_at, '') AS sort_ts,
-				0 AS src, m.id AS row_id
+				0 AS src, m.id AS row_id, 0 AS legacy_thinking
+			FROM messages m
+			JOIN sessions s ON s.id = m.session_id
+			WHERE %s AND %s AND m.%s`,
+			"COALESCE(m.dialogue_text, m.content)", w, sysPred, scope))
+		args = append(args, scopeArgs...)
+	}
+	if hasSource(f, "thinking") {
+		w := prefilterClause("m.thinking_text")
+		branches = append(branches, fmt.Sprintf(`
+			SELECT m.session_id AS session_id, s.project AS project,
+				s.agent AS agent,
+				COALESCE(s.transcript_revision,'') AS transcript_revision,
+				'thinking' AS location,
+				m.role AS role, '' AS tool_name,
+				m.ordinal AS ordinal, COALESCE(m.timestamp,'') AS ts,
+				m.thinking_text AS body,
+				COALESCE(s.ended_at, s.started_at, '') AS sort_ts,
+				4 AS src, m.id AS row_id, m.dialogue_text IS NULL AS legacy_thinking
 			FROM messages m JOIN sessions s ON s.id = m.session_id
-			WHERE %s AND %s AND m.%s`, w, sysPred, scope))
+			WHERE %s AND m.thinking_text <> '' AND %s AND m.%s`, w, sysPred, scope))
 		args = append(args, scopeArgs...)
 	}
 	if hasSource(f, "tool_input") {
@@ -629,7 +731,7 @@ func (db *DB) regexCandidateRows(
 				mm.ordinal AS ordinal, COALESCE(mm.timestamp,'') AS ts,
 				tc.input_json AS body,
 				COALESCE(s.ended_at, s.started_at, '') AS sort_ts,
-				1 AS src, tc.id AS row_id
+				1 AS src, tc.id AS row_id, 0 AS legacy_thinking
 			FROM tool_calls tc JOIN messages mm ON mm.id = tc.message_id
 			JOIN sessions s ON s.id = tc.session_id
 			WHERE %s AND tc.%s`, w, scope))
@@ -646,7 +748,7 @@ func (db *DB) regexCandidateRows(
 				mm.ordinal AS ordinal, COALESCE(mm.timestamp,'') AS ts,
 				tc.result_content AS body,
 				COALESCE(s.ended_at, s.started_at, '') AS sort_ts,
-				2 AS src, tc.id AS row_id
+				2 AS src, tc.id AS row_id, 0 AS legacy_thinking
 			FROM tool_calls tc JOIN messages mm ON mm.id = tc.message_id
 			JOIN sessions s ON s.id = tc.session_id
 			WHERE %s AND NOT EXISTS (SELECT 1 FROM tool_result_events tre
@@ -665,7 +767,7 @@ func (db *DB) regexCandidateRows(
 				COALESCE(tre.timestamp,'') AS ts,
 				tre.content AS body,
 				COALESCE(s.ended_at, s.started_at, '') AS sort_ts,
-				3 AS src, tre.id AS row_id
+				3 AS src, tre.id AS row_id, 0 AS legacy_thinking
 			FROM tool_result_events tre JOIN sessions s ON s.id = tre.session_id
 			WHERE %s AND tre.%s`, wEv, scope))
 		args = append(args, scopeArgs...)
@@ -674,13 +776,14 @@ func (db *DB) regexCandidateRows(
 		// Return an empty result set.
 		q := "SELECT '' AS session_id, '' AS project, '' AS agent, " +
 			"'' AS transcript_revision, '' AS location, " +
-			"'' AS role, '' AS tool_name, 0 AS ordinal, '' AS ts, '' AS body " +
+			"'' AS role, '' AS tool_name, 0 AS ordinal, '' AS ts, '' AS body, " +
+			"0 AS row_id, 0 AS legacy_thinking " +
 			"WHERE 0"
 		return db.getReader().QueryContext(ctx, q)
 	}
 
 	query := "SELECT session_id, project, agent, transcript_revision, location, role, tool_name, " +
-		"ordinal, ts, body FROM (" +
+		"ordinal, ts, body, row_id, legacy_thinking FROM (" +
 		strings.Join(branches, " UNION ALL ") +
 		") ORDER BY julianday(sort_ts) DESC, session_id ASC, ordinal ASC, src ASC, row_id ASC"
 	return db.getReader().QueryContext(ctx, query, args...)
@@ -837,23 +940,39 @@ func (db *DB) searchContentFTS(
 	if f.ExcludeSystem {
 		sysPred = "m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
 	}
+	// A row can match OR and NOT queries without every operand, so ask SQLite
+	// which operands this row matched. Snippets then follow a branch the row
+	// actually satisfied. Unquoted input never carries these operators. Syntax
+	// the parser does not model keeps the substring-based centering.
+	termHits, args := "''", []any{}
+	expr, _ := ParseFTSExpression(f.Pattern)
+	if expr != nil && expr.hasOrNot() && expr.sqliteProbeable() {
+		termHits, args = sqliteFTSTermHitsSQL(expr)
+	} else {
+		expr = nil
+	}
 	// Select the full content (not FTS snippet()) so the snippet is built in Go
 	// and secret redaction sees whole secrets rather than a pre-truncated window.
 	query := fmt.Sprintf(`
 		SELECT m.session_id, s.project, s.agent,
 			COALESCE(s.transcript_revision,''), 'message', m.role, '',
-			m.ordinal, COALESCE(m.timestamp,'') AS ts, m.content AS snippet
+			m.ordinal, COALESCE(m.timestamp,'') AS ts, COALESCE(m.dialogue_text, m.content) AS snippet,
+			%s AS term_hits
 		FROM messages_fts
 		JOIN messages m ON m.id = messages_fts.rowid
 		JOIN sessions s ON s.id = m.session_id
-		WHERE messages_fts MATCH ? AND %s AND m.%s
+		WHERE messages_fts.content MATCH ? AND %s AND m.%s
 		ORDER BY rank ASC, m.ordinal ASC, m.id ASC
-		LIMIT ? OFFSET ?`, sysPred, scope)
+		LIMIT ? OFFSET ?`, termHits, sysPred, scope)
 	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
-	args := []any{ftsQuery.match}
+	args = append(args, ftsQuery.match)
 	args = append(args, scopeArgs...)
 	args = append(args, f.Limit+1, f.Cursor)
-	page, err := db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, func(body string) string {
+	page, err := db.scanContentMatches(ctx, query, args, f.Limit, f.Cursor, func(body, hits string) string {
+		if expr != nil {
+			start, end := sqliteFTSSnippetRange(f.Pattern, body, expr, hits)
+			return f.BuildSnippet(body, start, end)
+		}
 		return f.ftsSnippet(body, ftsQuery.snippetTerm)
 	})
 	if err != nil {
@@ -878,29 +997,155 @@ func (f ContentSearchFilter) ftsSnippet(body, segmentedTerm string) string {
 }
 
 // FTSSnippetRange returns the byte range around which FTS-like snippets should
-// be centered. It first tries the de-quoted raw phrase, then falls back to the
-// first parsed prepared-FTS term, and finally to the start of the body.
+// be centered. It first tries the de-quoted raw phrase, then a positive operand
+// through which the parsed Boolean query holds when each operand is matched as
+// a case-insensitive substring, so `"alpha" OR "beta"` centers on beta when
+// only beta is present. Operator words and NOT operands never count as matches.
+// When the engine's match disagrees with this substring evaluation, it falls
+// back to the first positive operand, or its first word, found in body. A query
+// that does not parse falls back to its first term. Failing all of these, it
+// returns the start of the body.
 func FTSSnippetRange(pattern, body string) (int, int) {
-	if phrase := strings.Trim(pattern, "\""); phrase != "" {
-		if start, end, ok := CaseInsensitiveSpan(body, phrase); ok {
-			return start, end
-		}
+	if start, end, ok := ftsPhraseSpan(pattern, body); ok {
+		return start, end
 	}
-	for _, term := range FTSTerms(PrepareFTSQuery(pattern)) {
-		if term == "" {
-			continue
-		}
-		if start, end, ok := CaseInsensitiveSpan(body, term); ok {
-			return start, end
-		}
-		if fields := strings.Fields(term); len(fields) > 0 && fields[0] != term {
-			if start, end, ok := CaseInsensitiveSpan(body, fields[0]); ok {
+	expr, err := ParseFTSExpression(pattern)
+	if err != nil {
+		if terms := FTSTerms(PrepareFTSQuery(pattern)); len(terms) > 0 {
+			if start, end, ok := ftsTermSpan(body, terms[0]); ok {
 				return start, end
 			}
 		}
-		break
+		return 0, 0
 	}
-	return 0, 0
+	if expr == nil {
+		return 0, 0
+	}
+	matched := expr.matchedTerms(func(t *FTSExpr) bool {
+		_, _, ok := CaseInsensitiveSpan(body, t.Term)
+		return ok
+	})
+	if start, end, ok := firstFTSTermSpan(body, matched); ok {
+		return start, end
+	}
+	start, end, _ := firstFTSTermSpan(body, expr.positiveTerms())
+	return start, end
+}
+
+// sqliteFTSSnippetRange centers a snippet like FTSSnippetRange, but takes each
+// operand's match from SQLite. hits holds '1' or '0' for each of expr's terms
+// in query order. SQLite matches stemmed tokens, so `"foo bar"` matches
+// "foo-bar" and "run" matches "running"; substring evaluation would then
+// follow a branch the row did not match.
+func sqliteFTSSnippetRange(pattern, body string, expr *FTSExpr, hits string) (int, int) {
+	if start, end, ok := ftsPhraseSpan(pattern, body); ok {
+		return start, end
+	}
+	held := make(map[*FTSExpr]bool)
+	for i, t := range expr.terms() {
+		held[t] = i < len(hits) && hits[i] == '1'
+	}
+	matched := expr.matchedTerms(func(t *FTSExpr) bool { return held[t] })
+	start, end, _ := firstFTSTermSpan(body, matched)
+	return start, end
+}
+
+// sqliteFTSTermHitsSQL returns a SQL expression that yields one '1' or '0'
+// per term of expr, in query order, reporting whether the indexed content of
+// the row m.id matches that term's source text alone. It is meant for the
+// messages_fts query, whose table name the caller substitutes.
+func sqliteFTSTermHitsSQL(expr *FTSExpr) (string, []any) {
+	var parts []string
+	var args []any
+	for _, t := range expr.terms() {
+		parts = append(parts, "EXISTS (SELECT 1 FROM messages_fts AS term_fts "+
+			"WHERE term_fts.content MATCH ? AND term_fts.rowid = m.id)")
+		args = append(args, t.Raw)
+	}
+	return strings.Join(parts, " || "), args
+}
+
+// ftsPhraseSpan locates the de-quoted raw pattern in body.
+func ftsPhraseSpan(pattern, body string) (int, int, bool) {
+	if phrase := strings.Trim(pattern, "\""); phrase != "" {
+		return CaseInsensitiveSpan(body, phrase)
+	}
+	return 0, 0, false
+}
+
+// firstFTSTermSpan returns the span of the first of terms that ftsTermSpan
+// locates in body. Only when none is found does it try each term without
+// trailing '*' markers, which SQLite reads as a prefix marker, or as
+// punctuation inside quotes.
+func firstFTSTermSpan(body string, terms []*FTSExpr) (int, int, bool) {
+	for _, t := range terms {
+		if start, end, ok := ftsTermSpan(body, t.Term); ok {
+			return start, end, true
+		}
+	}
+	for _, t := range terms {
+		stem := strings.TrimRight(t.Term, "*")
+		if stem == t.Term {
+			continue
+		}
+		for _, word := range []string{stem, firstField(stem)} {
+			if start, end, ok := ftsTokenStartSpan(body, word); ok {
+				return start, end, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// ftsTermSpan locates term in body, falling back to its first word so a phrase
+// the engine matched across punctuation still centers near the match.
+func ftsTermSpan(body, term string) (int, int, bool) {
+	if start, end, ok := CaseInsensitiveSpan(body, term); ok {
+		return start, end, true
+	}
+	if word := firstField(term); word != "" && word != term {
+		return CaseInsensitiveSpan(body, word)
+	}
+	return 0, 0, false
+}
+
+// ftsTokenStartSpan locates word where it starts a token in body, preferring
+// an occurrence that is a whole token. SQLite matches tokens, so an occurrence
+// inside a longer word is never the match.
+func ftsTokenStartSpan(body, word string) (int, int, bool) {
+	if strings.TrimSpace(word) == "" {
+		return 0, 0, false
+	}
+	isWord := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+	found, foundStart, foundEnd := false, 0, 0
+	for off := 0; off < len(body); {
+		start, end, ok := CaseInsensitiveSpan(body[off:], word)
+		if !ok {
+			break
+		}
+		start, end = start+off, end+off
+		before, _ := utf8.DecodeLastRuneInString(body[:start])
+		after, _ := utf8.DecodeRuneInString(body[end:])
+		if start == 0 || !isWord(before) {
+			if end == len(body) || !isWord(after) {
+				return start, end, true
+			}
+			if !found {
+				found, foundStart, foundEnd = true, start, end
+			}
+		}
+		_, size := utf8.DecodeRuneInString(body[start:])
+		off = start + size
+	}
+	return foundStart, foundEnd, found
+}
+
+// firstField returns the first whitespace-separated word of s, or "".
+func firstField(s string) string {
+	if fields := strings.Fields(s); len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
 }
 
 // classifyFTSError maps a malformed FTS query into a SearchInputError so HTTP
@@ -926,7 +1171,8 @@ func classifyFTSError(err error) error {
 const SemanticOverfetchMin = 200
 
 // maxActivityExpansionCandidates caps the candidate count when an activity
-// cutoff makes SelectSurvivingVectorHits double its fetch. Starting from
+// cutoff or ContentSearchFilter.Candidates makes SelectSurvivingVectorHits
+// double its fetch. Starting from
 // SemanticOverfetchMin, the cap allows at most six fetches. It equals
 // sqlite-vec's KNN ceiling, and it also bounds the KNN and hydration work
 // that PostgreSQL and ClickHouse would otherwise do for large limits.
@@ -935,7 +1181,9 @@ const maxActivityExpansionCandidates = 4096
 // SelectSurvivingVectorHits returns the ranked vector hits that pass the
 // filter's session scope. When an activity cutoff rejects hits and leaves
 // fewer than f.Limit units, it fetches again with twice the candidates, until
-// the engine is exhausted or the candidate cap is reached. allowedSessions
+// the engine is exhausted or the candidate cap is reached. When
+// f.Candidates is set it expands the same way whenever fewer than f.Limit
+// units survive, and records whether the engine was exhausted. allowedSessions
 // returns an entry for each otherwise eligible session; false marks a
 // session that the activity cutoff rejects.
 func SelectSurvivingVectorHits(
@@ -963,8 +1211,12 @@ func SelectSurvivingVectorHits(
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if f.Candidates != nil {
+			f.Candidates.Exhausted = exhausted
+		}
 		next := clampRecallVectorCandidates(k*2, ceiling)
-		if !activityRejected || units >= f.Limit || exhausted || next <= k {
+		expand := activityRejected || f.Candidates != nil
+		if !expand || units >= f.Limit || exhausted || next <= k {
 			return surviving, nil
 		}
 		k = next
@@ -1376,7 +1628,7 @@ func (db *DB) fetchHybridFTSBatch(
 		SELECT m.session_id, m.ordinal,
 		       snippet(messages_fts, 0, '', '', '...', 32) AS snip
 		FROM messages_fts f JOIN messages m ON m.id = f.rowid
-		WHERE messages_fts MATCH ? AND m.role IN ('user','assistant')
+		WHERE f.content MATCH ? AND m.role IN ('user','assistant')
 		  AND m.is_system = 0 AND %s
 		  AND m.%s
 		ORDER BY f.rank, m.id LIMIT ? OFFSET ?`,
@@ -1402,7 +1654,7 @@ func (db *DB) fetchHybridFTSBatch(
 		hits = append(hits, hit)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, classifyFTSError(err)
 	}
 	return hits, nil
 }
@@ -1470,11 +1722,10 @@ func (db *DB) appendHybridFTSHits(
 // fused-score order. When the FTS leg contributed to a unit, its display
 // wins: the match anchors on the FTS-matched message's ordinal and centers
 // on the FTS snippet (the vector leg's chunk anchor may be a different run
-// member). Either way the returned snippet itself is built (and redacted)
-// from the anchor message's full content via SemanticSnippet, the same
-// guarantee mode "semantic" gives. Unit-less FTS rows arrive with their
-// derived range and subordinate flag already assigned pre-merge
-// (classifyUnitlessHybridHits), so no derivation runs here.
+// member). SemanticSnippet redacts the full dialogue projection for FTS hits
+// and the full content for vector-only hits before cutting a window.
+// Unit-less FTS rows already have their range and subordinate flag from
+// classifyUnitlessHybridHits, so no derivation runs here.
 func (db *DB) enrichHybridMatches(
 	ctx context.Context, f ContentSearchFilter, merged []FusedUnit,
 	vecDisplay, ftsDisplay map[string]hybridDisplay,
@@ -1501,6 +1752,10 @@ func (db *DB) enrichHybridMatches(
 		if !ok {
 			continue
 		}
+		content := info.content
+		if _, fromFTS := ftsDisplay[m.Unit.Key]; fromFTS {
+			content = info.dialogueContent
+		}
 		score := m.Score
 		out = append(out, ContentMatch{
 			SessionID:          d.sessionID,
@@ -1518,7 +1773,7 @@ func (db *DB) enrichHybridMatches(
 			ParentSessionID:    info.parentSessionID,
 			Sidechain:          info.isSidechain,
 			Timestamp:          info.timestamp,
-			Snippet:            f.SemanticSnippet(info.content, d.snippet),
+			Snippet:            f.SemanticSnippet(content, d.snippet),
 			Score:              &score,
 		})
 	}
@@ -1609,9 +1864,9 @@ type semanticHitKey struct {
 }
 
 // semanticHitInfo is the session/message metadata enrichSemanticHits attaches
-// to a surviving hit. content is the message's full, un-truncated content:
-// semantic/hybrid snippets are built from it (see SemanticSnippet) rather
-// than from the searcher's pre-truncated chunk/snippet text, so secret
+// to a surviving hit. content is the message's full, un-truncated content;
+// dialogueContent is its full dialogue projection for FTS-contributed hits.
+// Snippets use these bodies rather than pre-truncated searcher text, so secret
 // redaction sees the same whole-body context the substring/regex/fts paths
 // give it instead of a fragment that can split a secret at the truncation
 // boundary. relationshipType, parentSessionID, and isSidechain carry the
@@ -1619,6 +1874,7 @@ type semanticHitKey struct {
 // store lineage per hit); isSidechain is the ANCHOR ordinal's message flag.
 type semanticHitInfo struct {
 	project, agent, role, timestamp, content string
+	dialogueContent                          string
 	machine                                  string
 	displayName                              *string
 	transcriptRevision                       string
@@ -1655,7 +1911,7 @@ func (db *DB) enrichSemanticHits(
 			query := "WITH hits(session_id, ordinal) AS (VALUES " +
 				strings.Join(values, ", ") + ") " +
 				"SELECT m.session_id, s.project, s.agent, s.machine, COALESCE(s.display_name, s.session_name), m.role, m.ordinal, " +
-				"COALESCE(m.timestamp, ''), m.content, " +
+				"COALESCE(m.timestamp, ''), m.content, COALESCE(m.dialogue_text, m.content), " +
 				"COALESCE(s.transcript_revision, ''), " +
 				"COALESCE(s.relationship_type, ''), " +
 				"COALESCE(s.parent_session_id, ''), m.is_sidechain " +
@@ -1672,7 +1928,7 @@ func (db *DB) enrichSemanticHits(
 				var key semanticHitKey
 				var info semanticHitInfo
 				if err := rows.Scan(&key.sessionID, &info.project, &info.agent, &info.machine, &info.displayName,
-					&info.role, &key.ordinal, &info.timestamp, &info.content,
+					&info.role, &key.ordinal, &info.timestamp, &info.content, &info.dialogueContent,
 					&info.transcriptRevision,
 					&info.relationshipType, &info.parentSessionID,
 					&info.isSidechain); err != nil {
@@ -1731,9 +1987,9 @@ func approxSnippetSpan(content, approx string) (start, end int, ok bool) {
 }
 
 // SemanticSnippet builds the returned snippet for "semantic" and "hybrid"
-// matches from the message's full content, not from the searcher's
-// pre-truncated approx (chunk or FTS snippet() text): redaction
-// (BuildSnippet -> secrets.RedactWindow) must see the whole message so a
+// matches from the full message body, using its dialogue projection for FTS
+// hits. The searcher's pre-truncated approx only locates the window:
+// redaction (BuildSnippet -> secrets.RedactWindow) must see the whole body so a
 // secret straddling approx's truncation boundary cannot leak a fragment that
 // full-content redaction would otherwise catch. approx is used only to
 // center the window; when it cannot be located in content, FTSSnippetRange

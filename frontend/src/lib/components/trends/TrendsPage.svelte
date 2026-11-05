@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { m } from "../../i18n/index.js";
   import { onMount } from "svelte";
   import { trends } from "../../stores/trends.svelte.js";
@@ -12,7 +13,8 @@
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
   import { rollingRange } from "../../utils/dates.js";
-  import { chartSeriesColorMap } from "../../utils/chartPalette.js";
+  import type { SeriesStyle } from "@kenn-io/kit-ui/utils/palette";
+  import { chartSeriesStyleMap } from "../../utils/chartPalette.js";
   import type { TrendsGranularity } from "../../api/types.js";
   import { ChartColumnIcon, ChevronDownIcon } from "../../icons.js";
   import { Spinner, Toggle } from "@kenn-io/kit-ui";
@@ -68,15 +70,19 @@
     if (e.key === "Escape") groupByOpen = false;
   }
 
-  const termColorMap = $derived(chartSeriesColorMap(
+  const termStyleMap = $derived(chartSeriesStyleMap(
     (trends.response?.series ?? []).map((item) => item.term),
     settings.chartPalette,
-    (_term, index) => TREND_PALETTE[index % TREND_PALETTE.length]!,
+    TREND_PALETTE,
   ));
 
-  function colorFor(term: string, index: number): string {
-    return termColorMap.get(term) ??
-      TREND_PALETTE[index % TREND_PALETTE.length]!;
+  function styleFor(term: string, index: number): SeriesStyle {
+    return termStyleMap.get(term) ?? {
+      color: TREND_PALETTE[index % TREND_PALETTE.length]!,
+      fill: "solid",
+      dash: "solid",
+      marker: "circle",
+    };
   }
 
   function isGranularity(value: string | null): value is TrendsGranularity {
@@ -295,7 +301,7 @@
         spellcheck="false"
       ></textarea>
       {#if trends.errors.terms}
-        <div class="error">{trends.errors.terms}</div>
+        <div class="error" {@attach errorTelemetry("analytics")}>{trends.errors.terms}</div>
       {/if}
     </div>
 
@@ -345,7 +351,7 @@
       <TrendsLineChart
         buckets={trends.response?.buckets ?? []}
         series={trends.response?.series ?? []}
-        {colorFor}
+        {styleFor}
         {activeTerm}
         normalized={trends.normalized}
         onHover={(term) => (activeTerm = term)}
@@ -361,7 +367,7 @@
     <div class="table-panel">
       <TermTable
         series={trends.response?.series ?? []}
-        {colorFor}
+        {styleFor}
         {activeTerm}
         normalized={trends.normalized}
         messageCount={trends.response?.message_count ?? 0}

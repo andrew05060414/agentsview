@@ -68,12 +68,7 @@ describe("session search scope", () => {
     const thinkingPlusTool = message(2, "[Thinking]\nneedle\n[/Thinking]", {
       has_thinking: true,
       has_tool_use: true,
-      tool_calls: [
-        {
-          category: "",
-          tool_name: "Bash",
-        },
-      ],
+      tool_calls: [{ call_index: 0, category: "", tool_name: "Bash" }],
     });
     const legacyTool = message(3, "[Bash]\necho needle", { has_tool_use: true });
     const result = scope(
@@ -85,6 +80,22 @@ describe("session search scope", () => {
     expect(result.allowsBlock(thinkingPlusTool, "tool-output")).toBe(false);
     expect(result.messages).not.toContain(legacyTool);
     expect(result.allowsBlock(legacyTool, "tool-input")).toBe(false);
+  });
+
+  it("keeps empty messages whose role is shown when another block type is hidden", () => {
+    const emptyAnswer = message(4, "");
+    const emptyPrompt = message(5, "", { role: "user" });
+    const kept = scope([emptyAnswer, emptyPrompt], filtered(["user", "assistant", "tool"]));
+    expect(kept.items.map((item) => [item.kind, item.ordinals])).toEqual([["empty-group", [4, 5]]]);
+
+    const userOnly = scope([emptyAnswer, emptyPrompt], filtered(["user"]));
+    expect(userOnly.items.map((item) => [item.kind, item.ordinals])).toEqual([
+      ["empty-group", [5]],
+    ]);
+    expect(userOnly.messages).toEqual([emptyPrompt]);
+
+    const neither = scope([emptyAnswer, emptyPrompt], filtered(["thinking"]));
+    expect(neither.items).toEqual([]);
   });
 
   it("maps text and skill blocks to the message role filter", () => {

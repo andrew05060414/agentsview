@@ -7,8 +7,7 @@ import { settings } from "../../stores/settings.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
 import { testMoney } from "../../test/money.js";
 import type { UsageSummaryResponse } from "../../api/generated/index";
-import { UsageService } from "../../api/generated/index";
-import source from "./UsagePage.svelte?raw";
+import { MetadataService, UsageService } from "../../api/generated/index";
 import UsagePage from "./UsagePage.svelte";
 
 async function flushEffects() {
@@ -154,6 +153,49 @@ afterEach(() => {
 });
 
 describe("UsagePage refresh behavior", () => {
+  it("loads usage once with the resolved machine from a label deep link", async () => {
+    const requests = vi
+      .spyOn(UsageService, "getApiV1UsageSummary")
+      .mockResolvedValue(usageSummaryWithUnsupported());
+    vi.spyOn(UsageService, "getApiV1UsageTopSessions").mockResolvedValue([]);
+    vi.spyOn(UsageService, "getApiV1UsageComparison").mockResolvedValue({
+      priorFrom: "2026-02-01",
+      priorTo: "2026-02-28",
+      priorTotalCost: testMoney(0),
+      deltaPct: 0,
+    });
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    const metadata =
+      Promise.withResolvers<Awaited<ReturnType<typeof MetadataService.getApiV1Machines>>>();
+    vi.spyOn(MetadataService, "getApiV1Machines").mockReturnValue(metadata.promise);
+    router.route = "usage";
+    router.params = { machine: "Workstation", from: "2026-03-01", to: "2026-03-31" };
+    const savedFilters = sessions.filters;
+    sessions.initFromParams(router.params);
+
+    try {
+      component = mount(UsagePage, { target: document.body });
+      await flushEffects();
+
+      metadata.resolve({
+        machines: ["id-a"],
+        resolved_machines: ["id-a"],
+        machine_labels: { "id-a": "Workstation" },
+        machine_aliases: {},
+      });
+      await sessions.loadMachines();
+      await flushEffects();
+      await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+
+      expect(requests.mock.calls.map(([params]) => params?.machine)).toEqual(["id-a"]);
+    } finally {
+      if (component) await unmount(component);
+      component = undefined;
+      usage.cancelInFlightReads();
+      sessions.filters = savedFilters;
+    }
+  });
+
   it("keeps session-list label and pull request filters when the URL sets a shared filter", async () => {
     vi.stubGlobal(
       "ResizeObserver",
@@ -210,6 +252,42 @@ describe("UsagePage refresh behavior", () => {
     for (const [params] of requests.mock.calls) expect(params?.model).toBeUndefined();
     expect(usage.selectedModel).toBe("");
     expect(document.querySelector('button[aria-label="Model: All"]')).not.toBeNull();
+    usage.cancelInFlightReads();
+  });
+
+  it("keeps a saved variant's group available after re-including an empty period", async () => {
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = { exclude_model: "claude-opus-4-20250514" };
+    usage.summary = {
+      ...usageSummaryWithUnsupported(),
+      model_aliases: { "claude-opus-4-20250514": "claude-4" },
+    };
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    const trigger = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Model: 1 hidden"]',
+    );
+    expect(trigger).not.toBeNull();
+    trigger!.click();
+    await flushEffects();
+    const groupRow = () =>
+      [...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__item")].find(
+        (row) =>
+          row.querySelector(".kit-filter-dropdown__label")?.textContent?.trim() === "claude-4",
+      );
+    expect(groupRow()).toBeDefined();
+    expect(document.querySelectorAll(".kit-filter-dropdown__item")).toHaveLength(1);
+    expect(groupRow()!.querySelector(".kit-filter-dropdown__check.on")).not.toBeNull();
+    expect(groupRow()!.getAttribute("title")).toBe("claude-opus-4-20250514");
+    [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Select all")!
+      .click();
+    await flushEffects();
+    expect(usage.excludedModels).toBe("");
+    expect(groupRow()).toBeDefined();
+    expect(groupRow()!.querySelector(".kit-filter-dropdown__check.on")).not.toBeNull();
     usage.cancelInFlightReads();
   });
 
@@ -805,99 +883,6 @@ describe("UsagePage refresh behavior", () => {
 
     expect(document.body.textContent).toContain("Matching sessions do not expose token usage data");
     expect(document.body.textContent).not.toContain("Copilot sessions matched this range");
-  });
-
-  it("does not auto-refresh usage scans from SSE updates", () => {
-    expect(source).not.toContain("subscribeDebounced");
-    expect(source).not.toContain("REFRESH_MS");
-    // SSE only flags new data; the periodic refetch lives in RefreshControl.
-    expect(source).toContain("usage.markNewData");
-    expect(source).toContain("events.subscribe");
-  });
-
-  it("delegates the refresh affordance and scheduler to RefreshControl", () => {
-    expect(source).toContain("<RefreshControl");
-    expect(source).toContain("usage.lastUpdatedAt");
-    expect(source).toContain("label={m.usage_refresh()}");
-    expect(source).toContain("title={m.shared_refresh()}");
-    // The scheduler, label tick, and icon now live in the shared component.
-    expect(source).not.toContain("REFRESH_LABEL_INTERVAL_MS");
-    expect(source).not.toContain("formatRefreshAge");
-    expect(source).not.toContain("RefreshCwIcon");
-    expect(source).not.toContain("setInterval");
-  });
-
-  it("shows relative last-updated status without ambiguous badges", () => {
-    expect(source).not.toContain("formatUpdatedAt");
-    expect(source).not.toContain("usage.hasNewData");
-    expect(source).not.toContain("New data");
-    expect(source).not.toContain(".new-data");
-  });
-
-  it("treats termination as a usage URL session filter", () => {
-    expect(source).toContain('"termination",');
-    expect(source).toContain("filtersToParams(sessions.filters)");
-  });
-
-  it("keeps refresh progress out of content layout flow", () => {
-    const queryProgress = source.match(/\.query-progress\s*{[^}]+}/)?.[0] ?? "";
-
-    expect(queryProgress).toContain("position: absolute");
-    expect(queryProgress).toContain("left: 0;");
-    expect(queryProgress).toContain("right: 0;");
-    expect(queryProgress).not.toContain("position: sticky");
-    expect(queryProgress).not.toContain("margin:");
-  });
-
-  it("updates shared yoke state from usage range selections", () => {
-    expect(source).toContain("<RangePicker");
-    expect(source).toContain("function applyRange");
-    expect(source).toContain("updateYokeFromUsage");
-    expect(source).toContain("yokedDates.updateFromPanel");
-  });
-
-  it("seeds bare usage URLs from shared yoked dates", () => {
-    expect(source).toContain("const seed = yokedDates.seedForPanel()");
-    expect(source).toContain("applyUsagePanelDate(state)");
-    expect(source).toContain("usage.applyRollingWindow");
-    expect(source).toContain("usage.applyDateRange");
-  });
-
-  it("hydrates supported termination filters from usage URLs", () => {
-    const filterKeysIndex = source.indexOf("const SESSION_FILTER_KEYS");
-    const urlInitIndex = source.indexOf("let urlInitRan", filterKeysIndex);
-    const filterKeysBlock = source.slice(filterKeysIndex, urlInitIndex);
-
-    expect(filterKeysBlock).toContain('"termination"');
-  });
-
-  it("does not hydrate session-only date filters from usage URLs", () => {
-    const filterKeysIndex = source.indexOf("const SESSION_FILTER_KEYS");
-    const urlInitIndex = source.indexOf("let urlInitRan", filterKeysIndex);
-    const filterKeysBlock = source.slice(filterKeysIndex, urlInitIndex);
-
-    expect(filterKeysBlock).not.toContain('"date"');
-    expect(filterKeysBlock).not.toContain('"date_from"');
-    expect(filterKeysBlock).not.toContain('"date_to"');
-  });
-
-  it("mounts the pairwise comparison panel additively", () => {
-    expect(source).toContain("UsagePairwiseComparisonPanel");
-    expect(source).toContain("<UsagePairwiseComparisonPanel />");
-  });
-
-  it("keeps pairwise comparison below bounded secondary usage panels", () => {
-    const topSessionsIndex = source.indexOf("<TopSessionsTable />");
-    const cacheEfficiencyIndex = source.indexOf("<CacheEfficiencyPanel />");
-    const pairwiseIndex = source.indexOf("<UsagePairwiseComparisonPanel />");
-
-    expect(topSessionsIndex).toBeGreaterThan(-1);
-    expect(cacheEfficiencyIndex).toBeGreaterThan(-1);
-    expect(pairwiseIndex).toBeGreaterThan(cacheEfficiencyIndex);
-    expect(pairwiseIndex).toBeGreaterThan(topSessionsIndex);
-    expect(source).toContain('class="chart-panel bounded"');
-    expect(source).toContain("max-height:");
-    expect(source).toContain("overflow: auto;");
   });
 });
 

@@ -63,6 +63,35 @@ transaction or a pinned reader can push the WAL past it (249 MiB was observed).
 Before closing the replacement, the build runs a checked truncate checkpoint.
 The swap installs only the main file, so a failed checkpoint or close aborts it.
 
+When a Codex fork's replay parent is unavailable, a rebuild preserves an
+existing child and schedules it for retry. New messages and usage in that child
+remain absent from the archive until the parent and child source can be read
+and the source is reparsed. If the parent never returns, that delay is
+indefinite. A child with no saved messages is imported with its fallback
+transcript, even when a placeholder row exists, such as one created by a Recall
+import. That transcript may include copied parent messages and usage, and later
+appends are likewise held until recovery. The rebuild warns about the possible
+copied usage.
+
+The stale parser version does not distinguish a previously resolved child from
+a fallback. Parser checkpoints are optional, do not persist the replay gate,
+and are not copied with orphaned sessions. Treating a stale row as a fallback
+or resuming it without proven source and content state can overwrite archived
+child history or count parent usage twice. Live updates for unresolved forks
+need durable provenance and crash-safe retry and recovery; the current rebuild
+keeps the existing history rather than guessing that boundary.
+
+When an Antigravity CLI source yields a retryable low-fidelity transcript,
+sync and rebuild preserve any saved history and leave it stale for retry. A new
+session can use the fallback, but later fallback changes are held until a
+high-fidelity parse succeeds. A rebuild still installs, even when these
+preserved sessions are its only work. The sync still reports them as failures,
+so the request returns an error and attached archive sources do not drain until
+a high-fidelity parse succeeds.
+
+A daemon startup whose only unfinished work is queued fork retries still counts
+as complete for draining attached archive sources.
+
 The `raw_archive_*` tables record retained captures, root identities, accepted
 sources and deletion evidence. Seed import and restore permanently enable
 archive-only mode, which disables source sync and publication. These archives
@@ -121,6 +150,20 @@ bounded body reads resolve project evidence in their own SQLite snapshot; body
 reads also pin the database generation and message revision. This local contract
 does not widen raw artifacts or mirror schemas.
 
+Visible conversation exports use the existing `messages.dialogue_text` field.
+They do not use message search's fallback to rendered content: a NULL projection
+is an explicit coverage gap and an empty projection means no dialogue. Keep
+selected-text digests and lengths in the conversation index, and publish a new
+revision when dialogue alone changes. The writable-open upgrade initializes
+those fields from archived messages without reparsing or replacing message IDs.
+Copies preserve both projections and apply content policy to both.
+
+Keep a known dialogue projection even when it equals display content; NULL also
+represents unclassified messages and cannot carry both meanings. Data version
+146 reparses providers with dialogue classification in place, including the
+shared Codex parser. Retained sources that cannot be reparsed keep their content
+and classification gaps; export itself never reads the original source.
+
 ### Claude subagent sources
 
 Joined local subagent writes record contributing transcript paths with the
@@ -133,42 +176,39 @@ the archive; S3 materializations do not record temporary paths.
 ### Claude persisted tool results
 
 Claude Code (and iCodeMate CLI, which shares its transcript layout and parser)
-moves a large tool output to a side file in the session's `tool-results`
-folder and leaves a placeholder in the transcript. The parser inlines the side
-file while it exists, so the first sync archives the full output. Once Claude
-Code deletes the side file after its cleanup period, a later full parse sees
-only the placeholder. The parser marks exactly the tool_result block that
-genuinely tried and failed to resolve a `persistedOutputPath`
+moves a large tool output to a side file in the session's `tool-results` folder
+and leaves a placeholder in the transcript. The parser inlines the side file
+while it exists, so the first sync archives the full output. Once Claude Code
+deletes the side file after its cleanup period, a later full parse sees only the
+placeholder. The parser marks exactly the tool_result block that genuinely tried
+and failed to resolve a `persistedOutputPath`
 (`parser.ParsedToolResult.PersistedOutputUnresolved`; never derived from the
 placeholder text's own shape). `ingest.ReconcileProviderHistory`
-(`internal/ingest/history.go`) restores each flagged current event from the
-one archived event whose `tool_use_id`, source, and timestamp all match —
-never by array position, so a dedup collapse or a retry/branch reorder can
-never pair the wrong occurrence; no unique match leaves the event untouched,
-and a later, unflagged occurrence of the same `tool_use_id` is never
-overwritten. Restoration only happens when the archive held real text; that
-text, its length, and its raw digest are restored. When the archive held
-only a length without text (the `transcripts`/`usage` archive-content
-policies, or a blocked category), the event is left alone: "blank content,
-kept length" already means something else to every reader of
-`tool_result_events` (a deduped summary, re-derived from its one
-content-bearing event), and restoring a bare length would reproduce that
+(`internal/ingest/history.go`) restores each flagged current event from the one
+archived event whose `tool_use_id`, source, and timestamp all match — never by
+array position, so a dedup collapse or a retry/branch reorder can never pair the
+wrong occurrence; no unique match leaves the event untouched, and a later,
+unflagged occurrence of the same `tool_use_id` is never overwritten. Restoration
+only happens when the archive held real text; that text, its length, and its raw
+digest are restored. When the archive held only a length without text (the
+`transcripts`/`usage` archive-content policies, or a blocked category), the
+event is left alone: "blank content, kept length" already means something else
+to every reader of `tool_result_events` (a deduped summary, re-derived from its
+one content-bearing event), and restoring a bare length would reproduce that
 same shape for an unrelated reason with no way to tell the two apart later.
-Accepted limit: once such an event's side file ages out, its archived
-length cannot be recovered on a later reparse; the event keeps whatever
-length its current placeholder text itself resolves to, not the archived
-length.
+Accepted limit: once such an event's side file ages out, its archived length
+cannot be recovered on a later reparse; the event keeps whatever length its
+current placeholder text itself resolves to, not the archived length.
 
 This is the same provider-history dispatcher every other agent's archive
 preservation already goes through, gated by `ingest.IsClaudeFormatTranscript`
 (the agent and a `.jsonl` path, covering both Claude Code and iCodeMate CLI;
 `ingest.IsClaudeFormatAgent` alone would also match iCodeMate's unrelated
 VSCode-extension storage path), so hosted Postgres mirrors reach it with no
-separate wiring. `internal/sync/engine.go`'s
-`reconcileProviderHistoryContext` checks cheaply, over the parsed messages and
-before any store read, whether anything is flagged before loading the
-archived session. Rebuilds read the old archive, and S3 Claude sessions follow
-the same rule.
+separate wiring. `internal/sync/engine.go`'s `reconcileProviderHistoryContext`
+checks cheaply, over the parsed messages and before any store read, whether
+anything is flagged before loading the archived session. Rebuilds read the old
+archive, and S3 Claude sessions follow the same rule.
 
 ### Codex deletion scope
 
@@ -243,14 +283,16 @@ failed transfer leaves the thread and its pins intact.
 Four SQLite-only tables support local Codex imports: `parser_checkpoints` holds
 resume metadata, `parser_checkpoint_blobs` holds cursor and hash state,
 `session_signal_state` holds the incremental signal reducer, and
-`tool_call_occurrence_agent_state` holds per-agent result coordinates. The last
-table is populated lazily when a call receives a late result. Other providers do
-not maintain Codex signal state. Full writes commit the signal seed with the
-content and bind it to the stored transcript revision inside SQLite. A failed
-seed rolls back the content; there is no post-commit revision read. During a
-full resync, the disposable replacement archive defers the tool-call ID and
-result metadata indexes until after the bulk load. Rebuilding them must succeed
-before the replacement can be installed.
+`tool_call_occurrence_agent_state` holds per-agent result coordinates. Claude
+uses the first two tables for hash-only checkpoints, trusting bytes before the
+128 KiB tail anchor as append-only. The last table is populated lazily when a
+call receives a late result. Other providers do not maintain Codex signal state.
+Full writes commit the signal seed with the content and bind it to the stored
+transcript revision inside SQLite. A failed seed rolls back the content; there
+is no post-commit revision read. During a full resync, the disposable
+replacement archive defers the tool-call ID and result metadata indexes until
+after the bulk load. Rebuilding them must succeed before the replacement can be
+installed.
 
 Codex result events also retain a raw-content digest and whether the raw event
 participates in the summary. These local fields distinguish events that become
@@ -297,6 +339,49 @@ Transcript-only and usage-only writes omit parser checkpoints because resumable
 hash state can contain raw trailing transcript bytes. They retain staged parsing
 but publish projected messages and tool metadata without staged output. Late
 result updates use the same projection as newly inserted messages.
+
+## Attached archive source state
+
+Ordinary installations can read fixed Docbank backup snapshots through
+`internal/archivesource`. See the
+[configuration guide](../configuration.md#history-from-a-saved-archive) for the
+user contract and limits. Archive-only installations cannot attach sources.
+
+The compact index under `archive-sources/` is disposable. It contains accepted
+source metadata, not messages. Rebuild it from the verified saved application
+database. Do not migrate that saved database or adopt its runtime identity. Key
+a directory attachment by its archive ID, never by catalog bytes; a changed
+catalog re-registers sources under the same attachment and keeps completion.
+
+`archive_attachments` and `archive_attachment_sources` track membership and
+per-source completion targets. `archive_source_bindings` binds original
+archive/device/root/source identity to an immutable manifest.
+`archive_session_provenance` binds each namespaced session to that source.
+Publish provenance and content in the same ordinary or staged write transaction;
+ordinary ingestion must refuse IDs owned by an attached source. Completion
+follows successful parsing and scratch cleanup. Global parser markers do not
+clear unfinished attachment work.
+
+Validate ownership of kept and parser-excluded results, including ordinary
+remote imports, and run exclusion policies before staging freshness versions or
+changing session metadata. A collision in one DAG branch must leave all existing
+branches unchanged. Repeat ownership checks in content write and exclusion
+transactions.
+
+Restoring an attached session invalidates source completion in every matching
+attachment and updates pending counts in the restore transaction. The next drain
+reparses the restored row even if an upgrade completed while it was trashed.
+Restores take no sync lock, so they write a fresh completion marker, and a
+source completes only if the marker it read before parsing is unchanged.
+
+Rebuilds copy registrations and ownership bindings before parsing, and copy
+session provenance with retained rows. Available sources run as contributors
+against the replacement database. Initially offline or detached sources,
+including empty mount directories with no archive layout, retain their previous
+content and completion. Corrupt archives and missing pinned snapshots in
+available repositories fail preparation. After a contributor starts, a failed
+read discards the replacement; only repository-writer contention waits and
+retries. Keep explicit column lists when carrying these tables forward.
 
 ## Archive Content Policy
 
@@ -471,6 +556,17 @@ default as the `[pg]` config key, and an explicit `false` opts out.
 
 ## Backend Parity
 
+Automatic repository project naming belongs to the writable SQLite archive.
+`repository_project_names` retains choices derived from producer-recorded
+remotes and source snapshots; explicit folder rules and session assignments win.
+Identity writes apply names in the same transaction and retain source snapshot
+labels. Metadata copies preserve the registry, and rebuilds reapply it after
+restoring snapshots. The metadata-only `db repair-projects` command uses the
+same resolver. Updates advance session publication timestamps and reconcile
+identity observations, so replica reads consume the corrected project without
+their own naming inference. Hosted raw derivation does not consume this local
+archive registry.
+
 Reporting project-label keys are not repository identities. The reporting
 catalog must resolve every contributing session from the same read transaction;
 aggregate catalogs that ignore unknown observations cannot supply that evidence.
@@ -495,11 +591,17 @@ Keep identity-only corrections in the reporting digest. The wire contract is in
   `internal/readbase.Sessions`, with required backend SQL and typed scanners.
   `readbase.ReadOnlyStubs` owns unsupported archive writes; `MirrorStubs` adds
   mirror curation and insight stubs. `HostedStore` keeps explicit forwards.
+- Published `hostedRead` operations keep physical queries, alias/link/pin
+  hydration and cursors in one read-only repeatable-read transaction. Borrowed
+  views share runtime locks and configuration, never pool ownership. Their
+  pricing loads run synchronously on that transaction and stay view-local;
+  detached pricing singleflight belongs only to owning stores. Source probes
+  retain their separate live revision fence.
 - All four backends share activity report assembly and session usage selection
   in `internal/activity`. Explicit inputs supply usage, candidate streams,
-  message counts and project maps; SQL, pricing, caches and read lifetimes stay
-  in each backend. Daily usage query strategies and aggregation loops remain
-  per backend.
+  message counts and project maps; SQL, pricing, caches and read lifetimes
+  stay in each backend. Daily usage query strategies and aggregation loops
+  remain per backend.
 
 ### Usage cache divergence
 
@@ -554,8 +656,8 @@ rollup installs of every other session holding a changed identity; rollup
 installation re-verifies inside its transaction that no finalized identity
 gained an outside member and, when one did, reclassifies against the newly
 committed facts rather than failing the caller. A finalized daily row must never
-survive gaining a sibling. The daemon requeues invalidated sessions after
-commit and rebuilds their rollups; CLI writes leave rebuilding to the request.
+survive gaining a sibling. The daemon requeues invalidated sessions after commit
+and rebuilds their rollups; CLI writes leave rebuilding to the request.
 
 Treat a usage-cache file as identifiable only after both its SQLite
 `application_id` and `usage_cache_metadata.cache_kind` match. Filename matching
@@ -592,6 +694,24 @@ of a few seconds is expected and intended. Do not reintroduce a whole-snapshot
 recheck against the archive: validating a snapshot against a source that changes
 one session at a time livelocks the request.
 
+Refills retain token-message histories when the archive generation proves the
+existing messages unchanged, the install revision matches, and no activity-only
+facts or usage events exist. They seek past the saved message ordinal and
+normalize only appended messages. Message triggers maintain
+`sessions.usage_generation`. Edits and deletes rotate the generation. A
+backdated fact timestamp, an appended activity-only fact, an edit, a deletion,
+or a usage event falls back to complete extraction. Claude suffix replacement
+and late Codex usage updates also use complete extraction.
+
+Full extractions compare facts in bounded batches against one read-only cache
+snapshot and spool only changed or new rows. Comparison requires the expected
+install revision; installation checks that revision again. Complete per-session
+fact counts remove obsolete tails, and identity invalidation compares the
+complete cache before and after install. Each fact kind uses its own fixed index
+range, so a token-message append keeps activity and event rows at their existing
+positions. Existing mixed sessions move their activity and event rows once, on
+their next refill.
+
 Timezone rollup identity includes both the resolved zone name and its rule
 fingerprint. Cache-generation retirement cancels detached work immediately but
 keeps immutable coordinator pointers and the cache database alive until active
@@ -609,15 +729,15 @@ SQLite keeps paired candidates in memory per session and range start, with
 separate limits of 200,000 candidates and 4,096 entries. A full cache measured
 64.3 MiB of resident Go heap on Windows amd64, using the post-GC
 `runtime.MemStats.HeapInuse` delta for 200,000 candidates across 4,096 entries,
-with 36-byte session IDs, 24-byte models, and append-grown slices. Empty sessions
-use only the entry budget. A week report then a month report keep separate
-entries for their range starts. Entries run to `max(EffectiveEnd, RangeEnd)` and
-remain valid while the transcript revision and session creation time match.
-Reader swaps clear the entries and reject stores from earlier generations.
-Reports exceeding the entry limit reuse retained hits and store up to the cap.
-Reports exceeding the candidate budget skip storing new entries. Warm reads
-still load session revisions and merge the per-session candidates in SQLite's
-microsecond order.
+with 36-byte session IDs, 24-byte models, and append-grown slices. Empty
+sessions use only the entry budget. A week report then a month report keep
+separate entries for their range starts. Entries run to
+`max(EffectiveEnd, RangeEnd)` and remain valid while the transcript revision and
+session creation time match. Reader swaps clear the entries and reject stores
+from earlier generations. Reports exceeding the entry limit reuse retained hits
+and store up to the cap. Reports exceeding the candidate budget skip storing new
+entries. Warm reads still load session revisions and merge the per-session
+candidates in SQLite's microsecond order.
 
 Activity session selection checks terminal tool-execution events even when a
 session's `ended_at` predates the report. Keep the partial
@@ -630,6 +750,15 @@ The next writable SQLite open or PostgreSQL schema setup builds the index once
 for existing archives. PostgreSQL push must also detect its absence before
 taking the schema-current fast path. Creating the index scans existing tool
 results and can delay that first startup; it does not require a session resync.
+
+### PostgreSQL push preparation indexes
+
+`idx_sessions_data_version`, `idx_sessions_parentless_workers`, and
+`idx_sessions_source_missing` bound the parser-version check and empty repair
+queries. Owner preparation installs missing indexes automatically.
+Each first build scans `sessions` and blocks writes until installation commits.
+Restricted publishers keep writing before owner installation, using the
+existing queries until the indexes are available.
 
 ### Usage archive indexes
 
@@ -665,11 +794,19 @@ after column migrations, and startup `PRAGMA optimize` gathers its statistics.
 Bulk imports retain the index, and widening it needs no parser resync. Read-only
 opens use whichever form the archive has until a writable open widens it.
 
+SQLite's recursive session-tree steps, including unpaged sidebar and session
+list queries with children, put the tree first with `CROSS JOIN` so each queued
+row seeks its children. When few sessions have parents, startup statistics
+otherwise move a sessions scan outside that per-node lookup.
+
 PostgreSQL keeps `idx_sessions_parent` on `parent_session_id` alone. The wider
-SQLite index exists because, without it, SQLite builds a temporary
-`is_automated` index on every recursive step of the child lookup. PostgreSQL
-never builds temporary indexes, so it filters `is_automated` while it uses the
-parent-only index.
+SQLite index lets each recursive child lookup seek both `parent_session_id` and
+`is_automated` instead of filtering rows found by parent alone. PostgreSQL
+filters `is_automated` while it uses the parent-only index.
+
+Hosted PostgreSQL sidebar pages resolve contextual raw parent links and legacy
+parent edges once per statement. Root orphan checks and recursive child joins
+use that query-local edge set without changing parent identity or visibility.
 
 ### Dashboard metadata index
 
@@ -683,9 +820,12 @@ resync is required.
 Writable opens and completed bulk index builds run `PRAGMA optimize = 0x10012`.
 This considers all archive tables and limits the statistics samples. Statistics
 must cover competing indexes too: analyzing only the metadata index can leave
-SQLite choosing an older index that still reads message bodies. Full resync
-defers this index during import and rebuilds it before the replacement archive
-is installed. Read-only opens do not create indexes or collect statistics.
+SQLite choosing an older index that still reads message bodies. After optimize,
+the writer raises small `*_fts_data` row estimates and reloads statistics so
+FTS5 segment deletes keep using rowid searches as an empty archive grows. Full
+resync defers this index during import and rebuilds it before the replacement
+archive is installed. Read-only opens do not create indexes or collect
+statistics.
 
 ### Transcript usage identity
 
@@ -709,10 +849,11 @@ row IDs. The SQLite archive and the usage cache keep the original text and
 order.
 
 A metadata-only push therefore leaves unchanged messages, tool calls and usage
-events in place. A change to any accounting field still replaces the session's
-mirrored rows. A malformed local timestamp keeps its original text in the
-comparison, so it never matches PostgreSQL and the push reports the session as
-an error.
+events in place. When the transcript matches, accounting changes replace only
+usage events. A changed transcript replaces messages and their tool calls and
+results from the first changed message. A malformed local timestamp keeps its
+original text in the comparison, so it never matches PostgreSQL and the push
+reports the session as an error.
 
 ### Tool result summaries
 

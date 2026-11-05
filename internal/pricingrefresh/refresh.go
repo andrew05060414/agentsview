@@ -125,15 +125,26 @@ func SeedFallbackContext(ctx context.Context, database *db.DB) error {
 
 // RefreshIfStale refreshes when the last attempt is older than cooldown.
 // It can refresh and return an error at once: a fetch that degraded to a
-// LiteLLM-only snapshot (see pricing.FetchCatalog) still stores rows and
+// LiteLLM-only snapshot (see pricing.FetchCatalogContext) still stores rows and
 // reports true, and the error describes the degradation.
 func RefreshIfStale(
+	ctx context.Context,
 	database *db.DB,
-	fetch func() (pricing.Catalog, error),
+	fetch func(context.Context) (pricing.Catalog, error),
 	cooldown time.Duration,
 	now time.Time,
 ) (bool, error) {
-	stored, err := database.GetPricingMeta(refreshAttemptMetaKey)
+	return refreshIfStale(ctx, database, fetch, cooldown, now)
+}
+
+func refreshIfStale(
+	ctx context.Context,
+	database *db.DB,
+	fetch func(context.Context) (pricing.Catalog, error),
+	cooldown time.Duration,
+	now time.Time,
+) (bool, error) {
+	stored, err := database.GetPricingMetaContext(ctx, refreshAttemptMetaKey)
 	if err != nil {
 		return false, fmt.Errorf("reading pricing refresh meta: %w", err)
 	}
@@ -143,26 +154,55 @@ func RefreshIfStale(
 			return false, nil
 		}
 	}
-	return refreshAt(database, fetch, now)
+	return refreshAt(ctx, database, fetch, now)
 }
 
+// refreshAt records the attempt time before fetching, so a failed fetch
+// waits out the cooldown. A canceled refresh puts the previous time back:
+// the fetch did not fail, so the next refresh should retry at once.
 func refreshAt(
+	ctx context.Context,
 	database *db.DB,
-	fetch func() (pricing.Catalog, error),
+	fetch func(context.Context) (pricing.Catalog, error),
 	now time.Time,
 ) (bool, error) {
-	if err := database.SetPricingMeta(
-		refreshAttemptMetaKey, now.UTC().Format(time.RFC3339),
+	previousAttempt, err := database.GetPricingMetaContext(ctx, refreshAttemptMetaKey)
+	if err != nil {
+		return false, fmt.Errorf("reading pricing refresh meta: %w", err)
+	}
+	if err := database.SetPricingMetaContext(
+		ctx, refreshAttemptMetaKey, now.UTC().Format(time.RFC3339),
 	); err != nil {
 		return false, fmt.Errorf(
 			"recording pricing refresh attempt: %w", err,
 		)
 	}
-	catalog, fetchErr := fetch()
+	refreshed, err := fetchAndStore(ctx, database, fetch)
+	if err == nil || ctx.Err() == nil {
+		return refreshed, err
+	}
+	// The restore is one small write, so it runs after cancellation.
+	if restoreErr := database.SetPricingMetaContext(
+		context.WithoutCancel(ctx), refreshAttemptMetaKey, previousAttempt,
+	); restoreErr != nil {
+		return refreshed, fmt.Errorf(
+			"restoring pricing refresh attempt after cancellation: %w: %w",
+			restoreErr, err,
+		)
+	}
+	return refreshed, err
+}
+
+func fetchAndStore(
+	ctx context.Context,
+	database *db.DB,
+	fetch func(context.Context) (pricing.Catalog, error),
+) (bool, error) {
+	catalog, fetchErr := fetch(ctx)
 	if fetchErr != nil && catalog.GenAI == nil && len(catalog.LiteLLM) == 0 {
 		return false, fetchErr
 	}
-	if err := storeCatalog(database, catalog); err != nil {
+	if err := storeCatalog(ctx, database, catalog); err != nil {
 		return false, err
 	}
 	return true, fetchErr
@@ -170,21 +210,32 @@ func refreshAt(
 
 // Ensure seeds fallback pricing and refreshes online catalogs when due.
 func Ensure(
+	ctx context.Context,
 	database *db.DB,
 	offline bool,
-	fetch func() (pricing.Catalog, error),
+	fetch func(context.Context) (pricing.Catalog, error),
+	now time.Time,
+) (bool, error) {
+	return ensure(ctx, database, offline, fetch, now)
+}
+
+func ensure(
+	ctx context.Context,
+	database *db.DB,
+	offline bool,
+	fetch func(context.Context) (pricing.Catalog, error),
 	now time.Time,
 ) (bool, error) {
 	if offline {
-		if err := seedEmbeddedGenAI(context.Background(), database); err != nil {
+		if err := seedEmbeddedGenAI(ctx, database); err != nil {
 			return false, err
 		}
-		return false, storeFallback(database)
+		return false, storeFallbackContext(ctx, database)
 	}
-	if err := SeedFallback(database); err != nil {
+	if err := SeedFallbackContext(ctx, database); err != nil {
 		return false, err
 	}
-	return RefreshIfStale(database, fetch, RefreshCooldown, now)
+	return refreshIfStale(ctx, database, fetch, RefreshCooldown, now)
 }
 
 // EnsureCurrent applies the standard online pricing lifecycle.
@@ -248,31 +299,14 @@ func runCurrent(
 		releaseRefreshGateReference(database, gate)
 	}()
 
-	previousAttempt, err := database.GetPricingMeta(refreshAttemptMetaKey)
-	if err != nil {
-		return fmt.Errorf("reading pricing refresh meta: %w", err)
-	}
-	fetchCurrent := func() (pricing.Catalog, error) {
-		return fetch(ctx)
-	}
 	if force {
-		if err = SeedFallback(database); err == nil {
-			_, err = refreshAt(database, fetchCurrent, now)
+		if err := SeedFallbackContext(ctx, database); err != nil {
+			return err
 		}
-	} else {
-		_, err = Ensure(database, false, fetchCurrent, now)
-	}
-	if err == nil || ctx.Err() == nil {
+		_, err := refreshAt(ctx, database, fetch, now)
 		return err
 	}
-	if restoreErr := database.SetPricingMeta(
-		refreshAttemptMetaKey, previousAttempt,
-	); restoreErr != nil {
-		return fmt.Errorf(
-			"restoring pricing refresh attempt after cancellation: %w: %w",
-			restoreErr, err,
-		)
-	}
+	_, err := ensure(ctx, database, false, fetch, now)
 	return err
 }
 
@@ -288,10 +322,10 @@ func runCurrent(
 // refresh recomputes ownership from the stored table and converges:
 // retiring an already-deleted row is a no-op and a re-listed pattern is
 // re-adopted.
-func storeCatalog(database *db.DB, catalog pricing.Catalog) error {
+func storeCatalog(ctx context.Context, database *db.DB, catalog pricing.Catalog) error {
 	if catalog.GenAI != nil {
 		if err := database.UpsertGenAIPricing(
-			context.Background(), db.GenAIPricingDocument{
+			ctx, db.GenAIPricingDocument{
 				Version: catalog.GenAI.Version, SourceRef: catalog.GenAI.SourceRef,
 				Source: db.GenAIPricingSourceFetched,
 				Data:   catalog.GenAI.RawJSON(),
@@ -303,7 +337,7 @@ func storeCatalog(database *db.DB, catalog pricing.Catalog) error {
 	if len(catalog.LiteLLM) == 0 && len(catalog.OpenRouter) == 0 {
 		return nil
 	}
-	value, err := database.GetPricingMeta(pricing.OpenRouterModelsMetaKey)
+	value, err := database.GetPricingMetaContext(ctx, pricing.OpenRouterModelsMetaKey)
 	if err != nil {
 		return err
 	}
@@ -311,7 +345,7 @@ func storeCatalog(database *db.DB, catalog pricing.Catalog) error {
 	if err != nil {
 		return err
 	}
-	existing, err := database.ListModelPricing(context.Background())
+	existing, err := database.ListModelPricing(ctx)
 	if err != nil {
 		return fmt.Errorf("listing stored pricing: %w", err)
 	}
@@ -322,8 +356,8 @@ func storeCatalog(database *db.DB, catalog pricing.Catalog) error {
 		}
 	}
 	prices, owned, retired := catalog.Reconcile(stored, previous)
-	return database.ReconcileModelPricing(
-		dbModelPricing(prices), retired,
+	return database.ReconcileModelPricingContext(
+		ctx, dbModelPricing(prices), retired,
 		db.PricingMeta{
 			Key:   pricing.OpenRouterModelsMetaKey,
 			Value: pricing.EncodeOpenRouterModels(owned),
@@ -339,17 +373,13 @@ func seedEmbeddedGenAI(ctx context.Context, database *db.DB) error {
 	})
 }
 
-// storeFallback writes the embedded catalog over the stored table. Like
+// storeFallbackContext writes the embedded catalog over the stored table. Like
 // any non-OpenRouter source it outranks OpenRouter, so OpenRouter-owned
 // rows it covers under another spelling are retired and rows it lists
 // exactly pass to its ownership, in the same transaction, so a reseed
 // never leaves an OpenRouter row beside or under an embedded one while
 // the sentinel still claims it. Databases that never stored the sentinel
 // keep none.
-func storeFallback(database *db.DB) error {
-	return storeFallbackContext(context.Background(), database)
-}
-
 func storeFallbackContext(ctx context.Context, database *db.DB) error {
 	value, err := database.GetPricingMetaContext(
 		ctx, pricing.OpenRouterModelsMetaKey,

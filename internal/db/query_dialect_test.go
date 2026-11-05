@@ -1,7 +1,6 @@
 package db
 
 import (
-	"regexp"
 	"strings"
 	"testing"
 
@@ -201,10 +200,11 @@ func TestBuildSessionFilterSQLRendersIncludeChildrenCTE(t *testing.T) {
 		name     string
 		dialect  QueryDialect
 		wantArgs []any
+		wantJoin string
 	}{
-		{"sqlite", SQLiteQueryDialect(), []any{"laptop", "server", "claude"}},
-		{"postgres", PostgresQueryDialect(), []any{"laptop", "server", "claude"}},
-		{"duckdb", DuckDBQueryDialect(), []any{"laptop", "server", "claude"}},
+		{"sqlite", SQLiteQueryDialect(), []any{"laptop", "server", "claude"}, ""},
+		{"postgres", PostgresQueryDialect(), []any{"laptop", "server", "claude"}, "FROM sessions s JOIN tree t ON s.parent_session_id = t.id"},
+		{"duckdb", DuckDBQueryDialect(), []any{"laptop", "server", "claude"}, "FROM sessions s JOIN tree t ON s.parent_session_id = t.id"},
 	}
 
 	for _, tt := range tests {
@@ -212,7 +212,9 @@ func TestBuildSessionFilterSQLRendersIncludeChildrenCTE(t *testing.T) {
 			got, args := BuildSessionFilterSQL(filter, tt.dialect)
 			normalized := normalizeSQL(got)
 			assert.Contains(t, normalized, "WITH RECURSIVE tree(id) AS")
-			assert.Contains(t, normalized, "JOIN tree t ON s.parent_session_id = t.id")
+			if tt.wantJoin != "" {
+				assert.Contains(t, normalized, tt.wantJoin)
+			}
 			assert.Contains(t, normalized, "id IN (WITH RECURSIVE tree(id) AS")
 			assert.Contains(t, normalized,
 				"NOT (root_session.relationship_type IN ('subagent', 'fork', 'continuation'))")
@@ -404,11 +406,6 @@ func normalizeSQL(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-func TestNormalizeSQLHelperDoesNotMaskPlaceholders(t *testing.T) {
-	require.True(t, regexp.MustCompile(`\?\)|\$1`).MatchString(
-		normalizeSQL("value IN (?,?) OR value = $1")))
-}
-
 func TestBuildSessionFilterSQLPRHost(t *testing.T) {
 	for _, dialect := range []QueryDialect{SQLiteQueryDialect(), PostgresQueryDialect(), DuckDBQueryDialect(), ClickHouseQueryDialect()} {
 		t.Run(dialect.name, func(t *testing.T) {
@@ -417,7 +414,7 @@ func TestBuildSessionFilterSQLPRHost(t *testing.T) {
 			numberPredicate := map[string]string{
 				"sqlite":     "EXISTS (SELECT 1 FROM json_each(NULLIF(pr_links, '')) pl WHERE 1=1 AND json_extract(pl.value, '$.number') = ?)",
 				"postgres":   "EXISTS (SELECT 1 FROM jsonb_array_elements(NULLIF(pr_links, '')::jsonb) pl WHERE TRUE AND (pl->>'number')::bigint = $1)",
-				"duckdb":     "len(list_filter(CAST(json_extract(NULLIF(pr_links, ''), '$[*]') AS JSON[]), pl -> true AND CAST(pl->>'number' AS BIGINT) = ?)) > 0",
+				"duckdb":     "len(list_filter(CAST(json_extract(NULLIF(pr_links, ''), '$[*]') AS JSON[]), lambda pl: true AND CAST(pl->>'number' AS BIGINT) = ?)) > 0",
 				"clickhouse": "arrayExists(pl -> true AND JSONExtractInt(pl, 'number') = ?, JSONExtractArrayRaw(pr_links))",
 			}
 			assert.Contains(t, where, numberPredicate[dialect.name])

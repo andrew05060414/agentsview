@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   getMarkdownExportUrl: vi.fn().mockReturnValue("/api/v1/sessions/sess-123/md"),
   copyToClipboard: vi.fn().mockResolvedValue(true),
   reportTelemetry: vi.fn(),
+  syncClaudeAI: vi.fn(),
 }));
 
 vi.mock("../../utils/telemetry.js", () => ({ reportTelemetry: mocks.reportTelemetry }));
@@ -13,6 +14,7 @@ vi.mock("../../utils/telemetry.js", () => ({ reportTelemetry: mocks.reportTeleme
 vi.mock("../../api/client.js", () => ({
   downloadExport: mocks.downloadExport,
   getMarkdownExportUrl: mocks.getMarkdownExportUrl,
+  syncClaudeAI: mocks.syncClaudeAI,
 }));
 
 vi.mock("../../utils/clipboard.js", () => ({
@@ -24,6 +26,7 @@ import { sync } from "../../stores/sync.svelte.js";
 import { settings } from "../../stores/settings.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { router } from "../../stores/router.svelte.js";
+import { claudeAISync } from "../../stores/claudeAISync.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 import type { Session } from "../../api/types.js";
 
@@ -120,6 +123,24 @@ describe("AppHeader export actions", () => {
       expect(document.querySelector('[role="dialog"]') !== null).toBe(!importDisabled);
     },
   );
+
+  it("marks the Import button while Claude.ai Sync runs with the dialog closed", async () => {
+    mocks.syncClaudeAI.mockReturnValue(new Promise(() => {}));
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+    const importButton = document.querySelector<HTMLButtonElement>(".import-btn")!;
+    expect(importButton.getAttribute("aria-label")).toBe("Import conversations");
+    void claudeAISync.start("claude-ai", undefined, () => {});
+    await tick();
+    expect(importButton.getAttribute("aria-label")).toBe(
+      "Claude.ai Sync is running. Open Import to see progress or stop it.",
+    );
+    expect(importButton.querySelector(".sync-spinner")).not.toBeNull();
+    claudeAISync.stop();
+    await tick();
+    expect(importButton.getAttribute("aria-label")).toBe("Import conversations");
+    expect(importButton.querySelector(".sync-spinner")).toBeNull();
+  });
 
   it("copies markdown export link from export menu", async () => {
     component = mount(AppHeader, { target: document.body });
@@ -263,6 +284,20 @@ describe("AppHeader export actions", () => {
   });
 
   it("renders every route as a primary-nav tab", async () => {
+    sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      insight_generation_available: false,
+      friction_available: true,
+      friction_build_allowed: true,
+      friction_readable: true,
+      session_stats_available: false,
+      kata_available: false,
+      version: "dev",
+      commit: "unknown",
+      build_date: "",
+      read_only: false,
+    };
     component = mount(AppHeader, { target: document.body });
     await tick();
 
@@ -281,6 +316,7 @@ describe("AppHeader export actions", () => {
       "Recall",
       "Pinned",
       "Quality",
+      "Friction Log",
       "Trash",
       "Recent Edits",
       "Data",
@@ -288,6 +324,52 @@ describe("AppHeader export actions", () => {
       expect(labels).toContain(expected);
     }
     expect(labels).not.toContain("Token Usage");
+  });
+
+  it("shows the Friction Log tab on a server that reads digests but cannot build them", async () => {
+    sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      insight_generation_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
+      friction_readable: true,
+      session_stats_available: false,
+      version: "dev",
+      commit: "unknown",
+      build_date: "",
+      read_only: true,
+    } as never;
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+    const labels = Array.from(
+      document.querySelectorAll<HTMLElement>(".kit-top-bar__probe .kit-top-bar__tab"),
+    ).map((b) => b.textContent?.trim());
+    expect(labels).toContain("Friction Log");
+  });
+
+  it("hides the Friction Log tab when the server does not store digests", async () => {
+    sync.serverVersion = {
+      api_version: 1,
+      data_version: 1,
+      insight_generation_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
+      session_stats_available: false,
+      kata_available: false,
+      version: "dev",
+      commit: "unknown",
+      build_date: "",
+      read_only: true,
+    };
+    component = mount(AppHeader, { target: document.body });
+    await tick();
+
+    const labels = Array.from(
+      document.querySelectorAll<HTMLElement>(".kit-top-bar__probe .kit-top-bar__tab"),
+    ).map((b) => b.textContent?.trim());
+    expect(labels).toContain("Quality");
+    expect(labels).not.toContain("Friction Log");
   });
 
   it("distinguishes global sync from page refresh controls", async () => {
@@ -308,7 +390,10 @@ describe("AppHeader export actions", () => {
       api_version: 1,
       data_version: 1,
       session_stats_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
       insight_generation_available: false,
+      kata_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",
@@ -333,7 +418,10 @@ describe("AppHeader export actions", () => {
       api_version: 1,
       data_version: 1,
       session_stats_available: false,
+      friction_available: false,
+      friction_build_allowed: false,
       insight_generation_available: false,
+      kata_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",

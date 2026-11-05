@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
@@ -165,6 +166,7 @@ func requireWatchEvent(
 			}
 			return ev
 		case <-deadline:
+			stacktest.Dump(t)
 			require.FailNowf(t, "test failed", "did not receive %q event within %s", event, timeout)
 		}
 	}
@@ -184,6 +186,7 @@ func requireChannelClosed[T any](
 				return
 			}
 		case <-deadline:
+			stacktest.Dump(t)
 			require.FailNowf(t, "test failed", "channel not closed within %s", timeout)
 		}
 	}
@@ -1171,7 +1174,7 @@ func TestHTTPSearchContent_501PreservesBackendSpecificReason(t *testing.T) {
 			name: "PostgreSQL vector disabled",
 			body: "semantic search not available: semantic search: PostgreSQL " +
 				"requires [vector] enabled with a matching [vector.embeddings] " +
-				"config and a generation pushed by 'agentsview pg push'",
+				"config and a generation pushed by 'agentsview replica pg push'",
 		},
 	}
 	for _, tt := range tests {
@@ -1195,7 +1198,7 @@ func TestHTTPSearchContent_501PreservesBackendSpecificReason(t *testing.T) {
 			require.Error(t, err)
 			require.ErrorIs(t, err, service.ErrSemanticUnavailable)
 			assert.Equal(t, tt.body, err.Error())
-			assert.NotContains(t, err.Error(), "agentsview embeddings build")
+			assert.NotContains(t, err.Error(), "agentsview index embeddings build")
 		})
 	}
 }

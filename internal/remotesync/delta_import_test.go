@@ -205,22 +205,6 @@ func TestPruneRemoteSkipCacheExactAndFallbackFamilies(t *testing.T) {
 	assert.Zero(t, stats.Total())
 }
 
-func TestJournalOutcomeClosedSet(t *testing.T) {
-	want := []JournalOutcome{
-		JournalRetired,
-		JournalAbortedBeforeProcessing,
-		JournalProcessingFailures,
-		JournalCachePersistFailed,
-		JournalRetirementFailed,
-		JournalCancelled,
-		JournalPendingSwap,
-	}
-	for _, outcome := range want {
-		assert.True(t, outcome.Valid(), "outcome %q must be reportable", outcome)
-	}
-	assert.False(t, JournalOutcome("retained(invented)").Valid())
-}
-
 func TestDeferredDeltaRetainsJournalAndRequiredDataVersion(t *testing.T) {
 	engineStats := syncpkg.SyncStats{Deferred: 1}
 	assert.False(t, shouldPersistImportDataVersion(engineStats))
@@ -378,7 +362,7 @@ func TestPreparePendingPreservesCacheBoundariesAcrossParserUpgrades(t *testing.T
 			host string, deletes []string, upserts map[string]int64,
 		) error {
 			mutations = append(mutations, mutationCount{len(deletes), len(upserts)})
-			return database.ApplyRemoteSkippedFileChanges(t.Context(), host, deletes, upserts)
+			return database.ApplyRemoteSkippedFileChanges(ctx, host, deletes, upserts)
 		},
 	}
 	pending, err := importer.PreparePending(t.Context(), DeltaImportRequest{

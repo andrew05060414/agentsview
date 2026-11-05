@@ -153,13 +153,46 @@ and can mirror data to PostgreSQL, DuckDB, or ClickHouse.
   distinct from byte limits. Both helpers assume valid UTF-8 and do not
   sanitize malformed input.
 - Do not use emojis in code or output.
+- Tests must bind loopback (`127.0.0.1:0` or `[::1]:0`, or `httptest`, which
+  already does). A wildcard listen (`0.0.0.0`, `[::]`, bare `:0`) makes the
+  host firewall prompt for the test binary, and because `go test` relinks it
+  into a fresh temporary directory every run, the prompt returns every run.
+  A test that genuinely needs wildcard bind semantics must call
+  `internal/testutil.RequireWildcardListen(t)` first, which skips it on local
+  Windows runs unless `CI=true`. `AGENTSVIEW_TEST_WILDCARD_LISTEN=1`
+  enables these tests; `0` skips them on every platform.
 - Format Markdown with `mdformat --wrap 80` when `mdformat` and
   `mdformat-tables` are available.
+
+## Go Contexts
+
+- A function that does I/O, queries a database, calls a process or service,
+  sleeps, retries, or waits on a channel takes `ctx context.Context` first and
+  passes it on. Cobra commands start from `cmd.Context()`. Do not add a
+  wrapper that calls `context.Background()` for callers without a context;
+  give them the context-taking function.
+- Pass contexts as arguments. Only types that adapt a context to another
+  interface, such as `internal/ctxio`, and owners of a lifetime, such as the
+  server's base context or a background coordinator, may store one.
+- Detach only work that must outlive its caller: shutdown, final flushes,
+  cleanup after cancellation, and shared work that one waiter must not cancel
+  (see
+  [usage cache backfill](docs/agents/background-work.md#usage-cache-backfill)).
+  Cleanup that finishes one caller's work uses `context.WithoutCancel(ctx)`.
+  Shared work that belongs to no single caller starts from
+  `context.Background()`, so it carries no caller's request values. Bound
+  detached work and say why in a comment.
+- Tests use `t.Context()`. Inside `t.Cleanup`, where `t.Context()` is already
+  canceled, use `context.WithoutCancel(t.Context())`.
+- `make lint` checks part of this with `noctx`, `usetesting`, `fatcontext`, and
+  govet `lostcancel`. It compiles only `fts5` files, so check `pgtest`,
+  `chtest`, `duckdbtest`, and `s3test` files by hand.
 
 ## Pull Requests
 
 - Pull requests must have a user-facing benefit or improve the developer
   experience, and the body must say which one.
+- Write issues and pull requests in English.
 - Do not poll or watch GitHub Actions checks unless the developer explicitly
   requests it.
 - Do not use `gh api` to watch CI jobs unless the user explicitly requests it.

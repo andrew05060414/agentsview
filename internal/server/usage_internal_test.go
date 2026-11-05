@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"net/http"
 	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -50,6 +52,64 @@ type usageComparisonProjectKeySpy struct {
 	usageSummaryCountsSpy
 	activeLabels []string
 	projectMap   map[string]export.ProjectMapEntry
+}
+
+func TestUsageSummaryStreamUsesResolvedMachine(t *testing.T) {
+	s := testServer(t, 30*time.Second)
+	require.NoError(t, s.db.(*db.DB).SetSyncState(t.Context(), db.MachineLabelKeyPrefix+"id-a", "Workstation"))
+	spy := &usageSummaryCountsSpy{Store: s.db}
+	s.db = spy
+	s.sessions = service.NewReadOnlyBackend(spy)
+	w := serveGet(t, s, "/api/v1/usage/summary/stream?"+oneDayUsageRange+"&machine=Workstation")
+	assertRecorderStatus(t, w, http.StatusOK)
+	assert.Contains(t, w.Body.String(), "event: done\n")
+	assert.Contains(t, w.Body.String(), "event: progress\n")
+	require.Len(t, spy.filters, 1)
+	assert.Equal(t, "id-a", spy.filters[0].Machine)
+	assert.NotNil(t, spy.filters[0].Progress)
+}
+
+type usageMachineCatalogFailureStore struct{ db.Store }
+
+func (s usageMachineCatalogFailureStore) GetMachineLabels(context.Context) (map[string]string, error) {
+	return nil, errors.New("machine catalog database detail")
+}
+
+type usageProjectCatalogFailureStore struct {
+	db.Store
+	err error
+}
+
+func (s usageProjectCatalogFailureStore) GetActiveProjectLabels(context.Context) ([]string, error) {
+	return nil, s.err
+}
+
+func TestUsageStreamMapsCatalogFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		err     error
+		status  int
+		message string
+		machine bool
+	}{
+		{"machine metadata", nil, http.StatusInternalServerError, "internal error", true},
+		{"deadline", context.DeadlineExceeded, http.StatusGatewayTimeout, "gateway timeout", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := testServer(t, 30*time.Second)
+			query := "&project_key=pl1:sha256:known"
+			if tt.machine {
+				s.db = usageMachineCatalogFailureStore{Store: s.db}
+				query = "&machine=Workstation"
+			} else {
+				s.db = usageProjectCatalogFailureStore{Store: s.db, err: tt.err}
+			}
+			w := serveGet(t, s, "/api/v1/usage/summary/stream?"+oneDayUsageRange+query)
+			assertRecorderStatus(t, w, tt.status)
+			assert.Contains(t, w.Body.String(), `"error":"`+tt.message+`"`)
+			assert.NotContains(t, w.Body.String(), "machine catalog database detail")
+		})
+	}
 }
 
 func (s *usageComparisonProjectKeySpy) GetActiveProjectLabels(
@@ -125,6 +185,12 @@ func (s *usageSummaryCountsSpy) GetUsageMatchingSessionCount(
 ) (int, error) {
 	s.matchingSessionCalls++
 	return s.matchingSessionCount, nil
+}
+
+func (s *usageSummaryCountsSpy) GetPlanUsageSessionCounts(
+	_ context.Context, _ db.UsageFilter,
+) (db.PlanUsageSessionCounts, error) {
+	return db.PlanUsageSessionCounts{}, nil
 }
 
 func TestUsageSummaryScansCurrentPeriodOnly(t *testing.T) {
@@ -440,7 +506,7 @@ func TestUsagePairwiseComparisonScansTwoDailyFilters(t *testing.T) {
 }
 
 func TestUsagePairwiseComparisonOpenAPIOptionalSideParams(t *testing.T) {
-	s := testServer(t, 30)
+	s := testServer(t, 30*time.Second)
 	spec := readOpenAPISpec(t, s.Handler())
 	op := requireOpenAPIOperation(t, spec, "get", "/api/v1/usage/pairwise-comparison")
 

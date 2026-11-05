@@ -33,8 +33,16 @@ func newSessionSearchCommand() *cobra.Command {
 		limit, cursor, contextN                  int
 	)
 	cmd := &cobra.Command{
-		Use:          "search <pattern>",
-		Short:        "Search message and tool content across sessions",
+		Use:   "search <pattern>",
+		Short: "Search message and tool content across sessions",
+		Long: "Search archived message and tool content with redacted snippets. " +
+			"The default is substring search across available sources. " +
+			"Choose at most one of --regex, --fts, --semantic, or --hybrid. " +
+			"FTS and semantic/hybrid modes search messages only; semantic modes need an embedding index. " +
+			"JSON returns a numeric next_cursor for further matches; repeat the query, search mode, backend, and filters when continuing.",
+		Example: "  agentsview session search 'connection reset' --since 14d --in messages,tool_result --json\n" +
+			"  agentsview session search 'connection AND reset' --fts --json\n" +
+			"  agentsview session search 'why the build failed' --hybrid --scope top --json",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -107,13 +115,13 @@ func newSessionSearchCommand() *cobra.Command {
 	flags.BoolVar(&useHybrid, "hybrid", false,
 		"Hybrid semantic + full-text search (reciprocal rank fusion)")
 	flags.StringVar(&in, "in", "",
-		"Comma-separated sources: messages,tool_input,tool_result (default all)")
+		"Comma-separated sources: messages,thinking,tool_input,tool_result (default all; thinking: SQLite, PostgreSQL, DuckDB, and ClickHouse substring/regex only)")
 	flags.BoolVar(&excludeSystem, "exclude-system", false,
 		"Exclude system messages (included by default)")
 	flags.BoolVar(&reveal, "reveal", false, "Show full secret values (unredacted)")
 	flags.StringVar(&project, "project", "", "Filter by project name")
 	flags.StringVar(&excludeProject, "exclude-project", "", "Exclude project")
-	flags.StringVar(&machine, "machine", "", "Filter by machine")
+	flags.StringVar(&machine, "machine", "", machineFilterHelp)
 	flags.StringVar(&agent, "agent", "", "Filter by agent")
 	flags.StringVar(&date, "date", "", "Sessions active on YYYY-MM-DD")
 	flags.StringVar(&dateFrom, "date-from", "", "Sessions active on or after YYYY-MM-DD")
@@ -142,13 +150,13 @@ func validateScopeFlag(scope string, useSemantic, useHybrid bool) error {
 		return nil
 	}
 	if !useSemantic && !useHybrid {
-		return errors.New("--scope requires --semantic or --hybrid")
+		return cliUsageError(errors.New("--scope requires --semantic or --hybrid"), "choose one search mode and check --in / --scope with `agentsview session search --help`")
 	}
 	switch scope {
 	case "top", "all", "subordinate":
 		return nil
 	}
-	return fmt.Errorf("--scope must be top, all, or subordinate (got %q)", scope)
+	return cliValidationError(fmt.Errorf("--scope must be top, all, or subordinate (got %q)", scope), "use --scope top, all, or subordinate with --semantic or --hybrid")
 }
 
 // resolveContentSearchMode picks the search mode from the mutually exclusive
@@ -165,7 +173,7 @@ func resolveContentSearchMode(
 		}
 	}
 	if modes > 1 {
-		return "", errors.New("--regex, --fts, --semantic and --hybrid are mutually exclusive")
+		return "", cliUsageError(errors.New("--regex, --fts, --semantic and --hybrid are mutually exclusive"), "choose one search mode and check --in / --scope with `agentsview session search --help`")
 	}
 	mode := "substring"
 	switch {
@@ -181,15 +189,15 @@ func resolveContentSearchMode(
 	if useFTS {
 		for _, s := range sources {
 			if s != "messages" {
-				return "", errors.New("--fts searches messages only; drop --in or --fts")
+				return "", cliUsageError(errors.New("--fts searches messages only; drop --in or --fts"), "choose one search mode and check --in / --scope with `agentsview session search --help`")
 			}
 		}
 	}
 	if useSemantic || useHybrid {
 		for _, s := range sources {
 			if s != "messages" {
-				return "", fmt.Errorf(
-					"--%s searches messages only; drop --in", mode)
+				return "", cliUsageError(fmt.Errorf(
+					"--%s searches messages only; drop --in", mode), "omit --in or use --in messages with --semantic / --hybrid")
 			}
 		}
 	}

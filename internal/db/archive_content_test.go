@@ -515,6 +515,73 @@ func TestTranscriptsArchiveContentKeepsTextAndDropsToolPayloads(t *testing.T) {
 	assert.Equal(t, "errored", link.ResultEvents[0].Status)
 }
 
+func TestTranscriptArchiveRedactsQuotedToolRenderingFromDialogue(t *testing.T) {
+	for _, path := range []string{"write", "orphaned", "trashed"} {
+		for _, tc := range []struct{ name, content string }{
+			{"both-fields", "Kept prose.\n[Bash]\n$ cat archiveargumentsecret"},
+			{"dialogue-only", "Kept prose.\n[Bash]"},
+		} {
+			t.Run(path+"/"+tc.name, func(t *testing.T) {
+				source := testDB(t)
+				if path == "write" {
+					source.SetArchiveContent(config.ArchiveContentTranscripts)
+				}
+				require.NoError(t, source.UpsertSession(t.Context(), Session{
+					ID: "quoted-tool", Project: "project", Agent: "claude", Machine: "local",
+					MessageCount: 1,
+				}))
+				dialogue := "Kept prose.\n[Bash]\n$ cat archiveargumentsecret"
+				require.NoError(t, source.InsertMessages(t.Context(), []Message{{
+					SessionID: "quoted-tool", Role: "assistant", HasToolUse: true,
+					Content: tc.content, DialogueText: &dialogue,
+					ToolCalls: []ToolCall{{
+						ToolName: "Bash", Category: "Bash", ToolUseID: "quoted-call",
+						InputJSON: `{"command":"cat archiveargumentsecret"}`, Rendering: "[Bash]\n$ cat archiveargumentsecret",
+					}},
+				}}))
+				destination := source
+				if path != "write" {
+					destination = testDB(t)
+					destination.SetArchiveContent(config.ArchiveContentTranscripts)
+					copyData := func(ctx context.Context, sourcePath string) ([]string, error) {
+						return destination.CopyOrphanedDataFromExcluding(ctx, sourcePath, nil)
+					}
+					if path == "trashed" {
+						require.NoError(t, source.SoftDeleteSession(t.Context(), "quoted-tool"))
+						copyData = destination.CopyTrashedDataFrom
+					}
+					copied, err := copyData(t.Context(), source.Path())
+					require.NoError(t, err)
+					require.Equal(t, []string{"quoted-tool"}, copied)
+					if path == "trashed" {
+						_, err = destination.RestoreSession(t.Context(), "quoted-tool")
+						require.NoError(t, err)
+					}
+				}
+				messages, err := destination.GetAllMessages(t.Context(), "quoted-tool")
+				require.NoError(t, err)
+				require.Len(t, messages, 1)
+				assert.Equal(t, "Kept prose.\n[Bash]", messages[0].Content)
+				require.NotNil(t, messages[0].DialogueText)
+				assert.Equal(t, "Kept prose.\n[Bash]", *messages[0].DialogueText)
+				for _, mode := range []string{"substring", "fts"} {
+					filter := ContentSearchFilter{
+						Pattern: "archiveargumentsecret", Mode: mode, Sources: []string{"messages"},
+						SessionID: "quoted-tool", IncludeOneShot: true, IncludeAutomated: true, IncludeChildren: true,
+					}
+					page, err := destination.SearchContent(t.Context(), filter)
+					require.NoError(t, err)
+					assert.Empty(t, page.Matches, mode)
+					filter.Pattern = "prose"
+					page, err = destination.SearchContent(t.Context(), filter)
+					require.NoError(t, err)
+					assert.Len(t, page.Matches, 1, mode)
+				}
+			})
+		}
+	}
+}
+
 func TestTranscriptArchiveRedactsOverlappingToolRenderings(t *testing.T) {
 	for _, path := range []string{"write", "orphaned", "trashed"} {
 		for _, reverseCalls := range []bool{false, true} {
@@ -552,14 +619,14 @@ func TestTranscriptArchiveRedactsOverlappingToolRenderings(t *testing.T) {
 				if path != "write" {
 					destination = testDB(t)
 					destination.SetArchiveContent(config.ArchiveContentTranscripts)
-					copyData := func(sourcePath string) ([]string, error) {
-						return destination.CopyOrphanedDataFromExcluding(sourcePath, nil)
+					copyData := func(ctx context.Context, sourcePath string) ([]string, error) {
+						return destination.CopyOrphanedDataFromExcluding(ctx, sourcePath, nil)
 					}
 					if path == "trashed" {
 						require.NoError(t, source.SoftDeleteSession(t.Context(), "overlapping"))
 						copyData = destination.CopyTrashedDataFrom
 					}
-					copied, err := copyData(source.Path())
+					copied, err := copyData(t.Context(), source.Path())
 					require.NoError(t, err)
 					require.Len(t, copied, 1)
 				}
@@ -740,13 +807,13 @@ func TestCopiedTranscriptsDropUnrecoverableToolText(t *testing.T) {
 			}
 			destination := testDB(t)
 			destination.SetArchiveContent(config.ArchiveContentTranscripts)
-			copyData := func(sourcePath string) ([]string, error) {
-				return destination.CopyOrphanedDataFromExcluding(sourcePath, nil)
+			copyData := func(ctx context.Context, sourcePath string) ([]string, error) {
+				return destination.CopyOrphanedDataFromExcluding(ctx, sourcePath, nil)
 			}
 			if trashed {
 				copyData = destination.CopyTrashedDataFrom
 			}
-			copied, err := copyData(source.Path())
+			copied, err := copyData(t.Context(), source.Path())
 			require.NoError(t, err)
 			require.Len(t, copied, len(cases))
 			for _, tc := range cases {
@@ -887,7 +954,7 @@ func TestCopyOrphanedDataProjectsArchiveContent(t *testing.T) {
 		t.Cleanup(func() { require.NoError(t, destination.Close()) })
 		destination.SetArchiveContent(config.ArchiveContentTranscripts)
 
-		copied, err := destination.CopyOrphanedDataFrom(sourcePath)
+		copied, err := destination.CopyOrphanedDataFrom(t.Context(), sourcePath)
 		require.NoError(t, err)
 		require.Equal(t, 6, copied)
 
@@ -968,7 +1035,7 @@ func TestCopyOrphanedDataProjectsArchiveContent(t *testing.T) {
 		t.Cleanup(func() { require.NoError(t, destination.Close()) })
 		destination.SetArchiveContent(config.ArchiveContentUsage)
 
-		copied, err := destination.CopyOrphanedDataFrom(sourcePath)
+		copied, err := destination.CopyOrphanedDataFrom(t.Context(), sourcePath)
 		require.NoError(t, err)
 		require.Equal(t, 6, copied)
 
@@ -1056,9 +1123,9 @@ func TestUsageArchiveRefusesDerivedText(t *testing.T) {
 	require.ErrorIs(t, err, ErrArchiveContentExcluded)
 	sourcePath := filepath.Join(t.TempDir(), "source.db")
 	require.NoError(t, testDBAtPath(t, sourcePath, "source").Close())
-	require.ErrorIs(t, database.CopyInsightsFrom(sourcePath),
+	require.ErrorIs(t, database.CopyInsightsFrom(t.Context(), sourcePath),
 		ErrArchiveContentExcluded)
-	require.ErrorIs(t, database.CopyRecallEntriesFrom(sourcePath),
+	require.ErrorIs(t, database.CopyRecallEntriesFrom(t.Context(), sourcePath),
 		ErrArchiveContentExcluded)
 
 	insights, err := database.ListInsights(t.Context(), InsightFilter{})
@@ -1322,14 +1389,14 @@ func TestUsageOnlyPreservesModelMix(t *testing.T) {
 			if path != "write" {
 				destination = testDB(t)
 				destination.SetArchiveContent(config.ArchiveContentUsage)
-				copyData := func(sourcePath string) ([]string, error) {
-					return destination.CopyOrphanedDataFromExcluding(sourcePath, nil)
+				copyData := func(ctx context.Context, sourcePath string) ([]string, error) {
+					return destination.CopyOrphanedDataFromExcluding(ctx, sourcePath, nil)
 				}
 				if path == "trash copy" {
 					require.NoError(t, source.SoftDeleteSession(t.Context(), "usage-model"))
 					copyData = destination.CopyTrashedDataFrom
 				}
-				copied, err := copyData(source.Path())
+				copied, err := copyData(t.Context(), source.Path())
 				require.NoError(t, err)
 				require.Len(t, copied, 1)
 				if path == "trash copy" {
