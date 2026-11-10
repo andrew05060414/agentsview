@@ -18,9 +18,10 @@ const diffDeleteChunkSize = 500
 // declaration order. insertMessagesTx and the diff UPDATE share it
 // so the persisted tuple has exactly one definition.
 func messageInsertArgs(m Message) []any {
+	dialogue, dialogueIsContent := StoredDialogue(m.Content, m.ThinkingText, m.DialogueText)
 	return []any{
 		m.SessionID, m.Ordinal, m.Role, m.Content,
-		m.ThinkingText,
+		m.ThinkingText, dialogue, dialogueIsContent,
 		m.Timestamp, m.HasThinking, m.HasToolUse,
 		m.ContentLength, m.IsSystem,
 		m.Model, m.ReasoningEffort, string(m.TokenUsage),
@@ -48,6 +49,10 @@ var messageUpdateSetClause = func() string {
 // Both sides go through the same resolve helpers the insert path
 // uses, so equality is defined on exactly the persisted tuples.
 func messageRowEqual(a, b Message) bool {
+	if a.DialogueText != b.DialogueText &&
+		(a.DialogueText == nil || b.DialogueText == nil || *a.DialogueText != *b.DialogueText) {
+		return false
+	}
 	if a.SessionID != b.SessionID || a.Ordinal != b.Ordinal ||
 		a.Role != b.Role || a.Content != b.Content ||
 		a.ThinkingText != b.ThinkingText || a.Timestamp != b.Timestamp ||
@@ -135,11 +140,9 @@ type messageDiffPlan struct {
 // must use the full replace path; a load failure also degrades to
 // full replace rather than failing the write.
 func (db *DB) planStoredMessageDiff(
-	sessionID string, msgs []Message,
+	ctx context.Context, sessionID string, msgs []Message,
 ) (messageDiffPlan, []Message, bool, bool) {
-	stored, err := db.GetAllMessages(
-		context.Background(), sessionID,
-	)
+	stored, err := db.GetAllMessages(ctx, sessionID)
 	if err != nil {
 		return messageDiffPlan{}, nil, false, false
 	}
@@ -175,6 +178,7 @@ func transcriptMessagesEqual(stored, incoming []Message) bool {
 func transcriptMessageEqual(a, b Message) bool {
 	comparableTranscriptMessage := func(msg Message) Message {
 		msg.ID = 0
+		msg.DialogueText = nil
 		msg.ContentLength = 0
 		msg.SourceType = ""
 		msg.SourceParentUUID = ""

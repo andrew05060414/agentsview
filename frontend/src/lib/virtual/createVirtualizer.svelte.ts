@@ -9,6 +9,7 @@ import {
   windowScroll,
   // kit-ui-check-ignore: local wrapper preserves TanStack scroll reconciliation and measurement-cache semantics used by MessageList; replacing it with kit-ui VirtualList is a separate migration.
 } from "@tanstack/virtual-core";
+import { untrack } from "svelte";
 
 type PartialKeys<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
 
@@ -90,8 +91,15 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
     }
     lastMeasureCacheKey = opts.measureCacheKey;
 
+    const getItemKey = opts.getItemKey;
+    const orderChanged =
+      opts.count === instance.options.count &&
+      getItemKey !== undefined &&
+      instance.getVirtualItems().some((item) => item.key !== getItemKey(item.index));
     instance.setOptions(resolvedOpts);
     instance._willUpdate();
+    // A reorder can leave the visible range unchanged, so TanStack won't notify.
+    if (orderChanged) untrack(() => _version++);
 
     postUpdate?.(instance, opts, cacheKeyChanged);
 
@@ -110,12 +118,12 @@ function createBaseVirtualizer<TScroll extends Element | Window, TItem extends E
 }
 
 function scrollReconcileState(v: Virtualizer<HTMLElement, HTMLElement>) {
-  // Public cancelScroll() arrives in @tanstack/virtual-core 3.18.0; switch to it on upgrade.
+  // TanStack has no public read of the in-flight scroll target.
   return v as unknown as { scrollState: { index: number | null } | null };
 }
 
 export function cancelScrollReconcile(v: Virtualizer<HTMLElement, HTMLElement> | undefined) {
-  if (v) scrollReconcileState(v).scrollState = null;
+  v?.cancelScroll();
 }
 
 export function createVirtualizer(optsFn: () => ElementOpts) {

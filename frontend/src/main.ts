@@ -1,10 +1,13 @@
 import { mount } from "svelte";
 import App from "./App.svelte";
+import "./fonts.css";
 import "@kenn-io/kit-ui/theme.css";
 import "@kenn-io/kit-ui/mermaid.css";
 import "./app.css";
 import { initI18n } from "./lib/i18n/index.js";
 import { installPerfFetchInstrumentation } from "./lib/stores/perf.svelte.js";
+// Applies saved message colors before the first render.
+import "./lib/stores/messageColors.svelte.js";
 
 const target = document.getElementById("app");
 

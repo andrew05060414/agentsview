@@ -30,6 +30,9 @@ func TestCoreActionAllowlist(t *testing.T) {
 		event, key, value string
 		kept              bool
 	}{
+		{EventSearchEmpty, "query", "secret", false},
+		{EventErrorShown, "kind", "search", true},
+		{EventSyncFailed, "reason", "request", true},
 		{EventSearchRun, "query_type", "semantic", true},
 		{EventSearchRun, "query_type", "regex", false},
 		{EventSessionViewed, "agent", "freebuff", true},
@@ -47,6 +50,7 @@ func TestCoreActionAllowlist(t *testing.T) {
 		{EventScreenViewed, "screen", "pinned", true},
 		{EventScreenViewed, "screen", "trash", true},
 		{EventScreenViewed, "screen", "recent-edits", true},
+		{EventScreenViewed, "screen", "friction", true},
 		{EventScreenViewed, "screen", "data", true},
 		{EventScreenViewed, "screen", "settings", true},
 		{EventScreenViewed, "screen", "unknown", false},
@@ -80,28 +84,60 @@ func TestCoreActionAllowlist(t *testing.T) {
 		}
 		postCapture(t, srv.Handler(), string(body), status)
 	}
+	for _, tc := range []struct{ event, key string }{{EventErrorShown, "kind"}, {EventSyncFailed, "reason"}} {
+		body, err := json.Marshal(map[string]any{"event": tc.event})
+		require.NoError(t, err)
+		postCapture(t, srv.Handler(), string(body), http.StatusBadRequest)
+		for _, value := range []any{42, "unknown"} {
+			body, err := json.Marshal(map[string]any{"event": tc.event, "properties": map[string]any{tc.key: value}})
+			require.NoError(t, err)
+			postCapture(t, srv.Handler(), string(body), http.StatusAccepted)
+		}
+	}
 	require.NoError(t, reporter.Close())
 	sent := captured()
-	require.Len(t, sent, len(cases)-1)
+	require.Len(t, sent, len(cases)+3)
 	i := 0
 	for _, c := range cases {
 		if c.event == EventScreenViewed && c.key == "screen" && !c.kept {
 			continue
 		}
-		assert.NotContains(t, sent[i], "query", c.event)
+		assert.NotContains(t, sent[i].Properties, "query", c.event)
 		if c.event == EventVisitEnded {
-			assert.NotContains(t, sent[i], "duration_ms")
+			assert.NotContains(t, sent[i].Properties, "duration_ms")
 			if c.key == "duration_bucket" {
-				assert.Equal(t, "web", sent[i]["surface"])
+				assert.Equal(t, "web", sent[i].Properties["surface"])
 			}
 		}
 		if c.kept {
-			assert.Equal(t, c.value, sent[i][c.key])
+			assert.Equal(t, c.value, sent[i].Properties[c.key])
 		} else {
-			assert.NotContains(t, sent[i], c.key)
+			assert.NotContains(t, sent[i].Properties, c.key)
 		}
 		i++
 	}
+	for _, event := range sent[i : i+2] {
+		assert.Equal(t, "other", event.Properties["kind"])
+	}
+	for _, event := range sent[i+2:] {
+		assert.Equal(t, "other", event.Properties["reason"])
+	}
+}
+
+func TestSetupFinishedCapture(t *testing.T) {
+	t.Setenv(EnabledEnv, "1")
+	t.Setenv(GenericEnabledEnv, "1")
+	endpoint, captured := captureCollector(t)
+	reporter := captureReporter(t, endpoint, Options{})
+	srv := server.New(config.Config{Host: "127.0.0.1", Port: 8080}, dbtest.OpenTestDB(t), nil, server.WithTelemetryCapture(reporter.CaptureHandler()))
+	// Browser posts cannot skip the daemon's archive check and claim.
+	postCapture(t, srv.Handler(), `{"event":"setup_finished"}`, http.StatusBadRequest)
+	require.NoError(t, reporter.CaptureSetupFinished(t.Context()))
+	require.NoError(t, reporter.Close())
+	sent := captured()
+	require.Len(t, sent, 1)
+	assert.Equal(t, "setup_finished", sent[0].Event)
+	require.Error(t, DisabledReporter().CaptureSetupFinished(t.Context()))
 }
 
 func TestScreenViewWithoutScreenLeavesValidRetry(t *testing.T) {
@@ -129,6 +165,7 @@ func TestScreenViewWithoutScreenLeavesValidRetry(t *testing.T) {
 }
 
 func TestScreenViewDisabled(t *testing.T) {
+	clearTelemetryVetoes(t)
 	t.Setenv(EnabledEnv, "0")
 	t.Setenv(GenericEnabledEnv, "1")
 	path := filepath.Join(t.TempDir(), "screens")
@@ -157,47 +194,49 @@ func TestScreenViewClaimsAcrossDaemonRestarts(t *testing.T) {
 	}
 	sent := captured()
 	require.Len(t, sent, 1)
-	assert.Equal(t, "usage", sent[0]["screen"])
-	assert.Equal(t, "web", sent[0]["surface"])
+	assert.Equal(t, "usage", sent[0].Properties["screen"])
+	assert.Equal(t, "web", sent[0].Properties["surface"])
 }
 
-func captureCollector(t *testing.T) (string, func() []map[string]any) {
+type capturedEvent struct {
+	Event      string         `json:"event"`
+	Properties map[string]any `json:"properties"`
+}
+
+func captureCollector(t *testing.T) (string, func() []capturedEvent) {
 	t.Helper()
 	var mu sync.Mutex
-	var sent []map[string]any
+	var sent []capturedEvent
 	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		var payload struct {
-			Batch []struct {
-				Properties map[string]any `json:"properties"`
-			} `json:"batch"`
+			Batch []capturedEvent `json:"batch"`
 		}
 		if !assert.NoError(t, json.NewDecoder(req.Body).Decode(&payload)) {
 			http.Error(w, "invalid capture batch", http.StatusBadRequest)
 			return
 		}
 		mu.Lock()
-		for _, item := range payload.Batch {
-			sent = append(sent, item.Properties)
-		}
+		sent = append(sent, payload.Batch...)
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(collector.Close)
-	return collector.URL, func() []map[string]any {
+	return collector.URL, func() []capturedEvent {
 		mu.Lock()
 		defer mu.Unlock()
-		return append([]map[string]any(nil), sent...)
+		return append([]capturedEvent(nil), sent...)
 	}
 }
 
 func captureReporter(t *testing.T, endpoint string, opts Options) *Reporter {
 	t.Helper()
+	clearTelemetryVetoes(t)
 	if opts.ScreenClaimsPath == "" {
 		opts.ScreenClaimsPath = filepath.Join(t.TempDir(), "screens")
 	}
 	client, err := kittelemetry.NewReporter(kittelemetry.Options{
 		APIKey: "phc_test", Application: application, EnvPrefix: envPrefix,
-		DistinctID: "install-id", Source: "daemon", Endpoint: endpoint,
+		DistinctID: "install-id", Source: "daemon", Endpoint: endpoint, Version: "v1.2.3",
 	}, allowedEventOptions(opts)...)
 	require.NoError(t, err)
 	return &Reporter{client: client}

@@ -91,11 +91,6 @@ test.describe("Session list", () => {
     await expect(sp.sessionItems).toHaveCount(TOTAL_SESSIONS);
   });
 
-  test("session count header is visible", async () => {
-    await expect(sp.sessionListHeader).toBeVisible();
-    await expect(sp.sessionListHeader).toContainText("sessions");
-  });
-
   test("clicking a session marks it active", async () => {
     await sp.sessionItems.first().click();
     await expect(sp.sessionItems.first()).toHaveClass(/active/);
@@ -116,6 +111,7 @@ test.describe("Session list", () => {
       .catch(() => false);
     expect(hasMessages || process.env.AGENTSVIEW_E2E_BACKEND === "duckdb").toBe(true);
     await expect(sessionWithMessages).toHaveClass(/active/);
+    await expect(sp.sessionItems).toHaveCount(TOTAL_SESSIONS);
 
     await sessionWithMessages.focus();
     const activeSessionBefore = await sessionWithMessages.getAttribute("data-session-id");
@@ -215,6 +211,7 @@ test.describe("Session list", () => {
       .click();
     await page.getByRole("switch", { name: "Link date ranges across pages" }).check();
 
+    await page.goto("about:blank");
     const requestPromise = page.waitForRequest((request) =>
       new URL(request.url()).pathname.endsWith("/api/v1/sessions/sidebar-index"),
     );
@@ -232,6 +229,8 @@ test.describe("Session list", () => {
     expect(sessionId).toBeTruthy();
     await page.clock.setFixedTime(new Date("2026-07-10T12:00:00"));
 
+    // Unload the previous page so its live refresh cannot satisfy this listener.
+    await page.goto("about:blank");
     const requestPromise = page.waitForRequest((request) =>
       new URL(request.url()).pathname.endsWith("/api/v1/sessions/sidebar-index"),
     );

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { modelPickerItems } from "../../utils/model-groups.js";
   import { Card } from "@kenn-io/kit-ui";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import {
@@ -55,13 +56,49 @@
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
   import { m } from "../../i18n/index.js";
-  import { usageChartColorMaps } from "../../utils/usageChartColors.js";
+  import { usageChartStyleMaps } from "../../utils/usageChartStyles.js";
+  import { localDateStr } from "../../utils/dates.js";
 
   let mounted = false;
   let unsubEvents: (() => void) | undefined;
+  let pendingRefresh = false;
+  let visible = $state(!document.hidden);
+  let urlInitRan = $state(false);
+  let urlWritebackReady = $state(false);
+  const refreshReady = $derived(
+    visible && urlInitRan && urlWritebackReady && !sessions.machineFilterPending,
+  );
 
-  const chartColorMaps = $derived(
-    usageChartColorMaps(
+  function refreshUsage(): void {
+    if (!refreshReady) {
+      pendingRefresh = true;
+      return;
+    }
+    pendingRefresh = false;
+    void usage.fetchAll({ preserveTimeRange: true });
+  }
+
+  function onVisibilityChange(): void {
+    visible = !document.hidden;
+    if (document.hidden) {
+      if (usage.isQuerying) {
+        pendingRefresh = true;
+        usage.cancelInFlightReads();
+      }
+    } else {
+      if (pendingRefresh) refreshUsage();
+      else usage.markNewData();
+    }
+  }
+
+  $effect(() => {
+    if (!usage.hasNewData || !refreshReady || usage.isQuerying) return;
+    const timer = setTimeout(refreshUsage, Math.max(0, usage.lastFetchStartedAt + 60_000 - performance.now()));
+    return () => clearTimeout(timer);
+  });
+
+  const chartStyleMaps = $derived(
+    usageChartStyleMaps(
       usage.colorSummary,
       settings.chartPalette,
     ),
@@ -86,14 +123,31 @@
       : 0,
   );
 
-  const agentItems = $derived(
-    sessions.agents.map((a) => ({
-      name: a.name,
-      count: a.session_count,
-    })),
-  );
+  $effect(() => {
+    const summaryAgents = ((usage.attributionSummary ?? usage.summary)?.agentTotals ?? [])
+      .map((agent) => ({ name: agent.agent }));
+    const sessionAgents = sessions.agents.map((agent) => ({
+      name: agent.name, count: agent.session_count,
+    }));
+    const filteredAgents = [usage.excludedAgents, sessions.filters.agent]
+      .flatMap((csv) => csv.split(",").filter(Boolean).map((name) => ({ name })));
+    untrack(() => {
+      const agents = new Map(usage.knownAgents.map((agent) => [agent.name, agent]));
+      for (const agent of [...summaryAgents, ...sessionAgents, ...filteredAgents]) {
+        agents.set(agent.name, { ...agents.get(agent.name), ...agent });
+      }
+      usage.knownAgents = [...agents.values()].sort((a, b) => a.name.localeCompare(b.name));
+    });
+  });
 
-  const earliestSession = $derived(sync.stats?.earliest_session ?? null);
+  const agentItems = $derived(usage.knownAgents);
+
+  const earliestUsage = $derived(
+    [sync.stats?.earliest_session, sync.stats?.earliest_account_usage]
+      .filter((timestamp): timestamp is string => !!timestamp)
+      .map((timestamp) => localDateStr(new Date(timestamp)))
+      .sort()[0] ?? null,
+  );
 
   const rangeSelection = $derived(
     selectionFromWindow({
@@ -101,7 +155,7 @@
       windowDays: usage.windowDays,
       from: usage.from,
       to: usage.to,
-      earliestSession,
+      earliestSession: earliestUsage,
     }),
   );
 
@@ -113,7 +167,7 @@
         windowDays: sel.days,
       }));
     } else {
-      const range = resolveRange(sel, earliestSession);
+      const range = resolveRange(sel, earliestUsage);
       usage.setDateRange(range.from, range.to);
       updateYokeFromUsage(panelDateState(range.from, range.to, {
         mode: "fixed",
@@ -121,8 +175,7 @@
     }
   }
 
-  // Track every model we've seen in any summary response or
-  // model filter — never remove one. This keeps the model
+  // Track models from summary rows and applied filters. This keeps the model
   // dropdown usable when landing on a shared filtered URL.
   let knownModels: string[] = $state([]);
 
@@ -144,21 +197,17 @@
   // Seed from the filtered summary response.
   $effect(() => {
     const fromSummary = ((usage.attributionSummary ?? usage.summary)?.modelTotals ?? [])
-      .map((m) => m.model);
+      .map((model) => model.model);
     untrack(() => mergeIntoKnownModels(fromSummary));
   });
 
-  // Seed from URL/local model filters before a response arrives.
   $effect(() => {
-    const filtered = usage.excludedModels;
-    untrack(() => {
-      if (!filtered) return;
-      mergeIntoKnownModels(filtered.split(","));
-    });
+    const filtered = usage.excludedModels.split(",").filter(Boolean);
+    untrack(() => mergeIntoKnownModels(filtered));
   });
 
   const modelItems = $derived(
-    knownModels.map((m) => ({ name: m })),
+    modelPickerItems(knownModels, usage.excludedModels, usage.modelAliases),
   );
   const unsupportedUsageMessage = $derived.by(() => {
     const kind = usage.isTimeRangeSummaryProvisional
@@ -230,8 +279,6 @@
     return supported;
   }
 
-  let urlInitRan = $state(false);
-  let urlWritebackReady = $state(false);
   let initialFetchDone = $state(false);
 
   function selectUsageMode(mode: UsageMode): void {
@@ -428,7 +475,7 @@
 
   $effect(() => {
     const signature = sessionFilterSignature;
-    const ready = urlInitRan && urlWritebackReady;
+    const ready = urlInitRan && urlWritebackReady && !sessions.machineFilterPending;
     untrack(() => {
       if (!ready || !signature || router.route !== "usage" || !mounted) {
         return;
@@ -436,18 +483,16 @@
       if (!initialFetchDone) {
         initialFetchDone = true;
       }
-      usage.fetchAll({ preserveTimeRange: true });
+      refreshUsage();
     });
   });
 
   onMount(() => {
     mounted = true;
+    document.addEventListener("visibilitychange", onVisibilityChange);
     // The Agent dropdown reads sessions.agents, which is otherwise loaded
     // lazily by the sidebar filter control; a direct /usage visit needs it too.
     sessions.loadAgents();
-    // SSE events only flag new data; RefreshControl owns the periodic refresh
-    // and the manual button. The initial and filter-change fetches run from the
-    // effects above once URL/filter state is hydrated.
     unsubEvents = events.subscribe(() => usage.markNewData());
     tick().then(() => {
       urlWritebackReady = true;
@@ -455,6 +500,7 @@
   });
 
   onDestroy(() => {
+    document.removeEventListener("visibilitychange", onVisibilityChange);
     usage.cancelInFlightReads();
     unsubEvents?.();
   });
@@ -492,7 +538,7 @@
       <RangePicker
         selection={rangeSelection}
         busy={usage.isQuerying}
-        {earliestSession}
+        earliestSession={earliestUsage}
         onSelect={applyRange}
       />
 
@@ -522,7 +568,8 @@
         label={m.usage_model()}
         selectedLabel={usage.selectedModel}
         items={modelItems}
-        excludedCsv={usage.excludedModels}
+        excludedCsv={usage.displayedModels}
+        unlistedExcludedCount={usage.partlyExcludedModelCount}
         onToggle={(name) => usage.toggleModel(name)}
         onSelectAll={() => usage.selectAllModels()}
         onDeselectAll={() =>
@@ -535,7 +582,7 @@
         querySteps={usage.lastQuerySteps}
         liveQuery={usage.liveQuery}
         busy={usage.isQuerying}
-        onRefresh={() => usage.fetchAll({ preserveTimeRange: true })}
+        onRefresh={(reason) => reason === "manual" ? refreshUsage() : usage.markNewData()}
         label={m.usage_refresh()}
         title={m.shared_refresh()}
       />
@@ -572,13 +619,13 @@
 
     <Card level="default" padding="none" class="chart-panel wide">
       <CostTimeSeriesChart
-        colorMap={chartColorMaps[usage.toggles.timeSeries.groupBy]}
+        styleMap={chartStyleMaps[usage.toggles.timeSeries.groupBy]}
       />
     </Card>
 
     <Card level="default" padding="none" class="chart-panel wide">
       <AttributionPanel
-        colorMap={chartColorMaps[usage.toggles.attribution.groupBy]}
+        styleMap={chartStyleMaps[usage.toggles.attribution.groupBy]}
       />
     </Card>
 
@@ -643,6 +690,8 @@
   .usage-content :global(.usage-note) {
     padding: 12px 14px;
     border-left: 4px solid var(--accent-blue);
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
     color: var(--text-secondary);
   }
 

@@ -21,6 +21,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 )
 
 func TestFSEventsFlagMapping(t *testing.T) {
@@ -429,7 +430,7 @@ func TestDarwinWatcherColdArchiveCardinalityUsesOneRecursiveStream(t *testing.T)
 			require.NoError(t, err)
 			var appendBatch WatchBatch
 			observedBeforeClose := false
-			observationTimer := time.NewTimer(750 * time.Millisecond) //nolint:kennlint // absence check; the window only records whether the open append surfaces before close, and either outcome passes
+			observationTimer := time.NewTimer(750 * time.Millisecond) //nolint:kennlint // deadlinetest: absence check; the window only records whether the open append surfaces before close, and either outcome passes
 		observeOpenAppend:
 			for {
 				select {
@@ -1142,6 +1143,52 @@ func TestDarwinWatcherRootDeletionHandoffRetainsWrites(t *testing.T) {
 	assert.Equal(t, []string{ancestor}, batch.ReconcileRoots)
 }
 
+func TestDarwinWatcherRetiredStreamLossDoesNotRetireReplacement(t *testing.T) {
+	ancestor := t.TempDir()
+	root := filepath.Join(ancestor, "sessions")
+	require.NoError(t, os.Mkdir(root, 0o700))
+	var trace []string
+	backend, watcher := newDarwinLifecycleTestWatcher(t, &trace)
+	var nativeSink func([]fsevents.Event)
+	closed := 0
+	backend.newStream = func(_ string, sink func([]fsevents.Event)) (darwinStream, error) {
+		nativeSink = sink
+		return &handoffRecordingStream{close: func() {
+			closed++
+			sink([]fsevents.Event{{Path: root, Flags: fseventFlagRootChanged}})
+		}}, nil
+	}
+	watcher.RegisterRoots([]WatchRoot{{
+		Path: root, Recursive: true, Exists: true,
+		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
+	}}, 10)
+	setDarwinLifecycleRunningForTest(t, backend)
+
+	nativeSink([]fsevents.Event{{Path: root, Flags: fseventFlagRootChanged}})
+	backend.processLifecycleSignals()
+	for range 2 {
+		batch, ok := watcher.eventSink.Take(watcher.agentsForRoot)
+		require.True(t, ok)
+		require.Equal(t, []string{ancestor}, batch.ReconcileRoots)
+		for _, token := range batch.lifecycleTokens {
+			token.gate.acknowledgeLifecycle(token.generation)
+		}
+		backend.processLifecycleSignals()
+	}
+
+	backend.processLifecycleSignals()
+	state := backend.logical[root]
+	assert.Equal(t, 1, closed, "a callback drained during closure belongs to the retired stream")
+	assert.True(t, state.active)
+	assert.True(t, state.open.Load())
+	assert.Equal(t, darwinRootOpen, state.phase)
+	path := filepath.Join(root, "after-replacement.jsonl")
+	nativeSink([]fsevents.Event{{Path: path, Flags: fseventFlagItemModified | fseventFlagItemIsFile}})
+	batch, ok := watcher.eventSink.Take(watcher.agentsForRoot)
+	require.True(t, ok)
+	assert.Equal(t, []string{path}, batch.Paths)
+}
+
 func TestDarwinWatcherMissingRootAncestorAvoidsPerEntryWatch(t *testing.T) {
 	ancestor := t.TempDir()
 	for i := range 50 {
@@ -1171,9 +1218,23 @@ func TestDarwinWatcherMissingRootRealCreationDeletionRecreation(t *testing.T) {
 	ancestor := t.TempDir()
 	intermediate := filepath.Join(ancestor, "state")
 	root := filepath.Join(intermediate, "sessions")
+	second := filepath.Join(root, "second.jsonl")
+	var secondObserved atomic.Bool
 	backend, err := newDarwinWatchBackend(nil, 20*time.Millisecond)
 	require.NoError(t, err)
 	watcher, batches := newDarwinTestWatcherWithBackend(t, backend)
+	onChange := watcher.onChange
+	watcher.onChange = func(ctx context.Context, batch WatchBatch) error {
+		if slices.Contains(batch.Paths, second) || batch.FullSync ||
+			slices.Contains(batch.ReconcileRoots, ancestor) {
+			if _, err := os.Stat(second); err == nil {
+				secondObserved.Store(true)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		return onChange(ctx, batch)
+	}
 	results := watcher.RegisterRoots([]WatchRoot{{
 		Path: root, Recursive: true,
 		Scopes: []WatchScope{{Agent: "agent-a", SyncDir: ancestor}},
@@ -1181,6 +1242,7 @@ func TestDarwinWatcherMissingRootRealCreationDeletionRecreation(t *testing.T) {
 	require.Equal(t, RecursiveWatchResult{
 		Watched: 1, MissingRootLifecycleOwned: true,
 	}, results[0])
+	rootOpen := backend.logical[root].open.Load
 	watcher.Start()
 
 	require.NoError(t, os.Mkdir(intermediate, 0o700))
@@ -1191,6 +1253,7 @@ func TestDarwinWatcherMissingRootRealCreationDeletionRecreation(t *testing.T) {
 	waitForDarwinBatch(t, batches, func(batch WatchBatch) bool {
 		return slices.Contains(batch.ReconcileRoots, ancestor)
 	})
+	require.Eventually(t, rootOpen, 5*time.Second, time.Millisecond)
 	first := filepath.Join(root, "first.jsonl")
 	require.NoError(t, os.WriteFile(first, []byte("first"), 0o600))
 	waitForDarwinBatch(t, batches, func(batch WatchBatch) bool {
@@ -1205,11 +1268,11 @@ func TestDarwinWatcherMissingRootRealCreationDeletionRecreation(t *testing.T) {
 	waitForDarwinBatch(t, batches, func(batch WatchBatch) bool {
 		return slices.Contains(batch.ReconcileRoots, ancestor)
 	})
-	second := filepath.Join(root, "second.jsonl")
+	require.Eventually(t, rootOpen, 5*time.Second, time.Millisecond)
 	require.NoError(t, os.WriteFile(second, []byte("second"), 0o600))
-	waitForDarwinBatch(t, batches, func(batch WatchBatch) bool {
-		return slices.Contains(batch.Paths, second)
-	})
+	// Delayed removal events can retire the replacement stream after it opens.
+	// Its reconciliation must observe the file even when no path event survives.
+	require.Eventually(t, secondObserved.Load, 5*time.Second, time.Millisecond)
 }
 
 func TestDarwinWatcherRootShallowRenameAndRecreation(t *testing.T) {
@@ -2272,7 +2335,8 @@ func TestDarwinWatcherFallbackNativeCallbackDoesNotRunPolling(t *testing.T) {
 		nativeSink([]fsevents.Event{{Flags: fseventFlagKernelDropped}})
 		close(returned)
 	}()
-	requireReceiveWithin(t, returned, 100*time.Millisecond)
+	// Polling stays blocked until the native callback returns.
+	requireReceiveWithin(t, returned, time.Second)
 	requireReceiveWithin(t, pollingEntered, time.Second)
 	close(releasePolling)
 }
@@ -2720,6 +2784,7 @@ func waitForDarwinBatch(
 				return batch
 			}
 		case <-timer.C:
+			stacktest.Dump(t)
 			require.FailNow(t, "timed out waiting for matching Darwin watcher batch")
 			return WatchBatch{}
 		}

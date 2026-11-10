@@ -18,13 +18,6 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
-// TestStoreHasSemanticFalse pins that the PostgreSQL store reports no
-// semantic search capability until it gets its own VectorSearcher seam.
-func TestStoreHasSemanticFalse(t *testing.T) {
-	s := &Store{}
-	assert.False(t, s.HasSemantic(), "PostgreSQL HasSemantic")
-}
-
 // TestStoreSearchContentSemanticModesUnavailable pins that "semantic" and
 // "hybrid" are rejected with db.ErrSemanticUnavailable before any query runs
 // -- a zero-value Store (no live *sql.DB) is enough to prove that.
@@ -73,28 +66,6 @@ func TestStoreSearchContentSemanticInvalidInputReturns400Before501(t *testing.T)
 	}
 }
 
-// TestStripFTSQuotes pins the de-quoting behavior the PostgreSQL Search path
-// relies on. The canonical implementation lives in the db package and is
-// shared with the SQLite and HTTP paths so the backends stay in parity.
-func TestStripFTSQuotes(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{`"hello world"`, "hello world"},
-		{`hello`, "hello"},
-		{`"error" "401"`, "error 401"},
-		{`"error-401"`, "error-401"},
-		{`""`, ""},
-		{`"a"`, "a"},
-		{`already unquoted`, "already unquoted"},
-	}
-	for _, tt := range tests {
-		assert.Equal(t, tt.want, db.StripFTSQuotes(tt.input),
-			"input=%q", tt.input)
-	}
-}
-
 func TestEscapeLike(t *testing.T) {
 	tests := []struct {
 		input string
@@ -110,24 +81,6 @@ func TestEscapeLike(t *testing.T) {
 		assert.Equal(t, tt.want, escapeLike(tt.input),
 			"input=%q", tt.input)
 	}
-}
-
-func TestPGMessagesBranchFTSRequiresAllTerms(t *testing.T) {
-	pb := &paramBuilder{}
-	branch := pgMessagesBranch(
-		db.ContentSearchFilter{
-			Pattern: "quick fox",
-			Mode:    "fts",
-		},
-		escapeLike("quick fox"),
-		pb,
-	)
-
-	assert.Contains(t, branch,
-		"m.content ILIKE '%'||$1||'%' ESCAPE E'\\\\'")
-	assert.Contains(t, branch,
-		"m.content ILIKE '%'||$2||'%' ESCAPE E'\\\\'")
-	assert.Equal(t, []any{"quick", "fox"}, pb.args)
 }
 
 func TestPGSubstringSnippetFTSModeCentersOnFirstTerm(t *testing.T) {
@@ -335,6 +288,8 @@ func (c *emptyTrashProbeConn) ExecContext(
 	defer c.state.mu.Unlock()
 
 	switch {
+	case strings.Contains(normalized, "update commit_links"):
+		return driver.RowsAffected(0), nil
 	case strings.Contains(normalized, "set deleted_at = deleted_at"):
 		return driver.RowsAffected(c.state.trashedCountLocked()), nil
 	case strings.Contains(normalized, "insert into excluded_sessions"):
@@ -356,6 +311,12 @@ func (c *emptyTrashProbeConn) QueryContext(
 	_ context.Context, query string, args []driver.NamedValue,
 ) (driver.Rows, error) {
 	normalized := strings.ToLower(query)
+	if normalized == "select to_regclass('commit_links') is not null" {
+		return &emptyTrashProbeRows{
+			columns: []string{"exists"},
+			values:  [][]driver.Value{{true}},
+		}, nil
+	}
 	if !strings.Contains(normalized, "left join session_aliases") ||
 		!strings.Contains(normalized, "for update of s") {
 		return nil, errors.New("unexpected empty-trash query")

@@ -20,6 +20,7 @@ const (
 	tokenCoverageRepairMetadataKey        = "token_coverage_repair_v1"
 	sourceCurationBackfillMetadataKey     = "source_curation_baseline_backfill_v1"
 	codexThreadScopeMetadataKey           = "codex_thread_scope_v1"
+	dialogueDedupeMetadataKey             = "dialogue_dedupe_v1"
 	projectIdentityRemoteScrubMetadataKey = "git_remote_credentials_scrub_v1"
 	tokenCoverageBackfillBatchSize        = 1000
 )
@@ -120,6 +121,43 @@ SELECT
         ARRAY['server_tool_use', 'web_search_requests'],
         'web_search_requests')`
 
+// sessionPlanUsageDDL mirrors SQLite's session_plan_usage. Times stay
+// the archive's RFC 3339 text and groups its JSON text, so every backend
+// returns the same values; nothing range-queries these columns.
+const sessionPlanUsageDDL = `
+CREATE TABLE IF NOT EXISTS session_plan_usage (
+    session_id TEXT PRIMARY KEY,
+    has_plan_usage BOOLEAN NOT NULL DEFAULT FALSE,
+    data_as_of TEXT,
+    data_status TEXT NOT NULL DEFAULT '',
+    usage_source TEXT NOT NULL DEFAULT '',
+    weekly_percent DOUBLE PRECISION,
+    five_hour_percent DOUBLE PRECISION,
+    credits TEXT,
+    groups_json TEXT NOT NULL DEFAULT '[]',
+    is_final BOOLEAN NOT NULL DEFAULT FALSE,
+    outcome_kind TEXT NOT NULL DEFAULT '',
+    outcome_at TEXT,
+    counted_under TEXT NOT NULL DEFAULT '',
+    has_coverage BOOLEAN NOT NULL DEFAULT FALSE,
+    last_capture_at TEXT,
+    uncaptured_turns INT NOT NULL DEFAULT 0,
+    FOREIGN KEY (session_id)
+        REFERENCES sessions(id) ON DELETE CASCADE
+);
+`
+
+const commitLinksDDL = `
+CREATE TABLE IF NOT EXISTS commit_links (
+    session_id TEXT NOT NULL, sha TEXT NOT NULL,
+    branch TEXT NOT NULL, subject TEXT NOT NULL, repository TEXT NOT NULL,
+    message_ordinal INTEGER NOT NULL, call_index INTEGER NOT NULL, tool_use_id TEXT NOT NULL,
+    committed_at TEXT NOT NULL, turn_ordinal INTEGER, turn_text TEXT NOT NULL,
+    project TEXT NOT NULL, retained BOOLEAN NOT NULL, PRIMARY KEY(session_id,sha)
+);
+CREATE INDEX IF NOT EXISTS idx_commit_links_sha ON commit_links(sha);
+`
+
 // coreDDL creates the tables and indexes. It uses unqualified
 // names because Open() sets search_path to the target schema.
 //
@@ -215,6 +253,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role           TEXT NOT NULL,
     content        TEXT NOT NULL,
     thinking_text  TEXT NOT NULL DEFAULT '',
+    dialogue_text  TEXT,
     timestamp      TIMESTAMPTZ,
     has_thinking   BOOLEAN NOT NULL DEFAULT FALSE,
     has_tool_use   BOOLEAN NOT NULL DEFAULT FALSE,
@@ -279,16 +318,17 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_session
 
 CREATE INDEX IF NOT EXISTS idx_usage_events_occurred
     ON usage_events (occurred_at);
-
+` + sessionPlanUsageDDL + `
 CREATE TABLE IF NOT EXISTS cursor_usage_events (
     id BIGSERIAL PRIMARY KEY,
+    agent TEXT NOT NULL DEFAULT 'cursor',
     occurred_at TIMESTAMPTZ NOT NULL,
     model TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT '',
-    input_tokens INT NOT NULL DEFAULT 0,
-    output_tokens INT NOT NULL DEFAULT 0,
-    cache_write_tokens INT NOT NULL DEFAULT 0,
-    cache_read_tokens INT NOT NULL DEFAULT 0,
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
     charged_microdollars BIGINT NOT NULL DEFAULT 0,
     cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0,
     user_id TEXT NOT NULL DEFAULT '',
@@ -582,6 +622,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_result_events_dedup
         call_index, event_index
     );
 
+` + commitLinksDDL + `
+
 CREATE TABLE IF NOT EXISTS secret_findings (
     id               BIGINT GENERATED ALWAYS AS IDENTITY
                          PRIMARY KEY,
@@ -636,6 +678,73 @@ CREATE INDEX IF NOT EXISTS idx_insights_lookup
 CREATE INDEX IF NOT EXISTS idx_insights_cache
     ON insights (cache_key, created_at DESC)
     WHERE cache_key <> '';
+
+`
+
+// frictionReviewDDL adds daily state without altering the shipped findings schema.
+const frictionReviewDDL = `
+CREATE INDEX IF NOT EXISTS idx_sessions_friction_activity
+    ON sessions(COALESCE(ended_at, started_at))
+    WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS friction_digests (
+    date             TEXT PRIMARY KEY,
+    timezone         TEXT NOT NULL,
+    rules_version    TEXT NOT NULL,
+    built_at         TIMESTAMPTZ NOT NULL,
+    revision         INTEGER NOT NULL DEFAULT 1,
+    sessions_scanned INTEGER NOT NULL,
+    snapshot_json    TEXT NOT NULL,
+    summary_json     TEXT NOT NULL,
+    markdown         TEXT NOT NULL,
+    markdown_sha256  TEXT NOT NULL,
+    run_id           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friction_digest_sessions (
+    subject_id   TEXT PRIMARY KEY,
+    date         TEXT NOT NULL,
+    subject_kind TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_digest_sessions_date
+    ON friction_digest_sessions (date);
+
+CREATE TABLE IF NOT EXISTS friction_patterns (
+    fingerprint      TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    first_seen_date  TEXT NOT NULL,
+    last_seen_date   TEXT NOT NULL,
+    occurrence_count INTEGER NOT NULL,
+    session_count    INTEGER NOT NULL,
+    last_subject_id  TEXT NOT NULL,
+    last_ordinal     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_friction_patterns_last_seen
+    ON friction_patterns (last_seen_date);
+
+CREATE TABLE IF NOT EXISTS friction_issue_links (
+    fingerprint       TEXT PRIMARY KEY,
+    kata_instance_uid TEXT NOT NULL,
+    kata_project_uid  TEXT NOT NULL,
+    issue_uid         TEXT NOT NULL,
+    qualified_id      TEXT NOT NULL,
+    web_url           TEXT NOT NULL DEFAULT '',
+    source            TEXT NOT NULL,
+    linked_at         TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS friction_filing_state (
+    fingerprint     TEXT PRIMARY KEY,
+    state           TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    first_failed_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ,
+    last_error      TEXT NOT NULL DEFAULT '',
+    updated_at      TIMESTAMPTZ NOT NULL
+);
 `
 
 func migrateMoneyColumnsPG(
@@ -938,6 +1047,32 @@ func lockSyncMetadataRow(ctx context.Context, tx *sql.Tx, key string) error {
 	return nil
 }
 
+func accountUsageTokensWidePG(ctx context.Context, db pgProjectIdentityExecer) bool {
+	var wide bool
+	err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) = 4 FROM information_schema.columns
+		WHERE table_schema = current_schema()
+		  AND table_name = 'cursor_usage_events'
+		  AND column_name IN ('input_tokens', 'output_tokens',
+		                      'cache_write_tokens', 'cache_read_tokens')
+		  AND data_type = 'bigint'`).Scan(&wide)
+	return err == nil && wide
+}
+
+func migrateAccountUsageCountersPG(ctx context.Context, db pgProjectIdentityExecer) error {
+	if accountUsageTokensWidePG(ctx, db) {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE cursor_usage_events
+		ALTER COLUMN input_tokens TYPE BIGINT,
+		ALTER COLUMN output_tokens TYPE BIGINT,
+		ALTER COLUMN cache_write_tokens TYPE BIGINT,
+		ALTER COLUMN cache_read_tokens TYPE BIGINT`); err != nil {
+		return fmt.Errorf("widening PG account usage counters: %w", err)
+	}
+	return nil
+}
+
 // EnsureSchema creates the schema (if needed), then runs
 // idempotent CREATE TABLE / ALTER TABLE statements. The schema
 // parameter is the unquoted schema name (e.g. "agentsview").
@@ -972,6 +1107,9 @@ func EnsureSchema(
 	if _, err := db.ExecContext(ctx, frictionDDL); err != nil {
 		return fmt.Errorf("creating pg friction tables: %w", err)
 	}
+	if _, err := db.ExecContext(ctx, frictionReviewDDL); err != nil {
+		return fmt.Errorf("creating pg friction review tables: %w", err)
+	}
 	if err := ensureRawIngestSchemaPG(ctx, db); err != nil {
 		return err
 	}
@@ -1004,6 +1142,9 @@ func EnsureSchema(
 		time.Since(step).Round(time.Millisecond),
 	)
 	if err := migrateMoneyColumnsPG(ctx, db, existingColumns); err != nil {
+		return err
+	}
+	if err := migrateAccountUsageCountersPG(ctx, db); err != nil {
 		return err
 	}
 	step = time.Now()
@@ -1062,6 +1203,17 @@ func EnsureSchema(
 		time.Since(step).Round(time.Millisecond),
 	)
 	step = time.Now()
+	if err := dedupeStoredDialoguePG(ctx, db); err != nil {
+		return err
+	}
+	log.Printf(
+		"pg schema: dialogue deduplication step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
+	if err := createMissingPreparationIndexesPG(ctx, db); err != nil {
+		return err
+	}
 	if err := createPartialIndexesPG(ctx, db); err != nil {
 		return err
 	}
@@ -1070,7 +1222,9 @@ func EnsureSchema(
 		time.Since(step).Round(time.Millisecond),
 	)
 	step = time.Now()
-	createContentSearchIndexesPG(ctx, db)
+	if err := createContentSearchIndexesPG(ctx, db); err != nil {
+		log.Printf("pg schema: content search indexes unavailable, search will scan: %v", err)
+	}
 	log.Printf(
 		"pg schema: content search index step completed in %s",
 		time.Since(step).Round(time.Millisecond),
@@ -1086,6 +1240,7 @@ func EnsureSchema(
 		return err
 	}
 	if !runRepair {
+		ensureUsageChangeJournalPG(ctx, db)
 		log.Printf(
 			"pg schema: token coverage repair check completed"+
 				" in %s (repair skipped)",
@@ -1114,6 +1269,7 @@ func EnsureSchema(
 	if err := markTokenCoverageRepairDone(ctx, db); err != nil {
 		return err
 	}
+	ensureUsageChangeJournalPG(ctx, db)
 	log.Printf(
 		"pg schema: token coverage repair marker stored in %s",
 		time.Since(step).Round(time.Millisecond),
@@ -1123,6 +1279,38 @@ func EnsureSchema(
 		time.Since(start).Round(time.Millisecond),
 	)
 	return nil
+}
+
+var preparationIndexesPG = []struct{ name, ddl string }{
+	{"idx_sessions_data_version", `CREATE INDEX IF NOT EXISTS idx_sessions_data_version ON sessions(data_version)`},
+	{"idx_sessions_parentless_workers", `CREATE INDEX IF NOT EXISTS idx_sessions_parentless_workers ON sessions(id) WHERE ` + db.ParentlessWorkerSQL},
+	{"idx_sessions_source_missing", `CREATE INDEX IF NOT EXISTS idx_sessions_source_missing ON sessions(id) WHERE deletion_cause = 'source_missing'`},
+}
+
+// createMissingPreparationIndexesPG serializes publishers upgrading the same
+// archive, since concurrent IF NOT EXISTS creation can still collide.
+func createMissingPreparationIndexesPG(ctx context.Context, pg *sql.DB) error {
+	missing := false
+	for _, index := range preparationIndexesPG {
+		missing = missing || !pgHasIndex(ctx, pg, index.name)
+	}
+	if !missing {
+		return nil
+	}
+	tx, err := pg.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning PG preparation index installation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockSyncMetadataRow(ctx, tx, "preparation_indexes_lock"); err != nil {
+		return err
+	}
+	for _, index := range preparationIndexesPG {
+		if _, err := tx.ExecContext(ctx, index.ddl); err != nil {
+			return fmt.Errorf("creating PG preparation index %s: %w", index.name, err)
+		}
+	}
+	return tx.Commit()
 }
 
 // createPartialIndexesPG creates partial indexes on the PG schema.
@@ -1185,74 +1373,43 @@ func createPartialIndexesPG(ctx context.Context, db pgSessionExecer) error {
 	return nil
 }
 
-// createContentSearchIndexesPG adds a pg_trgm GIN index on messages.content so
-// the content search (ILIKE '%pattern%') is index-accelerated instead of
-// sequentially scanning the messages table as history grows.
-//
-// It is best-effort and never fails schema setup. pg_trgm is a trusted
-// extension on PostgreSQL 13+, but a role without CREATE privilege (or a
-// managed instance that blocks it) must still get a working — if slower —
-// store. Each statement runs in its own implicit transaction, so a failed
-// CREATE EXTENSION does not poison the rest of EnsureSchema. The gin_trgm_ops
-// operator class lives in whatever schema pg_trgm was installed in, which may
-// not be on the connection search_path (Open sets it to the target schema
-// only), so the opclass is schema-qualified to the extension's namespace.
-func createContentSearchIndexesPG(ctx context.Context, db *sql.DB) {
-	if _, err := db.ExecContext(ctx,
-		`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
-	); err != nil {
-		log.Printf(
-			"pg schema: pg_trgm unavailable, content search will scan: %v", err,
-		)
-		return
+// createContentSearchIndexesPG accelerates content, dialogue, and thinking
+// substring searches. Callers decide whether unavailable pg_trgm is fatal.
+// The opclass is qualified because the extension can live outside search_path.
+func createContentSearchIndexesPG(ctx context.Context, pg interface {
+	pgSessionExecer
+	hostedQuerier
+},
+) error {
+	if _, err := pg.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS pg_trgm`); err != nil {
+		return err
 	}
 	var extSchema string
-	if err := db.QueryRowContext(ctx,
-		`SELECT n.nspname FROM pg_extension e
-		 JOIN pg_namespace n ON n.oid = e.extnamespace
-		 WHERE e.extname = 'pg_trgm'`,
-	).Scan(&extSchema); err != nil {
-		log.Printf("pg schema: locating pg_trgm schema failed: %v", err)
-		return
+	if err := pg.QueryRowContext(ctx, `SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='pg_trgm'`).Scan(&extSchema); err != nil {
+		return err
 	}
 	quotedExt, err := quoteIdentifier(extSchema)
 	if err != nil {
-		log.Printf("pg schema: invalid pg_trgm schema %q: %v", extSchema, err)
-		return
+		return err
 	}
-	// fastupdate=off keeps the index bounded: the default fastupdate=on
-	// buffers inserts into a pending list that only VACUUM merges, which grows
-	// unbounded when continuous ingest starves autovacuum.
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(
-		`CREATE INDEX IF NOT EXISTS idx_messages_content_trgm
-		 ON messages USING gin (content %s.gin_trgm_ops)
-		 WITH (fastupdate = off)`, quotedExt,
-	)); err != nil {
-		log.Printf(
-			"pg schema: creating messages.content trigram index failed: %v", err,
-		)
-		return
+	// Disable the pending list so continuous ingest cannot grow it unbounded.
+	for _, index := range []struct{ name, expression string }{
+		{"idx_messages_content_trgm", "content"},
+		{"idx_messages_dialogue_trgm", "(COALESCE(dialogue_text, content))"},
+		{"idx_messages_thinking_trgm", "thinking_text"},
+	} {
+		if _, err := pg.ExecContext(ctx, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON messages USING gin (%s %s.gin_trgm_ops) WITH (fastupdate = off)`, index.name, index.expression, quotedExt)); err != nil {
+			return err
+		}
 	}
-	// CREATE INDEX IF NOT EXISTS only applies WITH (fastupdate = off) on
-	// first creation. Re-apply on every boot so stores upgraded from a
-	// prior schema (which left fastupdate=on) also get the bounded index.
-	if _, err := db.ExecContext(ctx,
-		`ALTER INDEX idx_messages_content_trgm SET (fastupdate = off)`,
-	); err != nil {
-		log.Printf(
-			"pg schema: disabling fastupdate on messages.content trigram index failed: %v",
-			err,
-		)
-	}
+	// Existing content indexes may still have fastupdate enabled.
+	_, err = pg.ExecContext(ctx, `ALTER INDEX idx_messages_content_trgm SET (fastupdate = off)`)
+	return err
 }
 
-// backfillIsAutomatedPG verifies is_automated for all PG
-// sessions, correcting both false negatives (new patterns or
-// stale imported rows) and stale false positives (patterns
-// tightened since last run). The stored classifier hash records
-// which classifier wrote the current audit, but it is not a
-// complete integrity marker: rows can arrive from stale clients
-// after the hash was stamped.
+// backfillIsAutomatedPG corrects stale automation verdicts. Per-row
+// classifier stamps track freshness when available; deleting the global
+// metadata key requests a complete recheck.
 func backfillIsAutomatedPG(
 	ctx context.Context, pg *sql.DB,
 ) error {
@@ -1260,12 +1417,12 @@ func backfillIsAutomatedPG(
 	return err
 }
 
-// runSchemaDataRepairsPG runs the non-DDL correctness repairs that
+// runSchemaDataRepairsPG runs the correctness repairs that
 // EnsureSchema performs: it recomputes is_automated, backfills
 // source-curation baselines, scrubs stored project remotes, and repairs
-// token-coverage flags. These issue only row-level writes, so the
-// compatible-schema fast path can run them without the index and
-// column DDL that can block concurrent pg serve reads (issue #887).
+// token-coverage flags. The one-time automation tracking installation
+// holds an exclusive sessions lock until commit, blocking reads and writes.
+// Subsequent repairs use row-level writes.
 func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 	if err := backfillIsAutomatedPG(ctx, db); err != nil {
 		return err
@@ -1274,6 +1431,9 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	if err := backfillCodexThreadScopePG(ctx, db); err != nil {
+		return err
+	}
+	if err := dedupeStoredDialoguePG(ctx, db); err != nil {
 		return err
 	}
 	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
@@ -1293,6 +1453,26 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	return markTokenCoverageRepairDone(ctx, db)
+}
+
+// dedupeStoredDialoguePG applies db.StoredDialogue to rows pushed before it:
+// a dialogue_text that repeats content on a message without thinking text
+// becomes NULL, which search already reads as content. The marker and the
+// UPDATE share one statement, so the rewrite runs once and a failure retries
+// it whole.
+func dedupeStoredDialoguePG(ctx context.Context, pg pgSessionExecer) error {
+	_, err := pg.ExecContext(ctx, `
+		WITH migration AS (
+			INSERT INTO sync_metadata (key, value) VALUES ($1, '1')
+			ON CONFLICT (key) DO NOTHING RETURNING key
+		)
+		UPDATE messages SET dialogue_text = NULL
+		WHERE dialogue_text = content AND thinking_text = ''
+		  AND EXISTS (SELECT 1 FROM migration)`, dialogueDedupeMetadataKey)
+	if err != nil {
+		return fmt.Errorf("removing duplicate dialogue text: %w", err)
+	}
+	return nil
 }
 
 // Backfill only thread deletion decisions present before per-file identities.
@@ -1320,17 +1500,19 @@ func backfillCodexThreadScopePG(ctx context.Context, pg pgSessionExecer) error {
 	return nil
 }
 
-// repairLegacySourceMissingDeletionPG restores mirror rows written while
-// source absence was represented as deletion. Source availability is local
-// SQLite sync state; PostgreSQL retains only user-owned deletion state.
-func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error {
-	_, err := pg.ExecContext(ctx, `
+const repairLegacySourceMissingDeletionSQL = `
 		UPDATE sessions
 		SET deleted_at = NULL,
 		    source_deleted_at = NULL,
 		    deletion_cause = NULL,
 		    updated_at = NOW()
-		WHERE deletion_cause = 'source_missing'`)
+		WHERE deletion_cause = 'source_missing'`
+
+// repairLegacySourceMissingDeletionPG restores mirror rows written while
+// source absence was represented as deletion. Source availability is local
+// SQLite sync state; PostgreSQL retains only user-owned deletion state.
+func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error {
+	_, err := pg.ExecContext(ctx, repairLegacySourceMissingDeletionSQL)
 	if err != nil {
 		return fmt.Errorf("repairing legacy PG source-missing deletions: %w", err)
 	}
@@ -1553,36 +1735,6 @@ func markProjectIdentityRemoteScrubDone(
 		return fmt.Errorf(
 			"storing project identity remote scrub metadata: %w", err,
 		)
-	}
-	return nil
-}
-
-func batchUpdateAutomatedPG(
-	ctx context.Context, pg *sql.DB,
-	ids []string, val bool,
-) error {
-	const batchSize = 500
-	for i := 0; i < len(ids); i += batchSize {
-		end := min(i+batchSize, len(ids))
-		batch := ids[i:end]
-		pb := &paramBuilder{}
-		valPh := pb.add(val)
-		phs := make([]string, len(batch))
-		for j, id := range batch {
-			phs[j] = pb.add(id)
-		}
-		_, err := pg.ExecContext(ctx,
-			"UPDATE sessions SET is_automated = "+valPh+
-				" WHERE id IN ("+
-				strings.Join(phs, ",")+
-				")",
-			pb.args...,
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"updating is_automated in PG: %w", err,
-			)
-		}
 	}
 	return nil
 }
@@ -2081,7 +2233,7 @@ func inferTokenCoverage(
 }
 
 // CheckSchemaCompat verifies that the PG schema has all columns
-func pgHasTable(ctx context.Context, db *sql.DB, name string) bool {
+func pgHasTable(ctx context.Context, db hostedQuerier, name string) bool {
 	var n int
 	err := db.QueryRowContext(ctx,
 		"SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1",
@@ -2160,7 +2312,7 @@ func CheckSchemaCompat(
 	}
 
 	_, err = db.ExecContext(ctx,
-		`SELECT session_id, ordinal, role, content, thinking_text,
+		`SELECT session_id, ordinal, role, content, thinking_text, dialogue_text,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, reasoning_effort, token_usage,
 			context_tokens, output_tokens, provider_id,
@@ -2245,6 +2397,16 @@ func CheckSchemaCompat(
 		)
 	}
 
+	_, err = db.ExecContext(ctx,
+		`SELECT session_id, `+planUsageColumns+`
+		 FROM session_plan_usage LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"session_plan_usage table missing required columns: %w",
+			err,
+		)
+	}
+
 	hasModelPricing := true
 	_, err = db.ExecContext(ctx,
 		`SELECT input_microdollars_per_mtok,
@@ -2302,7 +2464,7 @@ func CheckSchemaCompat(
 
 	if pgHasTable(ctx, db, "cursor_usage_events") {
 		_, err = db.ExecContext(ctx,
-			`SELECT id, occurred_at, model, kind,
+			`SELECT id, agent, occurred_at, model, kind,
 				input_tokens, output_tokens,
 				cache_write_tokens, cache_read_tokens,
 				charged_microdollars, cursor_token_fee_microdollars,
@@ -2416,7 +2578,8 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 	if err := checkPushSchemaCompat(ctx, db); err != nil {
 		return false
 	}
-	if !pgHasTable(ctx, db, "model_pricing") ||
+	if !pgHasTable(ctx, db, "commit_links") ||
+		!pgHasTable(ctx, db, "model_pricing") ||
 		!pgHasTable(ctx, db, "model_pricing_bands") ||
 		!pgHasTable(ctx, db, "genai_pricing") ||
 		!pgHasTable(ctx, db, "source_archives") ||
@@ -2426,6 +2589,11 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 		!pgHasTable(ctx, db, "source_session_project_identity_snapshot_scopes") ||
 		!pgHasTable(ctx, db, "source_worktree_project_mappings") ||
 		!pgHasTable(ctx, db, "source_worktree_project_mapping_scopes") ||
+		!pgHasTable(ctx, db, "friction_digests") ||
+		!pgHasTable(ctx, db, "friction_digest_sessions") ||
+		!pgHasTable(ctx, db, "friction_patterns") ||
+		!pgHasTable(ctx, db, "friction_issue_links") ||
+		!pgHasTable(ctx, db, "friction_filing_state") ||
 		!pgHasTable(ctx, db, "cursor_usage_events") ||
 		!pgHasTable(ctx, db, "friction_findings") {
 		return false
@@ -2436,17 +2604,24 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 	// so repeated pushes cannot duplicate cursor usage rows.
 	// A push may provision the schema for a read-only serve role. Include
 	// the Activity index so that upgrading through push installs it too.
-	return pgHasIndex(ctx, db, "idx_cursor_usage_events_dedup") &&
+	return accountUsageTokensWidePG(ctx, db) &&
+		pgHasIndex(ctx, db, "idx_cursor_usage_events_dedup") &&
 		pgHasIndex(ctx, db, "idx_tool_result_events_terminal")
 }
 
 // CheckDataVersionCompat rejects PG datasets containing rows written by a
 // newer agentsview parser. PG does not have SQLite's global user_version, so
-// the highest session data_version is the compatibility marker.
+// sessions carry the parser version.
 func CheckDataVersionCompat(ctx context.Context, pg *sql.DB) error {
+	return checkDataVersionCompat(ctx, pg)
+}
+
+const maxDataVersionSQL = `SELECT COALESCE(MAX(data_version), 0) FROM sessions`
+
+func checkDataVersionCompat(ctx context.Context, pg hostedQuerier) error {
 	var version int
 	err := pg.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(data_version), 0) FROM sessions`,
+		maxDataVersionSQL,
 	).Scan(&version)
 	if err != nil {
 		if isUndefinedTable(err) || isUndefinedColumn(err) {
@@ -2455,10 +2630,7 @@ func CheckDataVersionCompat(ctx context.Context, pg *sql.DB) error {
 		return fmt.Errorf("checking PG data version: %w", err)
 	}
 	if version > db.CurrentDataVersion() {
-		return &db.DataVersionTooNewError{
-			DatabaseVersion: version,
-			BinaryVersion:   db.CurrentDataVersion(),
-		}
+		return &db.DataVersionTooNewError{DatabaseVersion: version, BinaryVersion: db.CurrentDataVersion()}
 	}
 	return nil
 }

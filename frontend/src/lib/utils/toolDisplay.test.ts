@@ -1,9 +1,26 @@
 import { describe, it, expect } from "vite-plus/test";
-import { displayFormattedToolResult, displayToolName, displayToolResult } from "./toolDisplay.js";
+import {
+  displayFormattedToolResult,
+  displayToolName,
+  displayToolResult,
+  displayToolResultPreview,
+  toolResultImageSources,
+} from "./toolDisplay.js";
 import retainedFixtureSource from "./__fixtures__/retained-tool-image-1735.json?raw";
 
 const SMALL_PNG_DATA_URI =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+// A summary whose first section is pretty-printed with a blank line between
+// its blocks, as some providers write it.
+const BLANK_LINE_SUMMARY = `agent-a:\n[\n  {"type": "input_text", "text": "Saved"},\n\n  ${JSON.stringify(
+  {
+    type: "input_image",
+    image_url: SMALL_PNG_DATA_URI,
+  },
+)}\n]\n\nagent-b:\n${JSON.stringify([
+  { type: "input_image", image_url: SMALL_PNG_DATA_URI },
+])}\n\nTrailing prose`;
 
 describe("displayToolName", () => {
   it("returns category for codex exec_command", () => {
@@ -155,5 +172,70 @@ describe("displayFormattedToolResult", () => {
     expect(displayFormattedToolResult(content)).toBe(
       `${JSON.stringify({ type: "input_image", image_url: SMALL_PNG_DATA_URI })}\n\n![image/png](${SMALL_PNG_DATA_URI})\n\nTrailing prose`,
     );
+  });
+});
+
+describe("displayToolResultPreview", () => {
+  it("names retained images with the drop-mode placeholder", () => {
+    const decodedBytes = atob(SMALL_PNG_DATA_URI.split(",")[1]!).length;
+    const content = JSON.stringify([
+      { type: "input_text", text: "Saved" },
+      { type: "input_image", image_url: SMALL_PNG_DATA_URI },
+    ]);
+    const preview = displayToolResultPreview(content);
+    expect(preview).toBe(`Saved\n\n[Image: image/png, ${decodedBytes} bytes]`);
+    expect(preview).not.toContain("base64");
+  });
+
+  it("leaves results without images unchanged", () => {
+    expect(displayToolResultPreview("plain output")).toBe("plain output");
+  });
+
+  it("names images in summary sections whose JSON holds blank lines", () => {
+    const decodedBytes = atob(SMALL_PNG_DATA_URI.split(",")[1]!).length;
+    const placeholder = `[Image: image/png, ${decodedBytes} bytes]`;
+    const preview = displayToolResultPreview(BLANK_LINE_SUMMARY);
+    expect(preview).toBe(
+      `agent-a:\nSaved\n\n${placeholder}\n\nagent-b:\n${placeholder}\n\nTrailing prose`,
+    );
+  });
+});
+
+describe("toolResultImageSources", () => {
+  it("lists inline and offloaded images in block order across summary sections", () => {
+    const content = `agent-a:\n${JSON.stringify([
+      { type: "input_image", image_url: SMALL_PNG_DATA_URI },
+      { type: "input_text", text: "between" },
+    ])}\n\nagent-b:\n${JSON.stringify([
+      {
+        type: "agentsview_image",
+        version: 1,
+        text: "![x](asset://abc.png)",
+        image_ref: "asset://abc.png",
+      },
+    ])}`;
+    expect(toolResultImageSources(content)).toEqual([SMALL_PNG_DATA_URI, "asset://abc.png"]);
+  });
+
+  it("finds images in summary sections whose JSON holds blank lines", () => {
+    expect(toolResultImageSources(BLANK_LINE_SUMMARY)).toEqual([
+      SMALL_PNG_DATA_URI,
+      SMALL_PNG_DATA_URI,
+    ]);
+  });
+
+  it.each([
+    [
+      "dropped placeholder",
+      [{ type: "agentsview_image", version: 1, text: "[Image: image/png, 3 bytes]" }],
+    ],
+    ["remote URL", [{ type: "input_image", image_url: "https://example.com/image.png" }]],
+    ["SVG data URI", [{ type: "input_image", image_url: "data:image/svg+xml;base64,AAAA" }]],
+    [
+      "non-asset reference",
+      [{ type: "agentsview_image", version: 1, image_ref: "https://example.com/x" }],
+    ],
+  ])("finds no displayable image in a %s", (_name, blocks) => {
+    expect(toolResultImageSources(JSON.stringify(blocks))).toEqual([]);
   });
 });

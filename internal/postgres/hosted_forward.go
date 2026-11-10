@@ -26,14 +26,6 @@ func (h *HostedStore) GetAgents(ctx context.Context, excludeOneShot, excludeAuto
 	return h.physical.GetAgents(ctx, excludeOneShot, excludeAutomated)
 }
 
-func (h *HostedStore) GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error) {
-	return h.physical.GetMachines(ctx, excludeOneShot, excludeAutomated)
-}
-
-func (h *HostedStore) GetMachineLabels(ctx context.Context) (map[string]string, error) {
-	return h.physical.GetMachineLabels(ctx)
-}
-
 func (h *HostedStore) GetMachineAliases(ctx context.Context) (map[string]string, error) {
 	return h.physical.GetMachineAliases(ctx)
 }
@@ -112,6 +104,10 @@ func (h *HostedStore) GetUsageSessionCounts(ctx context.Context, f db.UsageFilte
 
 func (h *HostedStore) GetUsageMatchingSessionCount(ctx context.Context, f db.UsageFilter) (int, error) {
 	return h.physical.GetUsageMatchingSessionCount(ctx, f)
+}
+
+func (h *HostedStore) GetPlanUsageSessionCounts(ctx context.Context, f db.UsageFilter) (db.PlanUsageSessionCounts, error) {
+	return h.physical.GetPlanUsageSessionCounts(ctx, f)
 }
 
 func (h *HostedStore) ListInsights(ctx context.Context, f db.InsightFilter) ([]db.Insight, error) {

@@ -32,6 +32,7 @@ type ModalType =
   | "resync"
   | "update"
   | "confirmDelete"
+  | "toolImage"
   | null;
 
 /** A tool call a jump expects at its target message; a rewrite can renumber messages, so the jump checks it. */
@@ -73,7 +74,7 @@ export function parseScrollCall(
 }
 
 /** Block types that can be toggled visible/hidden. */
-export type BlockType = "user" | "assistant" | "thinking" | "tool" | "code" | "system";
+export type BlockType = "user" | "assistant" | "thinking" | "tool" | "code" | "system" | "hook";
 
 export const ALL_BLOCK_TYPES: BlockType[] = [
   "user",
@@ -82,6 +83,7 @@ export const ALL_BLOCK_TYPES: BlockType[] = [
   "tool",
   "code",
   "system",
+  "hook",
 ];
 
 const BLOCK_FILTER_KEY = "agentsview-block-filters";

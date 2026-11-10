@@ -2,15 +2,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount, type ComponentProps } from "svelte";
 import type { Session } from "../../api/types.js";
-import type {
-  DbMessage as Message,
-  DbSessionTiming as SessionTiming,
-} from "../../api/generated/index.js";
+import type { DbMessage as Message } from "../../api/generated/index.js";
 import { setLocale } from "../../i18n/index.js";
+import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
 import MessageContent from "./MessageContent.svelte";
-
-const timingState = vi.hoisted(() => ({ timing: null as SessionTiming | null }));
-vi.mock("../../stores/sessionTiming.svelte.js", () => ({ sessionTiming: timingState }));
 
 const copyMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const mermaidMock = vi.hoisted(() => vi.fn(() => ({ renderNow: vi.fn(), disconnect: vi.fn() })));
@@ -18,6 +13,7 @@ const forkMock = vi.hoisted(() => vi.fn());
 const pinMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const state = vi.hoisted(() => ({
   sessions: [] as Session[],
+  view: (row: Session) => row,
   activeSession: null as Session | null,
   readOnly: false,
   remote: false,
@@ -156,7 +152,7 @@ beforeEach(() => {
 afterEach(async () => {
   for (const component of components.splice(0)) await unmount(component);
   document.body.replaceChildren();
-  timingState.timing = null;
+  sessionTiming.reset();
   setLocale("en");
   vi.clearAllMocks();
   state.sessions = [];
@@ -203,7 +199,7 @@ describe("MessageContent", () => {
   ])(
     "uses the call evidence for $label, running=$running",
     async ({ duration, running, turnDurationMs, label }) => {
-      timingState.timing = {
+      sessionTiming.timing = {
         session_id: "session-1",
         total_duration_ms: 6000,
         tool_duration_ms: duration ?? 0,
@@ -245,6 +241,7 @@ describe("MessageContent", () => {
           has_tool_use: true,
           tool_calls: [
             {
+              call_index: 0,
               tool_use_id: "call-1",
               tool_name: "Bash",
               category: "Bash",
@@ -364,7 +361,7 @@ describe("MessageContent", () => {
     await render(message({ role: "user", content: "Do not translate this prompt." }));
     expect(text(".role-label")).toBe("用户");
     expect(document.querySelector(".role-icon")?.getAttribute("style")).toContain(
-      "var(--accent-blue-foreground)",
+      "var(--role-user-accent-foreground)",
     );
     expect(document.querySelector('button[aria-label="复制消息"]')?.getAttribute("title")).toBe(
       "复制消息",
@@ -398,7 +395,7 @@ describe("MessageContent", () => {
   it("uses the assistant accent foreground", async () => {
     await render();
     expect(document.querySelector(".role-icon")?.getAttribute("style")).toContain(
-      "var(--accent-purple-foreground)",
+      "var(--role-assistant-accent-foreground)",
     );
   });
   it("shows the missing context placeholder", async () => {
@@ -687,4 +684,59 @@ describe("MessageContent filtered code fences", () => {
 
     unmount(component);
   });
+});
+
+const docbankLookup = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ integration: "disabled", occurrences: [] }),
+);
+vi.mock("../../api/generated/sessions/sessions.js", () => ({
+  getApiV1SessionsByIdFileReferences: docbankLookup,
+}));
+
+it("shows tracked Docbank evidence under the matching message", async () => {
+  const { imageOccurrence, trackDocbank } = await import("./docbankTestHelpers.js");
+  await trackDocbank({ integration: "enabled", occurrences: [imageOccurrence] });
+  await render(message({ content: "What does this image show?" }), { session: session() });
+  expect(document.querySelectorAll(".docbank-matches")).toHaveLength(1);
+});
+
+it("passes session, ordinal, and archive call index through parallel tools", async () => {
+  const { imageOccurrence, trackDocbank } = await import("./docbankTestHelpers.js");
+  await trackDocbank({
+    integration: "enabled",
+    occurrences: [
+      {
+        ...imageOccurrence,
+        size: 3,
+        tool_name: "Read",
+        tool_use_id: "",
+        call_index: 0,
+        media_type: "image/png",
+      },
+      {
+        ...imageOccurrence,
+        size: 3,
+        tool_name: "Read",
+        tool_use_id: "",
+        call_index: 1,
+        media_type: "image/jpeg",
+      },
+    ],
+  });
+  await render(
+    message({
+      has_tool_use: true,
+      tool_calls: [
+        { tool_name: "Read", category: "read", result_content: "first", call_index: 0 },
+        { tool_name: "Read", category: "read", result_content: "second", call_index: 1 },
+      ],
+    }),
+    { session: session() },
+  );
+  for (const header of document.querySelectorAll<HTMLButtonElement>(".tool-header")) header.click();
+  await tick();
+  const rows = [...document.querySelectorAll(".docbank-matches")];
+  expect(rows).toHaveLength(2);
+  expect(rows[0]!.textContent).toContain("image/png");
+  expect(rows[1]!.textContent).toContain("image/jpeg");
 });

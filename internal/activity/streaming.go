@@ -238,20 +238,20 @@ func BuildCandidateArtifactsFromSource(
 	usage []UsageRow,
 ) (CandidateArtifacts, error) {
 	return buildCandidateArtifactsFromSource(
-		ctx, p, sessions, source, usage, false, nil,
+		ctx, p, sessions, source, func() ([]UsageRow, error) { return usage, nil }, false, nil,
 	)
 }
 
 // BuildCandidateArtifactsFromSourceWithSurvivorUsage is the store-facing
 // variant for usage rows that have already passed the shared survivor
-// selection. It prevents a second deduplication pass while keeping slice-backed
-// callers compatible with the raw-usage API above.
+// selection. It loads usage after the candidate stream ends and skips a second
+// deduplication pass.
 func BuildCandidateArtifactsFromSourceWithSurvivorUsage(
 	ctx context.Context,
 	p Params,
 	sessions []SessionMeta,
 	source CandidateSource,
-	usage []UsageRow,
+	usage func() ([]UsageRow, error),
 ) (CandidateArtifacts, error) {
 	return buildCandidateArtifactsFromSource(
 		ctx, p, sessions, source, usage, true, nil,
@@ -263,7 +263,7 @@ func buildCandidateArtifactsFromSource(
 	p Params,
 	sessions []SessionMeta,
 	source CandidateSource,
-	usage []UsageRow,
+	loadUsage func() ([]UsageRow, error),
 	usageIsSurvivorSet bool,
 	joint *jointActivityAccumulator,
 ) (CandidateArtifacts, error) {
@@ -327,6 +327,10 @@ func buildCandidateArtifactsFromSource(
 		return CandidateArtifacts{}, err
 	}
 	state.advance(p.EffectiveEnd)
+	usage, err := loadUsage()
+	if err != nil {
+		return CandidateArtifacts{}, err
+	}
 	report.Totals.ActiveMinutes = state.active.Minutes()
 	report.Totals.IdleMinutes = p.EffectiveEnd.Sub(p.RangeStart).Minutes() -
 		report.Totals.ActiveMinutes
@@ -335,9 +339,15 @@ func buildCandidateArtifactsFromSource(
 	}
 	survivors := usage
 	if !usageIsSurvivorSet {
-		survivors = dedupUsage(p.RangeStart, p.RangeEnd, p.EffectiveEnd, usage)
+		survivors, err = dedupUsage(ctx, p.RangeStart, p.RangeEnd, p.EffectiveEnd, usage)
+		if err != nil {
+			return CandidateArtifacts{}, err
+		}
 	}
-	allocated := AllocateUsageCosts(survivors)
+	allocated, err := AllocateUsageCostsContext(ctx, survivors)
+	if err != nil {
+		return CandidateArtifacts{}, err
+	}
 	if err := applyUsageRows(
 		&report, windows, survivors, allocated, kindBy,
 	); err != nil {
@@ -605,4 +615,41 @@ func secondPrecisionWindows(windows []BucketWindow) []BucketWindow {
 		}
 	}
 	return normalized
+}
+
+// TranscriptMessage is one parseable message of a session. Starts marks a
+// message inside the pairing window, which may start a pair.
+type TranscriptMessage struct {
+	Ordinal     int
+	At          time.Time
+	Role, Model string
+	Starts      bool
+	// Counted is storage eligibility, independent of the report window.
+	Counted bool
+}
+
+// AppendTranscriptPairs pairs each window message of one session with
+// the next parseable one. The prior model is the latest assistant model whose
+// message is later than the message before it, up to and including the start.
+// Times compare at microseconds, as the reports order them.
+func AppendTranscriptPairs(
+	out []IntervalCandidate, sessionID string, ms []TranscriptMessage,
+) []IntervalCandidate {
+	prior := "unknown"
+	for i, m := range ms {
+		if i > 0 && m.Role == "assistant" && m.Model != "" &&
+			m.At.UnixMicro() > ms[i-1].At.UnixMicro() {
+			prior = m.Model
+		}
+		if !m.Starts || i+1 == len(ms) {
+			continue
+		}
+		next := ms[i+1]
+		out = append(out, IntervalCandidate{
+			SessionID: sessionID, StartOrdinal: m.Ordinal, EndOrdinal: next.Ordinal,
+			Start: m.At, End: next.At, ClosingRole: next.Role,
+			ClosingModel: next.Model, PriorModel: prior,
+		})
+	}
+	return out
 }

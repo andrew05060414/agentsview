@@ -21,7 +21,7 @@ func TestPGSessionAnnotationParity(t *testing.T) {
 	_, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err, "Push")
 
-	store, err := NewStore(testPGURL(t), syncer.schema, true)
+	store, err := NewStore(t.Context(), testPGURL(t), syncer.schema, true)
 	require.NoError(t, err, "NewStore")
 	defer store.Close()
 	dbtest.AssertSessionAnnotationParity(t, local, store)
@@ -99,7 +99,7 @@ func TestPGPushAddsAnnotationColumnsToOlderSchema(t *testing.T) {
 	require.NoError(t, err, "Push migrates the schema")
 	assert.True(t, pushSchemaCurrent(ctx, pg))
 
-	store, err := NewStore(testPGURL(t), syncer.schema, true)
+	store, err := NewStore(t.Context(), testPGURL(t), syncer.schema, true)
 	require.NoError(t, err, "NewStore")
 	defer store.Close()
 	got, err := store.GetSession(ctx, dbtest.AnnotatedLauncherID)
@@ -107,4 +107,29 @@ func TestPGPushAddsAnnotationColumnsToOlderSchema(t *testing.T) {
 	require.NotNil(t, got)
 	assert.Equal(t, []string{"role=lead", "ticket=example-a"}, got.Labels)
 	require.Len(t, got.PRLinks, 1)
+}
+
+func TestSessionExclusionCounts(t *testing.T) {
+	syncer, local, _, ctx := newSessionProvenancePushSync(t, "agentsview_session_exclusions_test")
+	dbtest.SeedSessionExclusions(t, local)
+	_, err := syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+	store, err := NewStore(ctx, testPGURL(t), syncer.schema, true)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	dbtest.AssertSessionExclusionCounts(t, store)
+	t.Run("tree query plan", func(t *testing.T) {
+		query, args := db.BuildSessionExclusionCountsSQL(db.SessionFilter{
+			ExcludeOneShot: true, ExcludeAutomated: true, IncludeChildren: true,
+		}, db.PostgresQueryDialect())
+		rows, err := store.DB().QueryContext(t.Context(), "EXPLAIN "+query, args...)
+		require.NoError(t, err)
+		defer rows.Close()
+		for rows.Next() {
+			var line string
+			require.NoError(t, rows.Scan(&line))
+			require.NotContains(t, line, "SubPlan")
+		}
+		require.NoError(t, rows.Err())
+	})
 }

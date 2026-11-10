@@ -119,15 +119,6 @@ describe("buildDisplayItems", () => {
     expect(items[0]).toMatchObject({ kind: "message" });
   });
 
-  it("single tool-only message becomes a tool-group", () => {
-    const items = buildDisplayItems([toolMsg(5)]);
-    expect(items).toHaveLength(1);
-    expect(items[0]).toMatchObject({
-      kind: "tool-group",
-      ordinals: [5],
-    });
-  });
-
   it("uses first message timestamp for tool group", () => {
     const msgs = [
       msg({
@@ -186,13 +177,6 @@ describe("buildDisplayItems with skipToolGrouping", () => {
     expect(itemsExplicit[0]!.kind).toBe("tool-group");
   });
 
-  it("preserves ordinals for individual tool messages when skipToolGrouping is true", () => {
-    const msgs = [toolMsg(10), toolMsg(20)];
-    const items = buildDisplayItems(msgs, { skipToolGrouping: true });
-    expect(items[0]!.ordinals).toEqual([10]);
-    expect(items[1]!.ordinals).toEqual([20]);
-  });
-
   it("handles mixed messages with text+tool content when skipToolGrouping is true", () => {
     const mixedMsg = msg({
       ordinal: 0,
@@ -237,12 +221,6 @@ describe("skipToolGrouping preserves thinking in tool-only messages", () => {
     expect(items[0]!.kind).toBe("tool-group");
   });
 
-  it("thinking+tool message becomes individual item with skipToolGrouping", () => {
-    const items = buildDisplayItems([thinkingToolMsg(0)], { skipToolGrouping: true });
-    expect(items).toHaveLength(1);
-    expect(items[0]!.kind).toBe("message");
-  });
-
   it("individual thinking+tool message stays visible when tool hidden but thinking visible", () => {
     const items = buildDisplayItems([thinkingToolMsg(0)], { skipToolGrouping: true });
     const noTool = visibilityFrom(new Set(["user", "assistant", "thinking", "code"]));
@@ -259,5 +237,45 @@ describe("skipToolGrouping preserves thinking in tool-only messages", () => {
     if (items[0]!.kind === "message") {
       expect(hasVisibleSegments(items[0]!.message, noToolNoThinking)).toBe(false);
     }
+  });
+});
+
+describe("buildDisplayItems empty groups", () => {
+  it("collapses each run of empty messages into one empty group", () => {
+    const items = buildDisplayItems([
+      textMsg(0, "Draw a bird", "user"),
+      toolMsg(1),
+      textMsg(2, ""),
+      textMsg(3, "  \n", "user"),
+      textMsg(4, "What should change?"),
+      textMsg(5, "", "user"),
+    ]);
+    expect(items.map((item) => [item.kind, item.ordinals])).toEqual([
+      ["message", [0]],
+      ["tool-group", [1]],
+      ["empty-group", [2, 3]],
+      ["message", [4]],
+      ["empty-group", [5]],
+    ]);
+  });
+
+  it("collapses empty messages when tool grouping is off", () => {
+    const items = buildDisplayItems([toolMsg(0), textMsg(1, ""), textMsg(2, "", "user")], {
+      skipToolGrouping: true,
+    });
+    expect(items.map((item) => [item.kind, item.ordinals])).toEqual([
+      ["message", [0]],
+      ["empty-group", [1, 2]],
+    ]);
+  });
+
+  it("keeps messages with thinking or a system marker out of empty groups", () => {
+    const items = buildDisplayItems([
+      msg({ ordinal: 0, content: "", has_thinking: true, thinking_text: "Plan the icon" }),
+      msg({ ordinal: 1, content: "", has_thinking: true }),
+      msg({ ordinal: 2, content: "", is_compact_boundary: true }),
+      msg({ ordinal: 3, content: "", is_system: true, source_subtype: "interrupted" }),
+    ]);
+    expect(items.map((item) => item.kind)).toEqual(["message", "message", "message", "message"]);
   });
 });

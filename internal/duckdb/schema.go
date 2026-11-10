@@ -22,8 +22,14 @@ import (
 // serving bare ids that deduplicate across sessions.
 // v17 adds session groups to the rebuilt mirror. v18 adds per-call tool
 // observations for effectiveness rates. v19 adds session pull request links
-// and labels.
-const SchemaVersion = 19
+// and labels. v20 adds codex-cloud plan usage and capture coverage
+// (session_plan_usage).
+// v21 adds messages.dialogue_text.
+// v22 adds commit provenance and copied prompts.
+// v23 adds the agent identity and 64-bit counters to imported account usage rows.
+// v24 stores dialogue that repeats content as NULL (see db.StoredDialogue);
+// the rebuild drops the copies older pushes wrote.
+const SchemaVersion = 24
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -89,6 +95,31 @@ type columnSpec struct {
 }
 
 var mirrorTables = []tableSpec{
+	{
+		name: "commit_links",
+		create: `CREATE TABLE IF NOT EXISTS commit_links (
+ session_id TEXT NOT NULL, sha TEXT NOT NULL,
+ branch TEXT NOT NULL, subject TEXT NOT NULL, repository TEXT NOT NULL,
+ message_ordinal INTEGER NOT NULL, call_index INTEGER NOT NULL, tool_use_id TEXT NOT NULL,
+ committed_at TEXT NOT NULL, turn_ordinal INTEGER, turn_text TEXT NOT NULL,
+ project TEXT NOT NULL, retained BOOLEAN NOT NULL, PRIMARY KEY(session_id,sha))`,
+		columns: []columnSpec{
+			{name: "session_id", def: "TEXT NOT NULL"},
+			{name: "sha", def: "TEXT NOT NULL"},
+			{name: "branch", def: "TEXT NOT NULL"},
+			{name: "subject", def: "TEXT NOT NULL"},
+			{name: "repository", def: "TEXT NOT NULL"},
+			{name: "message_ordinal", def: "INTEGER NOT NULL"},
+			{name: "call_index", def: "INTEGER NOT NULL"},
+			{name: "tool_use_id", def: "TEXT NOT NULL"},
+			{name: "committed_at", def: "TEXT NOT NULL"},
+			{name: "turn_ordinal", def: "INTEGER"},
+			{name: "turn_text", def: "TEXT NOT NULL"},
+			{name: "project", def: "TEXT NOT NULL"},
+			{name: "retained", def: "BOOLEAN NOT NULL"},
+		},
+		indexes: []string{"CREATE INDEX IF NOT EXISTS idx_commit_links_sha ON commit_links(sha)"},
+	},
 	{
 		name: "sync_metadata",
 		create: `CREATE TABLE IF NOT EXISTS sync_metadata (
@@ -282,6 +313,7 @@ var mirrorTables = []tableSpec{
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
 			thinking_text TEXT NOT NULL DEFAULT '',
+			dialogue_text TEXT,
 			timestamp TIMESTAMP,
 			has_thinking BOOLEAN NOT NULL DEFAULT FALSE,
 			has_tool_use BOOLEAN NOT NULL DEFAULT FALSE,
@@ -313,6 +345,7 @@ var mirrorTables = []tableSpec{
 			{"role", "role TEXT NOT NULL DEFAULT ''"},
 			{"content", "content TEXT NOT NULL DEFAULT ''"},
 			{"thinking_text", "thinking_text TEXT NOT NULL DEFAULT ''"},
+			{"dialogue_text", "dialogue_text TEXT"},
 			{"timestamp", "timestamp TIMESTAMP"},
 			{"has_thinking", "has_thinking BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"has_tool_use", "has_tool_use BOOLEAN NOT NULL DEFAULT FALSE"},
@@ -387,16 +420,62 @@ var mirrorTables = []tableSpec{
 		},
 	},
 	{
+		// One row per session. Times and groups stay the archive's text so
+		// every backend returns the same values. No primary key: a push
+		// deletes and reinserts the row in one transaction.
+		name: "session_plan_usage",
+		create: `CREATE TABLE IF NOT EXISTS session_plan_usage (
+			session_id TEXT NOT NULL,
+			has_plan_usage BOOLEAN NOT NULL DEFAULT FALSE,
+			data_as_of TEXT,
+			data_status TEXT NOT NULL DEFAULT '',
+			usage_source TEXT NOT NULL DEFAULT '',
+			weekly_percent DOUBLE,
+			five_hour_percent DOUBLE,
+			credits TEXT,
+			groups_json TEXT NOT NULL DEFAULT '[]',
+			is_final BOOLEAN NOT NULL DEFAULT FALSE,
+			outcome_kind TEXT NOT NULL DEFAULT '',
+			outcome_at TEXT,
+			counted_under TEXT NOT NULL DEFAULT '',
+			has_coverage BOOLEAN NOT NULL DEFAULT FALSE,
+			last_capture_at TEXT,
+			uncaptured_turns INTEGER NOT NULL DEFAULT 0
+		)`,
+		columns: []columnSpec{
+			{"session_id", "session_id TEXT NOT NULL DEFAULT ''"},
+			{"has_plan_usage", "has_plan_usage BOOLEAN NOT NULL DEFAULT FALSE"},
+			{"data_as_of", "data_as_of TEXT"},
+			{"data_status", "data_status TEXT NOT NULL DEFAULT ''"},
+			{"usage_source", "usage_source TEXT NOT NULL DEFAULT ''"},
+			{"weekly_percent", "weekly_percent DOUBLE"},
+			{"five_hour_percent", "five_hour_percent DOUBLE"},
+			{"credits", "credits TEXT"},
+			{"groups_json", "groups_json TEXT NOT NULL DEFAULT '[]'"},
+			{"is_final", "is_final BOOLEAN NOT NULL DEFAULT FALSE"},
+			{"outcome_kind", "outcome_kind TEXT NOT NULL DEFAULT ''"},
+			{"outcome_at", "outcome_at TEXT"},
+			{"counted_under", "counted_under TEXT NOT NULL DEFAULT ''"},
+			{"has_coverage", "has_coverage BOOLEAN NOT NULL DEFAULT FALSE"},
+			{"last_capture_at", "last_capture_at TEXT"},
+			{"uncaptured_turns", "uncaptured_turns INTEGER NOT NULL DEFAULT 0"},
+		},
+		indexes: []string{
+			"CREATE INDEX IF NOT EXISTS idx_session_plan_usage_session ON session_plan_usage(session_id)",
+		},
+	},
+	{
 		name: "cursor_usage_events",
 		create: `CREATE TABLE IF NOT EXISTS cursor_usage_events (
 			id BIGINT,
+			agent TEXT NOT NULL DEFAULT 'cursor',
 			occurred_at TIMESTAMP NOT NULL,
 			model TEXT NOT NULL,
 			kind TEXT NOT NULL DEFAULT '',
-			input_tokens INTEGER NOT NULL DEFAULT 0,
-			output_tokens INTEGER NOT NULL DEFAULT 0,
-			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			input_tokens BIGINT NOT NULL DEFAULT 0,
+			output_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_read_tokens BIGINT NOT NULL DEFAULT 0,
 			charged_microdollars BIGINT NOT NULL DEFAULT 0,
 			cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0,
 			user_id TEXT NOT NULL DEFAULT '',
@@ -406,13 +485,14 @@ var mirrorTables = []tableSpec{
 		)`,
 		columns: []columnSpec{
 			{"id", "id BIGINT"},
+			{"agent", "agent TEXT NOT NULL DEFAULT 'cursor'"},
 			{"occurred_at", "occurred_at TIMESTAMP NOT NULL"},
 			{"model", "model TEXT NOT NULL DEFAULT ''"},
 			{"kind", "kind TEXT NOT NULL DEFAULT ''"},
-			{"input_tokens", "input_tokens INTEGER NOT NULL DEFAULT 0"},
-			{"output_tokens", "output_tokens INTEGER NOT NULL DEFAULT 0"},
-			{"cache_write_tokens", "cache_write_tokens INTEGER NOT NULL DEFAULT 0"},
-			{"cache_read_tokens", "cache_read_tokens INTEGER NOT NULL DEFAULT 0"},
+			{"input_tokens", "input_tokens BIGINT NOT NULL DEFAULT 0"},
+			{"output_tokens", "output_tokens BIGINT NOT NULL DEFAULT 0"},
+			{"cache_write_tokens", "cache_write_tokens BIGINT NOT NULL DEFAULT 0"},
+			{"cache_read_tokens", "cache_read_tokens BIGINT NOT NULL DEFAULT 0"},
 			{"charged_microdollars", "charged_microdollars BIGINT NOT NULL DEFAULT 0"},
 			{"cursor_token_fee_microdollars", "cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0"},
 			{"user_id", "user_id TEXT NOT NULL DEFAULT ''"},
@@ -1051,7 +1131,7 @@ func checkSchemaShapeCompat(
 			)
 		}
 		return fmt.Errorf(
-			"duckdb schema incompatible; rebuild with 'agentsview duckdb push --full'; missing: %s",
+			"duckdb schema incompatible; rebuild with 'agentsview replica duckdb push --full'; missing: %s",
 			strings.Join(missing, ", "),
 		)
 	}
@@ -1088,7 +1168,7 @@ func checkSchemaShapeCompat(
 	if got != SchemaVersion {
 		return fmt.Errorf(
 			"mirror schema version %d does not match this build's %d; "+
-				"rebuild with 'agentsview duckdb push --full'",
+				"rebuild with 'agentsview replica duckdb push --full'",
 			got, SchemaVersion,
 		)
 	}

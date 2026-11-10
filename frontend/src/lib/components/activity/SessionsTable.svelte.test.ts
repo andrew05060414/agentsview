@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { flushSync, mount, tick, unmount } from "svelte";
 import SessionsTable from "./SessionsTable.svelte";
@@ -7,6 +9,7 @@ import { router } from "../../stores/router.svelte.js";
 import type { Report } from "../../api/types.js";
 import type { ActivitySessionRow } from "../../api/generated/index";
 import { testMoney } from "../../test/money.js";
+import type { ActivitySessionSort } from "../../api/activity-report.js";
 
 function makeRow(overrides: Partial<ActivitySessionRow> = {}): ActivitySessionRow {
   return {
@@ -141,22 +144,65 @@ describe("SessionsTable", () => {
     await unmount(c);
   });
 
-  it("requests a server sort when the Cost header is clicked", async () => {
+  it.each([
+    ["cost", "desc", "agent_minutes", "desc"],
+    ["session", "asc", "agent_minutes", "desc"],
+    ["model", "asc", "agent_minutes", "desc"],
+    ["session", "desc", "session", "asc"],
+  ] as const)("requests %s %s from the server", async (key, direction, sortKey, sortDir) => {
     const onSort = vi.fn();
     const report = makeReport(fixtureRows());
     const c = mount(SessionsTable, {
       target: document.body,
-      props: { report, onSort },
+      props: { report, onSort, sortKey, sortDir },
     });
     await tick();
 
-    const costHeader = document.querySelector("th.sort-cost button") as HTMLElement | null;
-    expect(costHeader).toBeTruthy();
-    costHeader!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    const header = document.querySelector(`th.sort-${key} button`) as HTMLElement | null;
+    expect(header).toBeTruthy();
+    header!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     await tick();
 
-    expect(onSort).toHaveBeenCalledWith("cost", "desc");
+    expect(onSort).toHaveBeenCalledWith(key, direction);
     expect(rowOrder()).toEqual(["high-min", "low-min", "untimed"]);
+
+    await unmount(c);
+  });
+
+  it("keeps sorting across columns and directions as the applied sort changes", async () => {
+    const requested: [string, string][] = [];
+    const props = $state({
+      report: makeReport(fixtureRows()),
+      sortKey: "agent_minutes" as ActivitySessionSort,
+      sortDir: "desc" as "asc" | "desc",
+      onSort: (key: ActivitySessionSort, direction: "asc" | "desc") => {
+        requested.push([key, direction]);
+        props.sortKey = key;
+        props.sortDir = direction;
+      },
+    });
+    const c = mount(SessionsTable, { target: document.body, props });
+    await tick();
+
+    const sortedHeaders = () =>
+      [...document.querySelectorAll("th[aria-sort]")].map(
+        (th) => `${th.textContent?.trim()} ${th.getAttribute("aria-sort")}`,
+      );
+    for (const key of ["session", "session", "model", "cost", "cost", "first_active", "session"]) {
+      (document.querySelector(`th.sort-${key} button`) as HTMLElement).click();
+      await tick();
+    }
+
+    expect(requested).toEqual([
+      ["session", "asc"],
+      ["session", "desc"],
+      ["model", "asc"],
+      ["cost", "desc"],
+      ["cost", "asc"],
+      ["first_active", "desc"],
+      ["session", "asc"],
+    ]);
+    expect(sortedHeaders()).toEqual([`${m.activity_session()} ascending`]);
 
     await unmount(c);
   });
@@ -383,6 +429,7 @@ describe("SessionsTable", () => {
 
       const error = document.querySelector(".page-error")!;
       expect(error.textContent).toContain("server down");
+      expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics");
       error.querySelector("button")!.click();
       expect(onRetry).toHaveBeenCalledOnce();
       expect(onLoadMore).not.toHaveBeenCalled();

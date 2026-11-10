@@ -65,6 +65,35 @@ func (p *geminiProvider) SourcesForChangedPath(
 	return p.sources.SourcesForChangedPath(ctx, req)
 }
 
+func (p *geminiProvider) ChangedPathRelevance(
+	ctx context.Context,
+	req ChangedPathRequest,
+) (ChangedPathRelevance, error) {
+	if err := ctx.Err(); err != nil {
+		return ChangedPathUnclassified, err
+	}
+	// Gemini reads only chat recordings under tmp/ and two root metadata
+	// files. Everything else under a root, such as the nested Antigravity
+	// trees, belongs to other providers or to nobody.
+	outside := false
+	for _, root := range p.sources.roots {
+		path := filepath.Clean(req.Path)
+		rel, ok := relUnder(root, path)
+		if !ok {
+			continue
+		}
+		if rel == "tmp" || strings.HasPrefix(rel, "tmp"+string(filepath.Separator)) ||
+			geminiProjectMetadataPath(root, path) {
+			return ChangedPathUnclassified, nil
+		}
+		outside = true
+	}
+	if outside {
+		return ChangedPathNonData, nil
+	}
+	return ChangedPathUnclassified, nil
+}
+
 func (p *geminiProvider) SourceForReconciliation(
 	ctx context.Context,
 	path, project string,
@@ -466,7 +495,7 @@ func (s geminiSourceSet) Fingerprint(
 		MTimeNS: info.ModTime().UnixNano(),
 	}
 	h := sha256.New()
-	if err := addGeminiFingerprintPart(h, "session", path, info); err != nil {
+	if err := addGeminiFingerprintPart(ctx, h, "session", path, info); err != nil {
 		return SourceFingerprint{}, err
 	}
 	if _, err := fmt.Fprintf(
@@ -638,6 +667,7 @@ func geminiProjectMetadataPath(root, path string) bool {
 }
 
 func addGeminiFingerprintPart(
+	ctx context.Context,
 	h hash.Hash,
 	label string,
 	path string,
@@ -658,7 +688,9 @@ func addGeminiFingerprintPart(
 		return fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
-	if _, err := io.Copy(h, f); err != nil {
+	n, err := io.Copy(h, f)
+	recordContentRead(ctx, n)
+	if err != nil {
 		return fmt.Errorf("hash %s: %w", path, err)
 	}
 	return nil
@@ -671,6 +703,7 @@ func geminiProviderCapabilities() Capabilities {
 			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
+			ChangedPathRelevance: CapabilitySupported,
 			FindSource:           CapabilitySupported,
 			CompositeFingerprint: CapabilitySupported,
 			IncrementalAppend:    CapabilityNotApplicable,

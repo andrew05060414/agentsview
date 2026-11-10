@@ -15,6 +15,7 @@ import (
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/kept"
 )
 
 const (
@@ -42,7 +43,7 @@ type activityReportInput struct {
 	Project   string `query:"project" doc:"Filter by project"`
 	GitBranch string `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	Agent     string `query:"agent" doc:"Filter by agent"`
-	Machine   string `query:"machine" doc:"Filter by machine"`
+	Machine   string `query:"machine" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400."`
 	// Automation classes the report: "all" (default) keeps both, "interactive"
 	// drops automated sessions, "automated" drops interactive ones. Empty is
 	// treated as "all"; any other value is rejected.
@@ -69,16 +70,21 @@ type activityReportBuildInputs struct {
 func (s *Server) humaActivityReport(
 	ctx context.Context, in *activityReportInput,
 ) (*huma.StreamResponse, error) {
-	machine, err := db.ResolveMachineFilter(ctx, s.db, in.Machine)
+	input := activitySelectionInput{
+		Preset: in.Preset, Date: in.Date, From: in.From, To: in.To,
+		Timezone: in.Timezone, Bucket: in.Bucket, Project: in.Project,
+		GitBranch: in.GitBranch, Agent: in.Agent, Machine: in.Machine,
+		Automation: in.Automation,
+	}
+	if err := validateActivitySelectionSize(input); err != nil {
+		return nil, apiError(http.StatusBadRequest, err.Error())
+	}
+	machine, err := db.ResolveMachineFilter(ctx, s.db, input.Machine)
 	if err != nil {
 		return nil, serverError(err)
 	}
-	selection, err := resolveActivitySelection(activitySelectionInput{
-		Preset: in.Preset, Date: in.Date, From: in.From, To: in.To,
-		Timezone: in.Timezone, Bucket: in.Bucket, Project: in.Project,
-		GitBranch: in.GitBranch, Agent: in.Agent, Machine: machine,
-		Automation: in.Automation,
-	}, time.Now())
+	input.Machine = machine
+	selection, err := resolveActivitySelection(input, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +161,7 @@ func (s *Server) buildActivityReport(
 	}
 	return s.prepareActivityReport(
 		selection, inputs.tokenStore, artifacts, inputs.probe,
+		activity.SessionPageOptions{},
 	)
 }
 
@@ -226,17 +233,24 @@ func (s *Server) buildActivityArtifacts(
 		return activity.CandidateArtifacts{}, err
 	}
 	if s.activityReportFlights == nil {
-		s.activityReportFlights = newActivityReportBuildGroup()
+		s.activityReportFlights = &kept.Flights[activity.CandidateArtifacts]{}
 	}
-	return s.activityReportFlights.do(ctx, string(keyPayload), build)
+	return s.activityReportFlights.Do(ctx, string(keyPayload), build)
 }
 
+// prepareActivityReport signs a report over artifacts and fills its first
+// session page in the order sessionPage asks for.
 func (s *Server) prepareActivityReport(
 	selection resolvedActivitySelection,
 	tokenStore db.ActivityReportTokenStore,
 	artifacts activity.CandidateArtifacts,
 	probe activity.SourceProbe,
+	sessionPage activity.SessionPageOptions,
 ) (activity.Report, error) {
+	sessionPage, err := activity.NormalizeSessionPageOptions(sessionPage)
+	if err != nil {
+		return activity.Report{}, err
+	}
 	digest, err := activity.ArtifactDigest(artifacts)
 	if err != nil {
 		return activity.Report{}, err
@@ -248,7 +262,7 @@ func (s *Server) prepareActivityReport(
 		return activity.Report{}, err
 	}
 	page, err := activity.PageSessions(
-		artifacts.Sessions, artifacts.Membership, activity.SessionPageOptions{},
+		artifacts.Sessions, artifacts.Membership, sessionPage,
 	)
 	if err != nil {
 		return activity.Report{}, err
@@ -258,7 +272,8 @@ func (s *Server) prepareActivityReport(
 			Version: activitySessionCursorVersion,
 			Schema:  export.ActivityReportSchemaVersion,
 			Digest:  digest, Offset: page.Next,
-			Sort: activity.SessionSortAgentMinutes, Direction: "desc",
+			Sort: sessionPage.Sort, Direction: sessionPage.Direction,
+			BucketRange: sessionPage.BucketRange,
 		})
 		if err != nil {
 			return activity.Report{}, err

@@ -21,6 +21,70 @@ import (
 
 type syncStateStore = storage.SyncStateStore
 
+// handoffSyncState writes push state to the local archive and rides out a
+// worker handoff. The daemon closes its archive writer while a sync worker
+// runs, and a daemon push runs outside the sync lock, so a handoff can start
+// during a push. A write that hits a closed writer waits for it to reopen and
+// tries again.
+type handoffSyncState struct{ local *db.DB }
+
+func (h handoffSyncState) GetSyncState(ctx context.Context, key string) (string, error) {
+	return h.local.GetSyncState(ctx, key)
+}
+
+func (h handoffSyncState) SetSyncState(ctx context.Context, key, value string) error {
+	_, err := db.RetryAcrossHandoff(ctx, h.local, func() (struct{}, error) {
+		return struct{}{}, h.local.SetSyncState(ctx, key, value)
+	})
+	return err
+}
+
+func (h handoffSyncState) GetOrCreateSyncState(
+	ctx context.Context, key, defaultValue string,
+) (string, error) {
+	return db.RetryAcrossHandoff(ctx, h.local, func() (string, error) {
+		return h.local.GetOrCreateSyncState(ctx, key, defaultValue)
+	})
+}
+
+// databaseSyncStateWriter writes several sync-state values in one archive
+// transaction, and only while the archive's database ID is still databaseID.
+type databaseSyncStateWriter interface {
+	SetSyncStatesForDatabase(ctx context.Context, databaseID string, values map[string]string) error
+}
+
+func (h handoffSyncState) SetSyncStatesForDatabase(
+	ctx context.Context, databaseID string, values map[string]string,
+) error {
+	_, err := db.RetryAcrossHandoff(ctx, h.local, func() (struct{}, error) {
+		return struct{}{}, h.local.SetSyncStatesForDatabase(ctx, databaseID, values)
+	})
+	return err
+}
+
+// syncStateBatch collects sync-state writes so a caller can commit them
+// together. It is write-only.
+type syncStateBatch struct{ values map[string]string }
+
+func newSyncStateBatch() *syncStateBatch {
+	return &syncStateBatch{values: make(map[string]string)}
+}
+
+var errSyncStateBatchWriteOnly = errors.New("sync state batch is write-only")
+
+func (b *syncStateBatch) GetSyncState(context.Context, string) (string, error) {
+	return "", errSyncStateBatchWriteOnly
+}
+
+func (b *syncStateBatch) SetSyncState(_ context.Context, key, value string) error {
+	b.values[key] = value
+	return nil
+}
+
+func (b *syncStateBatch) GetOrCreateSyncState(context.Context, string, string) (string, error) {
+	return "", errSyncStateBatchWriteOnly
+}
+
 type scopedSyncStateStore struct {
 	base          syncStateStore
 	scope         string
@@ -117,6 +181,23 @@ func (s *scopedSyncStateStore) SetSyncState(ctx context.Context,
 	return s.base.SetSyncState(ctx, s.scopedKey(key), value)
 }
 
+func (s *scopedSyncStateStore) SetSyncStatesForDatabase(
+	ctx context.Context, databaseID string, values map[string]string,
+) error {
+	if err := s.ensureMigration(ctx); err != nil {
+		return err
+	}
+	writer, ok := s.base.(databaseSyncStateWriter)
+	if !ok {
+		return fmt.Errorf("sync state store %T cannot write in one transaction", s.base)
+	}
+	scoped := make(map[string]string, len(values))
+	for key, value := range values {
+		scoped[s.scopedKey(key)] = value
+	}
+	return writer.SetSyncStatesForDatabase(ctx, databaseID, scoped)
+}
+
 func (s *scopedSyncStateStore) GetOrCreateSyncState(ctx context.Context,
 	key, defaultValue string,
 ) (string, error) {
@@ -200,10 +281,15 @@ type Sync struct {
 	// fullRunCheckpointInterval, when positive, replaces
 	// fullPushRunCheckpointInterval.
 	fullRunCheckpointInterval time.Duration
+	// fullRunSaveTimeout, when positive, replaces
+	// defaultFullRunSaveTimeout.
+	fullRunSaveTimeout time.Duration
 	// pushBatchSize, when positive, replaces the session batch size.
 	pushBatchSize int
 	// afterPushBatch is a test hook called after each session batch.
 	afterPushBatch func()
+	// afterMessagePage is a test hook called after each copied message page.
+	afterMessagePage func()
 
 	closeOnce sync.Once
 	closeErr  error
@@ -216,7 +302,7 @@ func (s *Sync) effectiveSyncState() syncStateStore {
 	if s.syncState != nil {
 		return s.syncState
 	}
-	return s.local
+	return handoffSyncState{s.local}
 }
 
 func (s *Sync) aliasBackfillSyncStateOrDefault() syncStateStore {
@@ -232,7 +318,7 @@ func (s *Sync) aliasBackfillSyncStateOrDefault() syncStateStore {
 // When allowInsecure is true, non-loopback connections without TLS
 // produce a warning instead of failing.
 func New(
-	pgURL, schema string, local *db.DB,
+	ctx context.Context, pgURL, schema string, local *db.DB,
 	machine string, allowInsecure bool,
 	opts storage.PusherOptions,
 ) (*Sync, error) {
@@ -259,11 +345,11 @@ func New(
 		return nil, err
 	}
 
-	pg, err := Open(pgURL, schema, allowInsecure)
+	pg, err := Open(ctx, pgURL, schema, allowInsecure)
 	if err != nil {
 		return nil, err
 	}
-	if err = RejectHostedPush(context.Background(), pg); err != nil {
+	if err = RejectHostedPush(ctx, pg); err != nil {
 		pg.Close()
 		return nil, err
 	}
@@ -287,12 +373,12 @@ func New(
 		pg:    pg,
 		local: local,
 		syncState: newScopedSyncStateStore(
-			local,
+			handoffSyncState{local},
 			syncStateScope,
 			migrateLegacySyncState,
 		),
 		aliasBackfillState: newScopedSyncStateStore(
-			local,
+			handoffSyncState{local},
 			aliasBackfillStateScope,
 			false,
 		),
@@ -405,14 +491,20 @@ func (s *Sync) ensureSchemaLocked(ctx context.Context) error {
 		return err
 	}
 	if pushSchemaCurrent(ctx, s.pg) {
-		// Schema DDL is current, so skip the index and column
-		// maintenance that can lock against concurrent pg serve
-		// reads (issue #887). Still run the row-level data repairs
-		// so is_automated and token-coverage flags stay correct on
-		// existing rows.
+		if err := createMissingPreparationIndexesPG(ctx, s.pg); err != nil {
+			if !isInsufficientPrivilege(err) {
+				return err
+			}
+			log.Printf("pg schema: preparation indexes unavailable, insufficient privilege: %v", err)
+		}
+		// Skip general index and column maintenance, and run correctness
+		// repairs so is_automated and token-coverage flags stay current.
+		// The one-time automation tracking installation still takes an
+		// exclusive sessions lock, blocking reads and writes until commit.
 		if err := runSchemaDataRepairsPG(ctx, s.pg); err != nil {
 			return err
 		}
+		ensureUsageChangeJournalPG(ctx, s.pg)
 		// pushSchemaCurrent predates the vector tables, so a schema
 		// created before this feature is "current" yet lacks them; a
 		// plain post-upgrade pg push would never create them. Run the
@@ -482,7 +574,7 @@ func ReadStatus(
 			machine,
 		)
 	}
-	pg, err := Open(pgURL, schema, allowInsecure)
+	pg, err := Open(ctx, pgURL, schema, allowInsecure)
 	if err != nil {
 		return SyncStatus{}, err
 	}

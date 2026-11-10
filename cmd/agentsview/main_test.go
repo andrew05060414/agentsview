@@ -26,6 +26,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
@@ -37,6 +38,7 @@ import (
 	"go.kenn.io/agentsview/internal/storage"
 	agentsync "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
+	"go.kenn.io/kit/stacktest"
 )
 
 type cursorSecretRecorder struct {
@@ -128,7 +130,7 @@ func TestUsageNotificationHoldsIdleWorkAfterSync(t *testing.T) {
 	}}))
 	idled := make(chan struct{})
 	shutdown := make(chan error, 1)
-	tracker := server.NewIdleTracker(20*time.Millisecond, func() {
+	tracker := server.NewIdleTracker(20*time.Millisecond, func() { //nolint:kennlint // deadlinetest: absence check; the held cache write keeps notification work active beyond the idle deadline
 		close(idled)
 		shutdown <- database.Close()
 	})
@@ -224,17 +226,25 @@ func TestRuntimeWarningHelper(t *testing.T) {
 }
 
 func TestServeRuntimeRecordWriteFailureWarnsVisibleAfterStartupRelease(t *testing.T) {
-	out, err := runServeRuntimeWarningHelper(t, true)
+	out, err := runServeRuntimeWarningHelper(t, true, false)
 	require.NoError(t, err, string(out))
 	assert.Contains(t, string(out), "could not write daemon runtime record")
 	assert.Contains(t, string(out), "icacls <dir> /setowner <user>")
 }
 
-func TestServeRuntimeRecordWriteSuccessDoesNotWarnVisible(t *testing.T) {
-	out, err := runServeRuntimeWarningHelper(t, false)
-	require.NoError(t, err, string(out))
-	assert.Contains(t, string(out), "runtime record write reached")
-	assert.NotContains(t, string(out), "could not write daemon runtime record")
+func TestServePublishesStartupLifetime(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		background bool
+		want       string
+	}{{"foreground", false, "startup lifetime: true 0s"}, {"automatic background", true, "startup lifetime: false 2s"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runServeRuntimeWarningHelper(t, false, tc.background)
+			require.NoError(t, err, string(out))
+			assert.Contains(t, string(out), tc.want)
+			assert.NotContains(t, string(out), "could not write daemon runtime record")
+		})
+	}
 }
 
 func TestServeCommandMountsWritableServerAtBasePath(t *testing.T) {
@@ -329,7 +339,7 @@ func TestServeStaleArchiveHelperProcess(t *testing.T) {
 		})
 	}
 	original := writeDaemonRuntimeWithAuthAndNoSync
-	writeDaemonRuntimeWithAuthAndNoSync = func(dataDir, host string, port int, version, browserURL string, readOnly, requireAuth, noSync bool, explicitPort *int, caddyPID ...int) (string, error) {
+	writeDaemonRuntimeWithAuthAndNoSync = func(lifetime *daemonLifetime, dataDir, host string, port int, version, browserURL string, readOnly, requireAuth, noSync bool, explicitPort *int, caddyPID ...int) (string, error) {
 		base := fmt.Sprintf("http://%s:%d", host, port)
 		client := &http.Client{Timeout: 10 * time.Second, Transport: localTransport}
 		if kind != "" {
@@ -389,7 +399,7 @@ func TestServeStaleArchiveHelperProcess(t *testing.T) {
 			require.Contains(t, string(body), "hello")
 		}
 		fmt.Println("archive rebuild complete")
-		return original(dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort, caddyPID...)
+		return original(lifetime, dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort, caddyPID...)
 	}
 	runServe(t.Context(), cfg, serveOptions{SkipInitialSync: true}, 0)
 }
@@ -401,10 +411,14 @@ func TestPGServeRuntimeRecordWriteFailureWarnsVisible(t *testing.T) {
 }
 
 func runServeRuntimeWarningHelper(
-	t *testing.T, failWrite bool,
+	t *testing.T, failWrite, background bool,
 ) ([]byte, error) {
 	t.Helper()
 	dataDir := t.TempDir()
+	child := ""
+	if background {
+		child = "1"
+	}
 	marker := "runtime record write reached"
 	if failWrite {
 		// Wait for the remedy, which is emitted after the warning, so the parent
@@ -417,6 +431,9 @@ func runServeRuntimeWarningHelper(
 			"AGENTSVIEW_RUN_SERVE_RUNTIME_WARNING_HELPER=1",
 			"AGENTSVIEW_RUN_SERVE_RUNTIME_WARNING_FAIL=" + strconv.FormatBool(failWrite),
 			"AGENTSVIEW_DATA_DIR=" + dataDir,
+			backgroundChildEnvVar + "=" + child,
+			persistentDaemonEnvVar + "=false",
+			"AGENTSVIEW_DAEMON_IDLE_TIMEOUT=2s",
 		},
 		marker,
 	)
@@ -492,6 +509,7 @@ func runRuntimeWarningHelperProcess(
 		return stdoutOutput.Bytes(), nil
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		stacktest.Dump(t)
 		return combined, fmt.Errorf(
 			"%s helper deadline expired before stdout marker %q: %w\noutput:\n%s",
 			helperName, marker, ctx.Err(), combined,
@@ -521,6 +539,7 @@ func TestRunServeRuntimeWarningHelperProcess(t *testing.T) {
 	}
 	if os.Getenv("AGENTSVIEW_RUN_SERVE_RUNTIME_WARNING_FAIL") == "true" {
 		writeDaemonRuntimeWithAuthAndNoSync = func(
+			*daemonLifetime,
 			string, string, int, string, string, bool, bool, bool, *int, ...int,
 		) (string, error) {
 			return "", errors.New("forced runtime-record write failure")
@@ -528,11 +547,15 @@ func TestRunServeRuntimeWarningHelperProcess(t *testing.T) {
 	} else {
 		original := writeDaemonRuntimeWithAuthAndNoSync
 		writeDaemonRuntimeWithAuthAndNoSync = func(
+			lifetime *daemonLifetime,
 			dataDir, host string, port int, version, browserURL string, readOnly,
 			requireAuth, noSync bool, explicitPort *int, caddyPID ...int,
 		) (string, error) {
+			if snapshot := readStartupState(dataDir); snapshot != nil {
+				fmt.Printf("startup lifetime: %t %s\n", snapshot.Persistent, snapshot.IdleTimeout)
+			}
 			path, err := original(
-				dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort,
+				lifetime, dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort,
 				caddyPID...,
 			)
 			if os.Getenv("AGENTSVIEW_RUN_SERVE_BASE_PATH") != "" {
@@ -608,7 +631,7 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 		Port:    port,
 		DataDir: os.Getenv("AGENTSVIEW_DATA_DIR"),
 	}
-	prepareReplicaServe = func(storage.Replica, config.Config, string) (replicaServeStartup, error) {
+	prepareReplicaServe = func(context.Context, storage.Replica, config.Config, string, *ReplicaPushConfig) (replicaServeStartup, error) {
 		return replicaServeStartup{
 			cfg: appCfg, ctx: ctx,
 			rtOpts: serveRuntimeOptions{
@@ -624,7 +647,7 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 	// This is only an orphan guard if the parent dies; normal completion is
 	// driven by the parent observing the warning on stdout.
 	time.AfterFunc(2*time.Minute, func() { os.Exit(0) })
-	runReplicaServe(pgReplica{}, appCfg, "")
+	runReplicaServe(t.Context(), pgReplica{}, appCfg, "", nil)
 }
 
 func TestMustLoadConfig(t *testing.T) {
@@ -716,22 +739,98 @@ func TestPrepareServeRuntimeConfigPortZeroUsesAssignedPort(t *testing.T) {
 	assert.Equal(t, wantURL, rt.BrowserURL)
 }
 
-func TestSetupLogFile(t *testing.T) {
+func TestSetupLogFileRotatesOversizedLog(t *testing.T) {
 	dir := t.TempDir()
-	// Register after TempDir so LIFO cleanup closes the log file before
-	// TempDir removes the directory. On Windows, open files can't be deleted.
 	restoreTestLogOutput(t)
+	path := filepath.Join(dir, "debug.log")
+	writeTestFile(t, path, bytes.Repeat([]byte("x"), maxLogSize+1))
 
 	setupLogFile(dir)
 
-	// Log something and verify it reaches the file.
+	assert.FileExists(t, path+".1")
+}
+
+func TestSetupDebugLogWriterDefersRotation(t *testing.T) {
+	dir := t.TempDir()
+	restoreTestLogOutput(t)
+	path := filepath.Join(dir, "debug.log")
+	content := bytes.Repeat([]byte("x"), maxLogSize+1)
+	writeTestFile(t, path, content)
+
+	setupDebugLogWriter(dir)
+	log.Print("early startup message")
+
+	active, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.True(t, bytes.HasPrefix(active, content))
+	assert.Contains(t, string(active), "early startup message")
+	assert.NoFileExists(t, path+".1")
+}
+
+func TestSetupDebugLogWriterWritesWithoutLock(t *testing.T) {
+	dir := t.TempDir()
+	// Close the logger before TempDir cleanup on Windows.
+	restoreTestLogOutput(t)
+	path := filepath.Join(dir, "debug.log")
+	require.NoError(t, os.Mkdir(path+".rotate.lock", 0o700))
+
+	setupDebugLogWriter(dir)
 	log.Print("test-log-message")
 
-	logPath := filepath.Join(dir, "debug.log")
-	data, err := os.ReadFile(logPath)
-	require.NoError(t, err, "reading log file")
-	assert.Contains(t, string(data), "test-log-message",
-		"log file missing message")
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "test-log-message")
+}
+
+func TestSetupLogFileLiveWriterRotation(t *testing.T) {
+	dir := t.TempDir()
+	restoreTestLogOutput(t)
+	setupLogFile(dir)
+	path := filepath.Join(dir, "debug.log")
+	writeTestFile(t, path, bytes.Repeat([]byte("x\n"), maxLogSize/2+1))
+	ctx, cancel := context.WithCancel(t.Context())
+	first, done := make(chan struct{}), make(chan struct{})
+	var writeErr error
+	written := 0
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			writeErr = log.Output(1, fmt.Sprintf("rotation-message-%05d", written))
+			if written == 0 {
+				close(first)
+			}
+			if writeErr != nil {
+				return
+			}
+			written++
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	<-first
+	require.Eventually(t, func() bool {
+		rotateLogFile(path, maxLogSize)
+		_, err := os.Stat(path + ".1")
+		return err == nil
+	}, 10*time.Second, 10*time.Millisecond)
+	cancel()
+	<-done
+	require.NoError(t, writeErr)
+	backup, err := os.ReadFile(path + ".1")
+	require.NoError(t, err)
+	active, err := os.ReadFile(path)
+	require.NoError(t, err)
+	counts := make(map[string]int)
+	for line := range strings.SplitSeq(string(backup)+string(active), "\n") {
+		if _, message, ok := strings.Cut(line, "rotation-message-"); ok {
+			counts[message]++
+		}
+	}
+	for i := range written {
+		require.Equal(t, 1, counts[fmt.Sprintf("%05d", i)], "message %d must survive exactly once", i)
+	}
 }
 
 func TestSetupLogFileOpenFailure(t *testing.T) {
@@ -747,6 +846,76 @@ func TestSetupLogFileOpenFailure(t *testing.T) {
 
 	assert.Contains(t, buf.String(), "cannot open log file",
 		"expected warning about log file")
+}
+
+func TestRotateLogFileTailAndMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.log")
+	writeTestFile(t, path, []byte("discarded prefix\nfirst retained line\nlast diagnostic\n"))
+	writeTestFile(t, path+".1", []byte("older log"))
+	require.NoError(t, os.Chmod(path, 0o640))
+	source, err := os.Stat(path)
+	require.NoError(t, err)
+
+	rotateLogFile(path, 36)
+
+	retained, err := os.ReadFile(path + ".1")
+	require.NoError(t, err)
+	assert.Equal(t, "first retained line\nlast diagnostic\n", string(retained))
+	backup, err := os.Stat(path + ".1")
+	require.NoError(t, err)
+	assert.Equal(t, source.Mode().Perm(), backup.Mode().Perm())
+	active, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Empty(t, active)
+}
+
+func TestRotateLogFileLeavesActiveLog(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		limit     int64
+		holdLock  bool
+		symlink   bool
+		backupDir bool
+	}{
+		{"held lock", 512, true, false, false},
+		{"at size limit", 1025, false, false, false},
+		{"symlink", 512, false, true, false},
+		{"backup failure", 512, false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "test.log")
+			content := bytes.Repeat([]byte("line\n"), 205)
+			writeTestFile(t, path, content)
+			rotationPath := path
+			if tc.symlink {
+				rotationPath = filepath.Join(dir, "link.log")
+				requireSymlinkOrSkip(t, path, rotationPath)
+			}
+			if tc.holdLock {
+				writeTestFile(t, path+".1", []byte("older log"))
+				lock := flock.New(path + ".rotate.lock")
+				require.NoError(t, lock.RLock())
+				t.Cleanup(func() { require.NoError(t, lock.Close()) })
+			}
+			if tc.backupDir {
+				require.NoError(t, os.Mkdir(path+".1", 0o755))
+			}
+
+			rotateLogFile(rotationPath, tc.limit)
+
+			active, err := os.ReadFile(path)
+			require.NoError(t, err)
+			assert.Equal(t, content, active)
+			if tc.holdLock {
+				backup, err := os.ReadFile(path + ".1")
+				require.NoError(t, err)
+				assert.Equal(t, "older log", string(backup))
+			} else if !tc.backupDir {
+				assert.NoFileExists(t, rotationPath+".1")
+			}
+		})
+	}
 }
 
 func TestTruncateLogFile(t *testing.T) {
@@ -780,12 +949,6 @@ func TestTruncateLogFileUnderLimit(t *testing.T) {
 	assert.Equal(t, string(content), string(data), "content changed")
 }
 
-func TestTruncateLogFileMissing(t *testing.T) {
-	// Non-existent file: should not panic.
-	missing := filepath.Join(t.TempDir(), "missing", "log.txt")
-	truncateLogFile(missing, 1024)
-}
-
 func TestTruncateLogFileSymlink(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "real.log")
@@ -805,17 +968,19 @@ func TestTruncateLogFileSymlink(t *testing.T) {
 }
 
 func TestNewDaemonIdleTrackerUsesConfigTimeout(t *testing.T) {
-	t.Setenv(backgroundChildEnvVar, "1")
-	fired := make(chan struct{})
-	tracker := newDaemonIdleTracker(config.Config{DaemonIdleTimeout: 20 * time.Millisecond}, func() { close(fired) })
-	require.NotNil(t, tracker)
-	ctx := t.Context()
-	go tracker.Run(ctx)
-	select {
-	case <-fired:
-	case <-time.After(time.Second):
-		require.FailNow(t, "idle tracker did not fire")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv(backgroundChildEnvVar, "1")
+		fired := make(chan struct{})
+		tracker := newDaemonIdleTracker(config.Config{DaemonIdleTimeout: 20 * time.Millisecond}, func() { close(fired) })
+		require.NotNil(t, tracker)
+		ctx := t.Context()
+		go tracker.Run(ctx)
+		select {
+		case <-fired:
+		case <-time.After(time.Second):
+			require.FailNow(t, "idle tracker did not fire")
+		}
+	})
 }
 
 func TestNewDaemonIdleTrackerConfigZeroDisables(t *testing.T) {
@@ -861,6 +1026,34 @@ func TestPollUnwatchedScopesOnceUsesScopedAuthoritativeReconciliation(t *testing
 	require.Equal(t, 2, fake.calls)
 	assert.Equal(t, roots, fake.callRoots[0])
 	assert.Equal(t, roots, fake.callRoots[1])
+}
+
+func TestStartFileWatcherUsesSyncInterval(t *testing.T) {
+	projects := filepath.Join(t.TempDir(), "projects")
+	project := filepath.Join(projects, "project-a")
+	require.NoError(t, os.MkdirAll(project, 0o700))
+	cfg := config.Config{
+		SyncInterval: time.Second,
+		AgentDirs:    map[parser.AgentType][]string{parser.AgentClaude: {projects}},
+	}
+	calls := make(chan time.Time, 8)
+	stop, open, unwatched, _, _ := startFileWatcher(cfg, nil,
+		func(context.Context, agentsync.WatchBatch) error {
+			calls <- time.Now()
+			return nil
+		}, agentsync.WatcherOptions{})
+	t.Cleanup(stop)
+	require.Empty(t, unwatched)
+	open()
+	path := filepath.Join(project, "active.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("first\n"), 0o600))
+	first := receiveArchiveTest(t, calls)
+	require.NoError(t, os.WriteFile(path, []byte("second\n"), 0o600))
+	gap := receiveArchiveTest(t, calls).Sub(first)
+	// Callback timestamps follow dispatch; allow scheduling delay before the first timestamp.
+	const dispatchJitter = 250 * time.Millisecond
+	assert.GreaterOrEqual(t, gap, cfg.SyncInterval-dispatchJitter)
+	assert.Less(t, gap, 4*time.Second)
 }
 
 func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
@@ -1036,7 +1229,7 @@ func TestRemoteHostSyncFuncSerializesWithEngineExclusiveLock(t *testing.T) {
 	select {
 	case <-exclusiveEntered:
 		assert.Fail(t, "exclusive operation overlapped scheduled remote sync")
-	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the held remote sync keeps the exclusive operation out
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the held remote sync keeps the exclusive operation out
 	}
 
 	close(releaseRemote)
@@ -1242,50 +1435,52 @@ func TestRemoteHostSyncFuncForcesFullWhenDatabaseNeedsResync(t *testing.T) {
 }
 
 func TestStartRemoteHostSync_TracksRemoteWorkForIdleReaper(t *testing.T) {
-	idleFired := make(chan struct{})
-	idleTracker := server.NewIdleTracker(20*time.Millisecond, func() {
-		close(idleFired)
-	})
-	ctx := t.Context()
+	synctest.Test(t, func(t *testing.T) {
+		idleFired := make(chan struct{})
+		idleTracker := server.NewIdleTracker(20*time.Millisecond, func() {
+			close(idleFired)
+		})
+		ctx := t.Context()
 
-	syncEntered := make(chan struct{}, 1)
-	releaseSync := make(chan struct{})
-	syncFn := func() (int, error) {
-		select {
-		case syncEntered <- struct{}{}:
-		default:
+		syncEntered := make(chan struct{}, 1)
+		releaseSync := make(chan struct{})
+		syncFn := func() (int, error) {
+			select {
+			case syncEntered <- struct{}{}:
+			default:
+			}
+			<-releaseSync
+			return 1, nil
 		}
-		<-releaseSync
-		return 1, nil
-	}
 
-	done := make(chan struct{})
-	exited := make(chan struct{})
-	go func() {
-		runRemoteHostSyncLoop(ctx, "test-host", time.Millisecond, syncFn, nil, idleTracker, done)
-		close(exited)
-	}()
+		done := make(chan struct{})
+		exited := make(chan struct{})
+		go func() {
+			runRemoteHostSyncLoop(ctx, "test-host", time.Millisecond, syncFn, nil, idleTracker, done)
+			close(exited)
+		}()
 
-	select {
-	case <-syncEntered:
-	case <-time.After(time.Second):
-		require.FailNow(t, "remote sync did not enter")
-	}
-	go idleTracker.Run(ctx)
+		select {
+		case <-syncEntered:
+		case <-time.After(time.Second):
+			require.FailNow(t, "remote sync did not enter")
+		}
+		go idleTracker.Run(ctx)
 
-	select {
-	case <-idleFired:
-		require.FailNow(t, "idle tracker fired while remote sync was active")
-	case <-time.After(80 * time.Millisecond): //nolint:kennlint // absence check; the held remote sync keeps the idle tracker from firing
-	}
+		select {
+		case <-idleFired:
+			require.FailNow(t, "idle tracker fired while remote sync was active")
+		case <-time.After(80 * time.Millisecond):
+		}
 
-	close(releaseSync)
-	close(done)
-	select {
-	case <-exited:
-	case <-time.After(time.Second):
-		require.FailNow(t, "remote sync loop did not exit")
-	}
+		close(releaseSync)
+		close(done)
+		select {
+		case <-exited:
+		case <-time.After(time.Second):
+			require.FailNow(t, "remote sync loop did not exit")
+		}
+	})
 }
 
 func TestStartRemoteHostSync_ExitsOnContextCancel(t *testing.T) {
@@ -3899,4 +4094,42 @@ func TestCollectWatchRootsWatchesAliasHomeIndexes(t *testing.T) {
 	aliasRoot, ok := findCollectedWatchRoot(roots, alias)
 	require.True(t, ok, "the alias home must be watched for session_index.jsonl")
 	assert.False(t, aliasRoot.recursive)
+}
+
+func TestNoSyncRebuildNotice(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		noSync, archiveOnly, needsSync bool
+		want                           bool
+	}{
+		{"no-sync with stale archive", true, false, true, true},
+		{"no-sync with current archive", true, false, false, false},
+		{"syncing daemon rebuilds at startup", false, false, true, false},
+		{"archive-only rebuilds at startup", true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			notice := noSyncRebuildNotice(tc.noSync, tc.archiveOnly, tc.needsSync)
+			if tc.want {
+				assert.Contains(t, notice, "Click Sync")
+			} else {
+				assert.Empty(t, notice)
+			}
+		})
+	}
+}
+
+func TestNewDaemonIdleTrackerExplicitLifetime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv(backgroundChildEnvVar, "1")
+		t.Setenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT", "2s")
+		stopped := false
+		tracker := newDaemonIdleTracker(config.Config{SyncIdleAfter: time.Second, PersistentDaemon: true}, func() { stopped = true })
+		require.NotNil(t, tracker)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		go tracker.Run(ctx)
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		assert.False(t, stopped)
+	})
 }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -498,7 +499,7 @@ func TestExportSessionsCursorResetMainStderrIsOnlyStructuredJSON(t *testing.T) {
 	assert.NotEmpty(t, got.DatabaseID)
 }
 
-func TestExportSessionsMainStillPrintsFatalForNonCursorErrors(t *testing.T) {
+func TestExportSessionsMainPrintsValidationHintForInvalidFormat(t *testing.T) {
 	dataDir := testDataDir(t)
 	seedExportSessionsArchiveAt(t, filepath.Join(dataDir, "sessions.db"))
 
@@ -518,9 +519,9 @@ func TestExportSessionsMainStillPrintsFatalForNonCursorErrors(t *testing.T) {
 
 	var exitErr *exec.ExitError
 	require.ErrorAs(t, err, &exitErr)
-	assert.Equal(t, 1, exitErr.ExitCode())
+	assert.Equal(t, 65, exitErr.ExitCode())
 	assert.Contains(t, string(exitErr.Stderr), "fatal:")
-	assert.Contains(t, string(exitErr.Stderr), "invalid argument \"xml\"")
+	assert.Contains(t, string(exitErr.Stderr), "\nhint:")
 }
 
 func TestExportSessionsCursorResetMainHelperProcess(t *testing.T) {
@@ -595,6 +596,53 @@ func TestExportSessionsRequiresExistingDatabaseID(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, readonly.Close()) })
 	_, idErr := readonly.GetDatabaseID(t.Context())
 	require.ErrorIs(t, idErr, db.ErrDatabaseIDMissing)
+}
+
+func TestExportSessionsUpgradesRecordedRepositoryColumn(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		t.Run(fmt.Sprintf("parser_resync_%t", stale), func(t *testing.T) {
+			dataDir := testDataDir(t)
+			dbPath := filepath.Join(dataDir, "sessions.db")
+			seedExportSessionsArchiveAt(t, dbPath)
+			raw, err := sql.Open("sqlite3", dbPath)
+			require.NoError(t, err)
+			if stale {
+				_, err = raw.ExecContext(t.Context(), "PRAGMA user_version=137")
+				require.NoError(t, err)
+			}
+			var versionBefore int
+			require.NoError(t, raw.QueryRowContext(t.Context(), "PRAGMA user_version").Scan(&versionBefore))
+			_, err = raw.ExecContext(t.Context(), "ALTER TABLE session_project_identity_snapshots DROP COLUMN recorded_git_remote")
+			require.NoError(t, err)
+			require.NoError(t, raw.Close())
+
+			stdout, stderr, err := executeExportSessionsCommand(
+				newRootCommand(), "export", "sessions", "--format", "json",
+			)
+			assert.Empty(t, stderr)
+			if stale {
+				require.ErrorContains(t, err, "archive data needs resync")
+				assert.Empty(t, stdout)
+			} else {
+				require.NoError(t, err)
+				doc := decodeExportSessionsDocument(t, stdout)
+				assert.Len(t, doc.Sessions, 2)
+				assert.Equal(t, "export-sessions-test-db", doc.DatabaseID)
+			}
+			// The schema is readable, but export must not bypass parser upgrades.
+			readonly, err := db.OpenReadOnly(t.Context(), dbPath)
+			require.NoError(t, err)
+			assert.Equal(t, stale, readonly.NeedsResync())
+			require.NoError(t, readonly.Close())
+
+			raw, err = sql.Open("sqlite3", dbPath)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, raw.Close()) })
+			var versionAfter int
+			require.NoError(t, raw.QueryRowContext(t.Context(), "PRAGMA user_version").Scan(&versionAfter))
+			assert.Equal(t, versionBefore, versionAfter, "an export must not mark unread sources as reparsed")
+		})
+	}
 }
 
 func TestExportSessionsUpgradeRequiresBackgroundEvidenceBackfill(t *testing.T) {
@@ -791,7 +839,7 @@ func TestExportSessionsJSONGolden(t *testing.T) {
 	assert.NotContains(t, stdout, `"machine":"golden-host"`)
 	assert.NotContains(t, stdout, `"root_path":"/`)
 
-	assertGoldenBytes(t, "session_export_v6.json", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v7.json", []byte(stdout))
 }
 
 func TestExportSessionsNDJSONGolden(t *testing.T) {
@@ -806,7 +854,7 @@ func TestExportSessionsNDJSONGolden(t *testing.T) {
 	require.NoError(t, err, "export sessions ndjson golden")
 	require.Empty(t, stderr)
 
-	assertGoldenBytes(t, "session_export_v6.ndjson", []byte(stdout))
+	assertGoldenBytes(t, "session_export_v7.ndjson", []byte(stdout))
 }
 
 func firstExportSessionsCursor(t *testing.T) string {

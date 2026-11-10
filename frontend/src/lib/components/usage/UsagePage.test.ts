@@ -4,11 +4,12 @@ import { router } from "../../stores/router.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import { usage } from "../../stores/usage.svelte.js";
 import { settings } from "../../stores/settings.svelte.js";
+import { sync } from "../../stores/sync.svelte.js";
+import { events } from "../../stores/events.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
 import { testMoney } from "../../test/money.js";
 import type { UsageSummaryResponse } from "../../api/generated/index";
-import { UsageService } from "../../api/generated/index";
-import source from "./UsagePage.svelte?raw";
+import { MetadataService, UsageService } from "../../api/generated/index";
 import UsagePage from "./UsagePage.svelte";
 
 async function flushEffects() {
@@ -131,6 +132,8 @@ afterEach(() => {
   usage.attributionSummary = null;
   usage.summary = null;
   usage.referenceSummary = null;
+  usage.lastUpdatedAt = null;
+  usage.hasNewData = false;
   usage.topSessions = null;
   usage.errors.summary = null;
   usage.errors.topSessions = null;
@@ -147,6 +150,11 @@ afterEach(() => {
   usage.excludedProjectKeys = "";
   usage.excludedModels = "";
   usage.knownProjects = [];
+  usage.knownAgents = [];
+  usage.excludedAgents = "";
+  sessions.agents = [];
+  sessions.filters.agent = "";
+  sync.stats = null;
   settings.chartPalette = "agentsview";
   sessions.projects = [];
   yokedDates.setEnabled(false);
@@ -154,6 +162,226 @@ afterEach(() => {
 });
 
 describe("UsagePage refresh behavior", () => {
+  function visibility() {
+    let hidden = false;
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+    return async (value: boolean) => {
+      hidden = value;
+      document.dispatchEvent(new Event("visibilitychange"));
+      await flushEffects();
+    };
+  }
+
+  function usageReads() {
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    const side = {
+      totalCost: testMoney(0),
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+      totalTokens: 0,
+      sessionCount: 0,
+    };
+    vi.spyOn(UsageService, "getApiV1UsagePairwiseComparison").mockResolvedValue({
+      left: side,
+      right: side,
+      deltas: {
+        totalCostDelta: testMoney(0),
+        totalCostDeltaRatio: null,
+        inputTokensDelta: 0,
+        inputTokensDeltaRatio: null,
+        outputTokensDelta: 0,
+        outputTokensDeltaRatio: null,
+        cacheCreationDelta: 0,
+        cacheCreationDeltaRatio: null,
+        cacheReadDelta: 0,
+        cacheReadDeltaRatio: null,
+        totalTokensDelta: 0,
+        totalTokensDeltaRatio: null,
+        sessionCountDelta: 0,
+        sessionCountDeltaRatio: null,
+        costPerSessionDelta: null,
+        costPerSessionRatio: null,
+        tokensPerSessionDelta: null,
+        tokensPerSessionRatio: null,
+      },
+    });
+    vi.spyOn(UsageService, "getApiV1UsageTopSessions").mockResolvedValue([]);
+    vi.spyOn(UsageService, "getApiV1UsageComparison").mockResolvedValue({
+      priorFrom: "2024-05-01",
+      priorTo: "2024-05-31",
+      priorTotalCost: testMoney(0),
+      deltaPct: 0,
+    });
+    router.route = "usage";
+    return vi.spyOn(UsageService, "getApiV1UsageSummary");
+  }
+
+  async function mountLiveUsage() {
+    vi.useFakeTimers();
+    visibility();
+    const subscription = vi.spyOn(events, "subscribe");
+    const requests = usageReads().mockResolvedValue(usageSummaryWithUnsupported());
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    await vi.advanceTimersByTimeAsync(0);
+    return { requests, emit: subscription.mock.calls.at(-1)![0] };
+  }
+
+  it("keeps fixed event deadlines and queues polling during long reads", async () => {
+    const { requests, emit } = await mountLiveUsage();
+    const firstUpdatedAt = usage.lastUpdatedAt;
+    const firstQuerySteps = usage.lastQuerySteps;
+    const next = Promise.withResolvers<UsageSummaryResponse>();
+    requests.mockReturnValueOnce(next.promise);
+    for (let i = 0; i < 6; i++) {
+      emit({ scope: "sync" });
+      await flushEffects();
+      await vi.advanceTimersByTimeAsync(10_000);
+    }
+    expect(requests).toHaveBeenCalledTimes(2);
+    const signal = requests.mock.calls[1]![1]!.signal;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(requests).toHaveBeenCalledTimes(2);
+    expect(signal?.aborted).toBe(false);
+    const following = Promise.withResolvers<UsageSummaryResponse>();
+    requests.mockReturnValueOnce(following.promise);
+    next.resolve(tenModelUsageSummary());
+    await vi.advanceTimersByTimeAsync(0);
+    await flushEffects();
+    expect(usage.summary?.totals.inputTokens).toBe(100);
+    expect(usage.lastUpdatedAt).toBeGreaterThan(firstUpdatedAt!);
+    expect(usage.lastQuerySteps).not.toEqual(firstQuerySteps);
+    expect(requests).toHaveBeenCalledTimes(3);
+    following.resolve(tenModelUsageSummary());
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(requests).toHaveBeenCalledTimes(3);
+  });
+
+  it("starts a refresh immediately when the button is clicked", async () => {
+    const { requests } = await mountLiveUsage();
+    await vi.advanceTimersByTimeAsync(30_000);
+    document.querySelector<HTMLButtonElement>('button[aria-label="Refresh usage data"]')!.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requests).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels queued live refreshes on teardown", async () => {
+    const { requests, emit } = await mountLiveUsage();
+    emit({ scope: "sync" });
+    await flushEffects();
+    await unmount(component!);
+    component = undefined;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(requests).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts hidden reads and resumes once on return", async () => {
+    const setHidden = visibility();
+    const interrupted = Promise.withResolvers<UsageSummaryResponse>();
+    const requests = usageReads()
+      .mockReturnValueOnce(interrupted.promise)
+      .mockResolvedValue(usageSummaryWithUnsupported());
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    const signal = requests.mock.calls[0]?.[1]?.signal;
+    expect(signal?.aborted).toBe(false);
+    await setHidden(true);
+    expect(signal?.aborted).toBe(true);
+    expect(requests).toHaveBeenCalledTimes(1);
+    await setHidden(false);
+    await flushEffects();
+    expect(requests).toHaveBeenCalledTimes(2);
+    expect(requests.mock.calls[1]?.[0]).toEqual(requests.mock.calls[0]?.[0]);
+    interrupted.resolve(usageSummaryWithUnsupported());
+    await flushEffects();
+  });
+
+  it("refreshes when returning to a visible tab", async () => {
+    vi.useFakeTimers();
+    const setHidden = visibility();
+    const subscription = vi.spyOn(events, "subscribe");
+    const requests = usageReads().mockResolvedValue(usageSummaryWithUnsupported());
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    await flushEffects();
+    expect(usage.isQuerying).toBe(false);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await setHidden(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await setHidden(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requests).toHaveBeenCalledTimes(2);
+    const emit = subscription.mock.calls.at(-1)![0];
+    emit({ scope: "sync" });
+    await flushEffects();
+    await setHidden(true);
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(requests).toHaveBeenCalledTimes(2);
+    await setHidden(false);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requests).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(["visible", "hidden", "returning"])("hydrates machines while %s", async (state) => {
+    const setHidden = visibility();
+    if (state !== "visible") await setHidden(true);
+    const requests = vi
+      .spyOn(UsageService, "getApiV1UsageSummary")
+      .mockResolvedValue(usageSummaryWithUnsupported());
+    vi.spyOn(UsageService, "getApiV1UsageTopSessions").mockResolvedValue([]);
+    vi.spyOn(UsageService, "getApiV1UsageComparison").mockResolvedValue({
+      priorFrom: "2026-02-01",
+      priorTo: "2026-02-28",
+      priorTotalCost: testMoney(0),
+      deltaPct: 0,
+    });
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    const metadata =
+      Promise.withResolvers<Awaited<ReturnType<typeof MetadataService.getApiV1Machines>>>();
+    vi.spyOn(MetadataService, "getApiV1Machines").mockReturnValue(metadata.promise);
+    router.route = "usage";
+    router.params = { machine: "Workstation", from: "2026-03-01", to: "2026-03-31" };
+    const savedFilters = sessions.filters;
+    sessions.initFromParams(router.params);
+
+    try {
+      component = mount(UsagePage, { target: document.body });
+      await flushEffects();
+
+      if (state === "returning") await setHidden(false);
+      if (state !== "hidden") {
+        document
+          .querySelector<HTMLButtonElement>('button[aria-label="Refresh usage data"]')!
+          .click();
+        await flushEffects();
+      }
+      expect(requests).toHaveBeenCalledTimes(0);
+      metadata.resolve({
+        machines: ["id-a"],
+        resolved_machines: ["id-a"],
+        machine_labels: { "id-a": "Workstation" },
+        machine_aliases: {},
+      });
+      await sessions.loadMachines();
+      await flushEffects();
+      if (state === "hidden") {
+        expect(requests).toHaveBeenCalledTimes(0);
+        await setHidden(false);
+      }
+      await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+
+      expect(requests.mock.calls.map(([params]) => params?.machine)).toEqual(["id-a"]);
+    } finally {
+      if (component) await unmount(component);
+      component = undefined;
+      usage.cancelInFlightReads();
+      sessions.filters = savedFilters;
+    }
+  });
+
   it("keeps session-list label and pull request filters when the URL sets a shared filter", async () => {
     vi.stubGlobal(
       "ResizeObserver",
@@ -210,6 +438,42 @@ describe("UsagePage refresh behavior", () => {
     for (const [params] of requests.mock.calls) expect(params?.model).toBeUndefined();
     expect(usage.selectedModel).toBe("");
     expect(document.querySelector('button[aria-label="Model: All"]')).not.toBeNull();
+    usage.cancelInFlightReads();
+  });
+
+  it("keeps a saved variant's group available after re-including an empty period", async () => {
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    router.params = { exclude_model: "claude-opus-4-20250514" };
+    usage.summary = {
+      ...usageSummaryWithUnsupported(),
+      model_aliases: { "claude-opus-4-20250514": "claude-4" },
+    };
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    const trigger = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Model: 1 hidden"]',
+    );
+    expect(trigger).not.toBeNull();
+    trigger!.click();
+    await flushEffects();
+    const groupRow = () =>
+      [...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__item")].find(
+        (row) =>
+          row.querySelector(".kit-filter-dropdown__label")?.textContent?.trim() === "claude-4",
+      );
+    expect(groupRow()).toBeDefined();
+    expect(document.querySelectorAll(".kit-filter-dropdown__item")).toHaveLength(1);
+    expect(groupRow()!.querySelector(".kit-filter-dropdown__check.on")).not.toBeNull();
+    expect(groupRow()!.getAttribute("title")).toBe("claude-opus-4-20250514");
+    [...document.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "Select all")!
+      .click();
+    await flushEffects();
+    expect(usage.excludedModels).toBe("");
+    expect(groupRow()).toBeDefined();
+    expect(groupRow()!.querySelector(".kit-filter-dropdown__check.on")).not.toBeNull();
     usage.cancelInFlightReads();
   });
 
@@ -689,6 +953,101 @@ describe("UsagePage refresh behavior", () => {
     expect(loadAgents).toHaveBeenCalled();
   });
 
+  it("keeps billing-only agents available after filtering and deselects them", async () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(usage, "fetchAll").mockResolvedValue();
+    vi.spyOn(usage, "fetchAllWithResult").mockResolvedValue("ok");
+    vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+    router.route = "usage";
+    sessions.agents = [{ name: "grok", session_count: 1 }];
+    sessions.filters.agent = "";
+    const summary = usageSummaryWithUnsupported();
+    summary.agentTotals = [
+      {
+        agent: "grok-bot",
+        inputTokens: 12,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(0),
+      },
+    ];
+    usage.summary = summary;
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    document.querySelector<HTMLButtonElement>('[aria-label="Agent: All"]')!.click();
+    await flushEffects();
+    const billingOption = [
+      ...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__item"),
+    ].find((button) => button.textContent?.includes("grok-bot"));
+    expect(billingOption).toBeDefined();
+    usage.summary = { ...summary, agentTotals: [] };
+    await flushEffects();
+    const retainedOption = [
+      ...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__item"),
+    ].find((button) => button.textContent?.includes("grok-bot"));
+    expect(retainedOption).toBeDefined();
+    retainedOption!.click();
+    expect(usage.excludedAgents).toBe("grok-bot");
+    await unmount(component);
+    component = mount(UsagePage, { target: document.body });
+    await flushEffects();
+    document.querySelector<HTMLButtonElement>('.usage-toolbar [aria-label^="Agent:"]')!.click();
+    await flushEffects();
+    expect(
+      [...document.querySelectorAll(".kit-filter-dropdown__item")].some((button) =>
+        button.textContent?.includes("grok-bot"),
+      ),
+    ).toBe(true);
+    [...document.querySelectorAll<HTMLButtonElement>(".kit-filter-dropdown__bulk-btn")]
+      .find((button) => button.textContent?.trim() === "Deselect all")!
+      .click();
+    expect(usage.excludedAgents.split(",").sort()).toEqual(["grok", "grok-bot"]);
+  });
+
+  it.each(["2026-01-01T00:00:00Z", null])(
+    "includes billing history older than sessions (%s) in All",
+    async (earliestSession) => {
+      vi.stubGlobal(
+        "ResizeObserver",
+        class {
+          observe() {}
+          unobserve() {}
+          disconnect() {}
+        },
+      );
+      vi.spyOn(usage, "fetchAll").mockResolvedValue();
+      vi.spyOn(sessions, "loadAgents").mockResolvedValue();
+      router.route = "usage";
+      sync.stats = {
+        session_count: 0,
+        message_count: 0,
+        project_count: 0,
+        machine_count: 0,
+        earliest_session: earliestSession,
+        earliest_account_usage: "2020-06-01T12:00:00Z",
+      };
+      component = mount(UsagePage, { target: document.body });
+      await flushEffects();
+      document
+        .querySelector<HTMLButtonElement>(".usage-toolbar .kit-date-range-picker__trigger")!
+        .click();
+      await flushEffects();
+      [...document.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.trim() === "All")!
+        .click();
+      await flushEffects();
+      expect(usage.from).toBe("2020-06-01");
+    },
+  );
+
   it("ignores response-scoped project keys restored from a URL", async () => {
     vi.stubGlobal(
       "ResizeObserver",
@@ -805,99 +1164,6 @@ describe("UsagePage refresh behavior", () => {
 
     expect(document.body.textContent).toContain("Matching sessions do not expose token usage data");
     expect(document.body.textContent).not.toContain("Copilot sessions matched this range");
-  });
-
-  it("does not auto-refresh usage scans from SSE updates", () => {
-    expect(source).not.toContain("subscribeDebounced");
-    expect(source).not.toContain("REFRESH_MS");
-    // SSE only flags new data; the periodic refetch lives in RefreshControl.
-    expect(source).toContain("usage.markNewData");
-    expect(source).toContain("events.subscribe");
-  });
-
-  it("delegates the refresh affordance and scheduler to RefreshControl", () => {
-    expect(source).toContain("<RefreshControl");
-    expect(source).toContain("usage.lastUpdatedAt");
-    expect(source).toContain("label={m.usage_refresh()}");
-    expect(source).toContain("title={m.shared_refresh()}");
-    // The scheduler, label tick, and icon now live in the shared component.
-    expect(source).not.toContain("REFRESH_LABEL_INTERVAL_MS");
-    expect(source).not.toContain("formatRefreshAge");
-    expect(source).not.toContain("RefreshCwIcon");
-    expect(source).not.toContain("setInterval");
-  });
-
-  it("shows relative last-updated status without ambiguous badges", () => {
-    expect(source).not.toContain("formatUpdatedAt");
-    expect(source).not.toContain("usage.hasNewData");
-    expect(source).not.toContain("New data");
-    expect(source).not.toContain(".new-data");
-  });
-
-  it("treats termination as a usage URL session filter", () => {
-    expect(source).toContain('"termination",');
-    expect(source).toContain("filtersToParams(sessions.filters)");
-  });
-
-  it("keeps refresh progress out of content layout flow", () => {
-    const queryProgress = source.match(/\.query-progress\s*{[^}]+}/)?.[0] ?? "";
-
-    expect(queryProgress).toContain("position: absolute");
-    expect(queryProgress).toContain("left: 0;");
-    expect(queryProgress).toContain("right: 0;");
-    expect(queryProgress).not.toContain("position: sticky");
-    expect(queryProgress).not.toContain("margin:");
-  });
-
-  it("updates shared yoke state from usage range selections", () => {
-    expect(source).toContain("<RangePicker");
-    expect(source).toContain("function applyRange");
-    expect(source).toContain("updateYokeFromUsage");
-    expect(source).toContain("yokedDates.updateFromPanel");
-  });
-
-  it("seeds bare usage URLs from shared yoked dates", () => {
-    expect(source).toContain("const seed = yokedDates.seedForPanel()");
-    expect(source).toContain("applyUsagePanelDate(state)");
-    expect(source).toContain("usage.applyRollingWindow");
-    expect(source).toContain("usage.applyDateRange");
-  });
-
-  it("hydrates supported termination filters from usage URLs", () => {
-    const filterKeysIndex = source.indexOf("const SESSION_FILTER_KEYS");
-    const urlInitIndex = source.indexOf("let urlInitRan", filterKeysIndex);
-    const filterKeysBlock = source.slice(filterKeysIndex, urlInitIndex);
-
-    expect(filterKeysBlock).toContain('"termination"');
-  });
-
-  it("does not hydrate session-only date filters from usage URLs", () => {
-    const filterKeysIndex = source.indexOf("const SESSION_FILTER_KEYS");
-    const urlInitIndex = source.indexOf("let urlInitRan", filterKeysIndex);
-    const filterKeysBlock = source.slice(filterKeysIndex, urlInitIndex);
-
-    expect(filterKeysBlock).not.toContain('"date"');
-    expect(filterKeysBlock).not.toContain('"date_from"');
-    expect(filterKeysBlock).not.toContain('"date_to"');
-  });
-
-  it("mounts the pairwise comparison panel additively", () => {
-    expect(source).toContain("UsagePairwiseComparisonPanel");
-    expect(source).toContain("<UsagePairwiseComparisonPanel />");
-  });
-
-  it("keeps pairwise comparison below bounded secondary usage panels", () => {
-    const topSessionsIndex = source.indexOf("<TopSessionsTable />");
-    const cacheEfficiencyIndex = source.indexOf("<CacheEfficiencyPanel />");
-    const pairwiseIndex = source.indexOf("<UsagePairwiseComparisonPanel />");
-
-    expect(topSessionsIndex).toBeGreaterThan(-1);
-    expect(cacheEfficiencyIndex).toBeGreaterThan(-1);
-    expect(pairwiseIndex).toBeGreaterThan(cacheEfficiencyIndex);
-    expect(pairwiseIndex).toBeGreaterThan(topSessionsIndex);
-    expect(source).toContain('class="chart-panel bounded"');
-    expect(source).toContain("max-height:");
-    expect(source).toContain("overflow: auto;");
   });
 });
 

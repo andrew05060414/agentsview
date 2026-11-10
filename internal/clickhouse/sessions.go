@@ -139,7 +139,7 @@ func (s *Store) FindSessionIDsByPartial(ctx context.Context, partial string, lim
 	if limit <= 0 {
 		limit = 5
 	}
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT id FROM sessions
 		 WHERE position(id, ?) > 0 AND deleted_at IS NULL
 		 ORDER BY `+sessionActivityExpr+` DESC
@@ -160,7 +160,7 @@ func (s *Store) FindSessionIDsByRawSuffix(ctx context.Context, raw string, limit
 	if limit <= 0 {
 		limit = 5
 	}
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT id FROM sessions
 		 WHERE (id = ? OR endsWith(id, ?) OR endsWith(id, ?))
 		   AND deleted_at IS NULL
@@ -193,31 +193,37 @@ func scanIDs(rows *sql.Rows) ([]string, error) {
 }
 
 func (s *Store) GetStats(ctx context.Context, excludeOneShot, excludeAutomated bool) (db.Stats, error) {
+	count, args := db.StatsRootCountSQL(db.ClickHouseQueryDialect(), excludeOneShot, excludeAutomated)
 	query := `
 		SELECT
-			toInt64(COUNT(*)),
+			` + count + `,
 			toInt64(COALESCE(SUM(message_count), 0)),
 			toInt64(COUNT(DISTINCT project)),
 			toInt64(COUNT(DISTINCT machine)),
-			MIN(COALESCE(started_at, created_at))
+			MIN(COALESCE(started_at, created_at)),
+			(SELECT MIN(occurred_at) FROM cursor_usage_events)
 		FROM sessions
 		WHERE ` + rootSessionWhere(excludeOneShot, excludeAutomated)
 	var stats db.Stats
 	var earliest any
-	if err := s.queryRowContext(ctx, query).Scan(
+	var earliestAccount any
+	if err := s.pageQueryRowContext(ctx, query, args...).Scan(
 		&stats.SessionCount, &stats.MessageCount,
-		&stats.ProjectCount, &stats.MachineCount, &earliest,
+		&stats.ProjectCount, &stats.MachineCount, &earliest, &earliestAccount,
 	); err != nil {
 		return db.Stats{}, fmt.Errorf("fetching clickhouse stats: %w", err)
 	}
 	if v := formatDBTime(earliest); v != "" {
 		stats.EarliestSession = &v
 	}
+	if v := formatDBTime(earliestAccount); v != "" {
+		stats.EarliestAccountUsage = &v
+	}
 	return stats, nil
 }
 
 func (s *Store) GetProjects(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.ProjectInfo, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT project, toInt64(COUNT(*)) FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` GROUP BY project ORDER BY project`)
@@ -237,7 +243,7 @@ func (s *Store) GetProjects(ctx context.Context, excludeOneShot, excludeAutomate
 }
 
 func (s *Store) GetActiveProjectLabels(ctx context.Context) ([]string, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT DISTINCT project FROM sessions WHERE deleted_at IS NULL ORDER BY project`)
 	if err != nil {
 		return nil, fmt.Errorf("querying active project labels: %w", err)
@@ -247,7 +253,7 @@ func (s *Store) GetActiveProjectLabels(ctx context.Context) ([]string, error) {
 }
 
 func (s *Store) GetAgents(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.AgentInfo, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT agent, toInt64(COUNT(*)) FROM sessions WHERE agent <> '' AND `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` GROUP BY agent ORDER BY agent`)
@@ -267,7 +273,7 @@ func (s *Store) GetAgents(ctx context.Context, excludeOneShot, excludeAutomated 
 }
 
 func (s *Store) GetMachines(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]string, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT DISTINCT machine FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` ORDER BY machine`)
@@ -279,7 +285,7 @@ func (s *Store) GetMachines(ctx context.Context, excludeOneShot, excludeAutomate
 }
 
 func (s *Store) GetBranches(ctx context.Context, excludeOneShot, excludeAutomated bool) ([]db.BranchInfo, error) {
-	rows, err := s.queryContext(ctx,
+	rows, err := s.pageQueryContext(ctx,
 		`SELECT DISTINCT project, git_branch FROM sessions WHERE `+
 			rootSessionWhere(excludeOneShot, excludeAutomated)+
 			` ORDER BY project, git_branch`)

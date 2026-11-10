@@ -18,6 +18,22 @@ import (
 	"go.kenn.io/agentsview/internal/storage"
 )
 
+func TestCopyMirrorFileStopsOnCancellation(t *testing.T) {
+	dir := t.TempDir()
+	src, dst := filepath.Join(dir, "source"), filepath.Join(dir, "mirror.spare")
+	require.NoError(t, os.WriteFile(src, []byte("mirror data"), 0o600))
+	require.NoError(t, os.WriteFile(dst, []byte("previous snapshot"), 0o600))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, copyMirrorFile(ctx, src, dst), context.Canceled)
+	previous, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	assert.Equal(t, "previous snapshot", string(previous))
+	staged, err := filepath.Glob(filepath.Join(dir, ".mirror.spare.tmp-*"))
+	require.NoError(t, err)
+	assert.Empty(t, staged, "an interrupted copy must discard its staging file")
+}
+
 func seedRebuildFixture(t *testing.T, local *db.DB) []string {
 	t.Helper()
 
@@ -709,4 +725,24 @@ func TestSweepStaleTempFilesHandlesGlobMetacharactersInDirectory(t *testing.T) {
 
 	assert.NoFileExists(t, staleTmp,
 		"a stale temp file in a glob-metacharacter directory must still be swept")
+}
+
+// A --full push that cannot start its rebuild, because another push holds
+// the rebuild lock, reports that it never started, so a watch keeps the
+// --full request for its retry.
+func TestFullPushBlockedByAnotherRebuildIsNotStarted(t *testing.T) {
+	ctx := t.Context()
+	local := newLocalDB(t)
+	seedRebuildFixture(t, local)
+	path := filepath.Join(t.TempDir(), "mirror.duckdb")
+	run, err := newRebuildRun(ctx, local, "test-machine", storage.MirrorPushOptions{}, "other push")
+	require.NoError(t, err)
+	lock, _, _, err := claimRebuild(ctx, path, run, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, unlockRebuild(lock)) })
+
+	_, err = Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, true, nil)
+	require.Error(t, err)
+	_, notStarted := errors.AsType[storage.PushNotStartedError](err)
+	assert.True(t, notStarted, "the blocked rebuild recorded nothing to resume: %v", err)
 }

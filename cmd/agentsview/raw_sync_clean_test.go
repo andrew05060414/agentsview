@@ -8,27 +8,17 @@ import (
 )
 
 func TestRawSyncRegistersCleanUploads(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "raw-sync", "--help")
+	help, err := executeCommand(newRootCommand(), "source", "raw", "--help")
 
 	require.NoError(t, err)
 	assert.Contains(t, help, "clean-uploads")
-}
-
-func TestRawSyncCleanUploadsHelp(t *testing.T) {
-	help, err := executeCommand(
-		newRootCommand(), "raw-sync", "clean-uploads", "--help",
-	)
-
-	require.NoError(t, err)
-	assert.Contains(t, help, "Run one bounded server upload cleanup pass")
-	assert.Contains(t, help, "configured PostgreSQL target and AgentsView data directory")
 }
 
 func TestRawSyncCleanUploadsRejectsArguments(t *testing.T) {
 	testDataDir(t)
 
 	output, err := executeCommand(
-		newRootCommand(), "raw-sync", "clean-uploads", "unexpected",
+		newRootCommand(), "source", "raw", "clean-uploads", "unexpected",
 	)
 
 	require.Error(t, err)
@@ -40,7 +30,7 @@ func TestRawSyncCleanUploadsRequiresPostgreSQL(t *testing.T) {
 	testDataDir(t)
 	t.Setenv("AGENTSVIEW_PG_URL", "")
 
-	output, err := executeCommand(newRootCommand(), "raw-sync", "clean-uploads")
+	output, err := executeCommand(newRootCommand(), "source", "raw", "clean-uploads")
 
 	require.Error(t, err)
 	assert.Empty(t, output)

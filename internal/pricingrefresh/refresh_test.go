@@ -2,9 +2,11 @@ package pricingrefresh
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -16,6 +18,7 @@ import (
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/testutil"
 )
 
 const refreshAttemptMetaKeyForTest = "_litellm_last_attempt"
@@ -26,7 +29,7 @@ type fetchRecorder struct {
 	err   error
 }
 
-func (f *fetchRecorder) fetch() (pricing.Catalog, error) {
+func (f *fetchRecorder) fetch(context.Context) (pricing.Catalog, error) {
 	f.calls++
 	return pricing.Catalog{LiteLLM: f.rows}, f.err
 }
@@ -40,7 +43,7 @@ func TestEnsureSeedsFallbackAndFetchedModel(t *testing.T) {
 	}}}
 
 	refreshed, err := Ensure(
-		database, false, fetcher.fetch, pricingTestNow(),
+		t.Context(), database, false, fetcher.fetch, pricingTestNow(),
 	)
 	require.NoError(t, err)
 	assert.True(t, refreshed)
@@ -93,7 +96,7 @@ func TestRefreshIfStaleFreshAttemptSkipsFetch(t *testing.T) {
 	fetcher := &fetchRecorder{}
 
 	refreshed, err := RefreshIfStale(
-		database, fetcher.fetch, time.Hour, now,
+		t.Context(), database, fetcher.fetch, time.Hour, now,
 	)
 
 	require.NoError(t, err)
@@ -120,7 +123,7 @@ func TestRefreshIfStaleStaleTriggersFetch(t *testing.T) {
 	}}}
 
 	refreshed, err := RefreshIfStale(
-		database, fetcher.fetch, time.Hour, now,
+		t.Context(), database, fetcher.fetch, time.Hour, now,
 	)
 
 	require.NoError(t, err)
@@ -140,7 +143,7 @@ func TestRefreshIfStaleNeverAttemptedTriggersFetch(t *testing.T) {
 	fetcher := &fetchRecorder{}
 
 	refreshed, err := RefreshIfStale(
-		database, fetcher.fetch, time.Hour, pricingTestNow(),
+		t.Context(), database, fetcher.fetch, time.Hour, pricingTestNow(),
 	)
 
 	require.NoError(t, err)
@@ -155,7 +158,7 @@ func TestRefreshIfStaleFetchFailureRecordsAttempt(t *testing.T) {
 	fetcher := &fetchRecorder{err: wantErr}
 
 	refreshed, err := RefreshIfStale(
-		database, fetcher.fetch, time.Hour, now,
+		t.Context(), database, fetcher.fetch, time.Hour, now,
 	)
 
 	require.ErrorIs(t, err, wantErr)
@@ -164,7 +167,7 @@ func TestRefreshIfStaleFetchFailureRecordsAttempt(t *testing.T) {
 
 	second := &fetchRecorder{}
 	_, err = RefreshIfStale(
-		database, second.fetch, time.Hour, now.Add(time.Minute),
+		t.Context(), database, second.fetch, time.Hour, now.Add(time.Minute),
 	)
 	require.NoError(t, err)
 	assert.Zero(t, second.calls)
@@ -183,7 +186,7 @@ func TestRefreshIfStaleStoresDegradedCatalog(t *testing.T) {
 	}
 
 	refreshed, err := RefreshIfStale(
-		database, fetcher.fetch, time.Hour, pricingTestNow(),
+		t.Context(), database, fetcher.fetch, time.Hour, pricingTestNow(),
 	)
 
 	require.ErrorIs(t, err, wantErr,
@@ -214,7 +217,7 @@ func TestRefreshIfStaleStoresGenAIDocumentWhenLiteLLMFails(t *testing.T) {
 	require.NoError(t, err)
 	wantErr := errors.New("LiteLLM unavailable")
 
-	refreshed, err := RefreshIfStale(database, func() (pricing.Catalog, error) {
+	refreshed, err := RefreshIfStale(t.Context(), database, func(context.Context) (pricing.Catalog, error) {
 		return pricing.Catalog{GenAI: &document}, wantErr
 	}, time.Hour, pricingTestNow())
 
@@ -235,7 +238,7 @@ func TestEnsureFetchFailurePreservesFallback(t *testing.T) {
 	fetcher := &fetchRecorder{err: wantErr}
 
 	refreshed, err := Ensure(
-		database, false, fetcher.fetch, pricingTestNow(),
+		t.Context(), database, false, fetcher.fetch, pricingTestNow(),
 	)
 
 	require.ErrorIs(t, err, wantErr)
@@ -255,7 +258,7 @@ func TestEnsureSkipsFetchWithinCooldown(t *testing.T) {
 		OutputPerMTok: money.MustParseDollars("1"),
 	}}}
 
-	refreshed, err := Ensure(database, false, fetcher.fetch, now)
+	refreshed, err := Ensure(t.Context(), database, false, fetcher.fetch, now)
 
 	require.NoError(t, err)
 	assert.False(t, refreshed)
@@ -270,12 +273,12 @@ func TestEnsureSkipsFetchWithinCooldown(t *testing.T) {
 
 func TestEnsureOfflineSeedsFallbackWithoutFetch(t *testing.T) {
 	database := testDB(t)
-	fetch := func() (pricing.Catalog, error) {
+	fetch := func(context.Context) (pricing.Catalog, error) {
 		require.FailNow(t, "offline ensure must not fetch")
 		return pricing.Catalog{}, nil
 	}
 
-	refreshed, err := Ensure(database, true, fetch, pricingTestNow())
+	refreshed, err := Ensure(t.Context(), database, true, fetch, pricingTestNow())
 
 	require.NoError(t, err)
 	assert.False(t, refreshed)
@@ -302,7 +305,7 @@ func TestStoreCatalogRetiresShadowedOpenRouterRows(t *testing.T) {
 			InputPerMTok: money.MustParseDollars("8"),
 		},
 	}
-	require.NoError(t, storeCatalog(database, pricing.Catalog{
+	require.NoError(t, storeCatalog(t.Context(), database, pricing.Catalog{
 		OpenRouter: openrouter,
 	}))
 	meta, err := database.GetPricingMeta(pricing.OpenRouterModelsMetaKey)
@@ -314,7 +317,7 @@ func TestStoreCatalogRetiresShadowedOpenRouterRows(t *testing.T) {
 	assert.Nil(t, shadowed)
 
 	// LiteLLM now lists the model under its own spelling.
-	require.NoError(t, storeCatalog(database, pricing.Catalog{
+	require.NoError(t, storeCatalog(t.Context(), database, pricing.Catalog{
 		LiteLLM: []pricing.ModelPricing{{
 			ModelPattern: "minimax/MiniMax-M3",
 			InputPerMTok: money.MustParseDollars("2"),
@@ -347,7 +350,7 @@ func TestStoreFallbackReconcilesOpenRouterOwnership(t *testing.T) {
 		}
 	}
 	require.NotEmpty(t, spelled, "need a fallback pattern with lowercase")
-	require.NoError(t, storeCatalog(database, pricing.Catalog{
+	require.NoError(t, storeCatalog(t.Context(), database, pricing.Catalog{
 		OpenRouter: []pricing.ModelPricing{
 			{ModelPattern: exact, InputPerMTok: money.MustParseDollars("99")},
 			{ModelPattern: spelled, InputPerMTok: money.MustParseDollars("98")},
@@ -404,6 +407,87 @@ func TestEnsureCurrentCancellationAllowsImmediateRetry(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, retryCalls)
+}
+
+func TestCanceledRefreshAllowsImmediateRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		refresh func(context.Context, *db.DB, func(context.Context) (pricing.Catalog, error), time.Time) (bool, error)
+	}{
+		{"Ensure", func(ctx context.Context, database *db.DB, fetch func(context.Context) (pricing.Catalog, error), now time.Time) (bool, error) {
+			return Ensure(ctx, database, false, fetch, now)
+		}},
+		{"RefreshIfStale", func(ctx context.Context, database *db.DB, fetch func(context.Context) (pricing.Catalog, error), now time.Time) (bool, error) {
+			return RefreshIfStale(ctx, database, fetch, time.Hour, now)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			database := testDB(t)
+			now := pricingTestNow()
+			previous := seedPricingAttempt(t, database, now, 2*time.Hour)
+			ctx, cancel := context.WithCancel(t.Context())
+
+			_, err := tc.refresh(ctx, database, func(
+				context.Context,
+			) (pricing.Catalog, error) {
+				cancel()
+				return pricing.Catalog{}, ctx.Err()
+			}, now)
+
+			require.ErrorIs(t, err, context.Canceled)
+			assertPricingAttemptMeta(t, database, previous)
+			retry := &fetchRecorder{}
+			_, err = tc.refresh(t.Context(), database, retry.fetch, now.Add(time.Minute))
+			require.NoError(t, err)
+			assert.Equal(t, 1, retry.calls)
+		})
+	}
+}
+
+// A push refreshes pricing first. Canceling the push must end the refresh
+// even while a long archive write holds the lock its pricing writes need.
+func TestEnsureCurrentStopsWaitingBehindALongWrite(t *testing.T) {
+	database := testDB(t)
+	now := pricingTestNow()
+	previous := seedPricingAttempt(t, database, now, 2*time.Hour)
+	inWrite := make(chan struct{})
+	release := make(chan struct{})
+	endWrite := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(endWrite)
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- database.Update(t.Context(), func(*sql.Tx) error {
+			close(inWrite)
+			<-release
+			return nil
+		})
+	}()
+	<-inWrite
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	refreshed := make(chan error, 1)
+	go func() {
+		refreshed <- ensureCurrent(ctx, database, func(
+			context.Context,
+		) (pricing.Catalog, error) {
+			return pricing.Catalog{}, nil
+		}, now)
+	}()
+	require.Eventually(t, func() bool {
+		return testutil.GoroutineBlockedOnMutexIn("lockctx.Lock")
+	}, 10*time.Second, 5*time.Millisecond)
+	cancel()
+	select {
+	case err := <-refreshed:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the canceled refresh kept waiting for the archive write")
+	}
+
+	endWrite()
+	require.NoError(t, <-writeDone)
+	assertPricingAttemptMeta(t, database, previous)
 }
 
 func TestRefreshCurrentFetchesDespiteRecentAttempt(t *testing.T) {

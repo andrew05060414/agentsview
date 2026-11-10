@@ -182,6 +182,7 @@ func transcriptMessages(messages []Message) []Message {
 	for i := range stored {
 		if isToolOutputRow(stored[i]) {
 			stored[i].Content = ""
+			stored[i].DialogueText = nil
 			stored[i].ContentLength = 0
 		}
 		stored[i].ToolResults = nil
@@ -193,6 +194,13 @@ func transcriptMessages(messages []Message) []Message {
 		); changed {
 			stored[i].Content = redacted
 			stored[i].ContentLength = len(redacted)
+		}
+		if stored[i].DialogueText != nil {
+			if redacted, changed := redactToolUseRenderings(
+				*stored[i].DialogueText, stored[i].ToolCalls,
+			); changed {
+				stored[i].DialogueText = &redacted
+			}
 		}
 		calls := slices.Clone(stored[i].ToolCalls)
 		for j := range calls {
@@ -322,6 +330,7 @@ func usageOnlyMessages(messages []Message) []Message {
 		}
 		message.Content = ""
 		message.ThinkingText = ""
+		message.DialogueText = nil
 		message.ToolCalls = usageOnlyToolCalls(message.ToolCalls)
 		message.ToolResults = nil
 		message.HasThinking = false
@@ -494,19 +503,38 @@ func applyArchiveContentToCopiedSessionsTx(
 	policy config.ArchiveContent, sourceVersion int,
 ) error {
 	var err error
+	if policy.UsageOnly() {
+		owners, err := resolveTrailerOwners(ctx, tx, "1=1")
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM commit_trailers WHERE session_id IN (
+   SELECT key FROM json_each(?) WHERE value IN (SELECT id FROM `+tempIDsTable+`))`, owners); err != nil {
+			return err
+		}
+	}
 	switch policy {
 	case config.ArchiveContentFull:
-		// Sanitized content and its conversation projection were copied
-		// together. Neither needs to be read and rewritten when unchanged.
-		if sourceVersion >= sanitizedSourceDataVersion {
+		// Skip unchanged projections only when the source already carries
+		// visible metadata. Older indexes must derive it from copied dialogue.
+		if sourceVersion >= sanitizedSourceDataVersion && oldDBHasColumn(ctx, tx, "conversation_messages", "visible_digest") {
 			return nil
 		}
 	case config.ArchiveContentTranscripts:
+		if _, err := tx.ExecContext(ctx, `DELETE FROM commit_links WHERE session_id IN (SELECT id FROM `+tempIDsTable+`)`); err != nil {
+			return err
+		}
 		err = dropCopiedToolContentTx(ctx, tx, tempIDsTable)
 	case config.ArchiveContentUsage:
+		if _, err := tx.ExecContext(ctx, `DELETE FROM commit_links WHERE session_id IN (SELECT id FROM `+tempIDsTable+`)`); err != nil {
+			return err
+		}
 		err = compactCopiedSessionsForUsageTx(ctx, tx, tempIDsTable)
 	}
 	if err != nil {
+		return err
+	}
+	if err := refreshCopiedCodexForkDigestsTx(ctx, tx, tempIDsTable); err != nil {
 		return err
 	}
 	if active, err := conversationExportActiveTx(contextTransaction{ctx: ctx, tx: tx}); err != nil || !active {
@@ -553,28 +581,28 @@ func dropCopiedToolContentTx(
 			UPDATE tool_result_events SET content = ''
 			WHERE session_id` + inCopied},
 		{"tool-role message text", `
-			UPDATE messages SET content = '', content_length = 0
+			UPDATE messages SET content = '', dialogue_text = NULL, dialogue_is_content = 0, content_length = 0
 			WHERE (role = 'tool' OR source_subtype = '` +
 			parser.SourceSubtypeToolResult + `')
 			  AND session_id` + inCopied},
 		// RooCode and Kilo Legacy stored unpaired tool output as system-flagged
 		// user or system rows.
 		{"unmarked RooCode and Kilo Legacy tool output", `
-			UPDATE messages SET content = '', content_length = 0
+			UPDATE messages SET content = '', dialogue_text = NULL, dialogue_is_content = 0, content_length = 0
 			WHERE is_system = 1 AND session_id` +
 			inUnmarked(`'`+string(parser.AgentRooCode)+`', '`+
 				string(parser.AgentKiloLegacy)+`'`)},
 		// Zencoder stored system blocks embedded in tool results as
 		// system-flagged user rows, just like ordinary system notices.
 		{"unmarked Zencoder tool output", `
-			UPDATE messages SET content = '', content_length = 0
+			UPDATE messages SET content = '', dialogue_text = NULL, dialogue_is_content = 0, content_length = 0
 			WHERE is_system = 1 AND session_id` +
 			inUnmarked(`'`+string(parser.AgentZencoder)+`'`)},
 		// Codex, TraeX, and Augure Code stored unpaired agent notifications
 		// as ordinary user rows, with no field that distinguishes them from
 		// prompts.
 		{"unmarked Codex, TraeX, and Augure Code tool output", `
-			UPDATE messages SET content = '', content_length = 0
+			UPDATE messages SET content = '', dialogue_text = NULL, dialogue_is_content = 0, content_length = 0
 			WHERE role = 'user' AND session_id` +
 			inUnmarked(`'`+string(parser.AgentCodex)+`', '`+
 				string(parser.AgentTraeX)+`', '`+
@@ -582,20 +610,20 @@ func dropCopiedToolContentTx(
 		// gptme stored tool output as assistant rows without a model, while
 		// model replies carry the model name.
 		{"unmarked gptme tool output", `
-			UPDATE messages SET content = '', content_length = 0
+			UPDATE messages SET content = '', dialogue_text = NULL, dialogue_is_content = 0, content_length = 0
 			WHERE role = 'assistant' AND model = '' AND session_id` +
 			inUnmarked(`'`+string(parser.AgentGptme)+`'`)},
 		// OpenHands stored unpaired observations as user rows that are
 		// indistinguishable from prompts, so every user row loses its text.
 		{"unmarked OpenHands tool output", `
-			UPDATE messages SET content = '', content_length = 0
+			UPDATE messages SET content = '', dialogue_text = NULL, dialogue_is_content = 0, content_length = 0
 			WHERE role = 'user' AND session_id` +
 			inUnmarked(`'`+string(parser.AgentOpenHands)+`'`)},
 		// Aider surfaced its tool channel as assistant rows that are
 		// indistinguishable from replies, so every assistant row loses its
 		// text.
 		{"unmarked Aider tool output", `
-			UPDATE messages SET content = '', content_length = 0
+			UPDATE messages SET content = '', dialogue_text = NULL, dialogue_is_content = 0, content_length = 0
 			WHERE role = 'assistant' AND session_id` +
 			inUnmarked(`'`+string(parser.AgentAider)+`'`)},
 	}
@@ -675,7 +703,7 @@ func compactCopiedSessionsForUsageTx(
 			               WHERE tc.message_id = messages.id))`},
 		{"message payloads", `
 			UPDATE messages
-			SET content = '', thinking_text = '', has_thinking = 0,
+			SET content = '', dialogue_text = NULL, dialogue_is_content = 0, thinking_text = '', has_thinking = 0,
 			    has_tool_use = EXISTS (SELECT 1 FROM tool_calls tc
 			                           WHERE tc.message_id = messages.id),
 			    content_length = 0, is_system = 0,
@@ -736,7 +764,7 @@ func redactCopiedToolUseRenderingsTx(
 	ctx context.Context, tx *sql.Tx, tempIDsTable string,
 ) error {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT m.id, m.content, tc.tool_name, tc.category,
+		SELECT m.id, m.content, m.thinking_text, `+sqliteDialogueExprM+`, tc.tool_name, tc.category,
 		       COALESCE(tc.input_json, '')
 		  FROM messages m
 		  JOIN tool_calls tc ON tc.message_id = m.id
@@ -747,25 +775,28 @@ func redactCopiedToolUseRenderingsTx(
 	}
 	defer rows.Close()
 	type pending struct {
-		id      int64
-		content string
-		calls   []ToolCall
+		id       int64
+		content  string
+		thinking string
+		dialogue sql.NullString
+		calls    []ToolCall
 	}
 	// Rows arrive ordered by message, so each message's calls are
 	// contiguous and the last entry is the one being extended.
 	var entries []pending
 	for rows.Next() {
 		var id int64
-		var content string
+		var content, thinking string
+		var dialogue sql.NullString
 		var call ToolCall
 		if err := rows.Scan(
-			&id, &content, &call.ToolName, &call.Category, &call.InputJSON,
+			&id, &content, &thinking, &dialogue, &call.ToolName, &call.Category, &call.InputJSON,
 		); err != nil {
 			rows.Close()
 			return fmt.Errorf("scanning copied tool rendering: %w", err)
 		}
 		if len(entries) == 0 || entries[len(entries)-1].id != id {
-			entries = append(entries, pending{id: id, content: content})
+			entries = append(entries, pending{id: id, content: content, thinking: thinking, dialogue: dialogue})
 		}
 		last := &entries[len(entries)-1]
 		last.calls = append(last.calls, call)
@@ -778,12 +809,22 @@ func redactCopiedToolUseRenderingsTx(
 	for _, entry := range entries {
 		content := redactCopiedUnrecoverableToolRenderings(entry.content, entry.calls)
 		redacted, _ := redactToolUseRenderings(content, entry.calls)
-		if redacted == entry.content {
+		dialogue := entry.dialogue
+		if dialogue.Valid {
+			dialogue.String = redactCopiedUnrecoverableToolRenderings(dialogue.String, entry.calls)
+			dialogue.String, _ = redactToolUseRenderings(dialogue.String, entry.calls)
+		}
+		if redacted == entry.content && dialogue == entry.dialogue {
 			continue
 		}
+		var full *string
+		if dialogue.Valid {
+			full = &dialogue.String
+		}
+		stored, isContent := StoredDialogue(redacted, entry.thinking, full)
 		if _, err := tx.ExecContext(ctx,
-			"UPDATE messages SET content = ?, content_length = ? WHERE id = ?",
-			redacted, len(redacted), entry.id,
+			"UPDATE messages SET content = ?, content_length = ?, dialogue_text = ?, dialogue_is_content = ? WHERE id = ?",
+			redacted, len(redacted), stored, isContent, entry.id,
 		); err != nil {
 			return fmt.Errorf(
 				"redacting copied tool rendering %d: %w", entry.id, err,

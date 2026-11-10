@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strconv"
 )
 
@@ -105,7 +106,7 @@ func (db *DB) ReplaceSessionContentStaged(
 	signalsFn StagedSignalsFunc,
 ) error {
 	return db.replaceSessionContentStaged(
-		ctx, sessionID, msgs, staged, blocked, signalsFn, nil, nil,
+		ctx, sessionID, msgs, staged, blocked, signalsFn, nil, nil, nil,
 	)
 }
 
@@ -120,7 +121,7 @@ func (db *DB) ReplaceSessionContentStagedWithCheckpoint(
 	cp *ParserCheckpoint, blobs *ParserCheckpointBlobs,
 ) error {
 	return db.replaceSessionContentStaged(
-		ctx, sessionID, msgs, staged, blocked, signalsFn, cp, blobs,
+		ctx, sessionID, msgs, staged, blocked, signalsFn, cp, blobs, nil,
 	)
 }
 
@@ -169,7 +170,8 @@ func stagedSessionContentDigestTx(ctx context.Context,
 ) ([sha256.Size]byte, error) {
 	h := sha256.New()
 	rows, err := tx.QueryContext(ctx, `
-		SELECT ordinal, role, content, thinking_text, COALESCE(timestamp, ''),
+		SELECT ordinal, role, content, thinking_text,
+		       dialogue_text IS NOT NULL OR dialogue_is_content, COALESCE(`+sqliteDialogueExprBare+`, ''), COALESCE(timestamp, ''),
 		       has_thinking, has_tool_use, content_length, is_system, model,
 		       reasoning_effort, token_usage, context_tokens, output_tokens,
 		       has_context_tokens, has_output_tokens,
@@ -184,12 +186,12 @@ func stagedSessionContentDigestTx(ctx context.Context,
 	for rows.Next() {
 		var ordinal, hasThinking, hasToolUse, contentLength, isSystem int64
 		var contextTokens, outputTokens, hasContext, hasOutput int64
-		var isSidechain, isCompact int64
-		var role, content, thinking, timestamp, model, reasoningEffort, tokenUsage string
+		var isSidechain, isCompact, hasDialogue int64
+		var role, content, thinking, dialogue, timestamp, model, reasoningEffort, tokenUsage string
 		var claudeMessageID, claudeRequestID, sourceType, sourceSubtype string
 		var promptSource, sourceUUID, sourceParentUUID string
 		if err := rows.Scan(
-			&ordinal, &role, &content, &thinking, &timestamp,
+			&ordinal, &role, &content, &thinking, &hasDialogue, &dialogue, &timestamp,
 			&hasThinking, &hasToolUse, &contentLength, &isSystem, &model,
 			&reasoningEffort, &tokenUsage, &contextTokens, &outputTokens,
 			&hasContext, &hasOutput,
@@ -203,12 +205,12 @@ func stagedSessionContentDigestTx(ctx context.Context,
 		for _, value := range []int64{
 			ordinal, hasThinking, hasToolUse, contentLength, isSystem,
 			contextTokens, outputTokens, hasContext, hasOutput,
-			isSidechain, isCompact,
+			isSidechain, isCompact, hasDialogue,
 		} {
 			writeStagedDigestInt(h, value)
 		}
 		for _, value := range []string{
-			role, content, thinking, timestamp, model, reasoningEffort, tokenUsage,
+			role, content, thinking, dialogue, timestamp, model, reasoningEffort, tokenUsage,
 			claudeMessageID, claudeRequestID, sourceType, sourceSubtype,
 			promptSource, sourceUUID, sourceParentUUID,
 		} {
@@ -319,17 +321,22 @@ func stagedSessionContentDigestTx(ctx context.Context,
 	return digest, nil
 }
 
-func commitStagedDerivedStateAndCheckpoint(
+func (db *DB) commitStagedDerivedStateAndCheckpoint(
 	ctx context.Context, conn *sql.Conn, sessionID string,
 	signals *SessionSignalUpdate, findings []SecretFinding,
 	cp *ParserCheckpoint, blobs *ParserCheckpointBlobs,
 	msgs []Message,
+	write *SessionBatchWrite,
 ) error {
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := db.publishStagedSessionMetadataTx(ctx, tx, write); err != nil {
+		return err
+	}
+
 	if err := reconcileConversationMessagesTx(tx, sessionID, msgs, true, false); err != nil {
 		return err
 	}
@@ -379,6 +386,7 @@ func (db *DB) replaceSessionContentStaged(
 	staged StagedToolResults, blocked map[string]bool,
 	signalsFn StagedSignalsFunc,
 	cp *ParserCheckpoint, blobs *ParserCheckpointBlobs,
+	write *SessionBatchWrite,
 ) error {
 	if db.ArchiveContent().OmitsToolContent() {
 		// The in-memory rows contain all retained metadata. Staged output is
@@ -391,6 +399,12 @@ func (db *DB) replaceSessionContentStaged(
 			if err != nil {
 				return err
 			}
+		}
+		if write != nil {
+			projected := *write
+			projected.Signals, projected.Findings = update, findings
+			_, err := db.WriteSessionBatchAtomic(ctx, []SessionBatchWrite{projected})
+			return err
 		}
 		return db.ReplaceSessionContent(ctx, sessionID, msgs, update, findings)
 	}
@@ -417,6 +431,9 @@ func (db *DB) replaceSessionContentStaged(
 		return fmt.Errorf("beginning tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := db.publishStagedSessionMetadataTx(ctx, tx, write); err != nil {
+		return err
+	}
 
 	queueGenerationBefore, queueExistedBefore, err := artifactExportGenerationTx(
 		tx, sessionID,
@@ -446,7 +463,7 @@ func (db *DB) replaceSessionContentStaged(
 		return err
 	}
 	if err := replaceSessionMessagesTxStaged(
-		ctx, tx, sessionID, msgs, staged, blocked,
+		ctx, tx, sessionID, msgs, staged, blocked, write,
 	); err != nil {
 		return err
 	}
@@ -475,8 +492,8 @@ func (db *DB) replaceSessionContentStaged(
 		if err := tx.Rollback(); err != nil {
 			return err
 		}
-		return commitStagedDerivedStateAndCheckpoint(
-			ctx, conn, sessionID, signals, findings, cp, blobs, msgs,
+		return db.commitStagedDerivedStateAndCheckpoint(
+			ctx, conn, sessionID, signals, findings, cp, blobs, msgs, write,
 		)
 	}
 	// Summary resolution above recorded per-call content-failure
@@ -585,9 +602,9 @@ func detachStagedConn(ctx context.Context, conn *sql.Conn) {
 // the fly, and the event rows come from the staged handle.
 func replaceSessionMessagesTxStaged(
 	ctx context.Context, tx *sql.Tx, sessionID string, msgs []Message,
-	staged StagedToolResults, blocked map[string]bool,
+	staged StagedToolResults, blocked map[string]bool, write *SessionBatchWrite,
 ) error {
-	pins, err := savePinsTx(tx, sessionID)
+	pins, err := savePinsTx(tx, sessionID, msgs)
 	if err != nil {
 		return err
 	}
@@ -618,7 +635,13 @@ func replaceSessionMessagesTxStaged(
 		chunkBytes = 0
 		return nil
 	}
+	var retainedMessages []Message
 	for i, m := range msgs {
+		var retainedMessage Message
+		if write != nil && write.CodexForkState != nil {
+			retainedMessage = m
+			retainedMessage.ToolCalls = slices.Clone(m.ToolCalls)
+		}
 		for callIdx := range m.ToolCalls {
 			tc := ToolCall{
 				MessageID:         ids[i],
@@ -632,27 +655,44 @@ func replaceSessionMessagesTxStaged(
 				FilePath:          m.ToolCalls[callIdx].FilePath,
 				CallIndex:         callIdx,
 			}
-			if tc.ToolUseID != "" {
-				occurrence := callOccurrences[tc.ToolUseID]
-				callOccurrences[tc.ToolUseID] = occurrence + 1
-				stageKey := StagedToolCallKey(tc.ToolUseID, occurrence)
-				positions[stageKey] = StagedToolCallPosition{
-					ToolUseID: tc.ToolUseID,
-					Ordinal:   m.Ordinal,
-					CallIndex: callIdx,
+			occurrence := callOccurrences[tc.ToolUseID]
+			callOccurrences[tc.ToolUseID] = occurrence + 1
+			stageKey := StagedToolCallKey(tc.ToolUseID, occurrence)
+			forkCall, retained := false, false
+			if write != nil && write.CodexForkState != nil {
+				originalKey, mapped := write.StagedToolKeys[stageKey]
+				forkCall, retained = mapped, !mapped
+				if mapped {
+					stageKey = originalKey
 				}
-				summary, length, err := staged.ResolveSummary(
-					ctx, stageKey,
-				)
-				if err != nil {
-					return fmt.Errorf(
-						"resolving staged summary for %s/%s: %w",
-						sessionID, tc.ToolUseID, err,
+			}
+			// Archive-only calls use occurrence keys even without a provider ID.
+			if tc.ToolUseID != "" || forkCall {
+				if !retained {
+					if retainedMessage.ToolCalls != nil {
+						retainedMessage.ToolCalls[callIdx].ResultEvents = nil
+					}
+					positions[stageKey] = StagedToolCallPosition{
+						ToolUseID: tc.ToolUseID,
+						Ordinal:   m.Ordinal,
+						CallIndex: callIdx,
+					}
+					summary, length, err := staged.ResolveSummary(
+						ctx, stageKey,
 					)
-				}
-				tc.ResultContentLength = length
-				if !blocked[tc.Category] {
-					tc.ResultContent = summary
+					if err != nil {
+						return fmt.Errorf(
+							"resolving staged summary for %s/%s: %w",
+							sessionID, tc.ToolUseID, err,
+						)
+					}
+					tc.ResultContentLength = length
+					if !blocked[tc.Category] {
+						tc.ResultContent = summary
+					}
+				} else {
+					tc.ResultContent = m.ToolCalls[callIdx].ResultContent
+					tc.ResultContentLength = m.ToolCalls[callIdx].ResultContentLength
 				}
 				chunkBytes += int64(len(tc.ResultContent))
 			}
@@ -669,6 +709,9 @@ func replaceSessionMessagesTxStaged(
 				}
 			}
 		}
+		if retainedMessage.ToolCalls != nil {
+			retainedMessages = append(retainedMessages, retainedMessage)
+		}
 	}
 	if err := flush(); err != nil {
 		return err
@@ -679,9 +722,56 @@ func replaceSessionMessagesTxStaged(
 	); err != nil {
 		return err
 	}
+	// Retained archive rows carry their complete result events in memory.
+	// Parsed rows carry placeholders and get their events from scratch above.
+	if err := insertToolResultEventsTx(tx, resolveToolResultEvents(retainedMessages)); err != nil {
+		return err
+	}
 	return restorePinsTx(tx, sessionID, pins)
 }
 
 // toolCallStagedChunkBytes bounds resolved summary content in addition to
 // the shared SQL parameter limit, since one summary can dwarf ordinary rows.
 const toolCallStagedChunkBytes = 16 << 20
+
+// WriteSessionBatchStaged publishes metadata and ownership in the same transaction
+// as the streamed transcript, including unchanged-content retries.
+func (db *DB) WriteSessionBatchStaged(ctx context.Context, write SessionBatchWrite,
+	staged StagedToolResults, blocked map[string]bool, signals StagedSignalsFunc,
+) error {
+	if err := db.requireWritable(); err != nil {
+		return err
+	}
+	sanitized, err := sanitizeSessionBatchWriteContext(ctx, write)
+	if err != nil {
+		return err
+	}
+	write = db.storageSessionBatchWrite(sanitized)
+	if err := db.replaceSessionContentStaged(ctx, write.Session.ID, write.Messages, staged, blocked, signals,
+		write.Checkpoint, write.CheckpointBlobs, &write); err != nil {
+		return err
+	}
+	db.notifyUsageSessions([]string{write.Session.ID})
+	return nil
+}
+
+func (db *DB) publishStagedSessionMetadataTx(ctx context.Context, tx *sql.Tx, write *SessionBatchWrite) error {
+	if write == nil {
+		return nil
+	}
+	result, err := db.upsertSessionBatchTx(ctx, tx, *write)
+	if err != nil {
+		return err
+	}
+	queries := contextTransaction{ctx: ctx, tx: tx}
+	if err := writeSessionBatchMetadataTx(ctx, tx, queries, *write, result); err != nil {
+		return err
+	}
+	if write.DataVersion > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE sessions SET data_version=? WHERE id=?`, write.DataVersion, write.Session.ID); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE sessions SET source_missing_at=NULL WHERE id=?`, write.Session.ID)
+	return err
+}

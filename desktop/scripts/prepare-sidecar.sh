@@ -123,12 +123,26 @@ patch_tauri_version() {
 restore_pricing_snapshot() {
   (
     cd "$REPO_ROOT"
-    go run ./internal/pricing/cmd/litellm-snapshot -restore
+    ${DOWNLOAD_RETRY:-} go run ./internal/pricing/cmd/litellm-snapshot -restore
   )
 }
 
 install_frontend_deps() {
-  npm ci
+  ${DOWNLOAD_RETRY:-} npm ci
+}
+
+prepare_frontend() {
+  local dist="$REPO_ROOT/frontend/dist"
+  if [ "${AGENTSVIEW_FRONTEND_PREBUILT:-false}" != "true" ]; then
+    (
+      cd "$REPO_ROOT/frontend"
+      install_frontend_deps
+      npm run build
+    )
+  fi
+
+  rm -rf "$REPO_ROOT/internal/web/dist"
+  cp -r "$dist" "$REPO_ROOT/internal/web/dist"
 }
 
 main() {
@@ -147,14 +161,7 @@ main() {
     echo "warning: cross-target sidecar build requested from host $host_triple" >&2
   fi
 
-  (
-    cd "$REPO_ROOT/frontend"
-    install_frontend_deps
-    npm run build
-  )
-
-  rm -rf "$REPO_ROOT/internal/web/dist"
-  cp -r "$REPO_ROOT/frontend/dist" "$REPO_ROOT/internal/web/dist"
+  prepare_frontend
 
   ext=""
   if [[ "$target_triple" == *"windows"* ]]; then
@@ -173,10 +180,15 @@ main() {
   build_bin="$tmp_dir/agentsview$ext"
   restore_pricing_snapshot
 
+  local build_flags=(-tags fts5 -ldflags "$ldflags")
+  if [ "${AGENTSVIEW_SIDECAR_TRIMPATH:-true}" != "false" ]; then
+    build_flags+=(-trimpath)
+  fi
+
   (
     cd "$REPO_ROOT"
     CGO_ENABLED=1 GOOS="$goos" GOARCH="$goarch" \
-      go build -tags fts5 -ldflags "$ldflags" -trimpath \
+      go build "${build_flags[@]}" \
       -o "$build_bin" ./cmd/agentsview
   )
 

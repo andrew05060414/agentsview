@@ -16,6 +16,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/pricing/catalog"
 )
 
 type PricingRowSource string
@@ -194,6 +195,13 @@ func NewPricingResolverWithDigest(rows []EffectivePricingRow, digest string) *Pr
 	return resolver
 }
 
+// Copy returns a resolver over the same rows and digest with empty lookup
+// caches. A resolver caches lookups without locking, so each goroutine that
+// resolves prices needs its own copy.
+func (r *PricingResolver) Copy() *PricingResolver {
+	return NewPricingResolverWithDigest(r.rows, r.digest)
+}
+
 func NewPricingResolver(rows []EffectivePricingRow) *PricingResolver {
 	copied := make([]EffectivePricingRow, len(rows))
 	byModel := make(map[string]ModelRates, len(rows))
@@ -262,8 +270,14 @@ func (r *PricingResolver) ResolveBilled(providerID, reportedModel, canonicalMode
 // timestamp before applying one exact provider adjustment.
 func (r *PricingResolver) ResolveBilledAt(providerID, reportedModel, canonicalModel string, timestamp time.Time) (string, PricingLookup, error) {
 	pricedModel, lookup := r.ResolveAt(reportedModel, canonicalModel, timestamp)
+	if r == nil || !lookup.OK || lookup.Rates.Source == PricingRowSourceCustom {
+		return pricedModel, lookup, nil
+	}
+	if providerID == pricingpkg.OpenAIPriorityProviderID {
+		return pricedModel, r.withPriorityTier(lookup, pricedModel), nil
+	}
 	policy, ok := pricingpkg.BillingPolicyFor(providerID)
-	if !ok || !lookup.OK || lookup.Rates.Source == PricingRowSourceCustom {
+	if !ok {
 		return pricedModel, lookup, nil
 	}
 	rates, err := scaleModelRates(lookup.Rates, policy.Numerator, policy.Denominator)
@@ -273,6 +287,28 @@ func (r *PricingResolver) ResolveBilledAt(providerID, reportedModel, canonicalMo
 	lookup.Rates = rates
 	lookup.Adjustment = policy.Service + "@" + policy.Version
 	return pricedModel, lookup, nil
+}
+
+func (r *PricingResolver) withPriorityTier(lookup PricingLookup, pricedModel string) PricingLookup {
+	pattern, rates, ok := r.priorityRow(pricedModel)
+	if !ok {
+		return lookup
+	}
+	lookup.Rates = rates
+	lookup.Rates.Bands = slices.Clone(rates.Bands)
+	lookup.Pattern = pattern
+	lookup.Adjustment = pricingpkg.OpenAIPriorityProviderID
+	return lookup
+}
+
+// priorityRow returns the LiteLLM priority row and rates for a model.
+func (r *PricingResolver) priorityRow(model string) (string, ModelRates, bool) {
+	base := r.Lookup(model)
+	pattern := catalog.PriorityPattern(base.Pattern)
+	if rates, ok := r.byModel[pattern]; base.OK && ok {
+		return pattern, rates, true
+	}
+	return "", ModelRates{}, false
 }
 
 func scaleModelRates(r ModelRates, numerator, denominator int64) (ModelRates, error) {
@@ -667,27 +703,12 @@ func (r *PricingResolver) RecordResolvedComputedRequest(
 	lookup PricingLookup,
 	inputTokens, cacheWriteTokens, cacheReadTokens int,
 ) {
-	if r == nil || reportedModel == "" || pricedModel == "" {
-		return
+	band, ok := lookup.Rates.pricingBandForTokens(inputTokens, cacheWriteTokens, cacheReadTokens)
+	var threshold *int
+	if ok {
+		threshold = &band.AboveInputTokens
 	}
-	rec := r.record(reportedModel, pricedModel, lookup)
-	rec.computed = true
-	if !lookup.OK {
-		return
-	}
-	band, ok := lookup.Rates.pricingBandForTokens(
-		inputTokens,
-		cacheWriteTokens,
-		cacheReadTokens,
-	)
-	if !ok {
-		rec.baseRequestCount++
-		return
-	}
-	if rec.bandRequestCounts == nil {
-		rec.bandRequestCounts = make(map[int]int)
-	}
-	rec.bandRequestCounts[band.AboveInputTokens]++
+	r.accumulateResolved(reportedModel, pricedModel, lookup, false, true, 1, 0, threshold)
 }
 
 func (r *PricingResolver) RecordComputedAggregate(model string, lookup PricingLookup) {
@@ -697,15 +718,7 @@ func (r *PricingResolver) RecordComputedAggregate(model string, lookup PricingLo
 func (r *PricingResolver) RecordResolvedComputedAggregate(
 	reportedModel, pricedModel string, lookup PricingLookup,
 ) {
-	if r == nil || reportedModel == "" || pricedModel == "" {
-		return
-	}
-	rec := r.record(reportedModel, pricedModel, lookup)
-	rec.computed = true
-	if !lookup.OK {
-		return
-	}
-	rec.aggregateRowCount++
+	r.accumulateResolved(reportedModel, pricedModel, lookup, false, true, 0, 1, nil)
 }
 
 func (r *PricingResolver) RecordReported(model string, lookup PricingLookup) {
@@ -715,21 +728,42 @@ func (r *PricingResolver) RecordReported(model string, lookup PricingLookup) {
 func (r *PricingResolver) RecordResolvedComputed(
 	reportedModel, pricedModel string, lookup PricingLookup,
 ) {
-	if r == nil || reportedModel == "" || pricedModel == "" {
-		return
-	}
-	rec := r.record(reportedModel, pricedModel, lookup)
-	rec.computed = true
+	r.accumulateResolved(reportedModel, pricedModel, lookup, false, true, 0, 0, nil)
 }
 
 func (r *PricingResolver) RecordResolvedReported(
 	reportedModel, pricedModel string, lookup PricingLookup,
 ) {
+	r.accumulateResolved(reportedModel, pricedModel, lookup, true, false, 0, 0, nil)
+}
+
+// RecordResolvedCounts records provenance for pre-aggregated usage rows.
+func (r *PricingResolver) RecordResolvedCounts(reportedModel, pricedModel string, lookup PricingLookup, reported, requests, aggregates int, band *int) {
+	if reported+requests+aggregates == 0 {
+		return
+	}
+	r.accumulateResolved(reportedModel, pricedModel, lookup, reported > 0, requests+aggregates > 0, requests, aggregates, band)
+}
+
+func (r *PricingResolver) accumulateResolved(reportedModel, pricedModel string, lookup PricingLookup, reported, computed bool, requests, aggregates int, band *int) {
 	if r == nil || reportedModel == "" || pricedModel == "" {
 		return
 	}
 	rec := r.record(reportedModel, pricedModel, lookup)
-	rec.reported = true
+	rec.reported = rec.reported || reported
+	rec.computed = rec.computed || computed
+	if !lookup.OK {
+		return
+	}
+	rec.aggregateRowCount += aggregates
+	if band == nil {
+		rec.baseRequestCount += requests
+	} else if requests > 0 {
+		if rec.bandRequestCounts == nil {
+			rec.bandRequestCounts = make(map[int]int)
+		}
+		rec.bandRequestCounts[*band] += requests
+	}
 }
 
 // RecordUnattributedReported records an authoritative aggregate cost that

@@ -82,7 +82,7 @@ type providerResultAdmission struct {
 	kept []parser.ParseResult
 	// emitted holds only Session.ID and Session.File.Path of every admitted result.
 	emitted                []parser.ParseResult
-	retryIDs               []string
+	retries                []retryCause
 	firstHash              string
 	truncationVerifyFailed bool
 	validationErr          error
@@ -110,7 +110,11 @@ func (a *providerResultAdmission) admit(r parser.ParseResultOutcome) error {
 		File: parser.FileInfo{Path: r.Result.Session.File.Path},
 	}})
 	if r.DataVersion == parser.DataVersionNeedsRetry {
-		a.retryIDs = append(a.retryIDs, r.Result.Session.ID)
+		a.retries = append(a.retries, retryCause{
+			sessionID: r.Result.Session.ID,
+			path:      a.file.Path,
+			reason:    r.RetryReason,
+		})
 	}
 	kept := a.engine.dropUnchangedSharedSQLiteResults(
 		a.ctx, a.file, []parser.ParseResult{r.Result}, a.policy,
@@ -145,6 +149,11 @@ func validateProviderParseResultSessionIDs(def parser.AgentDef, result parser.Pa
 	}
 	for _, sessionID := range sessionIDs {
 		if err := validateProviderSessionID(def, sessionID.id, sessionID.field); err != nil {
+			return err
+		}
+	}
+	if plan := result.Session.PlanUsage; plan != nil {
+		if err := validateProviderSessionID(def, plan.CountedUnder, "plan usage counted-under session id"); err != nil {
 			return err
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -95,6 +96,23 @@ func prepareServeRuntimeConfig(ctx context.Context,
 	return cfg, nil
 }
 
+// startChromeHost listens for the Chrome native host only after
+// `agentsview chrome setup` wrote its launcher. Without the launcher Chrome
+// cannot start the relay, so the socket would serve nobody.
+func startChromeHost(ctx context.Context, dataDir string, srv *server.Server) error {
+	if _, err := os.Stat(chromehost.LauncherPath(dataDir)); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	socket, err := chromehost.SocketPath(dataDir)
+	if err != nil {
+		return err
+	}
+	warnStaleChromeLauncher(dataDir, socket)
+	return srv.ServeChromeHost(ctx, socket)
+}
+
 func startServerWithOptionalCaddy(
 	ctx context.Context,
 	cfg config.Config,
@@ -107,11 +125,7 @@ func startServerWithOptionalCaddy(
 		}
 	}
 	if opts.Mode == "serve" {
-		socket, err := chromehost.SocketPath(cfg.DataDir)
-		if err == nil {
-			err = srv.ServeChromeHost(ctx, socket)
-		}
-		if err != nil {
+		if err := startChromeHost(ctx, cfg.DataDir, srv); err != nil {
 			log.Printf("Chrome host unavailable: %v", err)
 		}
 	}
@@ -123,8 +137,10 @@ func startServerWithOptionalCaddy(
 	if err := waitForBackendReady(
 		ctx, cfg, srv, opts.BasePath, 5*time.Second, serveErrCh,
 	); err != nil {
+		// Shutdown runs after ctx may be canceled, so keep its values but not
+		// its cancellation.
 		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
+			context.WithoutCancel(ctx), 5*time.Second,
 		)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
@@ -141,8 +157,10 @@ func startServerWithOptionalCaddy(
 			ctx, cfg, opts.Mode, opts.OnCaddyStarted,
 		)
 		if err != nil {
+			// Shutdown runs after ctx may be canceled, so keep its values but not
+			// its cancellation.
 			shutdownCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
+				context.WithoutCancel(ctx), 5*time.Second,
 			)
 			defer cancel()
 			_ = srv.Shutdown(shutdownCtx)
@@ -151,8 +169,10 @@ func startServerWithOptionalCaddy(
 
 		publicPort, err := publicURLPort(cfg.PublicURL)
 		if err != nil {
+			// Shutdown runs after ctx may be canceled, so keep its values but not
+			// its cancellation.
 			shutdownCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
+				context.WithoutCancel(ctx), 5*time.Second,
 			)
 			defer cancel()
 			caddy.Stop()
@@ -166,8 +186,10 @@ func startServerWithOptionalCaddy(
 			5*time.Second,
 			caddy.Err(),
 		); err != nil {
+			// Shutdown runs after ctx may be canceled, so keep its values but not
+			// its cancellation.
 			shutdownCtx, cancel := context.WithTimeout(
-				context.Background(), 5*time.Second,
+				context.WithoutCancel(ctx), 5*time.Second,
 			)
 			defer cancel()
 			caddy.Stop()
@@ -301,8 +323,10 @@ func waitForServerRuntime(
 		}
 		return nil
 	case err := <-caddyErrCh:
+		// Shutdown runs after ctx may be canceled, so keep its values but not
+		// its cancellation.
 		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
+			context.WithoutCancel(ctx), 5*time.Second,
 		)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
@@ -318,8 +342,10 @@ func waitForServerRuntime(
 		}
 		return errors.New("managed caddy exited unexpectedly")
 	case <-ctx.Done():
+		// Shutdown runs after ctx may be canceled, so keep its values but not
+		// its cancellation.
 		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(), 5*time.Second,
+			context.WithoutCancel(ctx), 5*time.Second,
 		)
 		defer cancel()
 		if rt.Caddy != nil {

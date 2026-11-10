@@ -24,14 +24,12 @@ func OpenPreparedTestDB(path string) (*DB, error) {
 		return nil, fmt.Errorf("configuring prepared test CJK FTS: %w", err)
 	}
 
-	reader, err := sql.Open(sqliteArchiveDriverName, makeDSN(path, true))
-	if err != nil {
-		writer.Close()
-		return nil, fmt.Errorf("opening prepared test reader: %w", err)
+	db := &DB{
+		path: path, usageCache: newUsageCacheManager(path),
+		activityKept:      newActivityKeptMemo(),
+		sessionStatsFacts: newSessionStatsFactsMemo(),
 	}
-	reader.SetMaxOpenConns(4)
-
-	db := &DB{path: path, usageCache: newUsageCacheManager(path)}
+	reader := db.openReader(path)
 	db.usageCache.attachArchive(db)
 	db.writer.Store(writer)
 	db.reader.Store(reader)

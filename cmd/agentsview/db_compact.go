@@ -17,8 +17,12 @@ import (
 
 func newDBCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "db",
-		Short:   "Maintain the local archive",
+		Use:   "db",
+		Short: "Maintain the local archive",
+		Long: "Maintain the persistent local SQLite archive. " +
+			"Keep the original archive when preparing a new image.",
+		Example: "  agentsview db compact --help\n" +
+			"  agentsview db migrate --help",
 		GroupID: groupData,
 		Args:    cobra.NoArgs,
 	}
@@ -26,6 +30,7 @@ func newDBCommand() *cobra.Command {
 	cmd.AddCommand(newDBStripCommand())
 	cmd.AddCommand(newDBMigrateCommand())
 	cmd.AddCommand(newDBAdoptMachineCommand())
+	cmd.AddCommand(newDBRepairProjectsCommand())
 	return cmd
 }
 
@@ -43,7 +48,7 @@ func newDBCompactCommand() *cobra.Command {
 			if jsonOutput && !yes && !dryRun {
 				return errors.New("--format json requires --yes for db compact")
 			}
-			cfg, err := config.LoadMinimal()
+			cfg, err := config.LoadMinimalFor(config.ScopeLocal)
 			if err != nil {
 				return fmt.Errorf("loading config: %w", err)
 			}
@@ -129,8 +134,8 @@ func runDBCompact(
 	// only for maintenance would still run its deferred startup sync at
 	// archive scale and then stay resident. With no daemon, the command owns
 	// the archive directly through the write lock.
-	tr, err := detectTransportContext(
-		ctx, cfg.DataDir, cfg.AuthToken, backgroundAutoStartReadyTimeout,
+	tr, err := detectClientTransportContext(
+		ctx, &cfg, backgroundAutoStartReadyTimeout,
 	)
 	if err != nil {
 		return db.CompactResult{}, fmt.Errorf("resolving archive transport: %w", err)

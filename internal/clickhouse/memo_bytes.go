@@ -3,17 +3,11 @@ package clickhouse
 import (
 	"unsafe"
 
-	"go.kenn.io/agentsview/internal/activity"
-	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/readbase"
 )
 
-// Byte caps of the memos whose entries can be large. The two report memos
-// together hold as much as the server's own 256 MiB report cache; a range
-// in progress keeps every session's usage rows, so a year of a large mirror
-// still fits.
+// Byte caps of the memos whose entries can be large.
 const (
-	activityReportMemoBytes = 128 << 20
 	activityUsageRangeBytes = 256 << 20
 	activityUsageRowsBytes  = 128 << 20
 	dailyUsageRowsBytes     = 128 << 20
@@ -48,15 +42,13 @@ func aggregateRowBytes(r chUsageAggregateRow) int64 {
 
 func dailyUsageRowBytes(r chDailyUsageGroupRow) int64 {
 	return aggregateRowBytes(r.chUsageAggregateRow) + int64(unsafe.Sizeof(r)-unsafe.Sizeof(r.chUsageAggregateRow)) +
-		stringBytes(r.kind, r.contextID, r.priceError)
+		stringBytes(r.kind, r.contextID, r.priceError) +
+		int64(len(r.inexactModels)+len(r.inexactProjects))*int64(unsafe.Sizeof("")) +
+		stringBytes(r.inexactModels...) + stringBytes(r.inexactProjects...)
 }
 
 func usageSessionRowBytes(r chUsageSessionRow) int64 {
 	return int64(unsafe.Sizeof(r)) + stringBytes(r.sessionID, r.project, r.agent)
-}
-
-func topSessionBytes(e db.TopSessionEntry) int64 {
-	return int64(unsafe.Sizeof(e)) + stringBytes(e.SessionID, e.DisplayName, e.Agent, e.Project, e.StartedAt, e.Machine, e.GroupKey, e.GroupLabel, e.SessionName)
 }
 
 func analyticsSessionBytes(r readbase.AnalyticsSession) int64 {
@@ -98,8 +90,4 @@ func usageRangeBytes(r activityUsageRange) int64 {
 		n += int64(len(session)+len(revision)) + 32
 	}
 	return n
-}
-
-func reportEntryBytes(e activityReportEntry) int64 {
-	return activity.EstimatedArtifactBytes(e.artifacts)
 }

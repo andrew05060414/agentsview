@@ -13,10 +13,6 @@ import (
 	"go.kenn.io/agentsview/internal/storage"
 )
 
-// localSyncTimestampLayout is the layout ListSessionsForMirrorWindow
-// compares sync_marker against.
-const localSyncTimestampLayout = "2006-01-02T15:04:05.000Z"
-
 // Sync pushes the SQLite archive into one ClickHouse mirror. Push is
 // one-way: it never reads content back into SQLite.
 type Sync struct {
@@ -44,6 +40,10 @@ type Sync struct {
 	// snapshot syncUsagePrices loaded.
 	pricer *usagePricer
 
+	// fullRunRecorded reports that the current push recorded its full push
+	// run, so a later failure can resume it.
+	fullRunRecorded bool
+
 	// unownedPruned records that this Sync already removed this machine's
 	// mirror sessions without an archive id that the archive no longer
 	// holds. Pushes always record their archive, so no new ones appear.
@@ -54,6 +54,10 @@ type Sync struct {
 	// vectorBatchSessions overrides the vector flush session bound when
 	// positive; tests lower it to cover several flushes in one push.
 	vectorBatchSessions int
+	// vectorFlushKeysBytes overrides the bound on a vector flush DELETE's
+	// key parameters when positive; tests set it to split flushes over the
+	// native protocol too.
+	vectorFlushKeysBytes int
 
 	closeOnce sync.Once
 	closeErr  error

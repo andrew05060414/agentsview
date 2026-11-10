@@ -136,3 +136,43 @@ func TestSelfParentNeverPersists(t *testing.T) {
 		})
 	}
 }
+
+// Dialogue classification survives sanitization and persistence, including
+// ordinary prose whose dialogue and display text happen to be identical.
+func TestSanitizeMessagePreservesDialogueClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name, content, thinking string
+		dialogue, want          *string
+	}{
+		{name: "equal after content sanitization", content: "ans\x00wer", dialogue: Ptr("answer"), want: Ptr("answer")},
+		{name: "equal after dialogue sanitization", content: "answer", dialogue: Ptr("ans\x00wer\xff"), want: Ptr("answer")},
+		{name: "distinct dialogue kept", content: "answer [Read: file.txt]", dialogue: Ptr("answer"), want: Ptr("answer")},
+		{name: "empty dialogue for tool-only message kept", content: "[Read: file.txt]", dialogue: Ptr(""), want: Ptr("")},
+		{name: "duplicate with thinking kept", content: "answer", thinking: "reasoning", dialogue: Ptr("answer"), want: Ptr("answer")},
+		{name: "nil dialogue kept", content: "answer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := Message{
+				SessionID: "s1", Ordinal: 0, Role: "assistant",
+				Content: tc.content, ThinkingText: tc.thinking, DialogueText: tc.dialogue,
+			}
+			sanitized := m
+			if tc.dialogue != nil {
+				sanitized.DialogueText = Ptr(*tc.dialogue)
+			}
+			SanitizeMessage(&sanitized)
+			assert.Equal(t, tc.want, sanitized.DialogueText, "sanitized")
+		})
+	}
+
+	d := testDB(t)
+	insertSession(t, d, "s1", "project")
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "s1", []Message{{
+		SessionID: "s1", Role: "assistant", Content: "answer", DialogueText: Ptr("answer"),
+	}}))
+	stored, err := d.GetMessageByOrdinal(t.Context(), "s1", 0)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	require.NotNil(t, stored.DialogueText)
+	assert.Equal(t, "answer", *stored.DialogueText)
+}

@@ -460,7 +460,7 @@ describe("UsageStore filter persistence", () => {
     expect(usage.summary?.unsupportedUsage).toEqual({
       kind: "copilot-no-token-data",
     });
-    expect(usage.summary?.comparison).toEqual(usageComparison());
+    await vi.waitFor(() => expect(usage.summary?.comparison).toEqual(usageComparison()));
   });
 
   it("falls back to defaults on corrupted localStorage", async () => {
@@ -557,10 +557,66 @@ describe("UsageStore group-by linking", () => {
   });
 });
 
+describe("UsageStore treemap label scale", () => {
+  beforeEach(() => {
+    installStorage();
+    localStorage.removeItem(TOGGLES_KEY);
+  });
+
+  it("defaults to sqrt and ignores an unknown saved scale", async () => {
+    localStorage.setItem(
+      TOGGLES_KEY,
+      JSON.stringify({ attribution: { groupBy: "project", view: "treemap", labelScale: "cubic" } }),
+    );
+
+    const { usage } = await loadStore();
+
+    expect(usage.toggles.attribution.labelScale).toBe("sqrt");
+  });
+
+  it("remembers the chosen scale across reloads", async () => {
+    const first = await loadStore();
+    first.usage.setAttributionLabelScale("log");
+
+    const { usage } = await loadStore();
+
+    expect(usage.toggles.attribution.labelScale).toBe("log");
+  });
+});
+
 describe("UsageStore session filter params", () => {
   beforeEach(() => {
     installStorage();
     vi.clearAllMocks();
+  });
+
+  it("uses summary aliases when toggling a saved member exclusion", async () => {
+    const { usage } = await loadStore();
+    usage.excludedModels = "claude-opus-4-20250514";
+    usageServiceMocks.getApiV1UsageSummary.mockResolvedValueOnce({
+      ...usageSummary(),
+      model_aliases: { "claude-opus-4-20250514": "claude-4" },
+    });
+    await usage.fetchSummary();
+    usage.toggleModel("claude-4");
+    expect(usage.excludedModels).toBe("claude-4");
+  });
+
+  it("requests grouped model rows only from summary and pairwise endpoints", async () => {
+    const { usage } = await loadStore();
+    await usage.fetchAll();
+    expect(usageServiceMocks.getApiV1UsageSummary.mock.lastCall?.[0]).toEqual(
+      expect.objectContaining({ group_models: true }),
+    );
+    expect(usageServiceMocks.getApiV1UsagePairwiseComparison.mock.lastCall?.[0]).toEqual(
+      expect.objectContaining({ group_models: true }),
+    );
+    expect(usageServiceMocks.getApiV1UsageComparison.mock.lastCall?.[0]).not.toHaveProperty(
+      "group_models",
+    );
+    expect(usageServiceMocks.getApiV1UsageTopSessions.mock.lastCall?.[0]).not.toHaveProperty(
+      "group_models",
+    );
   });
 
   it("passes shared session filters to usage endpoints", async () => {
@@ -777,6 +833,12 @@ describe("UsageStore session filter params", () => {
         expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenCalledTimes(
           failRecovery ? 1 : 2,
         );
+        if (!failRecovery) {
+          expect(usageServiceMocks.getApiV1UsageComparison.mock.lastCall?.[0]).not.toHaveProperty(
+            "exclude_project_key",
+          );
+          expect(usage.summary?.comparison).toEqual(usageComparison());
+        }
         expect(usageServiceMocks.getApiV1UsagePairwiseComparison).toHaveBeenCalledTimes(3);
         expect(
           usageServiceMocks.getApiV1UsagePairwiseComparison.mock.lastCall?.[0],
@@ -1316,24 +1378,32 @@ describe("UsageStore session filter params", () => {
     expect(usage.querying.pairwise).toBe(false);
   });
 
-  it("records full refresh time and clears new-data hints", async () => {
+  it("records refresh time and preserves data marked during a read", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       vi.setSystemTime(new Date("2026-06-15T16:00:00Z"));
       const { usage } = await loadStore();
 
+      usage.markNewData();
+      expect(usage.hasNewData).toBe(true);
       await usage.fetchAll();
 
       expect(usage.lastUpdatedAt).toBe(new Date("2026-06-15T16:00:00Z").getTime());
+      expect(usage.hasNewData).toBe(false);
 
       usage.markNewData();
-      expect(usage.hasNewData).toBe(true);
 
+      const pending = Promise.withResolvers<UsageSummaryResponse>();
+      usageServiceMocks.getApiV1UsageSummary.mockReturnValueOnce(pending.promise);
       vi.setSystemTime(new Date("2026-06-15T16:03:00Z"));
-      await usage.fetchAll();
+      const refresh = usage.fetchAll();
+      expect(usage.hasNewData).toBe(false);
+      usage.markNewData();
+      pending.resolve(usageSummary(15));
+      await refresh;
 
       expect(usage.lastUpdatedAt).toBe(new Date("2026-06-15T16:03:00Z").getTime());
-      expect(usage.hasNewData).toBe(false);
+      expect(usage.hasNewData).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -1358,6 +1428,44 @@ describe("UsageStore session filter params", () => {
         name: "topSessions",
         startMs: 0,
         durationMs: 400,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("excludes waiting for the window summary from comparison apply time", async () => {
+    vi.useFakeTimers({ toFake: ["Date", "performance"] });
+    try {
+      const { usage } = await loadStore();
+      usage.applyDateRange("2026-06-04", "2026-06-18");
+      usage.summary = usageSummary(15);
+      usage.selectedTimeRange = { from: "2026-06-07", to: "2026-06-10" };
+      const windowResponse = Promise.withResolvers<UsageSummaryResponse>();
+      usageServiceMocks.getApiV1UsageSummary
+        .mockImplementationOnce(async () => {
+          const data = usageSummary(3);
+          attachResponseTiming(data, { sentAt: 0, headersAt: 10, bodyAt: 20 });
+          return data;
+        })
+        .mockReturnValueOnce(windowResponse.promise);
+      usageServiceMocks.getApiV1UsageComparison.mockImplementationOnce(async () => {
+        const data = usageComparison();
+        attachResponseTiming(data, { sentAt: 0, headersAt: 10, bodyAt: 30 });
+        return data;
+      });
+
+      const refresh = usage.fetchAll({ preserveTimeRange: true });
+      vi.advanceTimersByTime(100);
+      windowResponse.resolve(usageSummary(15));
+      await refresh;
+
+      expect(usage.summary?.comparison).toEqual(usageComparison());
+      const comparison = usage.lastQuerySteps.find((step) => step.name === "comparison")!;
+      expect(comparison.segments!.find((segment) => segment.phase === "apply")).toEqual({
+        phase: "apply",
+        startMs: 100,
+        durationMs: 0,
       });
     } finally {
       vi.useRealTimers();
@@ -1463,7 +1571,6 @@ describe("UsageStore session filter params", () => {
       await usage.fetchAll();
       const previousUpdatedAt = usage.lastUpdatedAt;
 
-      usage.markNewData();
       usageServiceMocks.getApiV1UsageTopSessions.mockRejectedValueOnce(
         new Error("top sessions failed"),
       );
@@ -1472,59 +1579,82 @@ describe("UsageStore session filter params", () => {
       await usage.fetchAll();
 
       expect(usage.lastUpdatedAt).toBe(previousUpdatedAt);
-      expect(usage.hasNewData).toBe(true);
     } finally {
       warn.mockRestore();
       vi.useRealTimers();
     }
   });
 
-  it("starts summary and top sessions together during full refresh", async () => {
-    const calls: string[] = [];
-    let resolveSummary: ((value: unknown) => void) | undefined;
-    const summaryPromise = new Promise((resolve) => {
-      resolveSummary = resolve;
-    });
-    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(() => {
-      calls.push("summary");
-      return summaryPromise;
-    });
-    usageServiceMocks.getApiV1UsageTopSessions.mockImplementationOnce(() => {
-      calls.push("topSessions");
-      return Promise.resolve([]);
-    });
-    usageServiceMocks.getApiV1UsageComparison.mockImplementationOnce(() => {
-      calls.push("comparison");
-      return Promise.resolve({
-        priorFrom: "2023-12-01",
-        priorTo: "2023-12-31",
-        priorTotalCost: testMoney(1),
-        deltaPct: 0.5,
-      });
-    });
+  it.each(["summary first", "comparison first"])(
+    "starts comparison with summary during full refresh, %s",
+    async (order) => {
+      let resolveSummary!: (value: UsageSummaryResponse) => void;
+      let resolveComparison!: (value: Comparison) => void;
+      usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveSummary = resolve;
+          }),
+      );
+      usageServiceMocks.getApiV1UsageComparison.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveComparison = resolve;
+          }),
+      );
 
+      const { usage } = await loadStore();
+      const fetch = usage.fetchAll();
+      expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenCalled();
+      expect(usageServiceMocks.getApiV1UsageComparison).toHaveBeenCalledTimes(1);
+      expect(usageServiceMocks.getApiV1UsageTopSessions).toHaveBeenCalled();
+      expect(usageServiceMocks.getApiV1UsageComparison.mock.lastCall?.[0]).toHaveProperty(
+        "current_microdollars",
+        0,
+      );
+      expect(usage.summary).toBeNull();
+
+      if (order === "summary first") {
+        resolveSummary(usageSummary(3));
+        await vi.waitFor(() => expect(usage.summary?.totals.totalCost).toEqual(testMoney(3)));
+        expect(usage.summary?.comparison).toBeUndefined();
+        resolveComparison(usageComparison());
+      } else {
+        resolveComparison(usageComparison());
+        await Promise.resolve();
+        expect(usage.summary).toBeNull();
+        resolveSummary(usageSummary(3));
+      }
+      await fetch;
+      expect(usage.summary?.totals.totalCost).toEqual(testMoney(3));
+      expect(usage.summary?.comparison).toEqual(usageComparison());
+    },
+  );
+
+  it("aborts pending comparison when totals fail during full refresh", async () => {
+    let rejectSummary!: (error: Error) => void;
+    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectSummary = reject;
+        }),
+    );
+    usageServiceMocks.getApiV1UsageComparison.mockImplementationOnce(
+      (_params, { signal }) =>
+        new Promise((_, reject) => {
+          signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        }),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { usage } = await loadStore();
     const fetch = usage.fetchAll();
-    await Promise.resolve();
-
-    expect(calls).toEqual(["summary", "topSessions"]);
-    expect(usage.summary).toBeNull();
-
-    resolveSummary?.(usageSummary());
+    const signal = usageServiceMocks.getApiV1UsageComparison.mock.lastCall?.[1].signal;
+    expect(signal?.aborted).toBe(false);
+    rejectSummary(new Error("Summary failed"));
     await fetch;
-    await Promise.resolve();
-
-    expect(calls).toEqual(["summary", "topSessions", "comparison"]);
-    expect(usage.summary).not.toBeNull();
-    expect(usage.summary?.comparison).toEqual({
-      priorFrom: "2023-12-01",
-      priorTo: "2023-12-31",
-      priorTotalCost: testMoney(1),
-      deltaPct: 0.5,
-    });
-    expect(usageServiceMocks.getApiV1UsageComparison.mock.lastCall?.[0]).toEqual(
-      expect.objectContaining({ current_microdollars: 0 }),
-    );
+    expect(signal?.aborted).toBe(true);
+    expect(usage.querying.comparison).toBe(false);
+    warn.mockRestore();
   });
 
   it("tracks cached usage refetches as querying without first-load skeletons", async () => {
@@ -1579,16 +1709,23 @@ describe("UsageStore session filter params", () => {
   });
 
   it("aborts visible panel requests on teardown", async () => {
-    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce(() => new Promise(() => {}));
+    const response = Promise.withResolvers<UsageSummaryResponse>();
+    usageServiceMocks.getApiV1UsageSummary
+      .mockReturnValueOnce(response.promise)
+      .mockResolvedValueOnce(usageSummary(7));
     const { usage } = await loadStore();
 
-    void usage.fetchSummary();
+    const interrupted = usage.fetchSummary();
     await Promise.resolve();
     usage.cancelInFlightReads();
 
     expect(vi.mocked(UsageService.getApiV1UsageSummary).mock.calls[0]?.[1]?.signal?.aborted).toBe(
       true,
     );
+    await usage.fetchSummary();
+    response.resolve(usageSummary(1));
+    await interrupted;
+    expect(usage.summary?.totals.totalCost).toEqual(testMoney(7));
   });
 
   it("reuses summary params for top sessions during full refresh", async () => {
@@ -1639,15 +1776,15 @@ describe("UsageStore session filter params", () => {
     const compare = usage as unknown as {
       fetchComparison: (
         summaryVersion: number,
-        summary: UsageSummaryResponse,
         params: typeof loadedSummary.params,
+        summary: Promise<typeof loadedSummary | null>,
       ) => Promise<void>;
     };
 
     const currentComparison = compare.fetchComparison(
       loadedSummary.version,
-      loadedSummary.summary,
       loadedSummary.params,
+      Promise.resolve(loadedSummary),
     );
     await Promise.resolve();
     const currentSignal = vi.mocked(UsageService.getApiV1UsageComparison).mock.calls[0]?.[1]
@@ -1657,8 +1794,8 @@ describe("UsageStore session filter params", () => {
 
     await compare.fetchComparison(
       loadedSummary.version - 1,
-      loadedSummary.summary,
       loadedSummary.params,
+      Promise.resolve(loadedSummary),
     );
 
     expect(currentSignal?.aborted).toBe(false);
@@ -1679,14 +1816,14 @@ describe("UsageStore session filter params", () => {
     const compare = usage as unknown as {
       fetchComparison: (
         summaryVersion: number,
-        summary: UsageSummaryResponse,
         params: typeof loadedSummary.params,
+        summary: Promise<typeof loadedSummary | null>,
       ) => Promise<void>;
     };
     void compare.fetchComparison(
       loadedSummary.version,
-      loadedSummary.summary,
       loadedSummary.params,
+      Promise.resolve(loadedSummary),
     );
     await Promise.resolve();
     const comparisonSignal = vi.mocked(UsageService.getApiV1UsageComparison).mock.calls[0]?.[1]
@@ -1705,7 +1842,7 @@ describe("UsageStore session filter params", () => {
     const { usage } = await loadStore();
 
     await usage.fetchSummary();
-    await Promise.resolve();
+    await vi.waitFor(() => expect(usage.summary?.comparison).toEqual(usageComparison()));
 
     expect(usageServiceMocks.getApiV1UsageComparison).toHaveBeenCalledTimes(1);
     expect(usageServiceMocks.getApiV1UsagePairwiseComparison).toHaveBeenCalledTimes(1);
@@ -1932,6 +2069,20 @@ describe("UsageStore time-series range selection", () => {
     vi.clearAllMocks();
   });
 
+  it("applies the brushed-range comparison", async () => {
+    const { usage } = await loadStore();
+    usage.applyDateRange("2026-06-04", "2026-06-18");
+    usage.summary = { ...usageSummary(15), comparison: usageComparison() };
+    const rangeResponse = Promise.withResolvers<UsageSummaryResponse>();
+    usageServiceMocks.getApiV1UsageSummary.mockReturnValueOnce(rangeResponse.promise);
+
+    usage.setTimeRange("2026-06-07", "2026-06-10");
+
+    rangeResponse.resolve(usageSummary(3));
+    await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+    expect(usage.summary?.comparison).toEqual(usageComparison());
+  });
+
   it("filters Usage requests without replacing the parent chart window", async () => {
     const { usage } = await loadStore();
     usage.applyDateRange("2026-06-04", "2026-06-18");
@@ -2141,6 +2292,81 @@ describe("UsageStore time-series range selection", () => {
       usage.cancelInFlightReads();
     },
   );
+
+  it("keeps plan-only model rows when deriving a selected range", async () => {
+    const { usage } = await loadStore();
+    usage.applyDateRange("2026-06-04", "2026-06-18");
+    const context = usageSummary(15);
+    context.modelTotals = [
+      {
+        model: "model-priced",
+        inputTokens: 40,
+        outputTokens: 4,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(4),
+        planOnlySessions: 2,
+      },
+      {
+        model: "model-plan-only",
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(0),
+        planOnlySessions: 3,
+      },
+    ];
+    context.daily = [
+      {
+        date: "2026-06-08",
+        inputTokens: 10,
+        outputTokens: 1,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        totalCost: testMoney(1),
+        modelsUsed: ["model-priced"],
+        projectBreakdowns: [],
+        modelBreakdowns: [
+          {
+            modelName: "model-priced",
+            inputTokens: 10,
+            outputTokens: 1,
+            cacheCreationTokens: 0,
+            cacheReadTokens: 0,
+            cost: testMoney(1),
+          },
+        ],
+        agentBreakdowns: [],
+        machineBreakdowns: [],
+      },
+    ];
+    usage.summary = context;
+
+    usage.setTimeRange("2026-06-08", "2026-06-09");
+
+    expect(usage.summary?.modelTotals).toEqual([
+      {
+        model: "model-priced",
+        inputTokens: 10,
+        outputTokens: 1,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(1),
+        planOnlySessions: 2,
+      },
+      {
+        model: "model-plan-only",
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(0),
+        planOnlySessions: 3,
+      },
+    ]);
+    usage.cancelInFlightReads();
+  });
 
   it("restores the parent summary when the selected-range request fails", async () => {
     const { usage } = await loadStore();
@@ -2514,6 +2740,40 @@ describe("UsageStore attribution focus", () => {
     usageServiceMocks.getApiV1UsageSummary.mockResolvedValue(usageSummary());
   });
 
+  it.each(["focus", "exclude"])(
+    "keeps raw model focus consistent after aliases arrive, then clears it on %s",
+    async (action) => {
+      const { usage } = await loadStore();
+      usage.setAttributionGroupBy("model");
+      usage.toggleSelection("model", "gpt-4o");
+      await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+      expect(usage.isSelected("model", "gpt-4o")).toBe(true);
+      usageServiceMocks.getApiV1UsageSummary.mockClear();
+
+      // A server restart adds aliases while the same tab retains its focus.
+      usageServiceMocks.getApiV1UsageSummary.mockResolvedValue({
+        ...usageSummary(),
+        modelTotals: [{ ...usageSummary().modelTotals[0]!, model: "group" }],
+        model_aliases: { "gpt-4o": "group", "claude-sonnet": "group" },
+      });
+      await usage.fetchAll();
+      expect(usage.selectedModel).toBe("gpt-4o");
+      expect(usage.isSelected("model", "group")).toBe(true);
+      expect(usageServiceMocks.getApiV1UsageSummary.mock.calls[0]?.[0].model).toBe("gpt-4o");
+
+      usageServiceMocks.getApiV1UsageSummary.mockClear();
+      if (action === "focus") usage.toggleSelection("model", "group");
+      else usage.toggleModel("group");
+      await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
+      expect(usage.hasSelection("model")).toBe(false);
+      expect(usageServiceMocks.getApiV1UsageSummary).toHaveBeenCalled();
+      for (const [params] of usageServiceMocks.getApiV1UsageSummary.mock.calls) {
+        expect(params.model).toBeUndefined();
+        expect(params.exclude_model).toBe(action === "focus" ? undefined : "group");
+      }
+    },
+  );
+
   it.each([
     ["project", "picker"],
     ["model", "picker"],
@@ -2649,7 +2909,7 @@ describe("UsageStore attribution focus", () => {
     "keeps every %s colored through brush and grouping changes",
     async (by) => {
       const { usage } = await loadStore();
-      const { usageChartColorMaps } = await import("../utils/usageChartColors.js");
+      const { usageChartStyleMaps } = await import("../utils/usageChartStyles.js");
       const { sessions } = await import("./sessions.svelte.js");
       const full = usageSummary(12);
       full.projectTotals[0]!.cost = testMoney(8);
@@ -2692,8 +2952,8 @@ describe("UsageStore attribution focus", () => {
       });
       await usage.fetchAll();
       const colors = {
-        agentsview: usageChartColorMaps(usage.colorSummary, "agentsview")[by],
-        matplotlib: usageChartColorMaps(usage.colorSummary, "matplotlib")[by],
+        agentsview: usageChartStyleMaps(usage.colorSummary, "agentsview")[by],
+        matplotlib: usageChartStyleMaps(usage.colorSummary, "matplotlib")[by],
       };
       usage.setTimeRange("2024-01-08", "2024-01-14");
       await vi.waitFor(() => expect(usage.isQuerying).toBe(false));
@@ -2712,10 +2972,10 @@ describe("UsageStore attribution focus", () => {
           : usage.attributionSummary?.agentTotals.length,
       ).toBe(2);
       for (const palette of ["agentsview", "matplotlib"] as const) {
-        const result = usageChartColorMaps(usage.colorSummary, palette)[by];
-        for (const [id, color] of colors[palette]) expect(result.get(id)).toBe(color);
+        const result = usageChartStyleMaps(usage.colorSummary, palette)[by];
+        for (const [id, style] of colors[palette]) expect(result.get(id)).toEqual(style);
         expect(result.size).toBe(2);
-        expect(new Set(result.values()).size).toBe(2);
+        expect(new Set([...result.values()].map((style) => style.color)).size).toBe(2);
       }
       usage.cancelInFlightReads();
     },
@@ -2933,8 +3193,8 @@ describe("UsageStore project zoom", () => {
     expect(usage.zoomRows).toEqual([]);
   });
 
-  it.each(["a metric change", "a same-range refresh"])(
-    "keeps zoom rows through %s, even when it fails",
+  it.each(["a metric change", "a same-range refresh", "a cancelled read"])(
+    "keeps zoom rows through %s",
     async (event) => {
       const { usage } = await loadStore();
       usageServiceMocks.getUsageZoom.mockResolvedValueOnce([group(1)]);
@@ -2956,12 +3216,18 @@ describe("UsageStore project zoom", () => {
       expect(usageServiceMocks.getUsageZoom).toHaveBeenCalledTimes(2);
       expect(usage.zoomRows).toEqual([group(1)]);
       expect(usage.loading.zoom).toBe(false);
+      if (event === "a cancelled read") {
+        usage.cancelInFlightReads();
+        expect(usageServiceMocks.getUsageZoom.mock.lastCall?.[1]?.signal?.aborted).toBe(true);
+      }
       reject(new Error("zoom failed"));
       await refreshed;
       await vi.waitFor(() => expect(usage.querying.zoom).toBe(false));
       expect(usage.zoomRows).toEqual([group(1)]);
       expect(usage.errors.zoom).toBeNull();
-      expect(warn).toHaveBeenCalledWith("usage.zoom refetch failed:", new Error("zoom failed"));
+      if (event === "a cancelled read") expect(warn).not.toHaveBeenCalled();
+      else
+        expect(warn).toHaveBeenCalledWith("usage.zoom refetch failed:", new Error("zoom failed"));
       warn.mockRestore();
       usage.cancelInFlightReads();
     },
@@ -3059,4 +3325,39 @@ describe("UsageStore project zoom", () => {
       expect(usage.zoomRows).toEqual([group(9)]);
     },
   );
+});
+
+describe("invalid machine refetches", () => {
+  beforeEach(() => {
+    installStorage();
+    vi.clearAllMocks();
+    usageServiceMocks.getApiV1UsageSummary.mockReset().mockResolvedValue(usageSummary());
+    usageServiceMocks.getApiV1UsageTopSessions.mockReset().mockResolvedValue([]);
+  });
+  it("clears cached usage scopes when the machine selector is rejected", async () => {
+    const { usage } = await loadStore();
+    const { sessions } = await import("./sessions.svelte.js");
+    sessions.filters.machine = "host-a";
+    await usage.fetchSummary({ loadComparison: false });
+    expect(usage.summary).not.toBeNull();
+    usage.setTimeRange("2024-01-10", "2024-01-20");
+    await vi.waitFor(() => expect(usage.querying.summary).toBe(false));
+    expect(usage.timeSeriesSummary).not.toBeNull();
+    usage.attributionSummary = usage.summary;
+    usage.referenceSummary = usage.summary;
+    usage.topSessions = [topSession("old-session")];
+    usageServiceMocks.getApiV1UsageSummary.mockImplementationOnce((params) => {
+      expect(params.machine).toBe("host-a");
+      return Promise.reject(
+        new apiRuntimeMocks.ApiError(400, "unknown machine", "invalid_machine_filter"),
+      );
+    });
+    await usage.fetchSummary({ loadComparison: false });
+    expect(usage.summary).toBeNull();
+    expect(usage.attributionSummary).toBeNull();
+    expect(usage.referenceSummary).toBeNull();
+    expect(usage.timeSeriesSummary).toBeNull();
+    expect(usage.topSessions).toBeNull();
+    expect(usage.errors.summary).toBe("unknown machine");
+  });
 });

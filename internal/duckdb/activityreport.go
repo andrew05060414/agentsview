@@ -9,6 +9,7 @@ import (
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/kept"
 	"go.kenn.io/agentsview/internal/money"
 )
 
@@ -70,6 +71,18 @@ func (s *Store) BuildActivityReportArtifacts(
 	activity.ReportProgress(onProgress, activity.Progress{Phase: activity.ProgressLoadingSessions})
 	f.IncludeSubagents = true
 	f.IncludeForks = true
+	// Take the key before the first read. A build spanning a handle swap
+	// stays under the old stamp, which later requests cannot reach.
+	var selection, key string
+	onDisk := !q.Partial && kept.DayPreset(q, time.Now())
+	if stamp := s.mirrorStamp(); !q.Partial && stamp != "" && !db.TerminationUsesTime(f.Termination) {
+		selection = kept.Selection(f, q)
+		key = stamp + "|" + s.pricingDigest
+		if report, ok := s.reports.Get(selection, key, onDisk); ok {
+			activity.ReportProgress(onProgress, report.Done)
+			return report.Artifacts, nil
+		}
+	}
 	rangeStartUTC, rangeEndUTC := db.ActivityReportInstantBoundsUTC(q)
 	lowerBound := db.PaddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
 	upperBound := db.PaddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
@@ -88,8 +101,11 @@ func (s *Store) BuildActivityReportArtifacts(
 		rangeStartUTC: rangeStartUTC, rangeEndUTC: rangeEndUTC,
 		lowerBound: lowerBound, upperBound: upperBound,
 	}
-	artifacts, _, err := activity.BuildReportArtifacts(
+	artifacts, done, err := activity.BuildReportArtifacts(
 		ctx, backend, sessions, ids, q, onProgress, "aggregating duckdb activity report")
+	if err == nil && key != "" {
+		s.reports.Put(selection, key, onDisk, kept.Report{Artifacts: artifacts, Done: done})
+	}
 	return artifacts, err
 }
 
@@ -598,13 +614,22 @@ func (s *Store) activityReportCandidateSource(
 			ctx context.Context,
 			yield func(activity.IntervalCandidate) error,
 		) error {
-			query := `SELECT
+			// Every subquery reads the requested sessions only. DuckDB turns
+			// the correlated subqueries into joins over their whole source,
+			// so reading messages here made each report scan and join the
+			// entire archive before the session filter applied.
+			query := `WITH scoped AS (
+				SELECT session_id, ordinal, timestamp, role, model
+				FROM messages
+				WHERE session_id IN (SELECT unnest(?))
+			)
+			SELECT
 				m.session_id, m.ordinal, successor.ordinal,
 				m.timestamp, successor.timestamp,
 				successor.role, successor.model,
 				COALESCE((
 					SELECT prior.model
-					FROM messages prior
+					FROM scoped prior
 					WHERE prior.session_id = m.session_id
 						AND prior.ordinal <= m.ordinal
 						AND prior.role = 'assistant'
@@ -612,7 +637,7 @@ func (s *Store) activityReportCandidateSource(
 						AND prior.timestamp IS NOT NULL
 						AND prior.timestamp > (
 							SELECT prior_previous.timestamp
-							FROM messages prior_previous
+							FROM scoped prior_previous
 							WHERE prior_previous.session_id = prior.session_id
 								AND prior_previous.ordinal < prior.ordinal
 								AND prior_previous.timestamp IS NOT NULL
@@ -622,20 +647,19 @@ func (s *Store) activityReportCandidateSource(
 					ORDER BY prior.ordinal DESC
 					LIMIT 1
 				), 'unknown')
-			FROM messages m
-			JOIN messages successor
+			FROM scoped m
+			JOIN scoped successor
 				ON successor.session_id = m.session_id
 				AND successor.ordinal = (
 					SELECT next.ordinal
-					FROM messages next
+					FROM scoped next
 					WHERE next.session_id = m.session_id
 						AND next.ordinal > m.ordinal
 						AND next.timestamp IS NOT NULL
 					ORDER BY next.ordinal
 					LIMIT 1
 				)
-			WHERE m.session_id IN (SELECT unnest(?))
-				AND m.timestamp IS NOT NULL
+			WHERE m.timestamp IS NOT NULL
 				AND m.timestamp >= CAST(? AS TIMESTAMP)
 				AND m.timestamp < CAST(? AS TIMESTAMP)
 			ORDER BY m.timestamp, m.session_id, m.ordinal`
@@ -809,9 +833,12 @@ func (s *Store) activityReportUsage(
 	for i, o := range rowsAcc {
 		baseRows[i] = o.row
 	}
-	mask, attribution, webSearchRequests := activity.UsageSurvivorSelectionForSessions(
-		q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
+	mask, attribution, webSearchRequests, err := activity.UsageSurvivorSelectionForSessions(
+		ctx, q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
 	)
+	if err != nil {
+		return nil, nil, err
+	}
 	out = make([]activity.UsageRow, 0, len(rowsAcc))
 	for i, o := range rowsAcc {
 		if !mask[i] {

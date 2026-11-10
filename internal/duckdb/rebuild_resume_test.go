@@ -4,8 +4,10 @@ package duckdb
 
 import (
 	"context"
+	"encoding/json/v2"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -133,6 +135,33 @@ func TestRebuildRestartsWhenScopeChangedSinceInterruption(t *testing.T) {
 	assert.Equal(t, "missing file", res.Diagnostics.RebuildReason)
 	assert.Equal(t, resumeSessionCount, res.SessionsPushed)
 	assert.Zero(t, res.Diagnostics.SkippedUnchangedSessions.Total)
+}
+
+func TestPushDiscardsV20RebuildWithoutDialogueText(t *testing.T) {
+	ctx := t.Context()
+	local := newLocalDB(t)
+	seedResumeSessions(t, local)
+	path := filepath.Join(t.TempDir(), "mirror.duckdb")
+	killedRebuild(t, path, local, storage.MirrorPushOptions{})
+
+	conn, err := Open(ctx, rebuildFilePath(path))
+	require.NoError(t, err)
+	runJSON, err := readMetadataKey(ctx, conn, rebuildRunMetadataKey)
+	require.NoError(t, err)
+	var run rebuildRun
+	require.NoError(t, json.Unmarshal([]byte(runJSON), &run))
+	run.SchemaVersion, run.DataVersion = 20, db.CurrentDataVersion()
+	encodedRun, err := json.Marshal(run)
+	require.NoError(t, err)
+	require.NoError(t, recordMetadataKey(ctx, conn, rebuildRunMetadataKey, string(encodedRun)))
+	require.NoError(t, recordMetadataKey(ctx, conn, schemaVersionMetadataKey, "20"))
+	require.NoError(t, recordMetadataKey(ctx, conn, dataVersionMetadataKey, strconv.Itoa(db.CurrentDataVersion())))
+	require.NoError(t, conn.Close())
+
+	res, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "missing file", res.Diagnostics.RebuildReason)
+	assert.Equal(t, resumeSessionCount, res.SessionsPushed)
 }
 
 // While another process has the rebuild file open, a push fails instead of
@@ -277,56 +306,4 @@ func TestErroredRebuildDroppedWhenMirrorNeedsNoRebuild(t *testing.T) {
 	assert.Empty(t, res.Diagnostics.RebuildReason)
 	assert.Equal(t, 1, res.Errors)
 	assert.NoFileExists(t, rebuildFilePath(path))
-}
-
-// While a reader holds the mirror, every manual push falls back to a
-// rebuild. A rebuild that ended with session errors is kept until the
-// incremental push can run, so the next held push resumes it instead of
-// starting over.
-func TestErroredRebuildResumesWhileMirrorHeld(t *testing.T) {
-	ctx := t.Context()
-	local := newLocalDB(t)
-	seedResumeSessions(t, local)
-	path := filepath.Join(t.TempDir(), "mirror.duckdb")
-	_, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
-	require.NoError(t, err)
-	held, err := OpenReadOnly(ctx, path)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, held.Close()) }()
-	writeFailingSession(t, local)
-
-	_, err = Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
-	require.ErrorContains(t, err, "session push errors")
-	require.FileExists(t, rebuildFilePath(path))
-
-	res, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
-	require.ErrorContains(t, err, "session push errors")
-	assert.Equal(t,
-		"resuming an unfinished rebuild, started because: mirror is held open by reader processes; incremental write access unavailable",
-		res.Diagnostics.RebuildReason)
-	assert.Equal(t, resumeSessionCount, res.Diagnostics.SkippedUnchangedSessions.Total)
-}
-
-// A resumed rebuild that a reader forced reports the readers as well as the
-// original reason, so the user knows closing them would avoid the rebuild.
-func TestHeldPushResumingErroredRebuildNamesReaders(t *testing.T) {
-	ctx := t.Context()
-	local := newLocalDB(t)
-	seedResumeSessions(t, local)
-	path := filepath.Join(t.TempDir(), "mirror.duckdb")
-	_, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
-	require.NoError(t, err)
-	writeFailingSession(t, local)
-	_, err = Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, true, nil)
-	require.ErrorContains(t, err, "session push errors")
-
-	held, err := OpenReadOnly(ctx, path)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, held.Close()) }()
-	res, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
-	require.ErrorContains(t, err, "session push errors")
-	assert.Equal(t,
-		"mirror is held open by reader processes; incremental write access unavailable; "+
-			"resuming an unfinished rebuild, started because: --full requested",
-		res.Diagnostics.RebuildReason)
 }

@@ -31,13 +31,25 @@ type AnalyticsBackend interface {
 	// TopSessionsSQL returns an ordered query without LIMIT or a trailing semicolon.
 	TopSessionsSQL(f db.AnalyticsFilter, metric string, includeTime bool) (string, []any)
 	ScanTopSession(*sql.Rows) (db.TopSession, error)
-	TrendsSQL() string
+	// TrendsSQL returns AnalyticsTrendsSQL for f, limited to the sessions
+	// sessionFilter selects. ordered asks for rows in session and ordinal
+	// order; a backend may sort anyway.
+	TrendsSQL(f, sessionFilter db.AnalyticsFilter, ordered bool) (string, []any)
 	FormatTime(any) string
 	// DuckDB binds captured IDs; ClickHouse reselects by filter to stay under its statement size cap.
 	Autonomy(ctx context.Context, ids []string, f db.AnalyticsFilter) (map[string]int, error)
-	VelocityMessages(ctx context.Context, ids []string, f db.AnalyticsFilter, loc *time.Location) (map[string][]db.TimingMessage, error)
+	// VelocitySessions returns each selected session's velocity contribution
+	// over its messages without Claude hooks.
+	VelocitySessions(ctx context.Context, ids []string, f db.AnalyticsFilter, loc *time.Location) (map[string]db.SessionVelocity, error)
 	VelocityToolCounts(ctx context.Context, ids []string, f db.AnalyticsFilter) (map[string]int, error)
-	ToolCountsSQL(ids []string) (string, []any)
+	// VisitSessionIDSets calls visit with SQL for a parenthesized relation of
+	// ids, either a placeholder list or a subquery, and the arguments it
+	// binds. visit must query with the context it receives. A backend may
+	// split ids across several calls.
+	VisitSessionIDSets(ctx context.Context, ids []string, visit func(ctx context.Context, idSet string, args []any) error) error
+	// ToolCountsSQL selects tool call counts for the sessions in idSet, a
+	// relation from VisitSessionIDSets.
+	ToolCountsSQL(idSet string, args []any) (string, []any)
 	// Session metadata supplies ClickHouse cache versions; DuckDB uses only rows.
 	PopulateFrustrationMarkers(ctx context.Context, rows []db.SignalRow, sessions []AnalyticsSession) error
 }
@@ -88,6 +100,10 @@ type AnalyticsSession struct {
 	NoCodeContextCount          int
 	RunawayToolLoopCount        int
 	PushVersion                 uint64 // ClickHouse cache version; zero for DuckDB.
+	PushFingerprint             string // DuckDB cache version; empty means uncached.
+	// FrustrationMarkers is the count ClickHouse push stored on the
+	// session; nil when the backend has none and must count them.
+	FrustrationMarkers *int
 }
 
 func (s *Analytics) analyticsSessionsModelTimeFiltered(
@@ -945,21 +961,14 @@ func (s *Analytics) GetTrendsTerms(
 	sessionFilter.Model = ""
 	sessionFilter.DayOfWeek = nil
 	sessionFilter.Hour = nil
-	sessions, err := s.analyticsSessions(ctx, sessionFilter)
-	if err != nil {
-		return db.TrendsTermsResponse{}, err
-	}
-	allowedSessions := make(map[string]bool, len(sessions))
-	for _, sess := range sessions {
-		allowedSessions[sess.ID] = true
-	}
-	if len(allowedSessions) == 0 {
-		return acc.Response(), nil
-	}
 	loc := analyticsLocation(f.Timezone)
 	flt := f.MessageScopeFilter()
 	modelFiltering := len(flt.Models) > 0
-	rows, err := s.backend.QueryContext(ctx, s.backend.TrendsSQL())
+	// A model filter credits a prompt to the next assistant reply, so the
+	// scope reducer needs rows in order. Without one, rows count on their
+	// own and need no sort.
+	query, args := s.backend.TrendsSQL(f, sessionFilter, modelFiltering)
+	rows, err := s.backend.QueryContext(ctx, query, args...)
 	if err != nil {
 		return db.TrendsTermsResponse{}, err
 	}
@@ -974,17 +983,11 @@ func (s *Analytics) GetTrendsTerms(
 		startedAt any
 		createdAt any
 	}
-	processRow := func(sessionID, content string, local time.Time) {
-		if !allowedSessions[sessionID] {
-			return
-		}
-		acc.Add(content, local)
-	}
 	emit := func(m db.ScopedMessage) {
 		if !m.HasLocalTime {
 			return
 		}
-		processRow(m.SessionID, m.Content, m.LocalTime)
+		acc.Add(m.Content, m.LocalTime)
 	}
 	reducer := db.NewScopeReducer(flt, emit)
 	for rows.Next() {
@@ -997,7 +1000,7 @@ func (s *Analytics) GetTrendsTerms(
 		local, has := analyticsLocalTime(ts, loc)
 		if !modelFiltering {
 			if has && flt.MatchesDayHour(local, true) {
-				processRow(row.sessionID, row.content, local)
+				acc.Add(row.content, local)
 			}
 			continue
 		}

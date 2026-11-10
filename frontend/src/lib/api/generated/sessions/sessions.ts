@@ -5,6 +5,7 @@ import type {
   BatchDeleteInputBody,
   DbSession,
   DbSessionActivityResponse,
+  DbSessionCommitList,
   DbSessionExternalParent,
   DbSessionLabels,
   DbSessionTiming,
@@ -15,8 +16,10 @@ import type {
   GetApiV1SessionIdsResolveParams,
   GetApiV1SessionsByIdActivityPathParameters,
   GetApiV1SessionsByIdChildrenPathParameters,
+  GetApiV1SessionsByIdCommitsPathParameters,
   GetApiV1SessionsByIdDirectoryPathParameters,
   GetApiV1SessionsByIdExportPathParameters,
+  GetApiV1SessionsByIdFileReferencesPathParameters,
   GetApiV1SessionsByIdMdParams,
   GetApiV1SessionsByIdMdPathParameters,
   GetApiV1SessionsByIdMessagesParams,
@@ -50,6 +53,7 @@ import type {
   ResolveSessionIDsResponse,
   ResumeRequest,
   ResumeResponse,
+  ServiceFileReferencesResult,
   ServiceMessageList,
   ServiceSessionDetail,
   ServiceSessionList,
@@ -333,6 +337,25 @@ export const getApiV1SessionsByIdChildren = async (
   });
 };
 
+export const getGetApiV1SessionsByIdCommitsUrl = ({
+  id,
+}: GetApiV1SessionsByIdCommitsPathParameters) => {
+  return `/api/v1/sessions/${encodeURIComponent(String(id))}/commits`;
+};
+
+/**
+ * @summary List session commits
+ */
+export const getApiV1SessionsByIdCommits = async (
+  { id }: GetApiV1SessionsByIdCommitsPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<DbSessionCommitList> => {
+  return orvalFetch<DbSessionCommitList>(getGetApiV1SessionsByIdCommitsUrl({ id }), {
+    ...options,
+    method: "GET",
+  });
+};
+
 export const getGetApiV1SessionsByIdDirectoryUrl = ({
   id,
 }: GetApiV1SessionsByIdDirectoryPathParameters) => {
@@ -366,6 +389,25 @@ export const getApiV1SessionsByIdExport = async (
   options?: Parameters<typeof orvalRequest>[1],
 ): Promise<Response> => {
   return orvalRequest<Response>(getGetApiV1SessionsByIdExportUrl({ id }), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getGetApiV1SessionsByIdFileReferencesUrl = ({
+  id,
+}: GetApiV1SessionsByIdFileReferencesPathParameters) => {
+  return `/api/v1/sessions/${encodeURIComponent(String(id))}/file-references`;
+};
+
+/**
+ * @summary Find session images in Docbank
+ */
+export const getApiV1SessionsByIdFileReferences = async (
+  { id }: GetApiV1SessionsByIdFileReferencesPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<ServiceFileReferencesResult> => {
+  return orvalFetch<ServiceFileReferencesResult>(getGetApiV1SessionsByIdFileReferencesUrl({ id }), {
     ...options,
     method: "GET",
   });

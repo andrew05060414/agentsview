@@ -1,7 +1,9 @@
 import type { EventSource } from "eventsource";
 import { triggerResync, triggerSync, watchSession, type SyncHandle } from "../api/client.js";
 import { MetadataService, SyncService } from "../api/generated/index";
-import { ApiError, isRemoteConnection } from "../api/runtime.js";
+import { ApiError, isAbortError, isRemoteConnection } from "../api/runtime.js";
+import { reportSyncFailed } from "../utils/telemetry.js";
+import { fileReferences } from "./file-references.svelte.js";
 import { events } from "./events.svelte.js";
 import type {
   SyncProgress,
@@ -12,6 +14,21 @@ import type {
 import type { DbSessionTiming as SessionTiming } from "../api/generated/index.js";
 
 type SyncCompleteListener = () => void;
+
+/**
+ * Sync, or rebuild the archive when the server says a plain sync cannot bring
+ * it current. A daemon with a stale archive answers /sync with 409 until the
+ * required full rebuild runs.
+ */
+function syncOrRebuild(onProgress?: (p: SyncProgress) => void): SyncHandle {
+  let current = triggerSync(onProgress);
+  const done = current.done.catch((err: unknown) => {
+    if (!(err instanceof ApiError && err.status === 409)) throw err;
+    current = triggerResync(onProgress);
+    return current.done;
+  });
+  return { abort: () => current.abort(), done };
+}
 
 const POLL_INTERVAL_MS = 10_000;
 
@@ -32,7 +49,12 @@ export function commitsDisagree(a: string | undefined, b: string | undefined): b
 
 class SyncStore {
   archiveStale: boolean = $state(false);
+  syncPending: boolean = $state(false);
+
   syncing: boolean = $state(false);
+  // Message from the last sync or resync that failed, cleared when one
+  // succeeds. The header Sync button has no other place to report it.
+  lastSyncError: string | null = $state(null);
   progress: SyncProgress | null = $state(null);
   lastSync: string | null = $state(null);
   lastSyncStats: SyncStats | null = $state(null);
@@ -64,6 +86,7 @@ class SyncStore {
 
   private watchEventSource: EventSource | null = null;
   private watchVisibilityHandler: (() => void) | null = null;
+  private pollVisibilityHandler: (() => void) | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastStatsParams: {
     include_one_shot?: boolean;
@@ -135,6 +158,7 @@ class SyncStore {
       this.lastSync = newLastSync;
       this.lastSyncStats = status.stats ?? null;
       this.archiveStale = status.archive_stale === true;
+      this.syncPending = status.sync_pending === true;
       const statusProgress = status.progress ?? null;
       let statusProgressCompleted = false;
       if (statusProgress) {
@@ -172,10 +196,21 @@ class SyncStore {
 
   startPolling() {
     this.stopPolling();
-    this.pollTimer = setInterval(() => this.loadStatus(), POLL_INTERVAL_MS);
+    this.pollVisibilityHandler = () => {
+      if (!document.hidden) void this.loadStatus();
+    };
+    document.addEventListener("visibilitychange", this.pollVisibilityHandler);
+    this.pollTimer = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      void this.loadStatus();
+    }, POLL_INTERVAL_MS);
   }
 
   stopPolling() {
+    if (this.pollVisibilityHandler) {
+      document.removeEventListener("visibilitychange", this.pollVisibilityHandler);
+      this.pollVisibilityHandler = null;
+    }
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
@@ -205,10 +240,12 @@ class SyncStore {
     const updateBackendHealth = opts.updateBackendHealth ?? true;
     try {
       this.serverVersion = await MetadataService.getApiV1Version();
+      fileReferences.enabled = this.serverVersion.docbank_enabled === true;
       events.setAvailable(this.serverVersion.read_only !== true);
       this.markRemoteReachable(true);
       this.versionMismatch = commitsDisagree(this.buildCommit, this.serverVersion.commit);
     } catch (error) {
+      events.settleStartup();
       if (updateBackendHealth) {
         this.markBackendFailure(error);
       }
@@ -236,7 +273,9 @@ class SyncStore {
       void this.refreshReadOnly(onComplete);
       return;
     }
-    this.runSync(triggerSync, onComplete);
+    // A stale archive only becomes current through a full rebuild, which a
+    // plain sync does not run on a daemon with a sync engine.
+    this.runSync(this.archiveStale ? triggerResync : syncOrRebuild, onComplete);
   }
 
   triggerResync(onComplete?: () => void, onError?: (err: Error) => void): boolean {
@@ -286,6 +325,7 @@ class SyncStore {
 
     handle.done
       .then((s: SyncStats) => {
+        this.lastSyncError = null;
         this.lastSyncStats = s;
         void this.loadStats();
         finalizeSync();
@@ -298,7 +338,7 @@ class SyncStore {
         onComplete?.();
       })
       .catch((err: unknown) => {
-        if (err instanceof DOMException && err.name === "AbortError") {
+        if (isAbortError(err)) {
           return;
         }
         finalizeSync();
@@ -309,22 +349,41 @@ class SyncStore {
         }
       });
 
+    handle.done.catch((err: unknown) => {
+      if (isAbortError(err)) return;
+      this.lastSyncError = err instanceof Error ? err.message : "Sync failed";
+      reportSyncFailed(err);
+    });
+
     return true;
   }
 
   watchSession(sessionId: string, onUpdate: () => void, onTiming?: (t: SessionTiming) => void) {
     this.unwatchSession();
+    let settle!: (seen: boolean) => void;
+    const ready = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => settle(false), 1000);
+      settle = (seen) => {
+        clearTimeout(timer);
+        resolve(seen);
+      };
+    });
     const open = () => {
       this.watchEventSource = watchSession(sessionId, onUpdate, onTiming);
       const es = this.watchEventSource;
+      es.addEventListener("error", () => {
+        if (this.watchEventSource !== es) return;
+        settle(false);
+      });
       es.addEventListener("session_ready", () => {
         if (this.watchEventSource !== es) return;
+        settle(true);
         onUpdate();
       });
     };
     if (typeof document === "undefined") {
       open();
-      return;
+      return ready;
     }
     this.watchVisibilityHandler = () => {
       if (document.hidden) {
@@ -337,6 +396,8 @@ class SyncStore {
     };
     document.addEventListener("visibilitychange", this.watchVisibilityHandler);
     if (!document.hidden) open();
+    else settle(false);
+    return ready;
   }
 
   unwatchSession() {

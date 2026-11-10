@@ -18,9 +18,8 @@ const (
 	rawSyncUploadStartMaxBytes  = 4 << 10
 	// Upload PATCH authentication runs before this route-specific extension.
 	rawSyncUploadReadTimeout = 15 * time.Minute
-	// Huma treats a body exactly equal to MaxBodyBytes as oversized, so the
-	// transport read ceiling is one byte above the service's accepted chunk.
-	rawSyncUploadReadMaxBytes = rawsync.DefaultUploadChunkBytes + 1
+	// Huma accepts a body of exactly MaxBodyBytes and rejects anything larger.
+	rawSyncUploadReadMaxBytes = rawsync.DefaultUploadChunkBytes
 )
 
 func (s *Server) registerRawUploadRoutes(group *huma.Group) {
@@ -32,7 +31,13 @@ func (s *Server) registerRawUploadRoutes(group *huma.Group) {
 		http.MethodHead, "/uploads/{upload_id}", "Read a raw upload offset",
 		s.humaRawSyncUploadStatus, s.humaTimeout(),
 	)
-	registerRoute(group,
+	// Huma infers RawBody as required before group modifiers run. Finalizing
+	// a full upload (including a zero-byte object) requires an empty PATCH.
+	appendGroup := huma.NewGroup(group)
+	appendGroup.UseSimpleModifier(func(op *huma.Operation) {
+		op.RequestBody.Required = false
+	})
+	registerRoute(appendGroup,
 		http.MethodPatch, "/uploads/{upload_id}", "Append a raw upload chunk",
 		s.humaRawSyncUploadAppend, s.humaReadDeadline(rawSyncUploadReadTimeout),
 		maxBodyBytes(rawSyncUploadReadMaxBytes),

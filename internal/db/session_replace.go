@@ -21,7 +21,11 @@ func (db *DB) ReplaceSessionKeepingTrashedCopy(
 	}
 	write.ReplaceMessages = true
 	write.RejectMessageCountDecrease = false
-	write = db.storageSessionBatchWrite(sanitizeSessionBatchWrite(write))
+	sanitized, err := sanitizeSessionBatchWriteContext(ctx, write)
+	if err != nil {
+		return "", err
+	}
+	write = db.storageSessionBatchWrite(sanitized)
 	id := write.Session.ID
 
 	// Writers hold db.mu, so the row read here matches the messages the transaction reads.
@@ -68,17 +72,24 @@ func (db *DB) ReplaceSessionKeepingTrashedCopy(
 	if err != nil {
 		return "", err
 	}
+	planUsage, err := sessionPlanUsageWithQuerier(ctx, tx, id)
+	if err != nil {
+		return "", err
+	}
 
-	// The batch writer replaces a session's usage events, so keep the stored ones unless the import supplies its own.
+	// The batch writer replaces a session's usage events and plan usage, so keep the stored ones unless the import supplies its own.
 	if len(write.UsageEvents) == 0 {
 		write.UsageEvents = events
+	}
+	if write.PlanUsage == nil {
+		write.PlanUsage = planUsage
 	}
 	externalParent, err := loadSessionExternalParent(ctx, tx, id)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
 	var pins []savedPin
-	if _, err := writeOneSessionBatchTx(
+	if _, err := db.writeOneSessionBatchTx(
 		ctx, tx, ctxTx, write, &pending, db.usageOnlyStorage(), &pins,
 	); err != nil {
 		return "", err
@@ -101,7 +112,8 @@ func (db *DB) ReplaceSessionKeepingTrashedCopy(
 			ev.ID, ev.SessionID = 0, copyID
 			copyWrite.UsageEvents[i] = ev
 		}
-		if _, err := writeOneSessionBatchTx(
+		copyWrite.PlanUsage = planUsage
+		if _, err := db.writeOneSessionBatchTx(
 			ctx, tx, ctxTx, copyWrite, &pending, db.usageOnlyStorage(), nil,
 		); err != nil {
 			return "", fmt.Errorf("writing replaced session copy: %w", err)

@@ -519,34 +519,6 @@ func TestPushFailsClosedWhenWriterHoldsMirror(t *testing.T) {
 	assertMirrorMessageCount(t, path, "sess-1", 2)
 }
 
-// TestPushExplicitRebuildsWhileMirrorHeldByReaders covers the explicit-push
-// side of the push-under-serve flow: a serving process holds the mirror
-// read-only, so the probe still inspects it (same-DSN read-only opens share
-// the in-process instance; across processes read-only locks coexist), the
-// incremental path is chosen, and only the incremental write open fails.
-// An explicit push then falls back to a full rebuild — which never
-// write-opens the destination (temp file plus atomic rename) — and records
-// the reader-hold reason.
-func TestPushExplicitRebuildsWhileMirrorHeldByReaders(t *testing.T) {
-	ctx := t.Context()
-	local, path := newPushFixture(t, 1)
-	_, err := Push(ctx, path, local, "m", storage.MirrorPushOptions{}, false, nil)
-	require.NoError(t, err)
-
-	held, err := OpenReadOnly(ctx, path)
-	require.NoError(t, err)
-
-	appendMessage(t, local, "sess-1")
-	res, err := Push(ctx, path, local, "m", storage.MirrorPushOptions{}, false, nil)
-	require.NoError(t, err)
-	assert.True(t, res.Diagnostics.Full,
-		"a reader-held mirror cannot be updated incrementally; an explicit push must rebuild")
-	assert.Contains(t, res.Diagnostics.RebuildReason, "held open by reader processes")
-
-	require.NoError(t, held.Close())
-	assertMirrorMessageCount(t, path, "sess-1", 3)
-}
-
 // TestPushIncrementalMirrorsSubagentLinkBackfill is the FINDING 4
 // regression: LinkSubagentSessions rewrites a session's parent_session_id
 // and relationship_type without any session file changing, so unless it
@@ -617,53 +589,44 @@ func assertMirrorSessionRelationship(
 	assert.Equal(t, wantRelationship, relationship, "mirror relationship_type")
 }
 
-// TestPushDefersHeldMirrorForAutomaticPushes is the bounded-watch-cost
-// contract: a watch-mode (automatic) incremental push whose write open is
-// blocked by a read-only serve handle must return a successful deferred
-// no-op — not rebuild the whole archive on every changed batch — and must
-// not advance the mirror's push cutoff, so the next unheld push catches up
-// on everything that changed while the mirror was held. The probe itself
-// still succeeds while the reader holds the file (read-only opens coexist),
-// which is also asserted here via the mid-hold ProbeMirror call.
-func TestPushDefersHeldMirrorForAutomaticPushes(t *testing.T) {
+// While readers hold the mirror, explicit and watched pushes catch up a
+// standby and swap it in. Later publications reuse the retired file.
+func TestPushPublishesWhileMirrorHeldByReaders(t *testing.T) {
+	skipReopenTestOnWindows(t)
 	ctx := t.Context()
-	watchOpts := storage.MirrorPushOptions{Automatic: true}
 	local, path := newPushFixture(t, 1)
-	_, err := Push(ctx, path, local, "m", watchOpts, false, nil)
+	_, err := Push(ctx, path, local, "m", storage.MirrorPushOptions{}, false, nil)
 	require.NoError(t, err)
-	baseline, err := ProbeMirror(ctx, path)
+	original, err := os.Stat(path)
 	require.NoError(t, err)
-	require.True(t, baseline.ShapeOK)
+	store, err := NewStore(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 
-	appendMessage(t, local, "sess-1")
+	appendFrustrationPrompt(t, local, "sess-1")
+	res, err := Push(ctx, path, local, "m", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	assert.False(t, res.Diagnostics.Full)
+	assert.Empty(t, res.Diagnostics.RebuildReason)
+	assert.Equal(t, 1, res.SessionsPushed)
+	first, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.False(t, os.SameFile(original, first))
+	store.checkMirrorReplacement(ctx, func(err error) { require.NoError(t, err) })
+
+	// Alias opens in the same process don't enforce DuckDB's inode lock.
+	// Keep a read-only handle at the live path to model a separate server.
 	held, err := OpenReadOnly(ctx, path)
 	require.NoError(t, err)
-
-	res, err := Push(ctx, path, local, "m", watchOpts, false, nil)
+	t.Cleanup(func() { require.NoError(t, held.Close()) })
+	appendFrustrationPrompt(t, local, "sess-1")
+	res, err = Push(ctx, path, local, "m", storage.MirrorPushOptions{Automatic: true}, false, nil)
 	require.NoError(t, err)
-	assert.True(t, res.Diagnostics.Deferred, "the held push must defer")
-	assert.Contains(t, res.Diagnostics.DeferredReason, "held open by reader processes")
-	assert.False(t, res.Diagnostics.Full, "a deferred push must not rebuild")
-	assert.Zero(t, res.SessionsPushed, "a deferred push must not write sessions")
-
-	midHold, err := ProbeMirror(ctx, path)
+	assert.False(t, res.Diagnostics.Deferred)
+	assert.Equal(t, 1, res.SessionsPushed)
+	second, err := os.Stat(path)
 	require.NoError(t, err)
-	assert.True(t, midHold.ShapeOK,
-		"a probe must still inspect a mirror held read-only by a serve handle")
-	assert.Equal(t, baseline.LastPushCutoff, midHold.LastPushCutoff,
-		"a deferred push must not advance the mirror's push cutoff")
-
-	require.NoError(t, held.Close())
-	assertMirrorMessageCount(t, path, "sess-1", 2)
-
-	catchUp, err := Push(ctx, path, local, "m", watchOpts, false, nil)
-	require.NoError(t, err)
-	assert.False(t, catchUp.Diagnostics.Deferred)
-	assert.False(t, catchUp.Diagnostics.Full,
-		"the unheld catch-up push must be incremental, not a rebuild")
-	assert.Equal(t, 1, catchUp.SessionsPushed,
-		"the catch-up push must pick up the change made while the mirror was held")
-	assertMirrorMessageCount(t, path, "sess-1", 3)
+	assert.True(t, os.SameFile(original, second), "the second publication must reuse the original inode")
 }
 
 // TestAutomaticIncrementalPushSkipsScopeCount pins the bounded-cost side of
@@ -1017,6 +980,77 @@ func TestPushDoesNotAdvanceStateOnError(t *testing.T) {
 	assertMirrorSessionAbsent(t, path, badID)
 }
 
+func TestPushSkipsInvalidBatchedSessionAfterReopen(t *testing.T) {
+	ctx := t.Context()
+	local := newLocalDB(t)
+	old := duckBatchFixture("invalid-batched", 1)
+	_, err := local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{old})
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "mirror.duckdb")
+	initial, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	require.Zero(t, initial.Errors)
+	mirror, err := OpenReadOnly(ctx, path)
+	require.NoError(t, err)
+	oldRows := duckBatchSnapshot(t, mirror, old.Session.ID)
+	var oldFingerprint string
+	require.NoError(t, mirror.QueryRowContext(ctx,
+		`SELECT agentsview_push_fingerprint FROM sessions WHERE id = ?`, old.Session.ID,
+	).Scan(&oldFingerprint))
+	require.NoError(t, mirror.Close())
+
+	replacement := duckBatchFixture(old.Session.ID, 203)
+	for i := range replacement.Messages {
+		replacement.Messages[i].Content = fmt.Sprintf("replacement %d", i)
+		replacement.Messages[i].ContentLength = len(replacement.Messages[i].Content)
+	}
+	replacement.Messages[150].Timestamp = "not-a-timestamp"
+	healthy := duckBatchFixture("valid-new", 1)
+	healthy.Messages[0].Content = "healthy session survives the failed batch"
+	healthy.Messages[0].ContentLength = len(healthy.Messages[0].Content)
+	_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{replacement, healthy})
+	require.NoError(t, err)
+	var logs bytes.Buffer
+	oldLog := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldLog) })
+
+	result, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	require.False(t, result.Diagnostics.Full)
+	assert.Equal(t, 1, result.Errors)
+	assert.Equal(t, 1, result.SessionsPushed)
+	assert.Contains(t, logs.String(), "skipping session "+old.Session.ID)
+	assert.Contains(t, logs.String(), "timestamp")
+	mirror, err = OpenReadOnly(ctx, path)
+	require.NoError(t, err)
+	assert.Equal(t, oldRows, duckBatchSnapshot(t, mirror, old.Session.ID))
+	var fingerprint, content string
+	require.NoError(t, mirror.QueryRowContext(ctx,
+		`SELECT agentsview_push_fingerprint FROM sessions WHERE id = ?`, old.Session.ID,
+	).Scan(&fingerprint))
+	assert.Equal(t, oldFingerprint, fingerprint)
+	require.NoError(t, mirror.QueryRowContext(ctx,
+		`SELECT content FROM messages WHERE session_id = ? AND ordinal = 0`, healthy.Session.ID,
+	).Scan(&content))
+	assert.Equal(t, "healthy session survives the failed batch", content)
+	assertDuckBatchParity(t, local, mirror, healthy.Session.ID)
+	require.NoError(t, mirror.Close())
+
+	replacement.Messages[150].Timestamp = "2026-01-02T03:04:05.123Z"
+	_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{replacement})
+	require.NoError(t, err)
+	retry, err := Push(ctx, path, local, "test-machine", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	assert.Zero(t, retry.Errors)
+	assert.Equal(t, 1, retry.SessionsPushed)
+	mirror, err = OpenReadOnly(ctx, path)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, mirror.Close()) }()
+	assertDuckBatchParity(t, local, mirror, old.Session.ID)
+	assertDuckBatchParity(t, local, mirror, healthy.Session.ID)
+}
+
 func TestSyncFullPushCreatesExpectedRows(t *testing.T) {
 	ctx := t.Context()
 	local := newLocalDB(t)
@@ -1038,7 +1072,7 @@ func TestSyncFullPushCreatesExpectedRows(t *testing.T) {
 	assertDuckDBCount(t, conn, "tool_result_events", 1)
 	assertDuckDBCount(t, conn, "usage_events", 1)
 	assertDuckDBCount(t, conn, "secret_findings", 1)
-	assertDuckDBCount(t, conn, "model_pricing", 1)
+	assertDuckDBCount(t, conn, "model_pricing", 2)
 	assertDuckDBCount(t, conn, "starred_sessions", 1)
 	assertDuckDBCount(t, conn, "pinned_messages", 1)
 
@@ -1209,86 +1243,6 @@ func TestSyncPushReportsProgressAcrossBatchBoundaries(t *testing.T) {
 	assert.Equal(t, count, progress[duckSessionPushBatchSize].SessionsDone)
 	assert.Equal(t, count, progress[duckSessionPushBatchSize].SessionsTotal)
 	assert.Equal(t, count, progress[duckSessionPushBatchSize].MessagesDone)
-}
-
-func TestDuckSessionFingerprintIncludesDeletionCause(t *testing.T) {
-	base := db.Session{ID: "session", Machine: "machine"}
-	withCause := base
-	cause := "source_missing"
-	withCause.DeletionCause = &cause
-
-	assert.NotEqual(t,
-		duckSessionFingerprintFields(base, base.Machine),
-		duckSessionFingerprintFields(withCause, withCause.Machine),
-	)
-}
-
-func TestDuckSessionFingerprintFieldsDiffer(t *testing.T) {
-	base := db.Session{
-		ID:               "sess-001",
-		Project:          "proj",
-		Machine:          "laptop",
-		Agent:            "claude",
-		MessageCount:     5,
-		UserMessageCount: 2,
-		CreatedAt:        "2026-03-11T12:00:00Z",
-	}
-	encode := func(s db.Session) string {
-		data, err := json.Marshal(duckSessionFingerprintFields(s, "laptop"))
-		require.NoError(t, err)
-		return string(data)
-	}
-	fp1 := encode(base)
-
-	tests := []struct {
-		name   string
-		modify func(s db.Session) db.Session
-	}{
-		{
-			name: "agent label change",
-			modify: func(s db.Session) db.Session {
-				s.AgentLabel = "triage"
-				return s
-			},
-		},
-		{
-			name: "entrypoint change",
-			modify: func(s db.Session) db.Session {
-				s.Entrypoint = "sdk-cli"
-				return s
-			},
-		},
-		{
-			name: "display name change",
-			modify: func(s db.Session) db.Session {
-				name := "new name"
-				s.DisplayName = &name
-				return s
-			},
-		},
-		{
-			name: "session_name change",
-			modify: func(s db.Session) db.Session {
-				n := "agent-provided-title"
-				s.SessionName = &n
-				return s
-			},
-		},
-		{
-			name: "transcript revision change",
-			modify: func(s db.Session) db.Session {
-				revision := "1"
-				s.TranscriptRevision = &revision
-				return s
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.NotEqual(t, fp1, encode(tt.modify(base)))
-		})
-	}
 }
 
 // TestDuckSessionFingerprintCoversEveryMirroredColumn enforces the
@@ -1480,7 +1434,7 @@ func TestSessionFingerprintsWriteColumn(t *testing.T) {
 
 func TestSyncUsesFallbackPricingWhenLocalPricingIsEmpty(t *testing.T) {
 	ctx := t.Context()
-	local := newLocalDB(t)
+	local := dbtest.OpenTestDB(t)
 	syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
 	require.NoError(t, createSchema(ctx, syncer.DB()))
 
@@ -2240,7 +2194,9 @@ type syncFixture struct {
 
 func newLocalDB(t *testing.T) *db.DB {
 	t.Helper()
-	return dbtest.OpenTestDB(t)
+	local := dbtest.OpenTestDB(t)
+	dbtest.SeedMirrorPricing(t, local)
+	return local
 }
 
 func newTestSync(
@@ -2291,6 +2247,13 @@ func newPushFixture(t *testing.T, n int) (*db.DB, string) {
 // next Push selects it as a candidate.
 func appendMessage(t *testing.T, local *db.DB, sessionID string) {
 	t.Helper()
+	appendSessionMessage(t, local, sessionID, "assistant", "appended", db.SessionSignalUpdate{})
+}
+
+func appendSessionMessage(
+	t *testing.T, local *db.DB, sessionID, role, content string, signals db.SessionSignalUpdate,
+) {
+	t.Helper()
 
 	ctx := t.Context()
 	sess, err := local.GetSession(ctx, sessionID)
@@ -2305,8 +2268,9 @@ func appendMessage(t *testing.T, local *db.DB, sessionID string) {
 	_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{
 		Session: *sess,
 		Messages: []db.Message{
-			syncMessage(sessionID, ordinal, "assistant", "appended", modifiedAt),
+			syncMessage(sessionID, ordinal, role, content, modifiedAt),
 		},
+		Signals: signals,
 	}})
 	require.NoError(t, err)
 }

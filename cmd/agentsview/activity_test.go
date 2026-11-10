@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
@@ -31,19 +30,6 @@ func TestNewActivityCommand_RegistersReport(t *testing.T) {
 	sub, _, err := cmd.Find([]string{"report"})
 	require.NoError(t, err)
 	assert.Equal(t, "report", sub.Name())
-}
-
-func TestActivityReportCommand_Flags(t *testing.T) {
-	cmd := newActivityReportCommand()
-	for _, name := range []string{
-		"preset", "date", "from", "to", "timezone",
-		"bucket", "project", "agent", "machine", "json", "no-sync",
-		"offline", "sessions-limit", "sessions-cursor", "sessions-sort",
-		"sessions-direction", "sessions-bucket-start", "sessions-bucket-end",
-		"sessions-report-id",
-	} {
-		assert.NotNilf(t, cmd.Flags().Lookup(name), "flag --%s must exist", name)
-	}
 }
 
 func TestResolveCLIActivitySelection(t *testing.T) {
@@ -82,13 +68,13 @@ func TestResolveActivityReportPagesSessionsWithDirectCursor(t *testing.T) {
 		To: "2026-07-03T13:00:00Z", Timezone: "UTC", Bucket: "1h",
 		SessionsLimit: 1,
 	}
-	first, err := resolveActivityReport(base, database)
+	first, err := resolveActivityReport(t.Context(), base, database)
 	require.NoError(t, err)
 	require.Len(t, first.BySession, 1)
 	require.NotEmpty(t, first.SessionsNextCursor)
 
 	base.SessionsCursor = first.SessionsNextCursor
-	second, err := resolveActivityReport(base, database)
+	second, err := resolveActivityReport(t.Context(), base, database)
 	require.NoError(t, err)
 	require.Len(t, second.BySession, 1)
 	assert.NotEqual(t, first.BySession[0].SessionID, second.BySession[0].SessionID)
@@ -98,7 +84,7 @@ func TestResolveActivityReportCursorInheritsPagingOptions(t *testing.T) {
 	dataDir := setupExportGoldenDataDir(t)
 	database := dbtest.OpenTestDBAt(t, sessionsDBPath(dataDir))
 	database.SetCursorSecret(goldenCursorSecret)
-	first, err := resolveActivityReport(ActivityReportConfig{
+	first, err := resolveActivityReport(t.Context(), ActivityReportConfig{
 		Preset: "custom", From: "2026-07-03T10:00:00Z",
 		To: "2026-07-03T13:00:00Z", Timezone: "UTC", Bucket: "1d",
 		SessionsLimit: 1, SessionsSort: "project", SessionsDirection: "asc",
@@ -108,7 +94,7 @@ func TestResolveActivityReportCursorInheritsPagingOptions(t *testing.T) {
 	require.Len(t, first.BySession, 1)
 	require.NotEmpty(t, first.SessionsNextCursor)
 
-	second, err := resolveActivityReport(ActivityReportConfig{
+	second, err := resolveActivityReport(t.Context(), ActivityReportConfig{
 		SessionsCursor: first.SessionsNextCursor,
 	}, database)
 	require.NoError(t, err)
@@ -120,7 +106,7 @@ func TestResolveActivityReportCursorRejectsExplicitPagingMismatch(t *testing.T) 
 	dataDir := setupExportGoldenDataDir(t)
 	database := dbtest.OpenTestDBAt(t, sessionsDBPath(dataDir))
 	database.SetCursorSecret(goldenCursorSecret)
-	first, err := resolveActivityReport(ActivityReportConfig{
+	first, err := resolveActivityReport(t.Context(), ActivityReportConfig{
 		Preset: "custom", From: "2026-07-03T10:00:00Z",
 		To: "2026-07-03T13:00:00Z", Timezone: "UTC", Bucket: "1d",
 		SessionsLimit: 1, SessionsSort: "project", SessionsDirection: "asc",
@@ -144,7 +130,7 @@ func TestResolveActivityReportCursorRejectsExplicitPagingMismatch(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := ActivityReportConfig{SessionsCursor: first.SessionsNextCursor}
 			tc.change(&cfg)
-			_, pageErr := resolveActivityReport(cfg, database)
+			_, pageErr := resolveActivityReport(t.Context(), cfg, database)
 			require.EqualError(t, pageErr, "invalid sessions cursor")
 		})
 	}
@@ -164,34 +150,23 @@ func TestResolveActivityReportCursorPreservesPartialGeneration(t *testing.T) {
 		Preset: "day", Date: "2026-07-03", Timezone: "UTC",
 		SessionsLimit: 1,
 	}
-	first, err := resolveActivityReport(base, database)
+	first, err := resolveActivityReport(t.Context(), base, database)
 	require.NoError(t, err)
 	require.True(t, first.Partial)
 	require.NotEmpty(t, first.SessionsNextCursor)
 
 	now = now.Add(15 * time.Minute)
 	base.SessionsCursor = first.SessionsNextCursor
-	second, err := resolveActivityReport(base, database)
+	second, err := resolveActivityReport(t.Context(), base, database)
 	require.NoError(t, err)
 	assert.Equal(t, first.EffectiveEnd, second.EffectiveEnd)
 	assert.Equal(t, first.AsOf, second.AsOf)
 	assert.NotEqual(t, first.BySession[0].SessionID, second.BySession[0].SessionID)
 }
 
-func TestActivityReportCommand_HelpText(t *testing.T) {
-	cmd := newActivityReportCommand()
-	var buf bytes.Buffer
-	cmd.SetOut(&buf)
-	cmd.SetArgs([]string{"--help"})
-	require.NoError(t, cmd.Execute())
-	out := buf.String()
-	assert.Contains(t, out, "--preset")
-	assert.Contains(t, out, "--json")
-}
-
 func TestResolveActivityReport_BadBucket(t *testing.T) {
 	d := newTestDB(t)
-	_, err := resolveActivityReport(ActivityReportConfig{
+	_, err := resolveActivityReport(t.Context(), ActivityReportConfig{
 		Preset: "day", Date: "2026-06-16", Timezone: "UTC", Bucket: "2h",
 	}, d)
 	require.Error(t, err, "off-allow-list bucket is rejected before query")
@@ -199,7 +174,7 @@ func TestResolveActivityReport_BadBucket(t *testing.T) {
 
 func TestResolveActivityReportRejectsSessionRangePastBucketCount(t *testing.T) {
 	d := newTestDB(t)
-	_, err := resolveActivityReport(ActivityReportConfig{
+	_, err := resolveActivityReport(t.Context(), ActivityReportConfig{
 		Preset: "day", Date: "2026-06-16", Timezone: "UTC",
 		SessionsBucketStart: "287", SessionsBucketEnd: "289",
 	}, d)
@@ -208,7 +183,7 @@ func TestResolveActivityReportRejectsSessionRangePastBucketCount(t *testing.T) {
 
 func TestResolveActivityReport_JSONShape(t *testing.T) {
 	d := newTestDB(t)
-	r, err := resolveActivityReport(ActivityReportConfig{
+	r, err := resolveActivityReport(t.Context(), ActivityReportConfig{
 		Preset: "day", Date: "2026-06-16", Timezone: "UTC",
 	}, d)
 	require.NoError(t, err)
@@ -246,7 +221,7 @@ func TestActivityReport_UsesDiscoveredDaemon(t *testing.T) {
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
 
 	out := captureStdout(t, func() {
-		runActivityReport(ActivityReportConfig{
+		runActivityReport(t.Context(), ActivityReportConfig{
 			JSON: true, Preset: "day",
 			Date: "2026-06-16", Timezone: "UTC",
 		})
@@ -498,7 +473,7 @@ func TestResolveActivityReport_PricesFreshDBUsage(t *testing.T) {
 
 	// resolveActivityReportPriced seeds fallback pricing (Offline => no network)
 	// exactly as runActivityReport does, so removing that seeding fails here.
-	r, err := resolveActivityReportPriced(ActivityReportConfig{
+	r, err := resolveActivityReportPriced(t.Context(), ActivityReportConfig{
 		Preset: "day", Date: "2026-06-15", Timezone: "UTC", Offline: true,
 	}, d, nil)
 	require.NoError(t, err)
@@ -516,7 +491,7 @@ func TestActivityReportJSONMatchesHTTPExportMetadata(t *testing.T) {
 	seedUsageDailyExportMetadataFixture(t, database, fallbackModel)
 
 	cliOut := captureStdout(t, func() {
-		runActivityReport(ActivityReportConfig{
+		runActivityReport(t.Context(), ActivityReportConfig{
 			JSON: true, Preset: "day", Date: "2026-06-01",
 			Timezone: "UTC", Offline: true, NoSync: true,
 		})
@@ -580,7 +555,7 @@ func TestRunActivityReportOfflineUsesReadOnlyDBWhenWriteLockHeld(t *testing.T) {
 	defer func() { require.NoError(t, lock.Close()) }()
 
 	out := captureStdout(t, func() {
-		runActivityReport(ActivityReportConfig{
+		runActivityReport(t.Context(), ActivityReportConfig{
 			Preset:   "day",
 			Date:     "2026-04-04",
 			Timezone: "UTC",

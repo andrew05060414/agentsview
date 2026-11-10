@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { formatDateTime, m } from "../../i18n/index.js";
   import type { Report } from "../../api/types.js";
   import type { ActivitySessionRow } from "../../api/generated/index";
@@ -79,7 +80,7 @@
   function setSort(key: ActivitySessionSort) {
     const direction = sortKey === key
       ? sortDir === "asc" ? "desc" : "asc"
-      : key === "project" || key === "agent" ? "asc" : "desc";
+      : key === "agent_minutes" || key === "cost" || key === "first_active" ? "desc" : "asc";
     onSort?.(key, direction);
   }
 
@@ -120,14 +121,20 @@
   interface Column {
     key: ActivitySessionSort;
     label: string;
+    // Fixed so a sort, which loads a different set of rows, cannot resize
+    // the columns. The em widths fit the longest translated header plus its
+    // sort arrow; Session takes the remaining width.
+    width?: string;
   }
 
   const sortColumns: Column[] = $derived([
-    { key: "project", label: m.activity_project() },
-    { key: "agent", label: m.activity_agent() },
-    { key: "agent_minutes", label: m.activity_agent_min() },
-    { key: "cost", label: m.activity_cost() },
-    { key: "first_active", label: m.activity_window() },
+    { key: "session", label: m.activity_session() },
+    { key: "model", label: m.activity_model(), width: "16%" },
+    { key: "project", label: m.activity_project(), width: "16%" },
+    { key: "agent", label: m.activity_agent(), width: "9.5em" },
+    { key: "agent_minutes", label: m.activity_agent_min(), width: "10.5em" },
+    { key: "cost", label: m.activity_cost(), width: "8em" },
+    { key: "first_active", label: m.activity_window(), width: "8.5em" },
   ]);
 
 </script>
@@ -165,10 +172,13 @@
     {#if rows.length > 0}
       <div class="table-scroll" bind:this={scrollEl} onscroll={loadMoreIfNearEnd}>
         <table class="table">
+          <colgroup>
+            {#each sortColumns as col (col.key)}
+              <col style:width={col.width} />
+            {/each}
+          </colgroup>
           <thead>
             <tr>
-              <TableHeaderCell label={m.activity_session()} />
-              <TableHeaderCell label={m.activity_model()} />
               {#each sortColumns as col}
                 <TableHeaderCell
                   class="sort-{col.key}"
@@ -212,7 +222,7 @@
                     {/if}
                   </div>
                 </td>
-                <td class="col-model">{rowModel(row)}</td>
+                <td class="col-model" title={rowModel(row)}>{rowModel(row)}</td>
                 <td class="col-project" title={row.project}>
                   {row.project}
                 </td>
@@ -238,7 +248,7 @@
     {/if}
   </div>
   {#if error}
-    <div class="page-error">
+    <div class="page-error" {@attach errorTelemetry("analytics")}>
       <span>{error}</span>
       <Button size="sm" onclick={() => onRetry?.()}>{m.shared_retry()}</Button>
     </div>
@@ -364,8 +374,13 @@
     border-radius: var(--radius-sm);
   }
 
+  /* Fixed layout sizes the columns from the colgroup alone, so neither the
+     loaded rows nor the sort arrow can move them. Below the minimum width the
+     table scrolls sideways. */
   .table {
     width: 100%;
+    min-width: 64em;
+    table-layout: fixed;
     border-collapse: collapse;
     font-size: 11px;
   }
@@ -388,6 +403,8 @@
     border-bottom: 1px solid var(--border-muted);
     color: var(--text-secondary);
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .session-row:last-child td {
@@ -396,10 +413,6 @@
 
   .session-row:hover {
     background: var(--bg-surface-hover);
-  }
-
-  .col-session {
-    max-width: 240px;
   }
 
   .session-cell {
@@ -438,12 +451,6 @@
 
   .session-link:hover {
     text-decoration: underline;
-  }
-
-  .col-project {
-    max-width: 140px;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   .empty {

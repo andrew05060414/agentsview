@@ -33,6 +33,7 @@ const (
 type QueryDialect struct {
 	position           func(haystack, needle string) string
 	parentRelation     func(childAlias, parentAlias string) string
+	machinePredicate   func(sessionIDExpr, machineExpr string, placeholders []string) string
 	name               string
 	placeholderStyle   placeholderStyle
 	trueLiteral        string
@@ -64,6 +65,9 @@ type QueryDialect struct {
 	// members of the IncludeChildren tree CTE. Empty means "UNION"; ClickHouse
 	// accepts only "UNION ALL" inside a recursive CTE.
 	recursiveUnion string
+	// recursiveChildJoin puts the tree first on SQLite so startup statistics
+	// cannot move a sessions scan outside the per-node child lookup.
+	recursiveChildJoin string
 	// starredPredicate renders the Starred filter for the given session id
 	// expression. Nil renders the correlated EXISTS the row stores use;
 	// ClickHouse needs an uncorrelated IN subquery.
@@ -106,11 +110,19 @@ func (d QueryDialect) FalseLiteral() string {
 	return d.falseLiteral
 }
 
-func (d QueryDialect) recursiveUnionSQL() string {
+// RecursiveUnionSQL returns the union operator supported by recursive CTEs.
+func (d QueryDialect) RecursiveUnionSQL() string {
 	if d.recursiveUnion == "" {
 		return "UNION"
 	}
 	return d.recursiveUnion
+}
+
+func (d QueryDialect) recursiveChildJoinSQL() string {
+	if d.recursiveChildJoin == "" {
+		return "FROM sessions s JOIN tree t ON "
+	}
+	return d.recursiveChildJoin
 }
 
 func (d QueryDialect) starredPredicateSQL(idExpr string) string {
@@ -170,10 +182,11 @@ func outerSessionID(q func(string) string) string {
 // SQLiteQueryDialect returns the SQLite SQL fragments used by the local store.
 func SQLiteQueryDialect() QueryDialect {
 	return QueryDialect{
-		name:             "sqlite",
-		placeholderStyle: placeholderQuestion,
-		trueLiteral:      "1",
-		falseLiteral:     "0",
+		name:               "sqlite",
+		placeholderStyle:   placeholderQuestion,
+		trueLiteral:        "1",
+		falseLiteral:       "0",
+		recursiveChildJoin: "FROM tree t CROSS JOIN sessions s ON ",
 		dateStartExpr: func(q func(string) string) string {
 			return "julianday(COALESCE(NULLIF(" + q("started_at") +
 				", ''), " + q("created_at") + "))"
@@ -407,7 +420,7 @@ func DuckDBQueryDialect() QueryDialect {
 				cond += " AND lower(pl->>'host') = " + hostPh
 			}
 			return "len(list_filter(CAST(json_extract(NULLIF(" + col +
-				", ''), '$[*]') AS JSON[]), pl -> " + cond + ")) > 0"
+				", ''), '$[*]') AS JSON[]), lambda pl: " + cond + ")) > 0"
 		},
 	}
 }
@@ -512,16 +525,30 @@ func (b *QueryBuilder) ContainsPredicate(col, pattern string) string {
 		b.dialect.caseInsensitiveLikeEsc
 }
 
+// RegexPrefixFilter adds a substring prefilter for a required regex prefix.
+// An empty prefix leaves the query and bind parameters unchanged.
+func (b *QueryBuilder) RegexPrefixFilter(col, prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	return " AND " + b.ContainsPredicate(col, prefix)
+}
+
 // RegexPredicate renders a parameterized regex predicate in the dialect's
 // native syntax. Backends may still choose to evaluate regexes in Go.
 func (b *QueryBuilder) RegexPredicate(col, pattern string) string {
 	return b.dialect.regexPredicate(col, b.Add(pattern))
 }
 
+// CursorTimestamp binds an activity timestamp with the dialect's cursor cast.
+func (b *QueryBuilder) CursorTimestamp(value string) string {
+	return b.dialect.cursorParam(b.Add(value))
+}
+
 // CursorBeforePredicate renders the keyset pagination predicate used by
 // session list queries ordered by recent activity DESC, id DESC.
 func (b *QueryBuilder) CursorBeforePredicate(cur SessionCursor) string {
-	ea := b.dialect.cursorParam(b.Add(cur.EndedAt))
+	ea := b.CursorTimestamp(cur.EndedAt)
 	id := b.Add(cur.ID)
 	return "(" + b.dialect.cursorActivityExpr + ", id) < (" + ea + ", " + id + ")"
 }
@@ -659,7 +686,7 @@ func BuildSessionFilterSQL(
 func BuildSessionBaseFilterSQL(
 	f SessionFilter, dialect QueryDialect,
 ) (string, []any) {
-	f = f.withAnnotationSelection()
+	f = f.withSelectionDefaults(f.HasAnnotationFilter())
 	b := NewQueryBuilder(dialect, 0)
 	preds := []string{
 		"message_count > 0",
@@ -679,6 +706,16 @@ func BuildSessionBaseFilterSQL(
 		preds = append(preds, pred)
 	}
 	return strings.Join(preds, " AND "), b.Args()
+}
+
+// StatsRootCountSQL counts the same canonical roots as an unfiltered sidebar.
+// Its separate scan preserves the existing filters for the other stats totals.
+func StatsRootCountSQL(dialect QueryDialect, excludeOneShot, excludeAutomated bool) (string, []any) {
+	where, args := BuildSessionBaseFilterSQL(SessionFilter{
+		ExcludeOneShot: excludeOneShot, ExcludeAutomated: excludeAutomated,
+	}, dialect)
+	where += " AND " + BuildCanonicalRootWhere(dialect, "sessions", true)
+	return "(SELECT " + dialect.SignedAggregate("COUNT(*)") + " FROM sessions WHERE " + where + ")", args
 }
 
 func (d QueryDialect) SidebarChildRelationshipsSQL() string {
@@ -714,6 +751,36 @@ func (d QueryDialect) WithParentRelation(relation func(string, string) string) Q
 	return d
 }
 
+// WithOrphanPredicate overrides the missing-parent test when a query already
+// provides resolved parent edges.
+func (d QueryDialect) WithOrphanPredicate(predicate func(string, string) string) QueryDialect {
+	d.orphanPredicate = predicate
+	return d
+}
+
+// WithMachinePredicate overrides machine membership without multiplying session
+// rows. Ordinary archives and replicas compare the scalar machine column.
+func (d QueryDialect) WithMachinePredicate(predicate func(string, string, []string) string) QueryDialect {
+	d.machinePredicate = predicate
+	return d
+}
+
+// MachinePredicate renders a machine filter for one session. The session ID
+// expression lets a backend match several contributing sources with EXISTS.
+func (b *QueryBuilder) MachinePredicate(sessionIDExpr, machineExpr string, values []string) string {
+	if b.dialect.machinePredicate == nil {
+		return inPredicate(machineExpr, values, b)
+	}
+	if len(values) == 0 {
+		return "1 = 0"
+	}
+	placeholders := make([]string, len(values))
+	for i, value := range values {
+		placeholders[i] = b.Add(value)
+	}
+	return b.dialect.machinePredicate(sessionIDExpr, machineExpr, placeholders)
+}
+
 func (d QueryDialect) ParentRelation(child, parent string) string {
 	if d.parentRelation != nil {
 		return d.parentRelation(child, parent)
@@ -740,17 +807,11 @@ func buildSessionFilterWithBuilder(
 		}
 		return qualifier + "." + col
 	}
-	f = f.withAnnotationSelection()
+	f = f.withSelectionDefaults(f.IDs != nil || f.HasAnnotationFilter())
 
 	if f.IDs != nil {
 		// Explicit hydration selects the requested rows rather than sidebar
 		// roots and their descendants. Keep caller-supplied row filters.
-		if !f.OneShotFilterSet {
-			f.ExcludeOneShot = false
-		}
-		if !f.AutomatedFilterSet {
-			f.ExcludeAutomated = false
-		}
 		preds, oneShot := sessionFilterPredicates(f, b, q)
 		if oneShot != "" {
 			preds = append(preds, oneShot)
@@ -816,9 +877,8 @@ func buildSessionFilterWithBuilder(
 		" WHERE root_session.message_count > 0" +
 		" AND root_session.deleted_at IS NULL AND " +
 		rootMatch +
-		" " + b.dialect.recursiveUnionSQL() + " " +
-		"SELECT s.id FROM sessions s" +
-		" JOIN tree t ON " + b.dialect.ParentRelation("s", "t") +
+		" " + b.dialect.RecursiveUnionSQL() + " " +
+		"SELECT s.id " + b.dialect.recursiveChildJoinSQL() + b.dialect.ParentRelation("s", "t") +
 		" WHERE " + SessionTreeMemberPredicate(f, b.dialect, "s") +
 		") SELECT id FROM tree"
 
@@ -832,7 +892,7 @@ func buildSessionFilterWithBuilder(
 func SessionTreeMemberPredicate(
 	f SessionFilter, dialect QueryDialect, sessionAlias string,
 ) string {
-	f = f.withAnnotationSelection()
+	f = f.withSelectionDefaults(f.HasAnnotationFilter())
 	pred := sessionAlias + ".message_count > 0 AND " + sessionAlias + ".deleted_at IS NULL"
 	if scope := dialect.AutomatedScopePredicate(NormalizeAutomatedScope(f.AutomatedScope, f.ExcludeAutomated), sessionAlias+".is_automated"); scope != "" {
 		pred += " AND " + scope
@@ -877,7 +937,7 @@ func sessionFilterPredicates(
 	}
 	if f.Machine != "" {
 		preds = append(preds,
-			inPredicate(q("machine"), splitCSV(f.Machine), b))
+			b.MachinePredicate(q("id"), q("machine"), splitCSV(f.Machine)))
 	}
 	if f.GitBranch != "" {
 		preds = append(preds, BranchPairPredicate(
@@ -963,13 +1023,10 @@ func (f SessionFilter) HasAnnotationFilter() bool {
 	return len(f.Labels) > 0 || !f.PR.IsZero()
 }
 
-// withAnnotationSelection lifts the default one-shot and automated
-// exclusions when the filter selects by label or pull request link. Those
-// filters name the sessions the caller wants, the way explicit IDs do, and
-// sessions started by a launcher are usually headless single-prompt runs
-// that the defaults would hide. Explicit one-shot and AutomatedScope filters still apply.
-func (f SessionFilter) withAnnotationSelection() SessionFilter {
-	if f.HasAnnotationFilter() {
+// withSelectionDefaults lifts implicit exclusions for an explicit selection.
+// Caller-supplied one-shot and automation filters still apply.
+func (f SessionFilter) withSelectionDefaults(explicitSelection bool) SessionFilter {
+	if explicitSelection {
 		if !f.OneShotFilterSet {
 			f.ExcludeOneShot = false
 		}
@@ -1027,7 +1084,7 @@ func annotationTreePredicate(
 		"SELECT annotated_session.id FROM sessions annotated_session" +
 		" WHERE " + SessionTreeMemberPredicate(f, b.dialect, "annotated_session") +
 		" AND " + strings.Join(preds, " AND ") +
-		" " + b.dialect.recursiveUnionSQL() + " " +
+		" " + b.dialect.RecursiveUnionSQL() + " " +
 		"SELECT annotated_parent.id FROM sessions annotated_parent" +
 		" JOIN sessions annotated_child ON " +
 		b.dialect.ParentRelation("annotated_child", "annotated_parent") +
@@ -1216,6 +1273,18 @@ func terminationPredicate(
 	status string, b *QueryBuilder, q func(string) string,
 ) string {
 	return renderTerminationPredicate(status, b.dialect.terminationExpr, q("termination_status"), b.terminationParam)
+}
+
+// TerminationUsesTime reports whether a termination filter compares
+// session times with the current time.
+func TerminationUsesTime(status string) bool {
+	for part := range strings.SplitSeq(status, ",") {
+		switch strings.TrimSpace(part) {
+		case "active", "stale", "unclean":
+			return true
+		}
+	}
+	return false
 }
 
 func renderTerminationPredicate(status, activityExpr, statusExpr string, param func(time.Time) string) string {

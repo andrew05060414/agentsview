@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM node:24-bookworm AS frontend-build
+FROM --platform=$BUILDPLATFORM node:24.22.1-bookworm AS frontend-build
 
 WORKDIR /src/frontend
 
@@ -11,9 +11,10 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 
 COPY frontend/ ./
+COPY internal/importer/claude_ai_requests.txt /src/internal/importer/claude_ai_requests.txt
 RUN npm run build
 
-FROM golang:1.27.2-bookworm AS build
+FROM golang:1.27.3-bookworm AS build
 
 ENV GOPROXY="https://proxy.golang.org|direct"
 

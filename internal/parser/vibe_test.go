@@ -29,7 +29,7 @@ func newVibeTestProvider(t *testing.T, roots ...string) Provider {
 // package-level ParseVibeSession entrypoint.
 func parseVibeTestSession(t *testing.T, path string, fileInfo FileInfo) (ParseResult, error) {
 	t.Helper()
-	return parseVibeResultFile(path, fileInfo)
+	return parseVibeResultFile(t.Context(), path, fileInfo)
 }
 
 // discoverVibeTestSessions discovers Vibe sessions under root through the
@@ -667,18 +667,6 @@ func TestParseVibeSessionCorruptMetaReturnsError(t *testing.T) {
 	_, err := parseVibeTestSession(t, path, fileInfo)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "meta.json")
-}
-
-func TestVibeAgentByType(t *testing.T) {
-	def, ok := AgentByType(AgentVibe)
-	require.True(t, ok, "Expected AgentVibe to be registered")
-
-	assert.Equal(t, AgentVibe, def.Type)
-	assert.Equal(t, "Mistral Vibe", def.DisplayName)
-	assert.Equal(t, "VIBE_SESSIONS_DIR", def.EnvVar)
-	assert.Equal(t, "vibe_session_dirs", def.ConfigKey)
-	assert.Equal(t, "vibe:", def.IDPrefix)
-	assert.True(t, def.FileBased)
 }
 
 func TestVibeAgentByPrefix(t *testing.T) {

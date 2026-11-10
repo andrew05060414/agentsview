@@ -56,23 +56,20 @@ func AnalyticsActivityAgentsSQL(where string, args []any, localDate string, loca
 		ORDER BY bucket, fs.agent`, queryArgs
 }
 
-func analyticsModelsSQL(ids []string) (string, []any) {
-	ph, args := db.InPlaceholders(ids)
+func analyticsModelsSQL(idSet string) string {
 	return `
 			SELECT DISTINCT model
 			FROM messages
-			WHERE session_id IN ` + ph + `
-				AND COALESCE(model, '') <> ''
-			ORDER BY model`, args
+			WHERE session_id IN ` + idSet + `
+				AND COALESCE(model, '') <> ''`
 }
 
-func analyticsModelTimesSQL(ids []string) (string, []any) {
-	ph, args := db.InPlaceholders(ids)
+func analyticsModelTimesSQL(idSet string) string {
 	return `
 			SELECT model, timestamp
 			FROM messages
-			WHERE session_id IN ` + ph + `
-				AND COALESCE(model, '') <> ''`, args
+			WHERE session_id IN ` + idSet + `
+				AND COALESCE(model, '') <> ''`
 }
 
 func analyticsSignalMessagesSQL(ids []string) (string, []any) {
@@ -149,18 +146,53 @@ func analyticsCandidateMessagesSQL(ph string, includeContent bool) string {
 			ORDER BY session_id, ordinal`
 }
 
-func AnalyticsTrendsSQL(systemPrefix string, dialect db.QueryDialect) string {
+// AnalyticsTrendsSQL selects trend candidate messages from the sessions
+// sessionPred selects. ordered keeps rows grouped by session in ordinal
+// order, which the scope reducer needs when a model filter is set.
+func AnalyticsTrendsSQL(
+	f db.AnalyticsFilter, windowPred func(string, string, string) (string, []any),
+	systemPrefix string, dialect db.QueryDialect,
+	sessionPred string, sessionPredArgs []any, ordered bool,
+) (string, []any) {
+	content := "m.content"
+	where := "s.deleted_at IS NULL AND " + sessionPred
+	var args []any
+	from, to := AnalyticsWindowBounds(f)
+	inWindow, windowArgs := windowPred("COALESCE(m.timestamp, s.started_at, s.created_at)", from, to)
+	if inWindow != "" && len(f.MessageScopeFilter().Models) > 0 {
+		content = "CASE WHEN " + inWindow + " THEN m.content ELSE '' END"
+		args = append(args, windowArgs...)
+	}
+	args = append(args, sessionPredArgs...)
+	if sessionWindow, sessionArgs := windowPred("COALESCE(s.started_at, s.created_at)", from, to); sessionWindow != "" {
+		messageWindow, messageArgs := windowPred("wm.timestamp", from, to)
+		where += " AND (" + sessionWindow + " OR s.id IN (SELECT wm.session_id FROM messages wm WHERE wm.timestamp IS NOT NULL AND " + messageWindow + "))"
+		args = append(args, sessionArgs...)
+		args = append(args, messageArgs...)
+	}
+	if inWindow != "" {
+		rowWindow := inWindow
+		if len(f.MessageScopeFilter().Models) > 0 {
+			rowWindow = "(" + inWindow + " OR m.role = 'assistant')"
+		}
+		where += " AND " + rowWindow
+		args = append(args, windowArgs...)
+	}
+	tail := ""
+	if ordered {
+		tail = `
+		ORDER BY m.session_id, m.ordinal`
+	}
 	return `
 		SELECT m.session_id, m.ordinal, m.role, m.is_system,
-			COALESCE(m.model, ''), m.content, m.timestamp,
+			COALESCE(m.model, ''), ` + content + `, m.timestamp,
 			s.started_at, s.created_at
 		FROM messages m
 		JOIN sessions s ON s.id = m.session_id
-		WHERE s.deleted_at IS NULL
+		WHERE ` + where + `
 			AND m.role IN ('user', 'assistant')
 			AND m.is_system = ` + dialect.FalseLiteral() + `
-			AND ` + systemPrefix + `
-		ORDER BY m.session_id, m.ordinal`
+			AND ` + systemPrefix + tail, args
 }
 
 const AnalyticsSessionColumns = `id, project, machine, agent, first_message,

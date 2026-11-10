@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"os"
@@ -40,7 +41,7 @@ func callParseClaudeSessionFrom(
 func callParseClaudeSessionFromWithLinks(
 	path string, offset int64, startOrdinal int, lastEntryUUID string,
 ) ([]ParsedMessage, []ClaudeSubagentLink, time.Time, int64, error) {
-	return claudeParseSessionFrom(path, offset, claudeIncrementalScan{
+	return claudeParseSessionFrom(context.Background(), path, offset, claudeIncrementalScan{
 		startOrdinal:  startOrdinal,
 		lastEntryUUID: lastEntryUUID,
 	})
@@ -238,6 +239,11 @@ func TestParseClaudeSession_SkippedMessages(t *testing.T) {
 		sess, _ := runClaudeParserTest(t, "test.jsonl", content)
 		assert.Equal(t, 1, sess.MessageCount)
 		assert.Equal(t, "real question", sess.FirstMessage)
+		path := createTestFile(t, "meta.jsonl", content)
+		appended, _, _, _, err := claudeParseSessionFrom(t.Context(), path, 0, claudeIncrementalScan{})
+		require.NoError(t, err)
+		require.Len(t, appended, 1)
+		assert.Equal(t, "real question", appended[0].Content)
 	})
 
 	t.Run("persists isCompactSummary as system message", func(t *testing.T) {
@@ -1575,7 +1581,7 @@ func TestParseClaudeSessionFrom_LinearBoundSessionAcceptsChainBreaks(
 			require.NoError(t, err)
 			require.NoError(t, f.Close())
 
-			newMsgs, _, _, _, perr := claudeParseSessionFrom(
+			newMsgs, _, _, _, perr := claudeParseSessionFrom(t.Context(),
 				path, offset, claudeIncrementalScan{
 					startOrdinal:      1,
 					lastEntryUUID:     "stored-tip",
@@ -1819,7 +1825,7 @@ func mustJSONString(t *testing.T, value string) string {
 
 // Two appended assistant entries with the same message.id form a
 // streaming run. The incremental path merges the run exactly as the
-// full parser does (mergeClaudeAssistantMessageChunks) and stays
+// full parser does (mergeClaudeAssistantMessageChunksContext) and stays
 // incremental, producing one merged message. Runs that straddle a
 // sync boundary are caught by the engine's LastClaudeMessageID check
 // instead.
@@ -1919,7 +1925,7 @@ func TestParseClaudeSessionFrom_QueuedCommandBeforeContinuationFallsBack(
 		require.NoError(t, err)
 		require.NoError(t, f.Close())
 
-		msgs, _, _, _, perr := claudeParseSessionFrom(
+		msgs, _, _, _, perr := claudeParseSessionFrom(t.Context(),
 			path, offset, claudeIncrementalScan{
 				startOrdinal:              2,
 				lastEntryUUID:             "a1",
@@ -2080,7 +2086,7 @@ func TestParseClaudeSessionFrom_LinearBoundNewRootFallsBack(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, _, perr := claudeParseSessionFrom(
+	_, _, _, _, perr := claudeParseSessionFrom(t.Context(),
 		path, offset, claudeIncrementalScan{
 			startOrdinal:      1,
 			lastEntryUUID:     "stored-tip",
@@ -2132,7 +2138,7 @@ func TestParseClaudeSessionFrom_UUIDLessAppendFallsBackForDAGSessions(
 			require.NoError(t, err)
 			require.NoError(t, f.Close())
 
-			msgs, _, _, _, perr := claudeParseSessionFrom(
+			msgs, _, _, _, perr := claudeParseSessionFrom(t.Context(),
 				path, offset, claudeIncrementalScan{
 					startOrdinal:      1,
 					lastEntryUUID:     "stored-tip",
@@ -2192,7 +2198,7 @@ func TestParseClaudeSessionFrom_RewindOntoFilteredEntryFallsBack(
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, _, _, _, perr := claudeParseSessionFrom(
+	_, _, _, _, perr := claudeParseSessionFrom(t.Context(),
 		path, offset, claudeIncrementalScan{
 			startOrdinal:      4,
 			lastEntryUUID:     "a2",
@@ -2948,7 +2954,7 @@ func TestExtractTextContent_ReturnsThinkingText(t *testing.T) {
 			{"type":"thinking","thinking":"second thought"},
 			{"type":"text","text":"reply B"}
 		]`)
-		text, thinking, hasThinking, _, _, _ := ExtractTextContent(t.Context(), content)
+		text, thinking, _, hasThinking, _, _, _ := ExtractTextContent(t.Context(), content)
 		assert.True(t, hasThinking)
 		assert.Equal(t, "first thought\n\nsecond thought", thinking)
 		assert.Contains(t, text, "[Thinking]\nfirst thought\n[/Thinking]")
@@ -2961,7 +2967,7 @@ func TestExtractTextContent_ReturnsThinkingText(t *testing.T) {
 			{"type":"thinking","thinking":""},
 			{"type":"thinking","thinking":"real thought"}
 		]`)
-		_, thinking, _, _, _, _ := ExtractTextContent(t.Context(), content)
+		_, thinking, _, _, _, _, _ := ExtractTextContent(t.Context(), content)
 		assert.Equal(t, "real thought", thinking)
 	})
 }
@@ -3218,4 +3224,65 @@ func TestParseClaudeSession_GenuineOutputMatchingTagShapeStaysUnflagged(
 	got := results[0].Messages[2].ToolResults[0]
 	assert.False(t, got.PersistedOutputUnresolved)
 	assert.Equal(t, genuine, DecodeContent(got.ContentRaw))
+}
+
+// TestParseClaudeSession_BlankThinkingKeepsUsage covers an assistant
+// response whose only content is an empty thinking block with an opaque
+// signature. The record renders no text, but its usage belongs to a
+// distinct provider response and must survive as a hidden row.
+func TestParseClaudeSession_BlankThinkingKeepsUsage(t *testing.T) {
+	content := loadFixture(t, "claude/blank_thinking_usage.jsonl")
+
+	assertBlankUsageRow := func(t *testing.T, msgs []ParsedMessage) {
+		t.Helper()
+		require.Len(t, msgs, 3)
+		blank := msgs[1]
+		assert.Equal(t, RoleAssistant, blank.Role)
+		assert.True(t, blank.IsSystem, "blank usage row must stay out of the transcript")
+		assert.Empty(t, blank.Content)
+		assert.Equal(t, "a1", blank.SourceUUID)
+		assert.Equal(t, "msg_blank", blank.ClaudeMessageID)
+		assert.Equal(t, 41, blank.ContextTokens)
+		assert.Equal(t, 7, blank.OutputTokens)
+		assert.JSONEq(t,
+			`{"input_tokens":11,"output_tokens":7,"cache_creation_input_tokens":13,"cache_read_input_tokens":17}`,
+			string(blank.TokenUsage))
+		assert.Equal(t, "msg_answer", msgs[2].ClaudeMessageID)
+		assert.False(t, msgs[2].IsSystem)
+	}
+
+	t.Run("full parse", func(t *testing.T) {
+		sess, msgs := runClaudeParserTest(t, "test.jsonl", content)
+		assertBlankUsageRow(t, msgs)
+		assert.Equal(t, 10, sess.TotalOutputTokens)
+	})
+
+	t.Run("incremental parse", func(t *testing.T) {
+		path := createTestFile(t, "test.jsonl", content)
+		msgs, _, _, err := callParseClaudeSessionFrom(path, 0, 0, "")
+		require.NoError(t, err)
+		assertBlankUsageRow(t, msgs)
+	})
+
+	t.Run("blank thinking chunk merges into its answer", func(t *testing.T) {
+		sameResponse := testjsonl.JoinJSONL(
+			`{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-01-10T11:00:00Z","message":{"role":"user","content":"prompt"}}`,
+			`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-10T11:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"opaque"}],"id":"msg_one","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"output_tokens":3}}}`,
+			`{"type":"assistant","uuid":"a2","parentUuid":"a1","timestamp":"2026-01-10T11:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"answer"}],"id":"msg_one","model":"claude-sonnet-4-6","usage":{"input_tokens":2,"output_tokens":3},"stop_reason":"end_turn"}}`,
+		)
+		_, msgs := runClaudeParserTest(t, "test.jsonl", sameResponse)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, "answer", msgs[1].Content)
+		assert.False(t, msgs[1].IsSystem)
+	})
+
+	t.Run("blank record without usage is still skipped", func(t *testing.T) {
+		noUsage := testjsonl.JoinJSONL(
+			`{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-01-10T11:00:00Z","message":{"role":"user","content":"prompt"}}`,
+			`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-10T11:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"opaque"}],"id":"msg_blank","usage":{"input_tokens":0,"output_tokens":0}}}`,
+		)
+		_, msgs := runClaudeParserTest(t, "test.jsonl", noUsage)
+		require.Len(t, msgs, 1)
+		assert.Equal(t, RoleUser, msgs[0].Role)
+	})
 }

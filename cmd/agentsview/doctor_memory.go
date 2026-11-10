@@ -111,7 +111,7 @@ func resolveDoctorMemoryService(
 	}
 	// Diagnostics must not generate installation identity or cursor-secret
 	// state. Both local and PostgreSQL reads begin with the read-only loader.
-	cfg, err := config.LoadReadOnly()
+	cfg, err := config.LoadReadOnlyFor(config.ScopeVector)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
@@ -123,7 +123,10 @@ func resolveDoctorMemoryService(
 		if !usePG {
 			return nil, nil, errors.New("doctor memory: PostgreSQL target was not selected")
 		}
-		return newPGReadService(cfg, pgCfg)
+		if err := cfg.ApplyDeploymentEmbeddings(); err != nil {
+			return nil, nil, fmt.Errorf("loading deployment embeddings: %w", err)
+		}
+		return newPGReadService(cmd.Context(), cfg, pgCfg)
 	}
 	// A direct read-only archive handle exposes the same bounded readiness
 	// provider without starting a daemon or scheduling sync work.
@@ -409,10 +412,10 @@ func writeDoctorMemoryReport(w io.Writer, report doctorMemoryReport) error {
 		report.Target.Lexical.Reason)
 	writeDoctorMemoryCapability(w, "Semantic search", report.Target.Semantic.Status,
 		report.Target.Semantic.Reason)
-	if report.Target.Semantic.Generation != "" {
+	if report.Target.Semantic.Generation != "" && report.Target.Semantic.Embedded != nil && report.Target.Semantic.Missing != nil {
 		fmt.Fprintf(w, "Semantic generation: %s (%d embedded, %d missing)\n",
 			sanitizeTerminal(report.Target.Semantic.Generation),
-			report.Target.Semantic.Embedded, report.Target.Semantic.Missing)
+			*report.Target.Semantic.Embedded, *report.Target.Semantic.Missing)
 	}
 	writeDoctorMemoryCapability(w, "Source freshness", report.Target.Sources.Status,
 		report.Target.Sources.Reason)

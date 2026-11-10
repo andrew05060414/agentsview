@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"testing"
 	"time"
 
 	kittelemetry "go.kenn.io/kit/telemetry/posthog"
@@ -15,12 +14,15 @@ import (
 const (
 	EnabledEnv            = "AGENTSVIEW_TELEMETRY_ENABLED"
 	GenericEnabledEnv     = kittelemetry.GenericEnabledEnv
-	postHogAPIKey         = "phc_AzHd9YvuHR7M5poKzC6eW654d3SgKyBdoQPuwkWhimUf"
 	EventDaemonActive     = "daemon_active"
+	EventSetupFinished    = "setup_finished"
 	EventAppOpened        = "app_opened"
 	EventVisitEnded       = "visit_ended"
 	EventScreenViewed     = "screen_viewed"
 	EventSearchRun        = "search_run"
+	EventSearchEmpty      = "search_empty"
+	EventErrorShown       = "error_shown"
+	EventSyncFailed       = "sync_failed"
 	EventSessionViewed    = "session_viewed"
 	EventExportRun        = "export_run"
 	EventInsightGenerated = "insight_generated"
@@ -60,9 +62,6 @@ func NewReporter(opts Options) (*Reporter, error) {
 		}
 		return &Reporter{client: client}, nil
 	}
-	if runningUnderGoTest() {
-		return DisabledReporter(), nil
-	}
 	if strings.TrimSpace(opts.InstallationID) == "" {
 		return nil, errors.New("installation ID is required")
 	}
@@ -92,7 +91,7 @@ func (r *Reporter) Enabled() bool {
 }
 
 func (r *Reporter) CaptureDaemonActive(ctx context.Context) error {
-	if runningUnderGoTest() || !r.Enabled() {
+	if !r.Enabled() {
 		return nil
 	}
 	select {
@@ -108,13 +107,29 @@ func (r *Reporter) EventAllowed(event string) bool {
 	return r != nil && r.client != nil && r.client.EventAllowed(event)
 }
 
+// CaptureSetupFinished queues the daemon's first visible session milestone.
+func (r *Reporter) CaptureSetupFinished(ctx context.Context) error {
+	if r == nil {
+		return errors.New("setup telemetry was not queued")
+	}
+	status, err := r.client.Report(ctx, EventSetupFinished, nil)
+	if err != nil {
+		return err
+	}
+	if status != kittelemetry.StatusQueued {
+		return errors.New("setup telemetry was not queued")
+	}
+	return nil
+}
+
 // CaptureHandler lets the web UI report allowlisted events through this reporter.
+// It rejects setup_finished, whose archive check and claim belong to the daemon.
 func (r *Reporter) CaptureHandler() http.Handler {
 	var client *kittelemetry.Reporter
 	if r != nil {
 		client = r.client
 	}
-	return kittelemetry.NewCaptureHandler(client)
+	return kittelemetry.NewCaptureHandler(client, kittelemetry.RejectEvents(EventSetupFinished))
 }
 
 func (r *Reporter) SanitizeProperties(
@@ -127,10 +142,6 @@ func (r *Reporter) SanitizeProperties(
 	return r.client.SanitizeProperties(event, properties)
 }
 
-func runningUnderGoTest() bool {
-	return testing.Testing()
-}
-
 func (r *Reporter) Close() error {
 	if r == nil || r.client == nil {
 		return nil
@@ -139,8 +150,13 @@ func (r *Reporter) Close() error {
 }
 
 func newKitReporter(opts Options) (*kittelemetry.Reporter, error) {
-	return kittelemetry.NewReporter(kittelemetry.Options{
-		APIKey:      postHogAPIKey,
+	return kittelemetry.NewReporter(kitOptions(opts), allowedEventOptions(opts)...)
+}
+
+// kitOptions leaves APIKey empty so kit uses the project key that release
+// builds set at link time.
+func kitOptions(opts Options) kittelemetry.Options {
+	return kittelemetry.Options{
 		Application: application,
 		EnvPrefix:   envPrefix,
 		DistinctID:  opts.InstallationID,
@@ -148,23 +164,27 @@ func newKitReporter(opts Options) (*kittelemetry.Reporter, error) {
 		Version:     opts.Version,
 		Commit:      opts.Commit,
 		Source:      "daemon",
-	}, allowedEventOptions(opts)...)
+	}
 }
 
 func allowedEventOptions(opts Options) []kittelemetry.Option {
 	return []kittelemetry.Option{
 		kittelemetry.WithAllowedEvent(EventDaemonActive),
+		kittelemetry.WithAllowedEvent(EventSetupFinished),
 		kittelemetry.WithAllowedEvent(EventAppOpened),
+		kittelemetry.WithAllowedEvent(EventSearchEmpty),
+		kittelemetry.WithAllowedEvent(EventErrorShown, kittelemetry.RequireProperty("kind", outcomeValues("search", "session", "insight", "analytics", "export", "other"))),
+		kittelemetry.WithAllowedEvent(EventSyncFailed, kittelemetry.RequireProperty("reason", outcomeValues("request", "sign_in_required", "browser_extension", "already_running", "other"))),
 		kittelemetry.WithAllowedEvent(EventVisitEnded,
 			kittelemetry.AllowProperty("surface", kittelemetry.AllowStringValues("web")),
 			kittelemetry.AllowProperty("duration_bucket", kittelemetry.AllowStringValues("under_1m", "1_to_5m", "5_to_30m", "over_30m"))),
 		kittelemetry.WithDailyEvent(EventScreenViewed, "screen", kittelemetry.NewDailyClaims(opts.ScreenClaimsPath)),
 		kittelemetry.WithAllowedEvent(EventScreenViewed,
-			kittelemetry.AllowProperty("screen", kittelemetry.AllowStringValues("sessions", "usage", "activity", "trends", "recall", "quality", "pinned", "trash", "recent-edits", "data", "settings")),
+			kittelemetry.AllowProperty("screen", kittelemetry.AllowStringValues("sessions", "usage", "activity", "trends", "recall", "quality", "pinned", "trash", "recent-edits", "friction", "data", "settings")),
 			kittelemetry.AllowProperty("surface", kittelemetry.AllowStringValues("web"))),
 		oneOf(EventSearchRun, "query_type", "text", "semantic", "hybrid"),
 		oneOf(EventSessionViewed, "agent", opts.AgentTypes...),
-		oneOf(EventExportRun, "format", "html", "insight_html", "csv", "markdown_link", "gist", "insight_gist"),
+		oneOf(EventExportRun, "format", "html", "insight_html", "friction_markdown", "csv", "markdown_link", "gist", "insight_gist"),
 		oneOf(EventInsightGenerated, "kind", opts.InsightKinds...),
 		oneOf(EventAnalyticsViewed, "page", "usage", "activity", "trends", "quality"),
 	}
@@ -173,4 +193,14 @@ func allowedEventOptions(opts Options) []kittelemetry.Option {
 func oneOf(event, property string, values ...string) kittelemetry.Option {
 	return kittelemetry.WithAllowedEvent(event,
 		kittelemetry.AllowProperty(property, kittelemetry.AllowStringValues(values...)))
+}
+
+func outcomeValues(values ...string) kittelemetry.PropertyFilter {
+	allowed := kittelemetry.AllowStringValues(values...)
+	return func(value any) (any, bool) {
+		if filtered, ok := allowed(value); ok {
+			return filtered, true
+		}
+		return "other", true
+	}
 }

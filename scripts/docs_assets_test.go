@@ -3,6 +3,7 @@ package scripts
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,6 +61,7 @@ func TestHydrateAssetsForceFetchesRemoteAssetBranches(t *testing.T) {
 	require.NoError(t, err)
 	scriptPath := filepath.Join(docsAssetsDir, "hydrate-assets.sh")
 	require.NoError(t, os.WriteFile(scriptPath, script, 0o755))
+	installScript(t, localRepo, filepath.Join("docs", "screenshots", "expected-assets.txt"))
 
 	output, err := runBash(t, localRepo, nil, scriptPath)
 	require.NoError(t, err, string(output))
@@ -111,6 +113,7 @@ func TestAssetPublishersRejectUnexpectedFiles(t *testing.T) {
 			require.NoError(t, os.WriteFile(filepath.Join(sourceDir, ".env.local"), []byte("TOKEN=secret\n"), 0o600))
 
 			scriptPath := installScript(t, repo, tc.scriptRel)
+			installScript(t, repo, filepath.Join("docs", "screenshots", "expected-assets.txt"))
 			output, err := runBash(t, repo, nil, scriptPath, "--source", sourceDir)
 
 			require.Error(t, err, string(output))
@@ -132,6 +135,7 @@ func TestGeneratedAssetPublisherAcceptsSemanticSetupScreenshot(t *testing.T) {
 		t, repo,
 		filepath.Join("docs", "screenshots", "update-generated-assets-branch.sh"),
 	)
+	installScript(t, repo, filepath.Join("docs", "screenshots", "expected-assets.txt"))
 	output, err := runBash(t, repo, nil, scriptPath, "--source", sourceDir)
 	require.NoError(t, err, string(output))
 
@@ -292,6 +296,15 @@ func TestZensicalDocsBuildExcludesScreenshotToolchain(t *testing.T) {
 
 	scriptPath := installScript(t, repo,
 		filepath.Join("docs", "zensical-docs.sh"))
+	installScript(t, repo, filepath.Join("docs", "scripts", "first_paint.py"))
+	installScript(t, repo, filepath.Join("docs", "scripts", "hold-first-paint.js"))
+	pythonPath := requireRunnablePython3(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(docsDir, "stylesheets"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(docsDir, "stylesheets", "extra.css"),
+		[]byte(`@font-face { font-family: Inter; src: url("/fonts/Inter-Regular.woff2"); }`),
+		0o644,
+	))
 	require.NoError(t, os.WriteFile(
 		filepath.Join(docsDir, "zensical.toml"),
 		[]byte("[project]\ndocs_dir = \"docs\"\nsite_dir = \"site\"\n"),
@@ -330,6 +343,32 @@ func TestZensicalDocsBuildExcludesScreenshotToolchain(t *testing.T) {
 	require.NoError(t, os.WriteFile(
 		agentGuide, []byte("contributor-only instructions\n"), 0o644,
 	))
+	// Names that are excluded at the top level only must survive when
+	// they appear deeper; bsdtar and GNU tar must agree.
+	nestedFiles := map[string]string{
+		filepath.Join("guide", "README.md"):           "guide readme\n",
+		filepath.Join("guide", "internal", "page.md"): "nested internal page\n",
+		filepath.Join(
+			"assets", "generated", "screenshots", "nested", "detail.png",
+		): "nested screenshot\n",
+		// Names that stay excluded wherever they appear.
+		filepath.Join("assets", "x.sh"):        "#!/bin/sh\n",
+		filepath.Join("assets", "sub", "y.sh"): "#!/bin/sh\n",
+		// An assets directory below the top is not the excluded one.
+		filepath.Join("guide", "assets", "z.sh"):       "#!/bin/sh\necho z\n",
+		filepath.Join("guide", "tool.go"):              "package guide\n",
+		filepath.Join("assets", "tools.sh", "run.txt"): "dropped with its directory\n",
+		"embed.go":  "package docs\n",
+		"README.md": "contributor readme\n",
+	}
+	for rel, content := range nestedFiles {
+		path := filepath.Join(docsDir, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	}
+	// A symlink named *.sh under the top-level assets/ is dropped as a file
+	// is; the old GNU tar exclude dropped any member type.
+	require.NoError(t, os.Symlink("x.sh", filepath.Join(docsDir, "assets", "link.sh")))
 	writeWebsiteTierFixture(t, docsDir)
 
 	fakeZensical := filepath.Join(docsDir, ".venv", "bin", "zensical")
@@ -342,7 +381,8 @@ cp -R "$public_docs"/. site/docs/
 printf '<urlset></urlset>\n' > site/docs/sitemap.xml
 `), 0o755))
 
-	output, err := runBash(t, docsDir, nil, scriptPath, "build")
+	output, err := runBash(t, docsDir,
+		append(envWithout("PYTHON"), "PYTHON="+pythonPath), scriptPath, "build")
 	require.NoError(t, err, string(output))
 	assert.FileExists(t, filepath.Join(docsDir, "site", "docs", "index.md"))
 	assert.FileExists(t, filepath.Join(
@@ -364,6 +404,36 @@ printf '<urlset></urlset>\n' > site/docs/sitemap.xml
 	assert.NoFileExists(t, filepath.Join(
 		docsDir, "site", "docs", "screenshots", "test-results", "trace.zip",
 	))
+
+	siteDocs := filepath.Join(docsDir, "site", "docs")
+	for _, rel := range []string{
+		filepath.Join("guide", "README.md"),
+		filepath.Join("guide", "internal", "page.md"),
+		filepath.Join("guide", "assets", "z.sh"),
+		filepath.Join("assets", "generated", "screenshots", "dashboard.png"),
+		filepath.Join(
+			"assets", "generated", "screenshots", "nested", "detail.png",
+		),
+	} {
+		want, err := os.ReadFile(filepath.Join(docsDir, rel))
+		require.NoError(t, err)
+		got, err := os.ReadFile(filepath.Join(siteDocs, rel))
+		require.NoError(t, err, rel)
+		assert.Equal(t, string(want), string(got), rel)
+	}
+	for _, rel := range []string{
+		"README.md",
+		filepath.Join("assets", "x.sh"),
+		filepath.Join("assets", "sub", "y.sh"),
+		filepath.Join("guide", "tool.go"),
+		"embed.go",
+	} {
+		assert.NoFileExists(t, filepath.Join(siteDocs, rel), rel)
+	}
+	assert.NoDirExists(t, filepath.Join(siteDocs, "assets", "tools.sh"),
+		"a directory named *.sh under assets/ is dropped with its contents")
+	_, err = os.Lstat(filepath.Join(siteDocs, "assets", "link.sh"))
+	assert.ErrorIs(t, err, fs.ErrNotExist, "the assets/ symlink named *.sh is dropped")
 }
 
 func writeWebsiteTierFixture(t *testing.T, docsDir string) {
@@ -371,13 +441,13 @@ func writeWebsiteTierFixture(t *testing.T, docsDir string) {
 
 	websiteDir := filepath.Join(docsDir, "website")
 	files := map[string]string{
-		"index.html":                         "<!doctype html>\n",
+		"index.html":                         "<!doctype html><meta charset=\"utf-8\">\n",
 		"index.md":                           "# Home\n",
-		filepath.Join("guide", "index.html"): "<!doctype html>\n",
+		filepath.Join("guide", "index.html"): "<!doctype html><meta charset=\"utf-8\">\n",
 		"guide.md":                           "# Guide\n",
-		"404.html":                           "<!doctype html>\n",
+		"404.html":                           "<!doctype html><meta charset=\"utf-8\">\n",
 		"favicon.svg":                        "<svg xmlns=\"http://www.w3.org/2000/svg\"/>\n",
-		filepath.Join("styles", "site.css"):  "body {}\n",
+		filepath.Join("styles", "site.css"):  `@font-face { font-family: Inter; src: url("/fonts/Inter-Regular.woff2"); }`,
 		filepath.Join("scripts", "site.js"):  "// site\n",
 		filepath.Join("fonts", "Inter-Regular.woff2"): "font\n",
 	}
@@ -466,6 +536,7 @@ var builtDocsRoutes = func() []string {
 		"chat-import",
 		"quality",
 		"commands",
+		"kata",
 		"session-export",
 		"conversation-export",
 		"reporting-export",
@@ -603,6 +674,12 @@ func writeGeneratedAssets(t *testing.T, dir, content string) {
 	t.Helper()
 	files := []string{
 		"screenshots/about-dialog.png",
+		"screenshots/import-claude-sync.png",
+		"screenshots/session-label-filters.png",
+		"screenshots/tool-rate-evidence.png",
+		"screenshots/tool-effectiveness-action.png",
+		"screenshots/tool-effectiveness-report.png",
+		"screenshots/usage-attribution-selected.png",
 		"screenshots/activity-message-frequency.png",
 		"screenshots/analytics-message-roles.png",
 		"screenshots/cost-chart-bars.png",

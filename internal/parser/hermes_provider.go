@@ -1506,7 +1506,7 @@ func (s hermesSourceSet) Fingerprint(
 	if info.IsDir() {
 		return SourceFingerprint{}, fmt.Errorf("stat %s: source is a directory", path)
 	}
-	hash, err := hashJSONLSourceFile(path)
+	hash, err := hashJSONLSourceFileContext(ctx, path)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -2166,6 +2166,9 @@ func addHermesStateSessionFingerprint(
 		ss.title,
 		len(messages),
 	); err != nil {
+		return err
+	}
+	if err := json.MarshalWrite(h, ss.modelUsage); err != nil {
 		return err
 	}
 	return encodeHermesStateSessionJSONL(h, ss, messages)

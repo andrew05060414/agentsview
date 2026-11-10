@@ -17,6 +17,7 @@ import (
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 
 	"go.kenn.io/agentsview/internal/apiclient"
+	"go.kenn.io/agentsview/internal/archivesource"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
@@ -39,8 +40,8 @@ type SyncConfig struct {
 	Trace      string
 }
 
-func runSync(cfg SyncConfig) {
-	if doSync(cfg) {
+func runSync(ctx context.Context, cfg SyncConfig) {
+	if doSync(ctx, cfg) {
 		os.Exit(1)
 	}
 }
@@ -49,15 +50,15 @@ func runSync(cfg SyncConfig) {
 // remote host failed. It owns the deferred cleanup (profile stop,
 // db close) so runSync can translate the result into a non-zero
 // exit code without skipping that cleanup.
-func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
+func doSync(ctx context.Context, cfg SyncConfig) (hadRemoteFailures bool) {
 	if err := validateArtifactSyncConfig(cfg); err != nil {
 		fatal("%v", err)
 	}
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
-		log.Fatalf("loading config: %v", err)
+		fatal("loading config: %v", err)
 	}
-	archiveOnly, err := archiveModeAfterRecovery(context.Background(), appCfg)
+	archiveOnly, err := archiveModeAfterRecovery(ctx, appCfg)
 	if err != nil {
 		fatal("reading archive mode: %v", err)
 	}
@@ -84,7 +85,7 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 	}
 
 	if err := os.MkdirAll(appCfg.DataDir, 0o755); err != nil {
-		log.Fatalf("creating data dir: %v", err)
+		fatal("creating data dir: %v", err)
 	}
 
 	setupLogFile(appCfg.DataDir)
@@ -104,8 +105,8 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 		// includeLocal is true. A remote-only request still needs a newly
 		// launched daemon to populate its existing local archive at startup.
 		appCfg.SkipInitialSync = includeLocal
-		tr, err := ensureTransport(
-			&appCfg, transportIntentArchiveWrite, 0,
+		tr, err := ensureTransportContext(
+			ctx, &appCfg, transportIntentArchiveWrite, 0,
 		)
 		if err != nil {
 			fatal("detecting daemon: %v", err)
@@ -120,7 +121,7 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 				fmt.Println("Running sync with remotes via daemon...")
 				progress := newRemoteProgressPrinter(os.Stdout, time.Now)
 				failures, err := runDaemonRemoteSync(
-					context.Background(), tr, appCfg.AuthToken,
+					ctx, tr, appCfg.AuthToken,
 					remoteHosts, cfg.Full, includeLocal, progress.Print,
 				)
 				progress.Finish()
@@ -130,7 +131,7 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 				}
 				if cfg.Target != "" {
 					result, err := runDaemonArtifactExchange(
-						context.Background(),
+						ctx,
 						tr,
 						appCfg.AuthToken,
 						cfg.Target,
@@ -156,7 +157,7 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 					onProgress = newSyncProgressPrinter(os.Stdout)
 				}
 				stats, err := runDaemonSync(
-					context.Background(), tr, appCfg.AuthToken, cfg.Full,
+					ctx, tr, appCfg.AuthToken, cfg.Full,
 					onProgress,
 				)
 				if progress != nil {
@@ -173,7 +174,7 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 					)
 					progress = newResyncProgressPrinter(os.Stdout, time.Now)
 					stats, err = runDaemonSync(
-						context.Background(), tr, appCfg.AuthToken, true,
+						ctx, tr, appCfg.AuthToken, true,
 						progress.Print,
 					)
 					progress.Finish()
@@ -184,7 +185,7 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 				printSyncSummary(stats, start)
 				if cfg.Target != "" {
 					result, err := runDaemonArtifactExchange(
-						context.Background(),
+						ctx,
 						tr,
 						appCfg.AuthToken,
 						cfg.Target,
@@ -210,14 +211,14 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 		}
 	}
 
-	database, writeLock, err := openWriteDB(context.Background(), appCfg)
+	database, writeLock, err := openWriteDB(ctx, appCfg)
 	if err != nil {
 		fatal("opening database: %v", err)
 	}
 	defer closeWriteDB(database, writeLock)
 
 	if cfg.Host != "" {
-		if err := runRemoteSyncOnce(appCfg, database, remoteHosts[0], cfg.Full); err != nil {
+		if err := runRemoteSyncOnce(ctx, appCfg, database, remoteHosts[0], cfg.Full); err != nil {
 			reportRemoteFailures([]remoteHostFailure{{Host: remoteHosts[0], Err: err}})
 			return true
 		}
@@ -226,10 +227,10 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 
 	if len(appCfg.RemoteHosts) == 0 {
 		if cfg.Target == "" {
-			runLocalSync(context.Background(), appCfg, database, cfg.Full)
+			runLocalSync(ctx, appCfg, database, cfg.Full)
 		} else {
 			result, err := runLocalAndArtifactFolderSync(
-				context.Background(), appCfg, database, cfg,
+				ctx, appCfg, database, cfg,
 			)
 			if err != nil {
 				fatal("local sync before artifact exchange: %v", err)
@@ -240,7 +241,7 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 	}
 	progress := newRemoteProgressPrinter(os.Stdout, time.Now)
 	_, failures, blocked := runConfiguredLocalAndRemotesCLI(
-		context.Background(), appCfg, database, appCfg.RemoteHosts,
+		ctx, appCfg, database, appCfg.RemoteHosts,
 		cfg.Full, progress.Print,
 	)
 	progress.Finish()
@@ -258,7 +259,7 @@ func doSync(cfg SyncConfig) (hadRemoteFailures bool) {
 	}
 	if cfg.Target != "" {
 		result, err := runArtifactFolderSync(
-			context.Background(), appCfg, database, cfg,
+			ctx, appCfg, database, cfg,
 		)
 		if err != nil {
 			fatal("%v", err)
@@ -415,11 +416,11 @@ func syncLocalAndRemotes(
 // error instead of exiting, so it backs both the single-host
 // --host path and the configured-hosts fan-out.
 func runRemoteSyncOnce(
-	appCfg config.Config, database *db.DB,
+	ctx context.Context, appCfg config.Config, database *db.DB,
 	rh config.RemoteHost, full bool,
 ) error {
 	_, err := runRemoteSyncTransport(
-		context.Background(), appCfg, database, rh, full,
+		ctx, appCfg, database, rh, full,
 	)
 	return err
 }
@@ -595,6 +596,7 @@ func reportRemoteFailures(failures []remoteHostFailure) {
 		fmt.Fprintf(os.Stderr, "  %s: %s\n",
 			f.Host.Host, summary)
 	}
+	fmt.Fprintln(os.Stderr, "hint: check the failed hosts in [[remote_hosts]] in config.toml; run `agentsview sync --help` before retrying")
 }
 
 // runConfiguredLocalAndRemotes coordinates a direct local sync with every
@@ -789,14 +791,20 @@ func runLocalSync(
 	return didResync
 }
 
-// runLocalSyncAuthoritative runs a local sync and returns an error unless its
-// provider discovery completed authoritatively. Push-watch callers use it so
-// a mirror update cannot acknowledge watcher reconciliation that never
-// established a complete view of the local sources.
+// runLocalSyncAuthoritative requires complete local ingestion before a direct
+// push. Pending attachments can retry without blocking a current archive's copy.
 func runLocalSyncAuthoritative(
 	ctx context.Context, appCfg config.Config, database *db.DB, full bool,
 ) (bool, error) {
 	didResync, stats, err := runLocalSyncResult(ctx, appCfg, database, full)
+	if _, pending := errors.AsType[archivesource.DrainError](err); pending && ctx.Err() == nil && !database.NeedsResync() && stats.Deferred == 0 {
+		// The coordinator drains attachments only after local ingestion
+		// completes. Its merged statistics may include attachment failures.
+		// An installed rebuild can still hold deferred sources, which must
+		// not reach an authoritative push.
+		log.Printf("attachment ingestion warning: %v", err)
+		return didResync, nil
+	}
 	if err != nil {
 		return didResync, err
 	}
@@ -883,6 +891,11 @@ func coordinateLocalSync(
 
 	engine := sync.NewEngine(ctx, database, localSyncEngineConfig(appCfg))
 	defer engine.Close()
+	attached, err := archivesource.NewManager(ctx, appCfg, database, engine, nil)
+	if err != nil {
+		return didResync, stats, err
+	}
+	defer attached.Close()
 
 	if fallbackOnAbort {
 		stats, err = engine.SyncThenRun(
@@ -904,15 +917,20 @@ func coordinateLocalSync(
 		}
 		return didResync, stats, errUnifiedRebuildAborted
 	}
-	if !stats.ProcessingComplete() {
+	if !stats.ProcessingCompleteOrRetrying() {
 		return didResync, stats, errors.New("local sync processing incomplete")
 	}
-	return didResync, stats, nil
+	archiveStats, err := attached.Drain(ctx, progress)
+	stats.Merge(archiveStats)
+	return didResync, stats, err
 }
 
 func localSyncEngineConfig(appCfg config.Config) sync.EngineConfig {
 	return sync.EngineConfig{
-		AgentDirs:               appCfg.AgentDirs,
+		AgentDirs: appCfg.AgentDirs,
+		RebuildSources: func(ctx context.Context) (sync.RebuildOptions, error) {
+			return archivesource.RebuildContributors(ctx, appCfg)
+		},
 		SourceMachines:          appCfg.SourceMachines,
 		ProviderMetadata:        appCfg.ProviderMetadata,
 		DisabledAgents:          appCfg.DisabledAgents,

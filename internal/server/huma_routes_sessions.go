@@ -37,6 +37,8 @@ func (s *Server) registerSessionRoutes() {
 	s.get(group, "/session-ids/resolve", "Resolve session IDs", s.humaResolveSessionIDs)
 	s.get(group, "/sessions/{id}", "Get session", s.humaGetSession)
 	s.get(group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
+	s.get(group, "/sessions/{id}/commits", "List session commits", s.humaSessionCommits)
+	s.get(group, "/sessions/{id}/file-references", "Find session images in Docbank", s.humaFileReferences)
 	s.get(group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
 	s.get(group, "/sessions/{id}/tool-sequences", "Get session tool sequences", s.humaToolSequences)
 	s.get(group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
@@ -76,7 +78,7 @@ type markdownDepth string
 type sessionFilterInput struct {
 	Project          string            `query:"project" doc:"Filter by project"`
 	ExcludeProject   string            `query:"exclude_project" doc:"Exclude a project"`
-	Machine          string            `query:"machine" doc:"Filter by machine"`
+	Machine          string            `query:"machine" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400."`
 	GitBranch        string            `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	Agent            string            `query:"agent" doc:"Filter by agent"`
 	Date             string            `query:"date" format:"date" doc:"Filter sessions active on this YYYY-MM-DD date"`
@@ -111,6 +113,7 @@ type SessionListFilters = sessionFilterInput
 
 // Batch selection belongs only to the session list, not sidebar discovery.
 type listSessionsInput struct {
+	ExclusionCounts optionalBoolParam `query:"exclusion_counts" doc:"Include default-exclusion counts; true also samples hidden children, false counts only one-shot and automated sessions. First page only."`
 	SessionListFilters
 	IDs    string `query:"ids" doc:"Comma-separated list of 1 to 100 session IDs. Quote IDs containing commas or line breaks with RFC 4180 CSV quoting; IDs containing CRLF are rejected. Raw IDs include host copies; tilde-qualified IDs match exactly. Explicit filters intersect the selection; discovery exclusions do not apply."`
 	IDsSet bool
@@ -295,6 +298,7 @@ func (s *Server) humaListSessions(
 	if err != nil {
 		return nil, err
 	}
+	filter.ExclusionCounts = optionalBoolValue(in.ExclusionCounts)
 	if in.IDsSet {
 		filter.IDs, err = parseSessionIDs(in.IDs)
 		if err != nil {
@@ -668,6 +672,10 @@ type sessionUsageResponse struct {
 	RollupCostSource    export.CostSource               `json:"rollup_cost_source,omitempty"`
 	HasRollupCost       *bool                           `json:"has_rollup_cost,omitempty"`
 	RollupSubagentCount *int                            `json:"rollup_subagent_count,omitempty"`
+	// PlanUsage carries codex-cloud plan figures. A session with only plan
+	// usage keeps has_token_data and has_cost false.
+	PlanUsage       *db.PlanUsageView       `json:"plan_usage,omitempty"`
+	CaptureCoverage *db.CaptureCoverageView `json:"capture_coverage,omitempty"`
 }
 
 type sessionUsageInput struct {
@@ -695,8 +703,9 @@ type sessionUsageBreakdownResponse struct {
 }
 
 type sessionUsageErrorBody struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string   `json:"code"`
+	Message    string   `json:"message"`
+	Candidates []string `json:"candidates,omitempty"`
 }
 
 type sessionUsageError struct {
@@ -754,6 +763,8 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 		SubagentCount:     usage.SubagentCount,
 		Breakdown:         breakdown,
 		ServerRunning:     true,
+		PlanUsage:         usage.PlanUsage.PlanUsageView(),
+		CaptureCoverage:   usage.PlanUsage.CaptureCoverageView(),
 	}
 }
 
@@ -761,13 +772,60 @@ func (s *Server) humaSessionUsage(
 	ctx context.Context,
 	in *sessionUsageInput,
 ) (*jsonOutput[sessionUsageResponse], error) {
+	response, err := s.exactSessionUsage(ctx, in)
+	usageErr, ok := errors.AsType[*sessionUsageError](err)
+	if !ok || (usageErr.Body.Code != "session_not_found" && usageErr.Body.Code != "ambiguous_session_id") {
+		return response, err
+	}
+	if strings.Contains(in.ID, "~") {
+		return nil, err
+	}
+	if agent, ok := parser.AgentByPrefix(in.ID); ok && agent.IDPrefix != "" {
+		return nil, err
+	}
+	candidates, resolveErr := s.sessions.FindSessionIDsByRawSuffix(ctx, in.ID, 5)
+	if resolveErr != nil {
+		return nil, sessionUsageQueryError(resolveErr)
+	}
+	switch len(candidates) {
+	case 0:
+		return nil, &sessionUsageError{Status: http.StatusNotFound, Body: sessionUsageErrorBody{
+			Code: "session_not_found", Message: "session not found",
+		}}
+	case 1:
+		resolved := *in
+		resolved.ID = candidates[0]
+		return s.exactSessionUsage(ctx, &resolved)
+	default:
+		return nil, &sessionUsageError{Status: http.StatusConflict, Body: sessionUsageErrorBody{
+			Code: "ambiguous_session_id", Message: "multiple sessions match; retry with a canonical candidate ID", Candidates: candidates,
+		}}
+	}
+}
+
+func sessionUsageQueryError(err error) error {
+	if handled := handleHumaContextError(err); handled != nil {
+		return handled
+	}
+	if identity, ok := errors.AsType[*db.SessionIdentityError](err); ok && identity.State == "ambiguous" {
+		return &sessionUsageError{Status: http.StatusConflict, Body: sessionUsageErrorBody{
+			Code: "ambiguous_session_id", Message: "multiple sessions match; retry with a canonical candidate ID",
+			Candidates: identity.Variants[:min(len(identity.Variants), 5)],
+		}}
+	}
+	return &sessionUsageError{Status: http.StatusInternalServerError, Body: sessionUsageErrorBody{
+		Code: "usage_query_failed", Message: "failed to query session usage",
+	}}
+}
+
+func (s *Server) exactSessionUsage(
+	ctx context.Context,
+	in *sessionUsageInput,
+) (*jsonOutput[sessionUsageResponse], error) {
 	if in.Rollup {
 		rollup, err := service.GetSessionUsageRollup(ctx, s.db, in.ID, in.Breakdown)
 		if err != nil {
-			if handled := handleHumaContextError(err); handled != nil {
-				return nil, handled
-			}
-			return nil, &sessionUsageError{Status: http.StatusInternalServerError, Body: sessionUsageErrorBody{Code: "usage_query_failed", Message: "failed to query session usage"}}
+			return nil, sessionUsageQueryError(err)
 		}
 		if rollup == nil {
 			return nil, &sessionUsageError{Status: http.StatusNotFound, Body: sessionUsageErrorBody{Code: "session_not_found", Message: "session not found"}}
@@ -794,16 +852,7 @@ func (s *Server) humaSessionUsage(
 		usage, err = s.db.GetSessionUsage(ctx, in.ID, in.Breakdown)
 	}
 	if err != nil {
-		if handled := handleHumaContextError(err); handled != nil {
-			return nil, handled
-		}
-		return nil, &sessionUsageError{
-			Status: http.StatusInternalServerError,
-			Body: sessionUsageErrorBody{
-				Code:    "usage_query_failed",
-				Message: "failed to query session usage",
-			},
-		}
+		return nil, sessionUsageQueryError(err)
 	}
 	if usage == nil {
 		return nil, &sessionUsageError{
@@ -1085,6 +1134,9 @@ func (s *Server) humaRestoreSession(ctx context.Context,
 	}
 	if n == 0 {
 		return nil, apiError(http.StatusNotFound, "session not found or not in trash")
+	}
+	if s.broadcaster != nil {
+		s.broadcaster.Emit("sessions")
 	}
 	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
@@ -1372,7 +1424,7 @@ func (s *Server) humaUploadSession(
 			"claude provider does not support uploads")
 	}
 	results, err := uploader.ParseUploadedTranscript(
-		upload.tempPath, project, machine,
+		ctx, upload.tempPath, project, machine,
 	)
 	if err != nil {
 		return nil, apiError(http.StatusBadRequest,
@@ -1431,6 +1483,9 @@ func (s *Server) humaUploadSession(
 			"failed to save session to database")
 	}
 	cleanupCommittedUpload(uploadCommit)
+	if s.broadcaster != nil {
+		s.broadcaster.Emit("sessions")
+	}
 	main := results[0]
 	return &jsonOutput[uploadSessionResponse]{
 		Body: uploadSessionResponse{
@@ -1807,4 +1862,25 @@ func (s *Server) humaResumeWithOpener(ctx context.Context,
 			Cwd:      launchDir,
 		},
 	}, nil
+}
+
+func (s *Server) humaFileReferences(ctx context.Context, in *idPathInput) (*jsonOutput[service.FileReferencesResult], error) {
+	result, err := service.FileReferences(ctx, s.sessions, in.ID)
+	if err != nil {
+		return nil, fileReferencesError(err)
+	}
+	return &jsonOutput[service.FileReferencesResult]{Body: result}, nil
+}
+
+func fileReferencesError(err error) error {
+	switch {
+	case errors.Is(err, service.ErrSessionNotFound):
+		return apiError(http.StatusNotFound, "session not found")
+	case errors.Is(err, service.ErrRevisionBoundReadUnavailable):
+		return apiError(http.StatusNotImplemented, err.Error())
+	case errors.Is(err, service.ErrSourceChanged):
+		return apiErrorWithCode(http.StatusConflict, "source_changed", err.Error())
+	default:
+		return serverError(err)
+	}
 }

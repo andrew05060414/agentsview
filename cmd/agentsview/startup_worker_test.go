@@ -152,7 +152,7 @@ func TestStartupWorkerPathDefersMaintenanceUntilReconciled(t *testing.T) {
 	select {
 	case <-maintenanceRan:
 		require.FailNow(t, "startup maintenance must wait for the deferred gap reconciliation")
-	case <-time.After(150 * time.Millisecond): //nolint:kennlint // absence check; the deferred gap reconciliation keeps maintenance waiting
+	case <-time.After(150 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the deferred gap reconciliation keeps maintenance waiting
 	}
 
 	gapErr := engine.ReconcileWatchRoots(t.Context(), reconcileRootPaths(cfg), true)
@@ -447,7 +447,7 @@ func TestStartupWorkerRanFailedSurfacedWithoutResync(t *testing.T) {
 func TestStartupWorkerLostResultRetriesParentLinks(t *testing.T) {
 	cfg := testConfigWithClaudeFixture(t)
 	var initial bytes.Buffer
-	require.NoError(t, runSyncWorker(cfg, syncWorkerRequest{Mode: "startup"}, &initial))
+	require.NoError(t, runSyncWorkerContext(t.Context(), cfg, syncWorkerRequest{Mode: "startup"}, &initial))
 	seeded := dbtest.OpenTestDBAt(t, cfg.DBPath)
 	for _, id := range []string{"startup-parent", "startup-child"} {
 		require.NoError(t, seeded.UpsertSession(t.Context(), db.Session{
@@ -573,6 +573,7 @@ func TestSyncWorkerRealSpawnEmitsTerminalResult(t *testing.T) {
 		"AGENTSVIEW_DATA_DIR=" + cfg.DataDir,
 		"CLAUDE_PROJECTS_DIR=" + claudeDir,
 	}
+	cmd.Env = append(cmd.Env, testRuntimeRootEnv()...)
 	// The Go runtime and SQLite need core system variables on Windows;
 	// passing them through keeps the env minimal without breaking the child.
 	for _, key := range []string{"SYSTEMROOT", "TEMP", "TMP"} {

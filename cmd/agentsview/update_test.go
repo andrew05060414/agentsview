@@ -5,13 +5,17 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/update"
 )
 
@@ -31,6 +35,7 @@ func TestPerformUpdateWithDaemonLifecycleRestartsStoppedDaemon(t *testing.T) {
 			assert.Equal(t, cfg.DataDir, got.DataDir)
 			return updateDaemonStopResult{
 				Stopped:          true,
+				Persistent:       true,
 				Host:             "127.0.0.1",
 				Port:             18080,
 				RequireAuth:      true,
@@ -48,12 +53,55 @@ func TestPerformUpdateWithDaemonLifecycleRestartsStoppedDaemon(t *testing.T) {
 			assert.Equal(t, 18080, stop.Port)
 			assert.True(t, stop.RequireAuth)
 			assert.True(t, stop.RequireAuthKnown)
+			assert.True(t, stop.Persistent)
 			return nil
 		},
 	)
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"load", "stop", "perform", "restart"}, calls)
+}
+
+func TestScopedConfigUpdateUsesDeploymentAuthForStartupFallback(t *testing.T) {
+	seedScopedConfigArchive(t)
+	dir := os.Getenv("AGENTSVIEW_DATA_DIR")
+	tokenFile := filepath.Join(dir, "deployment-token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("update-secret\n"), 0o600))
+	t.Setenv("AGENTSVIEW_MODE", "serve")
+	t.Setenv("AGENTSVIEW_AUTH_TOKEN_FILE", tokenFile)
+	t.Setenv("AGENTSVIEW_HOST", "")
+	t.Setenv("AGENTSVIEW_EMBEDDINGS_ENDPOINT", "http://127.0.0.1:1/v1")
+	writeTestConfig(t, dir, "[vector]\nenabled=false\n[insights]\nmodel='incomplete'\n")
+	host, port := testAuthenticatedPingServer(t, "update-secret")
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10))
+	cfg, err := loadDaemonConfigForUpdate()
+	require.NoError(t, err)
+
+	// Exercise real discovery without signaling the test process or replacing
+	// a binary. A daemon without a written runtime record needs its token.
+	orig := stopDaemonRuntimeForUpgrade
+	calls := 0
+	stopDaemonRuntimeForUpgrade = func(_ context.Context, cfg config.Config, rt *DaemonRuntime) error {
+		calls++
+		assert.Equal(t, port, rt.Port)
+		assert.True(t, daemonRecordPingConfirmed(rt.Record, cfg.AuthToken))
+		return nil
+	}
+	t.Cleanup(func() { stopDaemonRuntimeForUpgrade = orig })
+	result, err := stopWritableDaemonsForUpdate(t.Context(), cfg)
+	require.NoError(t, err)
+	assert.True(t, result.Stopped)
+	assert.Equal(t, 1, calls)
+}
+
+func TestScopedConfigUpdateRejectsInvalidDeploymentAuth(t *testing.T) {
+	seedScopedConfigArchive(t)
+	t.Setenv("AGENTSVIEW_MODE", "serve")
+	t.Setenv("AGENTSVIEW_AUTH_TOKEN_FILE", filepath.Join(os.Getenv("HOME"), "missing-token"))
+	_, err := loadDaemonConfigForUpdate()
+	require.ErrorContains(t, err, "AGENTSVIEW_AUTH_TOKEN_FILE")
 }
 
 func TestPerformUpdateWithDaemonLifecycleRestartsAfterInstallFailure(t *testing.T) {
@@ -187,7 +235,7 @@ func TestUpdateRestartPreservesPortChoice(t *testing.T) {
 			first, _, err := prepareRunServeRuntimeConfig(cmd.Context(), cfg, 0, nil)
 			require.NoError(t, err)
 			require.Equal(t, "http://viewer.example.test:8080", first.PublicURL)
-			_, err = WriteDaemonRuntimeWithAuthAndNoSync(
+			_, err = WriteDaemonRuntimeWithAuthAndNoSync(nil,
 				dir, first.Host, first.Port, "test", first.PublicURL, false, false, false, new(port),
 			)
 			require.NoError(t, err)
@@ -264,4 +312,160 @@ func TestRestartDaemonAfterUpdateArgsKeepsLegacyNonLoopbackWithAuthConfig(t *tes
 		"serve", "--background", "--host", "0.0.0.0", "--restart-port", "18080",
 		"--require-auth",
 	}, args)
+}
+
+func stubDistribution(t *testing.T, value string) {
+	t.Helper()
+	orig := distribution
+	distribution = value
+	t.Cleanup(func() { distribution = orig })
+}
+
+func TestUpdateRefusesInstallForPackageManagedBuild(t *testing.T) {
+	tests := []struct {
+		name         string
+		distribution string
+		wantErr      string
+	}{
+		{
+			name:         "homebrew",
+			distribution: "homebrew",
+			wantErr:      "Homebrew manages this installation; run `brew upgrade agentsview` instead",
+		},
+		{
+			name:         "other package manager",
+			distribution: "nix",
+			wantErr:      "nix manages this installation; upgrade agentsview through it instead",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubDistribution(t, tt.distribution)
+			dataDir := t.TempDir()
+			t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
+
+			_, err := executeCommand(newRootCommand(), "update", "--yes")
+
+			require.Error(t, err)
+			assert.Equal(t, tt.wantErr, err.Error())
+			// The refusal happens before any update check runs.
+			assert.NoFileExists(t, filepath.Join(dataDir, "update_check.json"))
+		})
+	}
+}
+
+func TestUpdateInstallRunsForSelfUpdatingBuilds(t *testing.T) {
+	tests := []struct {
+		name         string
+		distribution string
+	}{
+		{name: "source build", distribution: ""},
+		{name: "official direct download", distribution: "kenn"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubDistribution(t, tt.distribution)
+			origVersion := version
+			version = "1.0.0"
+			t.Cleanup(func() { version = origVersion })
+			dataDir := t.TempDir()
+			t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
+			// A fresh cached check for the running version lets the install
+			// path finish without the network once it is past the refusal.
+			cache := `{"checked_at":"` + time.Now().UTC().Format(time.RFC3339) +
+				`","version":"v1.0.0"}`
+			require.NoError(t, os.WriteFile(
+				filepath.Join(dataDir, "update_check.json"), []byte(cache), 0o600,
+			))
+
+			out, err := executeCommand(newRootCommand(), "update", "--yes")
+
+			require.NoError(t, err)
+			assert.Contains(t, out, "agentsview 1.0.0 is up to date.")
+			assert.NotContains(t, out, "manages this installation")
+		})
+	}
+}
+
+func TestUpdateCheckGivesPackageManagerGuidance(t *testing.T) {
+	tests := []struct {
+		name         string
+		distribution string
+		wantGuidance bool
+	}{
+		{name: "homebrew", distribution: "homebrew", wantGuidance: true},
+		{name: "source build", distribution: "", wantGuidance: false},
+		{name: "official direct download", distribution: "kenn", wantGuidance: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubDistribution(t, tt.distribution)
+			origVersion := version
+			version = "dev"
+			t.Cleanup(func() { version = origVersion })
+			dataDir := t.TempDir()
+			t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
+			// A fresh cached check lets --check answer without the network.
+			cache := `{"checked_at":"` + time.Now().UTC().Format(time.RFC3339) +
+				`","version":"v9.9.9"}`
+			require.NoError(t, os.WriteFile(
+				filepath.Join(dataDir, "update_check.json"), []byte(cache), 0o600,
+			))
+
+			out, err := executeCommand(newRootCommand(), "update", "--check")
+
+			require.NoError(t, err)
+			assert.Contains(t, out, "Latest release: v9.9.9")
+			if tt.wantGuidance {
+				assert.Contains(t, out, "run `brew upgrade agentsview` instead")
+			} else {
+				assert.NotContains(t, out, "manages this installation")
+			}
+		})
+	}
+}
+
+func TestRestartDaemonAfterUpdatePreservesLifetime(t *testing.T) {
+	for _, persistent := range []bool{false, true} {
+		t.Run(strconv.FormatBool(persistent), func(t *testing.T) {
+			dir := testDataDir(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			t.Setenv("AGENTSVIEW_TEST_REAL_CLI", "1")
+			t.Setenv("DO_NOT_TRACK", "1")
+			t.Setenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT", "0s")
+			var disabled []string
+			for _, def := range parser.Registry {
+				if def.FileBased || def.EnvVar != "" {
+					disabled = append(disabled, strconv.Quote(string(def.Type)))
+				}
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "config.toml"), []byte("disabled_agents = ["+strings.Join(disabled, ",")+"]\n"+"host = \"127.0.0.1\"\nport = 0\nno_browser = true\nno_sync = true\ndisable_update_check = true\n[vector]\nenabled = false\n"), 0o600))
+			cfg := config.Config{DataDir: dir}
+			t.Cleanup(func() {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 10*time.Second)
+				defer cancel()
+				_, err := stopWritableDaemonsForUpdate(cleanupCtx, cfg)
+				assert.NoError(t, err)
+			})
+			args := []string{"serve", "--background", "--no-sync"}
+			out, err := exec.CommandContext(ctx, os.Args[0], args...).CombinedOutput()
+			require.NoError(t, err, string(out))
+			if persistent {
+				out, err = exec.CommandContext(ctx, os.Args[0], "daemon", "start").CombinedOutput()
+				require.NoError(t, err, string(out))
+			}
+			rt := FindWritableDaemonRuntime(dir)
+			require.NotNil(t, rt)
+			stopped, err := stopWritableDaemonsForUpdate(ctx, cfg)
+			require.NoError(t, err)
+			t.Setenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT", "2s")
+			require.NoError(t, restartDaemonAfterUpdate(ctx, cfg, stopped))
+			rt = FindWritableDaemonRuntime(dir)
+			require.NotNil(t, rt)
+			assert.Equal(t, persistent, rt.Persistent)
+			time.Sleep(5 * time.Second) //nolint:kennlint // sleeptest: the child process uses the real clock for its two-second idle exit.
+			assert.Equal(t, persistent, FindWritableDaemonRuntime(dir) != nil)
+		})
+	}
 }

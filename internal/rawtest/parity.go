@@ -74,6 +74,7 @@ func EqualStored(t *testing.T, ctx context.Context, want *db.DB, got db.Store, i
 func normalizeSession(s db.Session) db.Session {
 	// Machine and file coordinates identify the custody transport, not content.
 	s.Machine = ""
+	s.SourceMachines = nil
 	s.FilePath = nil
 	s.FileSize = nil
 	s.FileMtime = nil
@@ -111,6 +112,8 @@ func normalizeMessages(t *testing.T, messages []db.Message) []db.Message {
 	for i := range messages {
 		m := &messages[i]
 		m.ID = 0
+		// DialogueText is a SQLite-only search projection, not captured source content.
+		m.DialogueText = nil
 		// PostgreSQL JSONB changes key order/whitespace, never the usage values.
 		if len(m.TokenUsage) > 0 {
 			var v any

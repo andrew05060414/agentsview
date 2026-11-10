@@ -2,6 +2,7 @@ package signals
 
 import (
 	"encoding/json/v2"
+	"fmt"
 	"regexp"
 	"slices"
 	"strings"
@@ -600,7 +601,7 @@ func IsContextToolCall(c ToolCallRow) bool {
 	case "Read", "Grep", "Glob":
 		return true
 	case "Bash":
-		return isContextCommand(commandText(c.InputJSON))
+		return isContextCommand(CommandText(c.InputJSON))
 	}
 	return false
 }
@@ -754,7 +755,12 @@ func commandClass(c ToolCallRow) string {
 	if c.Category != "Bash" {
 		return c.Category + ":" + c.ToolName
 	}
-	fields := strings.Fields(commandText(c.InputJSON))
+	if c.InputJSON == "" {
+		// Without the command, shell calls cannot be shown to run the
+		// same program.
+		return unretainedInputKey(c)
+	}
+	fields := strings.Fields(CommandText(c.InputJSON))
 	if len(fields) == 0 {
 		return c.Category + ":" + c.ToolName
 	}
@@ -762,10 +768,21 @@ func commandClass(c ToolCallRow) string {
 }
 
 func toolSignature(c ToolCallRow) string {
+	if c.InputJSON == "" {
+		return unretainedInputKey(c)
+	}
 	return c.ToolName + "\x00" + c.Category + "\x00" + c.InputJSON
 }
 
-func commandText(inputJSON string) string {
+// unretainedInputKey stands in for a call whose input the archive did not
+// keep. The key is unique to the call's position, so it matches no other
+// call.
+func unretainedInputKey(c ToolCallRow) string {
+	return fmt.Sprintf("\x01%d:%d", c.MessageOrdinal, c.CallIndex)
+}
+
+// CommandText extracts a shell script from stored tool input.
+func CommandText(inputJSON string) string {
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(inputJSON), &payload); err != nil {
 		return inputJSON

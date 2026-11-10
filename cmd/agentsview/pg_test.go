@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,17 +23,6 @@ func loadPGServeConfigForTest(t *testing.T, args ...string) (config.Config, stri
 		return config.Config{}, "", err
 	}
 	return loadReplicaServeConfig(cmd)
-}
-
-func restoreTestLogger(t *testing.T) {
-	t.Helper()
-	oldWriter := log.Writer()
-	t.Cleanup(func() {
-		if file, ok := log.Writer().(*os.File); ok && file != os.Stderr && file != os.Stdout {
-			_ = file.Close()
-		}
-		log.SetOutput(oldWriter)
-	})
 }
 
 func clearConfiguredAgentEnvVars(t *testing.T) {
@@ -146,7 +134,7 @@ func TestRunPGPush_IgnoresBrokenUnselectedTarget(t *testing.T) {
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
@@ -161,7 +149,7 @@ url = "postgres://archive"
 
 	var err error
 	out := captureStdout(t, func() {
-		err = runReplicaPush(pgReplica{}, ReplicaPushConfig{}, "archive")
+		err = runReplicaPush(t.Context(), pgReplica{}, ReplicaPushConfig{}, "archive")
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pg connection to archive permits plaintext")
@@ -175,7 +163,7 @@ func TestRunPGStatus_IgnoresBrokenUnselectedTarget(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
@@ -201,7 +189,7 @@ func TestRunPGStatus_IgnoresUnreadableLocalWatermark(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
 
@@ -228,7 +216,7 @@ func TestRunPGPushAll_AggregatesTargetFailures(t *testing.T) {
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "work"
@@ -241,7 +229,7 @@ machine_name = "workbox"
 url = "postgres://archive"
 `)
 
-	err := runReplicaPush(pgReplica{}, ReplicaPushConfig{AllTargets: true}, "")
+	err := runReplicaPush(t.Context(), pgReplica{}, ReplicaPushConfig{AllTargets: true}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "2 pg target(s) failed")
 	assert.Contains(t, err.Error(), "work (default): expanding url: environment variable(s) not set: BROKEN_WORK_TARGET")
@@ -254,7 +242,7 @@ func TestRunPGStatusAll_AggregatesTargetFailures(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "work"
@@ -281,7 +269,7 @@ func TestPGPushCommandPrefixesErrors(t *testing.T) {
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
 
@@ -305,7 +293,7 @@ func TestPGStatusCommandPrefixesErrors(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
 
@@ -376,7 +364,7 @@ func TestRunPGServeHelperProcess(t *testing.T) {
 	require.NoError(t, cmd.Flags().Parse(args[sep+1:]))
 	cfg, basePath, err := loadReplicaServeConfig(cmd)
 	require.NoError(t, err)
-	runReplicaServe(pgReplica{}, cfg, basePath)
+	runReplicaServe(t.Context(), pgReplica{}, cfg, basePath, nil)
 }
 
 func TestWritePGPushSummaryIncludesSkippedConflicts(t *testing.T) {

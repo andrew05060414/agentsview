@@ -233,7 +233,7 @@ func TestExtractTextContent(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := gjson.Parse(tt.json)
-			text, _, hasThinking, hasToolUse, tcs, _ := ExtractTextContent(t.Context(), result)
+			text, _, _, hasThinking, hasToolUse, tcs, _ := ExtractTextContent(t.Context(), result)
 			assert.Equal(t, tt.wantText, text, "text")
 			assert.Equal(t, tt.wantThink, hasThinking, "hasThinking")
 			assert.Equal(t, tt.wantToolUse, hasToolUse, "hasToolUse")
@@ -247,7 +247,7 @@ func TestExtractTextContent_AmpSkillNameExtraction(t *testing.T) {
 		`[{"type":"tool_use","id":"toolu_amp_skill","name":"skill","input":{"name":"walkthrough"}}]`,
 	)
 
-	text, _, hasThinking, hasToolUse, toolCalls, toolResults := ExtractTextContent(t.Context(), result)
+	text, _, _, hasThinking, hasToolUse, toolCalls, toolResults := ExtractTextContent(t.Context(), result)
 
 	require.Equal(t, "[Skill: walkthrough]", text, "text")
 	require.False(t, hasThinking, "hasThinking")
@@ -296,7 +296,7 @@ func TestExtractToolResults(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := gjson.Parse(tt.json)
-			_, _, _, _, _, trs := ExtractTextContent(t.Context(), result)
+			_, _, _, _, _, _, trs := ExtractTextContent(t.Context(), result)
 			require.Len(t, trs, len(tt.wantResults), "tool_results count")
 			for i := range tt.wantResults {
 				assert.Equalf(t, tt.wantResults[i].ToolUseID, trs[i].ToolUseID,
@@ -347,7 +347,7 @@ func TestExtractTextContent_IflowToolResult(t *testing.T) {
 		"tool_use_id":"tu_123",
 		"content":{"responseParts":{"functionResponse":{"response":{"output":"result text"}}}}
 	}]`
-	_, _, _, _, _, trs := ExtractTextContent(t.Context(), gjson.Parse(content))
+	_, _, _, _, _, _, trs := ExtractTextContent(t.Context(), gjson.Parse(content))
 	require.Len(t, trs, 1, "expected 1 tool result")
 	tr := trs[0]
 	assert.Equal(t, "tu_123", tr.ToolUseID, "ToolUseID")
@@ -362,7 +362,7 @@ func TestExtractTextContent_IflowToolResult(t *testing.T) {
 		"tool_use_id":"tu_456",
 		"content":{"other":"data"}
 	}]`
-	_, _, _, _, _, trs2 := ExtractTextContent(t.Context(), gjson.Parse(noOutput))
+	_, _, _, _, _, _, trs2 := ExtractTextContent(t.Context(), gjson.Parse(noOutput))
 	require.Len(t, trs2, 1, "expected 1 tool result")
 	assert.Zero(t, trs2[0].ContentLength, "ContentLength")
 	assert.Empty(t, DecodeContent(trs2[0].ContentRaw), "DecodeContent")
@@ -1005,6 +1005,24 @@ func TestExtractCommandText(t *testing.T) {
 			"<command-message>insights</command-message>",
 			"/insights",
 			true,
+		},
+		{
+			"args containing angle brackets",
+			"<command-message>explain</command-message>\n<command-name>/explain</command-name>\n<command-args>The cert covers app.<zone> and uses Map<string, number></command-args>",
+			"/explain The cert covers app.<zone> and uses Map<string, number>",
+			true,
+		},
+		{
+			"multiline args containing a closing tag lookalike",
+			"<command-name>/review</command-name>\n<command-message>review</command-message>\n<command-args>check </div> handling\nin the template</command-args>",
+			"/review check </div> handling\nin the template",
+			true,
+		},
+		{
+			"args with angle brackets followed by prose not rewritten",
+			"<command-name>/explain</command-name>\n<command-args>a <b> c</command-args> and then some prose",
+			"",
+			false,
 		},
 		{
 			"BOM-prefixed command envelope",

@@ -123,6 +123,27 @@ func TestSearchContentHybridVectorOnlyAndFTSOnlyBothAppear(t *testing.T) {
 	assert.ElementsMatch(t, []string{"fts-only", "vec-only"}, ids)
 }
 
+func TestSearchContentHybridFTSSnippetUsesDialogue(t *testing.T) {
+	d := testDB(t)
+	if !d.HasFTS(t.Context()) {
+		t.Skip("fts5 not available")
+	}
+	seedSearchSession(t, d, "fts-only", "proj", nil)
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "fts-only", []Message{{
+		SessionID: "fts-only", Ordinal: 0, Role: "assistant",
+		Content:      "[Thinking] reasoningneedle [/Thinking] answerneedle [Read: secretpath]",
+		DialogueText: new("answerneedle"),
+	}}))
+	d.SetVectorSearcher(&fakeVectorSearcher{})
+
+	page, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "answerneedle", Mode: "hybrid", Limit: 50,
+	})
+	require.NoError(t, err)
+	require.Len(t, page.Matches, 1)
+	assert.Equal(t, "answerneedle", page.Matches[0].Snippet)
+}
+
 // TestSearchContentHybridScoresStrictlyDescending pins that fused RRF scores
 // order the page strictly descending, with no inversions or unexpected ties
 // across a mix of a double-leg hit and single-leg (vector-only) hits.
@@ -688,4 +709,30 @@ func TestSearchContentHybridVectorOnlyMatchCarriesUnitRange(t *testing.T) {
 	assert.Equal(t, 2, m.Ordinal, "vector leg keeps its chunk anchor")
 	assert.Equal(t, [2]int{1, 2}, m.OrdinalRange)
 	assert.False(t, m.Subordinate)
+}
+
+func TestSearchContentHybridKeywordOnlyIgnoresMirrorScope(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "run", "project", func(s *Session) {
+		s.MessageCount, s.UserMessageCount = 4, 1
+	})
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "run", []Message{
+		{SessionID: "run", Ordinal: 0, Role: "user", Content: "question"},
+		{SessionID: "run", Ordinal: 1, Role: "assistant", Content: "needle haystack first"},
+		{SessionID: "run", Ordinal: 2, Role: "assistant", Content: "needle haystack second"},
+		{SessionID: "run", Ordinal: 3, Role: "assistant", Content: "needle haystack side", IsSidechain: true},
+	}))
+	// The mirror predates the sidechain flag and has narrower capped units.
+	searcher := &fakeVectorSearcher{units: []UnitRef{
+		{DocKey: "piece1", SessionID: "run", OrdinalStart: 1, OrdinalEnd: 1},
+		{DocKey: "piece2", SessionID: "run", OrdinalStart: 2, OrdinalEnd: 2},
+		{DocKey: "piece3", SessionID: "run", OrdinalStart: 3, OrdinalEnd: 3},
+	}}
+	d.SetVectorSearcher(searcher)
+	page, err := d.SearchContent(t.Context(), ContentSearchFilter{Pattern: "needle", Mode: "hybrid", KeywordOnly: true, IncludeOneShot: true, Scope: "top"})
+	require.NoError(t, err)
+	require.Len(t, page.Matches, 2)
+	for _, match := range page.Matches {
+		assert.Equal(t, [2]int{1, 2}, match.OrdinalRange)
+	}
 }

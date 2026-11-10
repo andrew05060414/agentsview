@@ -19,6 +19,7 @@ import (
 // ReportingExportOptions selects one UTC calendar date and fixes the current
 // time used to decide which hours have closed.
 type ReportingExportOptions struct {
+	ByMachine     bool
 	Date          time.Time
 	Now           time.Time
 	SchemaVersion int
@@ -34,6 +35,7 @@ type ReportingExportOptions struct {
 // ReportingDigestExportOptions selects an inclusive UTC date range and fixes
 // the current time used to decide which hours have closed.
 type ReportingDigestExportOptions struct {
+	ByMachine     bool
 	From          time.Time
 	To            time.Time
 	Now           time.Time
@@ -105,6 +107,11 @@ func (db *DB) ExportReportingDay(
 	if opts.afterSourceLoad != nil {
 		opts.afterSourceLoad(source.observerStats())
 	}
+	if opts.ByMachine {
+		if err := loadReportingMachineIdentity(ctx, tx, schemaVersion, &source); err != nil {
+			return export.ReportingDay{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return export.ReportingDay{}, fmt.Errorf("commit reporting snapshot: %w", err)
 	}
@@ -122,7 +129,7 @@ func (db *DB) ExportReportingDay(
 		Complete:      complete,
 		Hours:         hours,
 	}
-	if export.IsJointReportingSchemaVersion(schemaVersion) {
+	if schemaVersion == export.ReportingJointSchemaVersion {
 		day.BucketSeconds = int(bucket / time.Second)
 	}
 	day, _, err = export.FinalizeReportingDay(day)
@@ -216,6 +223,11 @@ func (db *DB) ExportReportingDigest(
 	if opts.afterSourceLoad != nil {
 		opts.afterSourceLoad(source.observerStats())
 	}
+	if opts.ByMachine {
+		if err := loadReportingMachineIdentity(ctx, tx, schemaVersion, &source); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit reporting snapshot: %w", err)
 	}
@@ -243,7 +255,7 @@ func (db *DB) ExportReportingDigest(
 			Complete:      resolved.complete,
 			Hours:         hours,
 		}
-		if export.IsJointReportingSchemaVersion(schemaVersion) {
+		if schemaVersion == export.ReportingJointSchemaVersion {
 			day.BucketSeconds = int(bucket / time.Second)
 		}
 		day, _, err = export.FinalizeReportingDay(day)
@@ -285,6 +297,47 @@ func reportingHoursFromSource(
 	hourCount, schemaVersion int,
 	projectKeys []string,
 	bucket time.Duration,
+) ([]export.ReportingHour, error) {
+	hours, err := reportingHoursFromMachineSource(ctx, source, date, hourCount, schemaVersion, projectKeys, bucket, "")
+	if err != nil || source.localMachineID == "" {
+		return hours, err
+	}
+	machines := map[string]bool{source.localMachineID: true}
+	for _, session := range mergeReportingSessions(source.activitySessions, source.usageSessions) {
+		machines[source.machineID(session.Machine)] = true
+	}
+	if len(source.standaloneUsage) > 0 {
+		machines[source.machineID("")] = true
+	}
+	for i := range hours {
+		hours[i].LocalMachineID = source.localMachineID
+		hours[i].Machines = make(map[string]export.ReportingHour, len(machines))
+	}
+	for machine := range machines {
+		parts, err := reportingHoursFromMachineSource(ctx, source, date, hourCount, schemaVersion, projectKeys, bucket, machine)
+		if err != nil {
+			return nil, err
+		}
+		for i, part := range parts {
+			part, _, err = export.FinalizeReportingHour(part)
+			if err != nil {
+				return nil, err
+			}
+			hours[i].Machines[machine] = part
+		}
+	}
+	for i := range hours {
+		hours[i], _, err = export.FinalizeReportingHour(hours[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return hours, nil
+}
+
+func reportingHoursFromMachineSource(
+	ctx context.Context, source reportingDaySource, date time.Time,
+	hourCount, schemaVersion int, projectKeys []string, bucket time.Duration, machine string,
 ) ([]export.ReportingHour, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -335,16 +388,24 @@ func reportingHoursFromSource(
 		return nil, err
 	}
 	projects := source.projects
+	if machine != "" {
+		sessions = slices.DeleteFunc(slices.Clone(sessions), func(s activity.SessionMeta) bool { return source.machineID(s.Machine) != machine })
+		ids = make([]string, 0, len(sessions))
+		for _, session := range sessions {
+			ids = append(ids, session.SessionID)
+		}
+		events = slices.DeleteFunc(slices.Clone(events), func(e activity.ActivityEvent) bool {
+			return source.machineID(sessionByID[e.SessionID].Machine) != machine
+		})
+		usage = slices.DeleteFunc(slices.Clone(usage), func(u activity.UsageRow) bool { return source.machineID(sessionByID[u.SessionID].Machine) != machine })
+	}
 	var references map[string]export.ProjectReference
 	var groupLabels map[string]string
-	if export.IsJointReportingSchemaVersion(schemaVersion) {
-		references = source.references
-		if schemaVersion == export.ReportingIdentitySchemaVersion {
-			projects, references, groupLabels = partitionReportingProjects(sessionByID, projects, references)
-			sessions = slices.Clone(sessions)
-			for i := range sessions {
-				sessions[i] = sessionByID[sessions[i].SessionID]
-			}
+	if schemaVersion == export.ReportingJointSchemaVersion {
+		projects, references, groupLabels = partitionReportingProjects(sessionByID, projects, source.references)
+		sessions = slices.Clone(sessions)
+		for i := range sessions {
+			sessions[i] = sessionByID[sessions[i].SessionID]
 		}
 		sessions, ids, events, usage = scopeJointReporting(sessions, events, usage, sessionByID, projects, projectKeys)
 		for i := range sessions {
@@ -386,7 +447,7 @@ func reportingHoursFromSource(
 			candidates = dayCandidates[first:last:last]
 		}
 		aggregate := activity.AggregateCandidates
-		if export.IsJointReportingSchemaVersion(schemaVersion) {
+		if schemaVersion == export.ReportingJointSchemaVersion {
 			aggregate = activity.AggregateCandidatesWithJointActivity
 		}
 		report, aggregateErr := aggregate(ctx, activity.Params{
@@ -430,15 +491,13 @@ func reportingHoursFromSource(
 		if !hour.HasData {
 			hour = quietReportingHour(hourStart, schemaVersion, bucket)
 		}
-		if export.IsJointReportingSchemaVersion(schemaVersion) {
+		if schemaVersion == export.ReportingJointSchemaVersion {
 			hour.BucketSeconds = int(bucket / time.Second)
 			hour.Joint, err = jointReportingHour(hourStart, bucket, report.JointActivity, report.BySession, usage, sessionByID, projects, references, projectKeys)
 			if err != nil {
 				return nil, err
 			}
-			if schemaVersion == export.ReportingIdentitySchemaVersion {
-				restoreReportingProjectLabels(&hour, projects, groupLabels)
-			}
+			restoreReportingProjectLabels(&hour, projects, groupLabels)
 		}
 		hours[i] = hour
 	}
@@ -450,18 +509,43 @@ func (db *DB) reportingUsageSessionsFrom(
 	tx *sql.Tx,
 	lowerBound, upperBound string,
 ) ([]activity.SessionMeta, []string, error) {
-	usageRows := dailyUsageRowsSQLWithWhere(
-		usageMessageEligibility,
-		usageEventEligibility,
-	)
+	// A usage row is in range when its own timestamp is, or, when it has
+	// none, its session's start is. One branch per case lets the timestamp
+	// indexes seek the range instead of reading every usage row.
 	rows, err := tx.QueryContext(ctx, `
-		WITH usage_candidates AS (`+usageRows+`),
-		usage_session_ids AS (
-			SELECT DISTINCT session_id
-			FROM usage_candidates
-			WHERE session_id != ''
-				AND ts >= ?
-				AND ts <= ?
+		WITH usage_session_ids AS (
+			SELECT m.session_id
+			FROM messages m INDEXED BY idx_messages_usage_timestamp
+			JOIN sessions s ON s.id = m.session_id
+			WHERE`+usageMessageEligibility+`
+				AND m.timestamp >= ?1 AND m.timestamp <= ?2
+			UNION
+			SELECT m.session_id
+			FROM messages m INDEXED BY idx_messages_usage_timestamp
+			JOIN sessions s ON s.id = m.session_id
+			WHERE`+usageMessageEligibility+`
+				AND m.timestamp IS NULL
+				AND s.started_at >= ?1 AND s.started_at <= ?2
+			UNION
+			SELECT m.session_id
+			FROM messages m INDEXED BY idx_messages_usage_timestamp
+			JOIN sessions s ON s.id = m.session_id
+			WHERE`+usageMessageEligibility+`
+				AND m.timestamp = ''
+				AND s.started_at >= ?1 AND s.started_at <= ?2
+			UNION
+			SELECT ue.session_id
+			FROM usage_events ue
+			JOIN sessions s ON s.id = ue.session_id
+			WHERE`+usageEventEligibility+`
+				AND ue.occurred_at >= ?1 AND ue.occurred_at <= ?2
+			UNION
+			SELECT ue.session_id
+			FROM usage_events ue
+			JOIN sessions s ON s.id = ue.session_id
+			WHERE`+usageEventEligibility+`
+				AND ue.occurred_at IS NULL
+				AND s.started_at >= ?1 AND s.started_at <= ?2
 		)
 		SELECT
 			s.id,
@@ -475,7 +559,7 @@ func (db *DB) reportingUsageSessionsFrom(
 			COALESCE(s.is_automated, 0),
 			s.relationship_type = 'subagent'
 		FROM sessions s
-		JOIN usage_session_ids u ON u.session_id = s.id
+		WHERE s.id != '' AND s.id IN usage_session_ids
 		ORDER BY s.id`,
 		lowerBound, upperBound,
 	)
@@ -547,13 +631,12 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 		query.RangeEnd.UTC().Format(time.RFC3339), 14,
 	)
 	rows, err := tx.QueryContext(ctx, `
-		SELECT occurred_at, model,
+		SELECT agent, occurred_at, COALESCE(NULLIF(model, ''), '<unknown>'),
 			input_tokens, output_tokens,
 			cache_write_tokens, cache_read_tokens,
 			charged_microdollars, dedup_key
 		FROM cursor_usage_events
-		WHERE model != ''
-			AND occurred_at >= ?
+		WHERE occurred_at >= ?
 			AND occurred_at <= ?`,
 		lowerBound, upperBound,
 	)
@@ -568,6 +651,7 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 		var inputTokens, outputTokens int
 		var cacheCreationTokens, cacheReadTokens int
 		if err := rows.Scan(
+			&row.Agent,
 			&row.Timestamp,
 			&row.Model,
 			&inputTokens,
@@ -581,19 +665,12 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 				"scanning standalone reporting usage: %w", err,
 			)
 		}
-		row.InputTokens,
-			row.OutputTokens,
-			row.CacheCreationTokens,
-			row.CacheReadTokens = UsageEventRowTokens(
-			"cursor",
-			inputTokens,
-			outputTokens,
-			cacheCreationTokens,
-			cacheReadTokens,
-		)
-		row.Agent = "cursor"
+		row.InputTokens = max(inputTokens, 0)
+		row.OutputTokens = max(outputTokens, 0)
+		row.CacheCreationTokens = max(cacheCreationTokens, 0)
+		row.CacheReadTokens = max(cacheReadTokens, 0)
 		row.MessageOrdinal = -1
-		row.UsageSource = "cursor"
+		row.UsageSource = row.Agent
 		row.CostSource = export.CostSourceReported
 		row.Priced = true
 		row.Contributes = true
@@ -936,7 +1013,7 @@ func buildReportingFirstSeen(
 	sessionByID := make(map[string]activity.SessionMeta, len(sessions))
 	for _, session := range sessions {
 		sessionByID[session.SessionID] = session
-		// Identity groups split a project; count the project, as version 4 does.
+		// Identity groups split a project; count the project, not each group.
 		project := session.Project
 		if label, grouped := groupLabels[project]; grouped {
 			project = label

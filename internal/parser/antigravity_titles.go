@@ -12,13 +12,21 @@ import (
 )
 
 // AntigravitySummariesDBName is the per-root store where Antigravity keeps
-// conversation titles and workspace metadata, apart from each conversation's transcript.
+// conversation titles and workspace metadata, apart from each conversation's
+// transcript.
 const AntigravitySummariesDBName = "conversation_summaries.db"
 
-// AntigravitySummary holds metadata extracted from conversation_summaries.db.
+const antigravityTitleQuery = "SELECT conversation_id, title FROM conversation_summaries"
+
+// Matching markers can hide writes, so cached titles expire.
+func AntigravityStoreTitles(ctx context.Context, path string) (map[string]string, SQLiteContainerState, error) {
+	return sqliteStoreTitles(ctx, path, "conversation_summaries", "conversation_id", antigravityTitleQuery)
+}
+
+// AntigravitySummary holds the workspace metadata Antigravity keeps in
+// conversation_summaries.db next to the title. Titles are read separately
+// through AntigravityStoreTitles.
 type AntigravitySummary struct {
-	Title                string
-	TitlePresent         bool
 	Cwd                  string
 	Project              string
 	ParentConversationID string
@@ -31,25 +39,28 @@ type antigravitySummarySnapshot struct {
 	readAt    time.Time
 }
 
-var antigravityTitleNow = time.Now
+var antigravitySummaryNow = time.Now
 
 var antigravitySummaryCache = struct {
 	sync.Mutex
 	stores map[string]antigravitySummarySnapshot
 }{stores: make(map[string]antigravitySummarySnapshot)}
 
-func InvalidateAntigravityTitles(path string) {
+// InvalidateAntigravitySummaries drops the cached workspace metadata read.
+func InvalidateAntigravitySummaries(path string) {
 	antigravitySummaryCache.Lock()
 	defer antigravitySummaryCache.Unlock()
 	delete(antigravitySummaryCache.stores, path)
 }
 
-// AntigravityStoreSummaries returns the cached or freshly read conversation summaries.
+// AntigravityStoreSummaries returns the cached or freshly read workspace
+// metadata (cwd, project, parent conversation) keyed by conversation ID.
+// Matching markers can hide writes, so cached reads expire.
 func AntigravityStoreSummaries(ctx context.Context, path string) (map[string]AntigravitySummary, SQLiteContainerState, error) {
 	state, ok := StatSQLiteContainerState(path)
 	antigravitySummaryCache.Lock()
 	defer antigravitySummaryCache.Unlock()
-	now := antigravityTitleNow()
+	now := antigravitySummaryNow()
 	if prior, cached := antigravitySummaryCache.stores[path]; ok && cached && prior.state == state && now.Sub(prior.readAt) < SQLiteContainerDigestVerifyInterval {
 		return prior.summaries, prior.state, prior.err
 	}
@@ -69,36 +80,6 @@ func AntigravityStoreSummaries(ctx context.Context, path string) (map[string]Ant
 	return summaries, state, err
 }
 
-// AntigravityStoreTitles returns the title mapping for compatibility with title-only callers.
-// Matching markers can hide writes, so cached titles expire.
-func AntigravityStoreTitles(ctx context.Context, path string) (map[string]string, SQLiteContainerState, error) {
-	summaries, state, err := AntigravityStoreSummaries(ctx, path)
-	if err != nil {
-		return nil, state, err
-	}
-	titles := make(map[string]string, len(summaries))
-	for id, s := range summaries {
-		if s.TitlePresent {
-			titles[id] = s.Title
-		}
-	}
-	return titles, state, nil
-}
-
-func readAntigravityTitles(ctx context.Context, path string) (map[string]string, error) {
-	summaries, err := readAntigravitySummaries(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	titles := make(map[string]string, len(summaries))
-	for id, s := range summaries {
-		if s.TitlePresent {
-			titles[id] = s.Title
-		}
-	}
-	return titles, nil
-}
-
 func readAntigravitySummaries(ctx context.Context, path string) (map[string]AntigravitySummary, error) {
 	if !IsRegularFile(path) {
 		return nil, nil
@@ -110,85 +91,54 @@ func readAntigravitySummaries(ctx context.Context, path string) (map[string]Anti
 	}
 	defer store.Close()
 
-	// Inspect available columns so mock/older schemas without workspace_uris or parent_conversation_id still work.
-	rows, err := store.QueryContext(ctx, "PRAGMA table_info(conversation_summaries)")
+	// Older schemas lack workspace_uris or parent_conversation_id.
+	var hasID, hasWorkspace, hasParent bool
+	if err := store.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM pragma_table_info('conversation_summaries') WHERE name = 'conversation_id'),
+		EXISTS(SELECT 1 FROM pragma_table_info('conversation_summaries') WHERE name = 'workspace_uris'),
+		EXISTS(SELECT 1 FROM pragma_table_info('conversation_summaries') WHERE name = 'parent_conversation_id')`,
+	).Scan(&hasID, &hasWorkspace, &hasParent); err != nil {
+		return nil, err
+	}
+	if !hasID || (!hasWorkspace && !hasParent) {
+		return nil, nil
+	}
+	workspaceExpr, parentExpr := "NULL", "NULL"
+	if hasWorkspace {
+		workspaceExpr = "workspace_uris"
+	}
+	if hasParent {
+		parentExpr = "parent_conversation_id"
+	}
+	rows, err := store.QueryContext(ctx,
+		"SELECT conversation_id, "+workspaceExpr+", "+parentExpr+" FROM conversation_summaries")
 	if err != nil {
 		return nil, err
 	}
-	hasWorkspace := false
-	hasParent := false
+	defer rows.Close()
+
+	summaries := make(map[string]AntigravitySummary)
 	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull, pk int
-		var dfltValue sql.NullString
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			_ = rows.Close()
+		var id string
+		var workspaceURIs, parentID sql.NullString
+		if err := rows.Scan(&id, &workspaceURIs, &parentID); err != nil {
 			return nil, err
 		}
-		if name == "workspace_uris" {
-			hasWorkspace = true
-		} else if name == "parent_conversation_id" {
-			hasParent = true
+		var summary AntigravitySummary
+		if workspaceURIs.Valid && workspaceURIs.String != "" {
+			summary.Cwd = extractAntigravityWorkspace(workspaceURIs.String)
+			if summary.Cwd != "" {
+				summary.Project = ExtractProjectFromCwdWithBranchContext(ctx, summary.Cwd, "")
+			}
+		}
+		if parentID.Valid {
+			summary.ParentConversationID = strings.TrimSpace(parentID.String)
+		}
+		if summary != (AntigravitySummary{}) {
+			summaries[id] = summary
 		}
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	_ = rows.Close()
-
-	query := "SELECT conversation_id, title"
-	if hasWorkspace {
-		query += ", workspace_uris"
-	}
-	if hasParent {
-		query += ", parent_conversation_id"
-	}
-	query += " FROM conversation_summaries"
-
-	queryRows, err := store.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer queryRows.Close()
-
-	summaries := make(map[string]AntigravitySummary)
-	for queryRows.Next() {
-		var id string
-		var title sql.NullString
-		var workspaceURIs sql.NullString
-		var parentID sql.NullString
-
-		scanDests := []any{&id, &title}
-		if hasWorkspace {
-			scanDests = append(scanDests, &workspaceURIs)
-		}
-		if hasParent {
-			scanDests = append(scanDests, &parentID)
-		}
-		if err := queryRows.Scan(scanDests...); err != nil {
-			return nil, err
-		}
-
-		var summary AntigravitySummary
-		if title.Valid {
-			summary.TitlePresent = true
-			summary.Title = strings.TrimSpace(title.String)
-		}
-		if hasWorkspace && workspaceURIs.Valid && workspaceURIs.String != "" {
-			cwd := extractAntigravityWorkspace(workspaceURIs.String)
-			summary.Cwd = cwd
-			if cwd != "" {
-				summary.Project = ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
-			}
-		}
-		if hasParent && parentID.Valid {
-			summary.ParentConversationID = strings.TrimSpace(parentID.String)
-		}
-		summaries[id] = summary
-	}
-	if err := queryRows.Err(); err != nil {
 		return nil, err
 	}
 	return summaries, nil
@@ -269,39 +219,46 @@ func AntigravitySessionRoot(path string) (string, bool) {
 	return "", false
 }
 
-// applyAntigravityTitle sets the session's title and workspace from its root's store.
+// applyAntigravityTitle sets the session's title from its root's store. An
+// unreadable store or missing entry leaves no title signal, so the stored
+// name survives the write. It also applies the store's workspace metadata.
 func applyAntigravityTitle(ctx context.Context, sess *ParsedSession, src antigravitySource) {
 	applyAntigravitySummary(ctx, sess, src)
+	titles, _, err := AntigravityStoreTitles(ctx, filepath.Join(src.Root, AntigravitySummariesDBName))
+	if err != nil {
+		return
+	}
+	if title, ok := titles[src.ID]; ok {
+		sess.SessionName = title
+		sess.SessionNamePresent = true
+	}
 }
 
-// applyAntigravitySummary sets the session's title, cwd, project, and parent from its root's store.
-// An unreadable store or missing entry leaves no title signal, so the stored
-// name survives the write.
+// applyAntigravitySummary fills the session's cwd, project, and parent from
+// its root's store without overriding values the transcript already set.
 func applyAntigravitySummary(ctx context.Context, sess *ParsedSession, src antigravitySource) {
 	summaries, _, err := AntigravityStoreSummaries(ctx, filepath.Join(src.Root, AntigravitySummariesDBName))
 	if err != nil {
 		return
 	}
-	if summary, ok := summaries[src.ID]; ok {
-		if summary.TitlePresent {
-			sess.SessionName = summary.Title
-			sess.SessionNamePresent = true
+	summary, ok := summaries[src.ID]
+	if !ok {
+		return
+	}
+	if sess.Cwd == "" && summary.Cwd != "" {
+		sess.Cwd = summary.Cwd
+	}
+	if sess.Project == "" {
+		if summary.Project != "" {
+			sess.Project = summary.Project
+		} else if sess.Cwd != "" {
+			sess.Project = ExtractProjectFromCwdWithBranchContext(ctx, sess.Cwd, "")
 		}
-		if sess.Cwd == "" && summary.Cwd != "" {
-			sess.Cwd = summary.Cwd
-		}
-		if sess.Project == "" {
-			if summary.Project != "" {
-				sess.Project = summary.Project
-			} else if sess.Cwd != "" {
-				sess.Project = ExtractProjectFromCwdWithBranchContext(ctx, sess.Cwd, "")
-			}
-		}
-		if sess.ParentSessionID == "" && summary.ParentConversationID != "" {
-			sess.ParentSessionID = antigravityIDPrefix + summary.ParentConversationID
-			if sess.RelationshipType == "" {
-				sess.RelationshipType = RelSubagent
-			}
+	}
+	if sess.ParentSessionID == "" && summary.ParentConversationID != "" {
+		sess.ParentSessionID = antigravityIDPrefix + summary.ParentConversationID
+		if sess.RelationshipType == "" {
+			sess.RelationshipType = RelSubagent
 		}
 	}
 }
@@ -309,5 +266,7 @@ func applyAntigravitySummary(ctx context.Context, sess *ParsedSession, src antig
 // PreservesStoredSessionName reports whether a parse carries no title signal
 // for an agent whose titles live outside the transcript.
 func PreservesStoredSessionName(sess ParsedSession) bool {
-	return (sess.Agent == AgentCodex || sess.Agent == AgentAntigravity) && !sess.SessionNamePresent
+	return (sess.Agent == AgentCodex ||
+		sess.Agent == AgentAntigravity ||
+		sess.Agent == AgentQoder) && !sess.SessionNamePresent
 }

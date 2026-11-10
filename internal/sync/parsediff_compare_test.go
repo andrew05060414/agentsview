@@ -116,6 +116,18 @@ func TestCompareSessionFields(t *testing.T) {
 			},
 		},
 		{
+			name: "preserved session name ignores parsed name drift",
+			stored: func(s *db.Session) {
+				s.Agent = "qoder"
+				s.SessionName = new("Name in the app")
+			},
+			prepared: func(s *db.Session) {
+				s.Agent = "qoder"
+				s.SessionName = new("Name from export")
+				s.PreserveSessionName = true
+			},
+		},
+		{
 			name: "session name drift is informational for incremental agents",
 			prepared: func(s *db.Session) {
 				s.SessionName = new("Renamed")

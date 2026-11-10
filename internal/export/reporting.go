@@ -16,34 +16,30 @@ const (
 	// ReportingSchemaVersion is the current wire version for hour, day, and
 	// digest exports consumed by downstream integrations.
 	ReportingSchemaVersion = 3
-	// ReportingJointSchemaVersion adds opt-in session-free joint bucket cells.
-	ReportingJointSchemaVersion = 4
-	// ReportingIdentitySchemaVersion partitions project contributions by identity evidence.
-	ReportingIdentitySchemaVersion = 5
+	// ReportingJointSchemaVersion adds opt-in session-free joint bucket cells,
+	// with project contributions partitioned by identity evidence.
+	ReportingJointSchemaVersion = 5
 )
 
 // IsSupportedReportingSchemaVersion reports whether reporting exports can
 // still produce the requested wire semantics.
 func IsSupportedReportingSchemaVersion(version int) bool {
-	return version == ReportingSchemaVersion || IsJointReportingSchemaVersion(version)
-}
-
-// IsJointReportingSchemaVersion reports whether the schema includes joint cells.
-func IsJointReportingSchemaVersion(version int) bool {
-	return version == ReportingJointSchemaVersion || version == ReportingIdentitySchemaVersion
+	return version == ReportingSchemaVersion || version == ReportingJointSchemaVersion
 }
 
 // ReportingHour is one immutable UTC-hour export. Digest identifies the
 // canonical document body with the derived Digest field omitted.
 type ReportingHour struct {
-	SchemaVersion int               `json:"schema_version"`
-	BucketSeconds int               `json:"bucket_seconds,omitzero"`
-	Period        string            `json:"period"`
-	Digest        string            `json:"digest"`
-	HasData       bool              `json:"has_data"`
-	Activity      ReportingActivity `json:"activity"`
-	Usage         ReportingUsage    `json:"usage"`
-	Joint         *ReportingJoint   `json:"joint,omitempty"`
+	SchemaVersion  int                      `json:"schema_version"`
+	BucketSeconds  int                      `json:"bucket_seconds,omitzero"`
+	Period         string                   `json:"period"`
+	Digest         string                   `json:"digest"`
+	HasData        bool                     `json:"has_data"`
+	Activity       ReportingActivity        `json:"activity"`
+	Usage          ReportingUsage           `json:"usage"`
+	Joint          *ReportingJoint          `json:"joint,omitempty"`
+	LocalMachineID string                   `json:"local_machine_id,omitempty"`
+	Machines       map[string]ReportingHour `json:"machines,omitempty"`
 }
 
 // ReportingDay is one UTC date exported from a single read snapshot. A
@@ -238,13 +234,15 @@ func FinalizeReportingHour(hour ReportingHour) (ReportingHour, []byte, error) {
 	}
 
 	digest, err := DigestCanonical(reportingHourDigestInput{
-		SchemaVersion: hour.SchemaVersion,
-		BucketSeconds: hour.BucketSeconds,
-		Period:        hour.Period,
-		HasData:       hour.HasData,
-		Activity:      hour.Activity,
-		Usage:         hour.Usage,
-		Joint:         hour.Joint,
+		SchemaVersion:  hour.SchemaVersion,
+		BucketSeconds:  hour.BucketSeconds,
+		Period:         hour.Period,
+		HasData:        hour.HasData,
+		Activity:       hour.Activity,
+		Usage:          hour.Usage,
+		Joint:          hour.Joint,
+		LocalMachineID: hour.LocalMachineID,
+		Machines:       hour.Machines,
 	})
 	if err != nil {
 		return ReportingHour{}, nil, fmt.Errorf("digest reporting hour: %w", err)
@@ -329,13 +327,15 @@ func FinalizeReportingDay(day ReportingDay) (ReportingDay, []byte, error) {
 }
 
 type reportingHourDigestInput struct {
-	SchemaVersion int               `json:"schema_version"`
-	BucketSeconds int               `json:"bucket_seconds,omitzero"`
-	Period        string            `json:"period"`
-	HasData       bool              `json:"has_data"`
-	Activity      ReportingActivity `json:"activity"`
-	Usage         ReportingUsage    `json:"usage"`
-	Joint         *ReportingJoint   `json:"joint,omitempty"`
+	SchemaVersion  int                      `json:"schema_version"`
+	BucketSeconds  int                      `json:"bucket_seconds,omitzero"`
+	Period         string                   `json:"period"`
+	HasData        bool                     `json:"has_data"`
+	Activity       ReportingActivity        `json:"activity"`
+	Usage          ReportingUsage           `json:"usage"`
+	Joint          *ReportingJoint          `json:"joint,omitempty"`
+	LocalMachineID string                   `json:"local_machine_id,omitempty"`
+	Machines       map[string]ReportingHour `json:"machines,omitempty"`
 }
 
 func parseReportingHour(value string) (time.Time, error) {

@@ -40,14 +40,19 @@ not download screenshots and other large media.
   the legacy-URL redirect table.
 - `zensical-docs.sh`: builds from a temporary public-docs copy so maintainer
   files are excluded, then assembles the website tier, Markdown twins,
-  `llms.txt`, and root sitemap into `site/`.
+  `llms.txt`, and root sitemap into `site/`. It then runs
+  `scripts/first_paint.py`, which embeds the fonts in the site's stylesheets
+  and inlines `scripts/hold-first-paint.js` in every page, so no page paints
+  text in a fallback face.
 - `assets/hydrate-assets.sh`: hydrates ignored local assets from orphan
   branches.
 - `assets/update-static-assets-branch.sh`: updates curated static assets.
 - `screenshots/`: Docker/Playwright screenshot generator and generated asset
   branch updater.
 - `scripts/check_built_site.py` and `scripts/check_vercel_redirects.py`:
-  post-build validation.
+  post-build validation. CI also runs the shared
+  [first-paint check](https://github.com/kenn-io/actions/tree/main/first-paint)
+  on `site/`.
 
 `docs/assets/static/`, `docs/assets/generated/`, `docs/site/`, `docs/.venv/`,
 and `docs/zensical-public-docs.*` are ignored local outputs.
@@ -106,25 +111,18 @@ asset refs.
 
 ## Updating Generated Screenshots
 
-Regenerate screenshots and update the local `docs-generated-assets` orphan
-branch:
+Generate the complete set on the managed capture worker and review its images
+and assembled preview. Follow the [capture guide](screenshots/README.md) for
+pinned inputs, repeatability checks, and retained results.
+
+Import the reviewed job's asset directory into the local orphan branch:
 
 ```bash
-make docs-generated-assets-branch
+bash docs/screenshots/update-generated-assets-branch.sh --source "$CAPTURE_ASSETS"
 ```
 
-Push that branch when generated screenshots should be published:
-
-```bash
-bash docs/screenshots/update-generated-assets-branch.sh --push
-```
-
-For the initial import or a manual refresh from an existing directory:
-
-```bash
-bash docs/screenshots/update-generated-assets-branch.sh \
-  --source docs/assets/generated --push
-```
+Add `--push` only when publication is authorized. The corpus and build inputs
+remain in private managed storage.
 
 ## Updating Static Assets
 
@@ -163,7 +161,7 @@ vercel link
 Deploy committed docs changes with:
 
 ```bash
-scripts/update-docs.sh
+scripts/update-docs.sh --source /managed/attempts/request-1-attempt-1/run-1/capture/assets
 ```
 
 Create a Vercel preview/staging deployment before production with:

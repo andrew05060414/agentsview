@@ -9,8 +9,8 @@ import (
 
 // hybridDisplay carries what one fused unit needs for presentation: the
 // anchor (session, ordinal) the match reports and enriches by, the unit's
-// ordinal span and subordinate flag, plus the leg's raw approximate snippet
-// text used only to center the redacted window.
+// ordinal span and subordinate flag, plus the vector leg's approximate
+// snippet or the keyword leg's dialogue and snippet window.
 type hybridDisplay struct {
 	sessionID    string
 	ordinal      int
@@ -18,6 +18,7 @@ type hybridDisplay struct {
 	ordinalEnd   int
 	subordinate  bool
 	snippet      string
+	content      string
 }
 
 // hybridLeg is one rank-ordered fusion leg: entries for db.RRFMerge plus
@@ -38,18 +39,24 @@ const maxHybridKeywordBatches = 4
 // fused at unit granularity with db.RRFMerge. The keyword leg is the mirror's
 // recency-ordered term-AND ILIKE ranking, the same substitution the
 // PostgreSQL store makes for BM25. The caller has already validated the
-// filter and confirmed a searcher is wired.
+// filter before selecting either hybrid leg.
 func (s *Store) searchContentHybrid(
 	ctx context.Context, f db.ContentSearchFilter,
 ) (db.ContentSearchPage, error) {
-	searcher := s.getVectorSearcher()
-	if searcher == nil {
-		return db.ContentSearchPage{}, s.semanticUnavailableError()
+	var searcher db.VectorSearcher
+	if !f.KeywordOnly {
+		if searcher = s.getVectorSearcher(); searcher == nil {
+			return db.ContentSearchPage{}, s.semanticUnavailableError()
+		}
 	}
 	k := max(f.Limit*4, db.SemanticOverfetchMin)
-	vecLeg, err := s.hybridVectorLeg(ctx, f, searcher, k)
-	if err != nil {
-		return db.ContentSearchPage{}, err
+	var vecLeg hybridLeg
+	var err error
+	if searcher != nil {
+		vecLeg, err = s.hybridVectorLeg(ctx, f, searcher, k)
+		if err != nil {
+			return db.ContentSearchPage{}, err
+		}
 	}
 	kwLeg, err := s.hybridKeywordLeg(ctx, f, searcher, k)
 	if err != nil {
@@ -124,11 +131,11 @@ func (s *Store) fetchHybridKeywordBatch(
 	kf := f
 	kf.Mode = "fts"
 	var args []any
-	contentPred := contentSearchPredicate("m.content", kf, &args)
+	contentPred := contentSearchPredicate("COALESCE(m.dialogue_text, m.content)", kf, &args)
 	args = append(args, scopeArgs...)
 	args = append(args, k, offset)
 	rows, err := s.queryContext(ctx, `
-		SELECT m.session_id, m.ordinal, m.content
+		SELECT m.session_id, m.ordinal, COALESCE(m.dialogue_text, m.content)
 		FROM messages m
 		JOIN sessions s ON s.id = m.session_id
 		WHERE `+contentPred+`
@@ -153,6 +160,7 @@ func (s *Store) fetchHybridKeywordBatch(
 		hit.ordinal = int(ordinal)
 		start, end := db.FTSSnippetRange(f.Pattern, content)
 		lo, hi := db.SnippetBounds(content, start, end, db.ContentSnippetRadius)
+		hit.content = content
 		hit.snippet = content[lo:hi]
 		hits = append(hits, hit)
 	}
@@ -174,7 +182,7 @@ func (s *Store) appendHybridKeywordHits(
 	for i, hit := range hits {
 		refs[i] = db.MessageRef{SessionID: hit.sessionID, Ordinal: hit.ordinal}
 	}
-	units, err := searcher.ResolveMessageUnits(ctx, refs)
+	units, err := db.ResolveHybridMessageUnits(ctx, searcher, refs)
 	if err != nil {
 		return fmt.Errorf("resolving keyword hits to units: %w", err)
 	}
@@ -258,8 +266,8 @@ func (s *Store) classifyUnitlessHybridHits(
 // enrichHybridMatches looks up metadata for the fused units and assembles
 // the page in fused-score order. When the keyword leg contributed a unit its
 // display wins: the match anchors on the keyword-matched message and centers
-// on the keyword snippet. Either way the snippet is built and redacted from
-// the anchor message's full content.
+// on the keyword snippet and uses dialogue for presentation. Vector-only hits
+// use the anchor message's rendered content.
 func (s *Store) enrichHybridMatches(
 	ctx context.Context, f db.ContentSearchFilter, merged []db.FusedUnit,
 	vecDisplay, kwDisplay map[string]hybridDisplay,
@@ -285,6 +293,11 @@ func (s *Store) enrichHybridMatches(
 		if !ok {
 			continue
 		}
+		content := info.content
+		if _, keyword := kwDisplay[m.Unit.Key]; keyword {
+			content = d.content
+		}
+		snippet := f.SemanticSnippet(content, d.snippet)
 		score := m.Score
 		out = append(out, db.ContentMatch{
 			SessionID:       d.sessionID,
@@ -301,7 +314,7 @@ func (s *Store) enrichHybridMatches(
 			ParentSessionID: info.parentSessionID,
 			Sidechain:       info.isSidechain,
 			Timestamp:       info.timestamp,
-			Snippet:         f.SemanticSnippet(info.content, d.snippet),
+			Snippet:         snippet,
 			Score:           &score,
 		})
 	}

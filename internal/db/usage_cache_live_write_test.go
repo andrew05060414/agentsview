@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 )
 
 // seedLiveWriteSession inserts one session whose message carries a unique
@@ -91,6 +92,10 @@ func TestUsageSummarySurvivesArchiveWriteDuringRollupBuild(t *testing.T) {
 			cache, err := database.usageCache.Generation(
 				t.Context(), snapshot.DatabaseID)
 			require.NoError(t, err)
+			// Keep the filled facts, but force the next request to build rollups.
+			_, err = cache.db.ExecContext(t.Context(),
+				`DELETE FROM usage_rollup_installs WHERE session_id = 'reported'`)
+			require.NoError(t, err)
 			var written atomic.Bool
 			cache.rollup.observer.beforeEnsure = func() {
 				if written.Swap(true) {
@@ -156,6 +161,7 @@ func waitUsageNotification(t *testing.T, batches <-chan struct{}) {
 	select {
 	case <-batches:
 	case <-time.After(10 * time.Second):
+		stacktest.Dump(t)
 		require.FailNow(t, "usage notification batch did not finish")
 	}
 }
@@ -487,4 +493,37 @@ func TestUsageTimezoneRecencyBreaksStampTies(t *testing.T) {
 				"equal stamps did not favor the zone requested last")
 		})
 	}
+}
+
+// A resync bulk load suspends the usage generation insert trigger. Usage
+// cached before the load must not let a message inserted before the cached
+// tail during the load be skipped as an append, and the restored trigger must
+// keep catching such inserts afterwards.
+func TestBulkImportRestoresUsageGenerationInvalidation(t *testing.T) {
+	database := testDB(t)
+	const day = "2026-08-10T09:00:00Z"
+	seedLiveWriteSession(t, database, "session", "project", day, 0, 10)
+	appendLiveWriteMessage(t, database, "session", day, 4, 7)
+	require.Equal(t, 17, liveWriteDailyInput(t, database, "project"))
+
+	require.NoError(t, database.DropBulkImportIndexes(t.Context()))
+	appendLiveWriteMessage(t, database, "session", day, 2, 5)
+	seedLiveWriteSession(t, database, "loaded", "project", day, 0, 3)
+	require.NoError(t, database.RebuildBulkImportIndexes(t.Context()))
+
+	// Append reuse needs a generation; a session created during the load has
+	// none until the rebuild assigns one. Check before any later insert, whose
+	// restored trigger would assign one itself.
+	var missing int
+	require.NoError(t, database.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM sessions WHERE usage_generation IS NULL`,
+	).Scan(&missing))
+	assert.Zero(t, missing)
+
+	assert.Equal(t, 25, liveWriteDailyInput(t, database, "project"))
+
+	appendLiveWriteMessage(t, database, "session", day, 1, 11)
+	assert.Equal(t, 36, liveWriteDailyInput(t, database, "project"))
+	appendLiveWriteMessage(t, database, "loaded", day, 1, 13)
+	assert.Equal(t, 49, liveWriteDailyInput(t, database, "project"))
 }

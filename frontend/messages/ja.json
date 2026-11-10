@@ -70,6 +70,7 @@
   "header_transcript_blocks_tool": "ツール呼び出し",
   "header_transcript_blocks_code": "コードブロック",
   "header_transcript_blocks_system": "システム境界",
+  "header_transcript_blocks_hook": "フック",
   "header_actions_follow_latest": "最新のメッセージをフォローする",
   "header_actions_toggle_sort": "並べ替え順序を切り換える (o)",
   "header_actions_cycle_layout": "サイクルレイアウト: {layout} (l)",
@@ -96,12 +97,15 @@
   "header_actions_import_archive_only": "アーカイブ専用モードではインポートできません",
   "header_actions_import_conversations": "会話をインポートする",
   "header_actions_import": "インポート",
+  "header_actions_import_claude_syncing": "Claude.ai の同期を実行中です。インポートを開くと、進行状況の確認や停止ができます。",
   "header_actions_toggle_theme": "テーマの切り替え",
   "header_actions_settings": "設定",
   "header_actions_keyboard_shortcuts": "キーボードショートカット",
   "header_actions_keyboard_shortcuts_shortcut": "キーボードショートカット(?)",
   "status_bar_archive_stale": "アーカイブの結果が古い可能性があります。",
   "status_bar_archive_rebuilding": "アーカイブの結果が古い可能性があります。再構築が完了するまで変更は一時停止されています。",
+  "status_bar_archive_stale_rebuild": "アーカイブの結果が古い可能性があります。クリックして再構築します。",
+  "status_bar_sync_failed": "同期に失敗しました",
   "status_bar_sessions": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
@@ -157,8 +161,10 @@
   "command_palette_search_error": "検索は利用できません",
   "command_palette_search_failed": "検索に失敗しました。もう一度試してください。",
   "command_palette_semantic_setup_title": "セマンティック検索が設定されていません",
-  "command_palette_semantic_setup_config_step": "1. [vector] セクションを config.toml に追加し、埋め込みサーバーのモデルとエンドポイントを調整します (Ollama など、OpenAI 互換のエンドポイントであればどれでも機能します)。",
-  "command_palette_semantic_setup_build_step": "2. デーモンを再起動し、インデックスを構築します。",
+  "command_palette_semantic_setup_config_step": "1. config.toml に次を追加します：",
+  "command_palette_semantic_setup_local": "Ollama で Nomic を使用中ですか？共有ローカルサーバーへの切り替え時にインデックスを維持するには、設定例をすべて適用してください。",
+  "command_palette_semantic_setup_local_link": "サーバー設定",
+  "command_palette_semantic_setup_build_step": "2. デーモンを再起動してインデックスを作成します。初回ダウンロード前に CLI が確認します：",
   "command_palette_semantic_copy_config": "設定スニペットをコピーする",
   "command_palette_semantic_copy_command": "コピーコマンド",
   "command_palette_semantic_copied": "コピーしました！",
@@ -167,9 +173,6 @@
   "command_palette_semantic_ready_intro": "セマンティック検索は設定されていますが、このアーカイブには埋め込みインデックスが構築されていません。",
   "command_palette_semantic_build_button": "埋め込みの構築",
   "command_palette_semantic_build_hint": "ビルドはサーバー上でバックグラウンドで実行されます。この検索は終了すると再実行されます。",
-  "command_palette_semantic_building_title": "埋め込みインデックスを構築中...",
-  "command_palette_semantic_building_scanning": "アーカイブをスキャンしています...",
-  "command_palette_semantic_building_progress": "{percentLabel} が埋め込まれています",
   "command_palette_semantic_failed_title": "埋め込みのビルドに失敗しました",
   "command_palette_search_timeout_title": "検索に時間がかかりすぎました",
   "command_palette_search_timeout_detail": "もう一度やり直してください。最初のセマンティック検索またはハイブリッド検索は、埋め込みモデルがウォームアップしている間は遅くなる可能性があります。",
@@ -385,9 +388,22 @@
       }
     }
   ],
+  "tool_block_image_alt": "ツール出力の画像",
+  "tool_block_image_open": "画像を原寸で表示",
+  "tool_block_image_close": "原寸の画像を閉じる",
   "thinking_block_label": "考え",
   "compact_boundary_title": "この時点でコンテキスト ウィンドウが圧縮されました",
   "compact_boundary_label": "圧縮されたコンテキスト",
+  "transcript_empty_messages": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "空のメッセージ {count} 件"
+      }
+    }
+  ],
+  "transcript_empty_messages_title": "これらのメッセージにはテキスト、思考、ツール呼び出しがありません",
   "compact_boundary_show_full_summary": "完全な概要を表示",
   "sidebar_session_count": [
     {
@@ -442,6 +458,8 @@
   "sidebar_filters_no_match": "一致しません",
   "sidebar_filters_no_agents": "エージェントなし",
   "sidebar_filters_machine": "マシン",
+  "sidebar_filters_machine_loading": "マシンを読み込み中...",
+  "sidebar_filters_machine_update_failed": "マシンのフィルターを更新できませんでした。もう一度お試しください。",
   "sidebar_filters_search_machines": "マシンを検索...",
   "sidebar_filters_no_machines": "マシンはありません",
   "sidebar_filters_min_prompts": "最小プロンプト",
@@ -574,6 +592,7 @@
   "analytics_export_csv": "CSVのエクスポート",
   "analytics_activity_by_day_hour": "日別および時間別の活動",
   "analytics_summary_sessions": "セッション",
+  "analytics_summary_sessions_scope": "{range} · サブエージェントを含む",
   "analytics_summary_messages": "メッセージ",
   "analytics_summary_projects": "プロジェクト",
   "analytics_summary_active_days": "アクティブな日",
@@ -834,6 +853,10 @@
   "usage_tokens_attribution_title": "トークンの帰属",
   "usage_attribution_treemap": "ツリーマップ",
   "usage_attribution_list": "リスト",
+  "usage_label_scale_title": "ラベルサイズの尺度",
+  "usage_label_scale_linear": "線形",
+  "usage_label_scale_sqrt": "平方根",
+  "usage_label_scale_log": "対数",
   "usage_chart_style": "グラフの表示",
   "usage_chart_style_smooth": "なめらか",
   "usage_chart_style_lines": "折れ線",
@@ -860,7 +883,7 @@
   "settings_search_empty": "一致する設定がありません",
   "settings_search_clear": "検索をクリア",
   "settings_search_result": "{category}を表示中",
-  "settings_search_keywords_appearance": "テーマのコントラスト レイアウト テキスト フォント ブロック ズーム zoom",
+  "settings_search_keywords_appearance": "テーマのコントラスト レイアウト テキスト フォント ブロック ズーム zoom 色 色覚 color",
   "settings_search_keywords_language": "言語ロケールの翻訳",
   "settings_search_keywords_date_ranges": "リンクされたページの日付範囲",
   "settings_search_keywords_terminal": "ターミナル再開バイナリ引数クリップボードの起動",
@@ -1708,6 +1731,14 @@
   "insights_page_template_tool_reliability": "ツールの信頼性",
   "insights_page_template_model_cost": "モデルとコスト",
   "insights_page_template_instruction_opportunities": "指導の機会",
+  "insights_page_template_friction_review": "フリクションレビュー",
+  "friction_review_summary_title": "モデルが作成した要約",
+  "friction_review_summary_notice": "このダイジェストの概要とパターン名からモデルが作成した要約です。検出結果、ダイジェスト、課題は変更しません。",
+  "friction_review_summary_empty": "このダイジェストの要約はまだありません。",
+  "friction_review_summary_generate": "要約を生成",
+  "friction_review_summary_regenerate": "再生成",
+  "friction_review_summary_generating": "生成中: {phase}",
+  "friction_review_summary_unavailable": "このアーカイブでは要約を生成できません。",
   "insights_page_scope_no_automated": "自動化なし",
   "insights_page_scope_both": "両方",
   "insights_page_scope_only_automated": "自動化のみ",
@@ -2034,6 +2065,7 @@
   "appearance_chart_palette": "グラフの色",
   "appearance_chart_palette_agentsview": "エージェントビュー",
   "appearance_chart_palette_matplotlib": "Matplotlib",
+  "appearance_chart_palette_colorblind": "色覚サポート",
   "appearance_message_layout": "メッセージのレイアウト",
   "appearance_block_visibility": "ブロックの表示",
   "settings_github_token_saved": "GitHub トークンが保存されました。",
@@ -2052,56 +2084,32 @@
   "settings_embeddings_load_failed": "埋め込みステータスのロードに失敗しました",
   "settings_embeddings_model_label": "モデル",
   "settings_embeddings_dimension_label": "次元",
-  "settings_embeddings_status_label": "状態",
-  "settings_embeddings_status_idle": "アイドル状態",
-  "settings_embeddings_status_scanning": "走査",
-  "settings_embeddings_status_embedding": "埋め込み",
-  "settings_embeddings_status_running": "ランニング",
   "settings_embeddings_scanning_hint": "セッションの変更をスキャンしています - 総作業量はまだわかりません。",
-  "settings_embeddings_progress_chunks": [
-    {
-      "declarations": [
-        "input count",
-        "input doneLabel",
-        "input totalLabel",
-        "local countPlural = count: plural"
-      ],
-      "selectors": ["countPlural"],
-      "match": {
-        "countPlural=one": "{doneLabel} / {totalLabel} チャンク",
-        "countPlural=other": "{doneLabel} / {totalLabel} チャンク"
-      }
-    }
-  ],
   "settings_embeddings_rate": [
     {
       "declarations": ["input count", "input rateLabel", "local countPlural = count: plural"],
       "selectors": ["countPlural"],
       "match": {
-        "countPlural=one": "{rateLabel} チャンク/秒",
-        "countPlural=other": "{rateLabel} チャンク/秒"
+        "countPlural=one": "{rateLabel} テキスト区間/秒",
+        "countPlural=other": "{rateLabel} テキスト区間/秒"
       }
     }
   ],
   "settings_embeddings_elapsed": "経過 {duration}",
-  "settings_embeddings_eta": "到着予定時刻 {duration}",
-  "settings_embeddings_eta_estimating": "残り時間を見積もっています...",
   "settings_embeddings_duration_hours_minutes": "{hours}時 {minutes}分",
   "settings_embeddings_duration_minutes_seconds": "{minutes}分 {seconds}秒",
   "settings_embeddings_duration_seconds": "{seconds}秒",
   "settings_embeddings_last_build_label": "最終ビルド",
   "settings_embeddings_last_build_completed": "完了",
-  "settings_embeddings_last_build_failed": "失敗した",
   "settings_embeddings_last_build_activated": "新しい世代を有効化しました",
   "settings_embeddings_last_build_documents": "埋め込まれたドキュメント",
-  "settings_embeddings_last_build_chunks": "埋め込まれたチャンク",
+  "settings_embeddings_last_build_chunks": "索引済みテキスト区間",
   "settings_embeddings_generations_title": "世代",
   "settings_embeddings_generations_empty": "埋め込み世代はまだ存在しません。",
   "settings_embeddings_state_active": "アクティブ",
   "settings_embeddings_state_building": "構築中",
   "settings_embeddings_state_retired": "廃止済み",
   "settings_embeddings_coverage": "{embeddedLabel} が埋め込まれています · {missingLabel} が見つかりません",
-  "settings_embeddings_progress_aria": "埋め込みの進行状況",
   "settings_remote_connected_version": "接続済み (v{version})",
   "settings_remote_server_returned": "サーバーが {status} を返しました",
   "settings_remote_connection_failed": "接続に失敗しました",
@@ -2184,6 +2192,9 @@
   "system_boundary_interrupted": "リクエストが中断されました",
   "system_boundary_task_notification": "タスク通知",
   "system_boundary_stop_hook": "フックフィードバックを停止する",
+  "system_boundary_hook_success": "フック出力",
+  "system_boundary_stop_hook_summary": "停止フックの概要",
+  "system_boundary_hook_cancelled": "フックのキャンセル",
   "system_boundary_peer_message": "別のセッションからのメッセージ",
   "system_boundary_title": "システム境界: {subtype}",
   "system_boundary_show_content": "コンテンツを表示",
@@ -2587,13 +2598,14 @@
   "import_claude_stop": "停止",
   "import_claude_terminal": "ターミナル",
   "import_claude_copy_command": "コマンドをコピー",
-  "import_claude_setup_load": "次に {url} を開き、デベロッパー モードをオンにして「パッケージ化されていない拡張機能を読み込む」を選び、表示されたフォルダーを選択してください。",
-  "import_claude_open_chrome": "Chrome を開いて接続してください。",
+  "import_claude_setup_load": "次に AgentsView を再起動し、{url} を開き、デベロッパー モードをオンにして「パッケージ化されていない拡張機能を読み込む」を選び、表示されたフォルダーを選択してください。",
+  "import_claude_open_chrome": "AgentsView 拡張機能を有効にした状態で Chrome を開いてください。AgentsView の起動後にセットアップを実行した場合は、AgentsView を再起動してください。",
   "import_claude_tab_note": "claude.ai のタブが開いていない場合、同期時にバックグラウンドでタブを開きます。同期後もタブは開いたままになります。",
   "import_claude_signed_out": "AgentsView 拡張機能が入っている Chrome プロフィールで claude.ai にログインしてください。拡張機能は 1 つの Chrome プロフィールでのみ有効にしてください。同期は最初に接続したプロフィールを使用します。",
   "import_claude_reload_extension": "次に {url} で拡張機能を再読み込みしてください。",
   "import_claude_update_app": "AgentsView をアップグレードした場合は再起動してください。",
   "import_claude_syncing": "同期中...",
+  "import_claude_sync_background": "このダイアログを閉じても同期は続きます。",
   "import_claude_sync_failed": "同期に失敗しました",
   "import_claude_sign_in_failed": "ログインに失敗しました",
   "import_claude_desktop_note": "ログインにはメールで届くコードを使います。Google アカウントの場合は Chrome のウェブ UI から同期してください。",
@@ -2825,5 +2837,318 @@
   "usage_all_projects": "すべてのプロジェクト",
   "usage_clear_selection": "選択をクリア",
   "usage_open_project": "開く",
-  "usage_loading": "読み込み中..."
+  "usage_loading": "読み込み中...",
+  "plan_usage_title": "プラン使用量",
+  "plan_usage_trigger_weekly": "プラン使用量: 週 {percent}%",
+  "plan_usage_as_of": "プラン使用量 ({time} 時点)",
+  "plan_usage_not_checked": "プラン使用量: 未確認",
+  "plan_usage_still_updating": "プラン使用量: 更新中 ({time} 時点)",
+  "plan_usage_not_reported_yet": "プラン使用量: 未報告 ({time} 時点)",
+  "plan_usage_partial": "一部のプラン使用量 ({time} 時点)",
+  "plan_usage_not_reported": "OpenAI から報告されていません",
+  "plan_usage_too_many_subagents": "サブエージェントのチャットが多すぎて OpenAI の使用量レポートに含められません",
+  "plan_usage_could_not_check": "AgentsView はプラン使用量を確認できませんでした",
+  "plan_usage_account_unavailable": "このアカウントでは使用量を利用できません",
+  "plan_usage_counted_under": "チャット {title} に含めて集計",
+  "plan_usage_stale": "その後: {reason} ({time})。これらの数値は古い可能性があります。",
+  "plan_usage_left_out_later": "OpenAI の使用量レポートにこのチャットが含まれていません",
+  "plan_usage_weekly_share": "Codex の週間上限の {percent}%",
+  "plan_usage_five_hour_share": "Codex の 5 時間上限の {percent}%",
+  "plan_usage_credits": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} クレジット"
+      }
+    }
+  ],
+  "plan_usage_credits_note": "クレジットは OpenAI の使用量レポートが示すとおりに表示します。",
+  "plan_usage_col_split": "モデル、推論強度、速度",
+  "plan_usage_col_weekly": "週間",
+  "plan_usage_col_five_hour": "5 時間",
+  "plan_usage_col_credits": "クレジット",
+  "capture_tokens_live": "トークンをライブで取得 ({time} 時点)",
+  "capture_turns_not_captured": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} ターンが未取得"
+      }
+    }
+  ],
+  "capture_turns_not_captured_covered": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input time",
+        "local countPlural = count: plural"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countLabel} ターンが未取得。{time} より前のターンはプラン使用量に含まれます"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_waiting": "Codex Cloud: 初回同期を待機中",
+  "status_bar_codex_cloud_importing_found": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud: インポート中、これまでに {countLabel} 件のチャットを検出"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_importing_progress": "Codex Cloud: {total} 件のチャット中 {imported} 件をインポート中",
+  "status_bar_codex_cloud_up_to_date": "Codex Cloud: {time} 時点で最新",
+  "status_bar_codex_cloud_retrying": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "Codex Cloud: {countLabel} 件のチャットをインポートできませんでした"
+      }
+    }
+  ],
+  "status_bar_codex_cloud_error": "Codex Cloud: エラー",
+  "status_bar_codex_cloud_off": "Codex Cloud: オフ",
+  "status_bar_codex_cloud_config_error": "Codex Cloud: 設定エラー",
+  "status_bar_codex_cloud_live_attention": "Codex Cloud: ライブトークンの確認が必要です",
+  "status_bar_codex_cloud_oldest_failure": "最も古い失敗: {time}",
+  "status_bar_codex_cloud_last_success": "最後に成功した同期: {time}",
+  "status_bar_codex_cloud_homes": "Codex ホーム: {homes}",
+  "appearance_message_colors": "メッセージの色",
+  "appearance_message_colors_description": "メッセージの種類ごとに色を設定します。色覚サポートのプリセットは、一般的な色覚特性でも区別しやすい色合いを使い、線のパターンも加えるため、種類を色だけでなく形でも見分けられます。",
+  "appearance_message_colors_preset": "メッセージの色のプリセット",
+  "appearance_message_colors_preset_default": "テーマの既定",
+  "appearance_message_colors_preset_colorblind": "色覚サポート",
+  "appearance_message_colors_preset_custom": "カスタム",
+  "appearance_message_colors_patterns": "色に加えて線のパターンでメッセージの種類を示す",
+  "appearance_message_colors_reset_all": "既定に戻す",
+  "appearance_message_colors_reset_role": "リセット",
+  "appearance_message_colors_reset_role_label": "{role}の色をリセット",
+  "appearance_message_colors_role_label": "{role}の色",
+  "appearance_message_colors_picker": "カラーピッカーを開く",
+  "appearance_message_colors_hex": "16 進カラー",
+  "appearance_message_colors_warning_text": "{modes}では文字が読みにくい可能性があります（{ratio}:1、必要 {required}:1）。",
+  "appearance_message_colors_warning_marker": "{modes}では色のマーカーが見えにくい可能性があります（{ratio}:1、必要 {required}:1）。",
+  "appearance_message_colors_mode_light": "ライトモード",
+  "appearance_message_colors_mode_dark": "ダークモード",
+  "appearance_message_colors_mode_high_contrast_light": "ハイコントラストのライトモード",
+  "appearance_message_colors_mode_high_contrast_dark": "ハイコントラストのダークモード",
+  "appearance_message_colors_swatch_blue": "青",
+  "appearance_message_colors_swatch_vermillion": "朱色",
+  "appearance_message_colors_swatch_bluish_green": "青緑",
+  "appearance_message_colors_swatch_reddish_purple": "赤紫",
+  "appearance_message_colors_swatch_dark_yellow": "暗い黄色",
+  "appearance_message_colors_swatch_gray": "グレー",
+  "appearance_message_colors_preview": "プレビュー",
+  "appearance_message_colors_preview_user": "日付のテストはなぜ失敗するのですか？",
+  "appearance_message_colors_preview_assistant": "フィクスチャが UTC を前提にしていたので更新しました。",
+  "nav_friction": "フリクションログ",
+  "friction_page_help_docs": "フリクションログの仕組み",
+  "friction_page_refresh": "フリクションログを更新",
+  "friction_date_label": "ダイジェストの日付",
+  "friction_date_previous": "前のダイジェスト",
+  "friction_date_next": "次のダイジェスト",
+  "friction_date_no_match": "一致する日付がありません",
+  "friction_build_now": "今すぐ作成",
+  "friction_build_title": "ダイジェストがまだない完了済みの日すべてについてダイジェストを作成します",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 件のダイジェストを作成しました" }
+    }
+  ],
+  "friction_build_nothing": "完了済みの日にはすべてダイジェストがあります。",
+  "friction_build_failed": "作成に失敗しました: {error}",
+  "friction_empty_title": "フリクションダイジェストはまだありません",
+  "friction_empty_hint": "ダイジェストはローカルの各日が終わると自動で作成され、作成されなかった日は毎時のジョブが補います。「今すぐ作成」で不足している日をすぐに作成できます。",
+  "friction_empty_hint_remote": "ダイジェストはローカルの各日が終わると自動で作成され、作成されなかった日は毎時のジョブが補います。不足している日をすぐに作成するには、AgentsView を実行しているマシンでこのページを開くか、サーバーで require_auth を有効にしてください。",
+  "friction_load_error": "フリクションログを読み込めませんでした",
+  "friction_retry": "再試行",
+  "friction_issue_open": "Kata で {issue} を開く",
+  "friction_issue_file": "Kata に登録",
+  "friction_issue_file_title": "このパターンを Kata に登録するか、Kata に既にある課題をリンクします",
+  "friction_issue_link": "課題をリンク",
+  "friction_issue_link_label": "Kata の課題",
+  "friction_issue_link_placeholder": "agentsview#f001",
+  "friction_issue_link_submit": "リンク",
+  "friction_issue_cancel": "キャンセル",
+  "friction_issue_unlink": "リンク解除",
+  "friction_issue_unlink_title": "リンクを削除します。Kata の課題はそのまま残ります",
+  "friction_filing_retry": "登録に失敗しました。再試行します",
+  "friction_filing_needs_person": "登録を停止しました",
+  "friction_filing_paused": "自動登録を一時停止中",
+  "friction_filing_paused_title": "リンクが削除されたため、自動登録はこのパターンをスキップします。登録またはリンクすると再開します。",
+  "friction_digest_heading": "フリクションログ — {date}",
+  "friction_digest_built": "{when} に作成（{timezone}）",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "{countNumber} 件のセッションで失敗"
+      }
+    }
+  ],
+  "friction_clean_title": "フリクションは見つかりませんでした",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "スキャンした {countNumber} 件のセッションで検出された項目はありません。"
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "この日にアクティブなセッションはありませんでした。",
+  "friction_deferral_said": "作業を後回し：「{phrase}」",
+  "friction_pattern_retry_loop": "再試行ループ",
+  "friction_pattern_runaway_loop": "暴走したツールループ",
+  "friction_pattern_edit_churn": "繰り返しの編集",
+  "friction_pattern_mid_task_compaction": "タスク途中のコンテキスト圧縮",
+  "friction_pattern_context_pressure": "コンテキストの逼迫",
+  "friction_pattern_iteration_runaway": "ユーザー入力のない長時間実行",
+  "friction_digest_missing": "{date} のダイジェストはありません。",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 件のセッションをスキャン" }
+    }
+  ],
+  "friction_headline_title": "要確認",
+  "friction_p0_title": "複数のセッションで失敗したツール",
+  "friction_patterns_new": "新しいパターン",
+  "friction_patterns_recurring": "繰り返し発生しているパターン",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 回発生" }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 件のセッション" }
+    }
+  ],
+  "friction_pattern_first_seen": "初回検出 {date}",
+  "friction_section_corrections": "修正指示",
+  "friction_section_errors": "エラー",
+  "friction_section_workarounds": "回避策",
+  "friction_section_deferrals": "先送り",
+  "friction_section_patterns": "パターン",
+  "friction_section_frustration": "苛立ち",
+  "friction_section_interruptions": "中断",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=other": "{countNumber} 回の中断" }
+    }
+  ],
+  "friction_kind_correction": "修正指示",
+  "friction_kind_error": "エラー",
+  "friction_kind_workaround": "回避策",
+  "friction_kind_deferral": "先送り",
+  "friction_kind_pattern": "パターン",
+  "friction_kind_frustration": "苛立ち",
+  "friction_kind_interruption": "中断",
+  "friction_disabled_title": "このサーバーではフリクションログがオフです",
+  "friction_disabled_hint": "このサーバーはダイジェストを作成しません。config.toml で [friction] enabled = true を設定し、デーモンを再起動してください。読み取り専用のアーカイブではダイジェストを作成できません。",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "Markdown を表示",
+  "friction_markdown_copy": "Markdown をコピー",
+  "friction_markdown_copied": "Markdown をコピーしました",
+  "friction_markdown_download": "Markdown をダウンロード",
+  "friction_markdown_loading": "Markdown を読み込み中…",
+  "friction_markdown_error": "Markdown ダイジェストを読み込めませんでした。",
+  "friction_open_session": "{session} をメッセージ {ordinal} で開く",
+  "friction_open_session_start": "{session} を開く",
+  "friction_quality_card_title": "フリクションログ",
+  "friction_quality_card_body": "セッションで見つかった修正指示、ツールエラー、回避策、先送り、繰り返し発生するパターンの日次ダイジェスト。",
+  "friction_quality_card_open": "フリクションログを開く",
+  "friction_session_title": "フリクションの検出結果",
+  "friction_session_loading": "フリクションの検出結果を読み込み中…",
+  "friction_session_error": "フリクションの検出結果を利用できません。",
+  "friction_session_empty": "このセッションにフリクションの検出結果はありません。",
+  "friction_session_jump": "メッセージ {ordinal}",
+  "friction_session_jump_title": "メッセージ {ordinal} へ移動",
+  "docbank_subagent_open_session": "セッションとして開くと、ファイルの一致が表示されます。",
+  "docbank_checking": "Docbank を確認中…",
+  "docbank_current": "現在のバージョン",
+  "docbank_prior": "以前のバージョン",
+  "docbank_trash": "ゴミ箱",
+  "docbank_not_found": "Docbank にありません",
+  "docbank_read_unavailable": "セッションのファイルを読み込めません",
+  "docbank_unavailable": "Docbank を利用できません",
+  "docbank_limit_exceeded": "Docbank の検索上限に達しました",
+  "docbank_bytes_not_kept": "画像のバイトは保持されていません",
+  "docbank_file": "ファイル {n} · {mediaType} · {size}",
+  "docbank_file_without_size": "ファイル {n} · {mediaType}",
+  "docbank_more": "Docbank にあと {count} 件",
+  "meaning_name": "意味で検索",
+  "meaning_off": "オフ",
+  "meaning_on": "オン",
+  "meaning_uses_ollama": "有効にすると Ollama を使用します",
+  "meaning_ollama": "オン · Ollama",
+  "meaning_turning_on": "有効化中",
+  "meaning_turn_on": "有効にする",
+  "meaning_download": "{size} を一度ダウンロードし、すべての Kenn アプリで共有します",
+  "meaning_downloaded": "このコンピューターに保存済み",
+  "meaning_configured": "設定済みのサーバーを使用",
+  "meaning_downloading": "{total} 中 {done} をダウンロード中",
+  "meaning_indexing": "{total} {items} 中 {done} をインデックス中",
+  "meaning_time_left": "残り {time}",
+  "meaning_meanwhile": "キーワード検索は引き続き利用できます",
+  "meaning_under_minute": "1分未満",
+  "meaning_about_time": "約 {time}",
+  "meaning_progress": "意味検索の設定",
+  "meaning_hint": "意味検索はオフです",
+  "meaning_chunks": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": { "countPlural=one": "テキスト区間", "countPlural=other": "テキスト区間" }
+    }
+  ],
+  "empty_archive_title": "まだセッションがありません",
+  "empty_archive_desc": "AgentsView はこれらのフォルダーからセッションを読み取ります。エージェントがいずれかに書き込むと、ここに表示されます。",
+  "empty_archive_choose_folders": "フォルダーを選択"
 }

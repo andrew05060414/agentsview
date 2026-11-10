@@ -60,6 +60,7 @@ function kindVisible(
       return isVisible("thinking");
     case "code":
       return isVisible("code");
+    case "tool-meta":
     case "tool-input":
     case "tool-output":
     case "tool-history":
@@ -85,10 +86,28 @@ export function projectSessionScope(input: SessionScopeInput): SessionScope {
   const filteredItems = buildDisplayItems(baseMessages, {
     skipToolGrouping: !isVisible("tool"),
   });
-  const itemVisible = (item: DisplayItem): boolean =>
-    item.kind === "tool-group" || hasVisibleSegments(item.message, isTranscriptBlockVisible);
+  const messageVisible = (message: Message): boolean =>
+    hasVisibleSegments(message, isTranscriptBlockVisible);
+  // An empty group keeps the members whose role is still shown, so hiding an
+  // unrelated block type does not hide an empty prompt.
+  const visibleItems = (source: DisplayItem[]): DisplayItem[] =>
+    source.flatMap((item): DisplayItem[] => {
+      if (item.kind === "tool-group") return [item];
+      if (item.kind === "message") return messageVisible(item.message) ? [item] : [];
+      const members = item.messages.filter(messageVisible);
+      const [first] = members;
+      if (first === undefined) return [];
+      return [
+        {
+          kind: "empty-group",
+          messages: members,
+          ordinals: members.map((message) => message.ordinal),
+          timestamp: first.timestamp,
+        },
+      ];
+    });
 
-  const normalItems = hasBlockFilters ? filteredItems.filter(itemVisible) : baseItems;
+  const normalItems = hasBlockFilters ? visibleItems(filteredItems) : baseItems;
   let items: DisplayItem[];
   if (transcriptMode === "normal") {
     items = normalItems;
@@ -97,16 +116,18 @@ export function projectSessionScope(input: SessionScopeInput): SessionScope {
       keepAnswerBeforeTrailingTools: input.keepAnswerBeforeTrailingTools,
     });
   } else {
-    items = filterDisplayItemsByTranscriptMode(filteredItems, "focused", {
-      keepAnswerBeforeTrailingTools: input.keepAnswerBeforeTrailingTools,
-      isMessageVisible: (message) => hasVisibleSegments(message, isTranscriptBlockVisible),
-    }).filter(itemVisible);
+    items = visibleItems(
+      filterDisplayItemsByTranscriptMode(filteredItems, "focused", {
+        keepAnswerBeforeTrailingTools: input.keepAnswerBeforeTrailingTools,
+        isMessageVisible: messageVisible,
+      }),
+    );
   }
 
   const messages: Message[] = [];
   const included = new Set<Message>();
   for (const item of items) {
-    const group = item.kind === "tool-group" ? item.messages : [item.message];
+    const group = item.kind === "message" ? [item.message] : item.messages;
     for (const message of group) {
       if (included.has(message)) continue;
       included.add(message);

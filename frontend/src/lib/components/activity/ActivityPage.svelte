@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { formatDateTime, m } from "../../i18n/index.js";
   import { onMount, untrack } from "svelte";
   import {
@@ -366,6 +367,7 @@
 
   function onMachineChange(value: string) {
     activity.setMachine(value);
+    if (!activity.machines.length) activity.loadFilterOptions();
     activity.load();
   }
 
@@ -442,7 +444,7 @@
       <Typeahead
         options={machineOptions}
         value={activity.machine}
-        fallbackLabel={m.activity_all_machines()}
+        fallbackLabel={activity.machine || m.activity_all_machines()}
         placeholder={m.activity_filter_machines_placeholder()}
         title={m.activity_filter_by_machine()}
         emptyLabel={m.activity_no_matching_machines()}
@@ -520,7 +522,7 @@
     {:else if activity.loading}
       <div class="status">{m.activity_loading_report()}</div>
     {:else if activity.error}
-      <div class="status error">
+      <div class="status error" {@attach errorTelemetry("analytics")}>
         <span>{activity.error}</span>
         <button class="retry-btn" onclick={() => activity.load()}>
           {m.shared_retry()}

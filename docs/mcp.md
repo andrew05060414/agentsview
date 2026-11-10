@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-09
+last_edited: 2026-11-06
 title: MCP Server
 description: Connect assistant clients to your AgentsView session history with MCP
 ---
@@ -9,12 +9,17 @@ The `agentsview mcp` command runs a read-only
 assistant clients can use it to search prior sessions, inspect a session before
 opening it, fetch message slices, search raw content, see which tools a session
 ran and which files it edited, report activity, tool use, and quality signals,
-summarize and compare token usage, and search the AgentsView guides without
-leaving the assistant.
+summarize and compare token usage, explain one session's cost, and search the
+AgentsView guides without leaving the assistant.
 
 MCP tool results warn when the archive is stale during a full parser rebuild.
 
 ## When To Use It
+
+Machine filters accept exact IDs, aliases, comma-separated ID/alias lists, or a
+unique whole display label. A valid 32-hex installation ID takes precedence even
+without stored sessions. Unknown or ambiguous names return an error with
+choices.
 
 Use the MCP server when you want a coding assistant to answer questions such as:
 
@@ -23,11 +28,20 @@ Use the MCP server when you want a coding assistant to answer questions such as:
 - "Open the relevant messages around this search hit."
 - "Which sessions changed `internal/server/routes.go`, and what did they run?"
 - "Summarize recent token usage for this project."
+- "Why did yesterday's most expensive session cost so much?"
 - "How much agent time and cost did this week take, and where did agents
   struggle?"
 
 The tools are read-only. They expose session history and usage data, but they do
 not mutate the archive or resync files directly.
+
+Every tool explicitly declares read-only, non-destructive, and idempotent hints.
+`search_content` and `query_recall` are open-world because their semantic search
+modes can send queries to the configured embedding provider.
+`get_session_file_references` is also open-world because it queries the
+configured Docbank service. The other tools advertise a closed environment of
+archived data and bundled guides. These hints help clients classify calls; they
+do not authorize access.
 
 ### Discover running HTTP listeners
 
@@ -42,9 +56,10 @@ IPv6) so local clients can connect. Other bound addresses remain unchanged.
 
 The listener publishes its actual bound port after startup, including when
 started with port zero, and removes its record on orderly shutdown. Status omits
-records whose process has exited. Stdio sessions are not listening endpoints and
-do not appear. An empty JSON list means no HTTP listeners were found in this
-application's configured data directory.
+records it can determine have exited. Records from another PID namespace remain
+listed when kit cannot judge their process identity. Stdio sessions are not
+listening endpoints and do not appear. An empty JSON list means no HTTP
+listeners were found in this application's configured data directory.
 
 ## Quick Start
 
@@ -64,30 +79,45 @@ For local desktop-style MCP clients, use stdio:
 Restart or reload your MCP client after adding the server. Once connected, the
 client will see these tools:
 
-| Tool                   | Purpose                                                                  |
-| ---------------------- | ------------------------------------------------------------------------ |
-| `search_sessions`      | Full-text search across recorded sessions                                |
-| `list_sessions`        | List recent or filtered sessions                                         |
-| `get_session_overview` | Fetch metadata and a compact message preview                             |
-| `get_messages`         | Read paginated message bodies from one session                           |
-| `get_memory_status`    | Report archive, lexical, semantic, and source readiness                  |
-| `search_content`       | Substring, regex, terms, semantic, or hybrid search over session text    |
-| `get_usage_summary`    | Aggregate token and cost usage                                           |
-| `query_recall`         | Search extracted Recall entries when the backend supports Recall queries |
-| `get_tool_calls`       | List the tool calls one session made, with inputs and result sizes       |
-| `get_recent_edits`     | Find which sessions edited a file, newest edit first                     |
-| `get_child_sessions`   | List the sub-agent and fork sessions started from one session            |
-| `compare_usage`        | Compare token usage and cost between two models or two projects          |
-| `get_activity_report`  | Report agent time, sessions, and cost for a day, week, month, or range   |
-| `get_tool_usage`       | Count tool calls by category, agent, and tool name                       |
-| `get_quality_signals`  | Show health grades, outcomes, failures, and example sessions             |
-| `search_docs`          | Search the AgentsView guides bundled with this version                   |
+| Tool                          | Purpose                                                                  |
+| ----------------------------- | ------------------------------------------------------------------------ |
+| `search_sessions`             | Full-text search across recorded sessions                                |
+| `list_sessions`               | List recent or filtered sessions                                         |
+| `get_session_overview`        | Fetch metadata and a compact message preview                             |
+| `get_messages`                | Read paginated message bodies from one session                           |
+| `get_memory_status`           | Report archive, lexical, semantic, and source readiness                  |
+| `search_content`              | Substring, regex, terms, semantic, or hybrid search over session text    |
+| `get_usage_summary`           | Aggregate token and cost usage                                           |
+| `get_session_usage`           | Show one session's tokens and cost by model and by request               |
+| `query_recall`                | Search extracted Recall entries when the backend supports Recall queries |
+| `get_session_file_references` | Find retained image bytes in Docbank, including prior versions and trash |
+| `get_tool_calls`              | List the tool calls one session made, with inputs and result sizes       |
+| `get_recent_edits`            | Find which sessions edited a file, newest edit first                     |
+| `get_child_sessions`          | List the sub-agent and fork sessions started from one session            |
+| `compare_usage`               | Compare token usage and cost between two models or two projects          |
+| `get_activity_report`         | Report agent time, sessions, and cost for a day, week, month, or range   |
+| `get_tool_usage`              | Count tool calls by category, agent, and tool name                       |
+| `get_quality_signals`         | Show health grades, outcomes, failures, and example sessions             |
+| `search_docs`                 | Search the AgentsView guides bundled with this version                   |
+| `get_friction_digest`         | Read a dated Friction Log digest as Markdown or the summary object       |
+| `list_friction_patterns`      | List recurring friction patterns ranked by occurrences                   |
+
+The two Friction Log tools appear when the backend stores the Friction Log.
+`get_friction_digest` defaults to the latest digest; pass `date` (YYYY-MM-DD)
+and `format` (`markdown` or `summary`). `list_friction_patterns` accepts `kind`,
+`since`, and `limit` (default 20, max 100). Each pattern includes its linked
+[Kata](/docs/kata/) issue as `issue`, or, when automatic filing has not linked
+it, the reason as `filing`. Both tools report
+[Friction Log](/docs/configuration/#friction-log) heuristics, not ground truth.
 
 `list_sessions` accepts `labels` (every listed label must match) and `pr`
-(`owner/repo`, `owner/repo#123`, or `github.com::owner/repo#123`). Its rows include each
-session's labels, pull request links, and parent session. See
+(`owner/repo`, `owner/repo#123`, or `github.com::owner/repo#123`). Its rows
+include each session's labels, pull request links, and parent session. See
 [labels](/docs/session-api/#agentsview-session-label) and
 [pull request links](/docs/session-api/#pull-request-links).
+
+With Docbank and every optional tool listed, the tool list the server sends is
+about 87 KB. `TestNewServer_CatalogFitsBudget` fails when it grows past 96 KB.
 
 ### Focused memory profile
 
@@ -115,6 +145,8 @@ remote servers report `unknown` with an `unsupported` reason. The tools use the
 same schemas and backend selection as the full profile, over either stdio or
 StreamableHTTP. Omitting `--profile` or choosing `--profile full` preserves the
 complete tool list above.
+
+This profile's tool list is about 21 KB, and the same test holds it under 24 KB.
 
 The native
 [AgentsView Memory package](https://github.com/kenn-io/agentsview/tree/main/plugins/agentsview-memory)
@@ -178,13 +210,16 @@ default. Set `include_one_shot: true` or `include_automated: true` to include
 those classes. An empty result can therefore omit a matching one-shot or
 automated session.
 
-When a vector search index is configured, prefer `search_content` with
-`mode: "hybrid"` or `mode: "semantic"` for questions about prior work,
+Prefer `search_content` with `mode: "hybrid"` for questions about prior work,
 especially when the exact wording is unknown. Hybrid combines semantic
 similarity with keyword matching. Use `context` to include surrounding messages.
-If the index is unavailable, use `search_sessions` for keyword search, or
-`search_content` with substring/regex for exact errors, identifiers, and code
-fragments. The default search mode remains substring.
+Hybrid returns its keyword matches when search by meaning is unavailable. The
+response includes `effective_mode: "hybrid_keyword"` and a `note` beside
+`coverage` explaining why. Keyword matches need the query words to appear. If
+there are no matches or only a few, try one or two short substring queries with
+key terms or synonyms. Preserve `scope`, inclusion, and current-session filters.
+Disclose keyword-only results once. Use substring/regex for exact errors,
+identifiers, and code fragments. The default remains substring.
 
 `search_content` accepts a `mode` of `substring` (default), `regex`, `terms`,
 `semantic`, or `hybrid`. `terms` splits `pattern` on whitespace and requires
@@ -195,13 +230,27 @@ belong to no exchange and never match. `%`, `_`, and backslashes stay literal;
 tool and system content is outside this mode. The `terms` mode currently
 requires a SQLite or PostgreSQL backend.
 
-`scope` can be `top`, `all` (default), or `subordinate` for terms, semantic, and
-hybrid searches. The semantic and hybrid modes need the opt-in
-[semantic search](/docs/semantic-search/) index on the local SQLite archive;
-without it they return a "not available" error. Exact `session_id`,
-`git_branch`, `project`, `agent`, `date_from`, and `date_to` filters apply
-before the final limit. Limits default to 10 and go up to 50; a value outside
-that range falls back to the default.
+`scope` can be `top`, `all` (default), or `subordinate` for substring, regex,
+terms, semantic, and hybrid searches. `all` includes child sessions and
+sidechain messages; `top` excludes them, and `subordinate` returns only them.
+Child sessions bypass the one-shot exclusion; top-level one-shot sessions still
+require `include_one_shot: true`. Semantic mode needs the opt-in
+[semantic search](/docs/semantic-search/) index and returns a "not available"
+error without it. Exact `session_id`, `git_branch`, `project`, `agent`,
+`date_from`, and `date_to` filters apply before the final limit. Limits default
+to 10 and go up to 50; a value outside that range falls back to the default.
+
+To find one past session that covered several ideas, pass `concepts` instead of
+`pattern`: two to five distinct natural-language strings. The mode defaults to
+`semantic`, and any other explicit mode is rejected. AgentsView searches each
+concept separately and keeps only sessions with evidence for all of them, even
+when different exchanges carry that evidence. Results rank by the mean of each
+concept's strongest score. Each match lists `concept_evidence` in request order:
+the concept, its snippet, score, ordinal, `ordinal_range`, and
+`transcript_revision`. Concept searches do not page, so `cursor` is rejected.
+`candidate_truncated` is true when a session may be missing: one concept's
+candidate search filled up or stopped at its fetch cap, or more sessions matched
+than the limit allowed.
 
 A `terms` snippet shows about 60 characters of context around the first
 occurrence of each term. Terms that sit far apart in a long exchange produce
@@ -213,14 +262,27 @@ Every match carries a conversation-unit citation: an `ordinal_range` of
 `parent_session_id`, and `is_sidechain` fields that flag hits from sidechain
 runs and subagent or fork sessions. The response also reports the
 `effective_mode`, the `effective_scope` for modes that support scope, and the
-`exclusions` that applied by default. `next_cursor` is present when another page
-exists. To continue `search_content`, pass `next_cursor` as the numeric `cursor`
-and echo the returned RFC3339 `activity_cutoff` unchanged. The cutoff keeps the
-recent-activity exclusion fixed across pages of an unchanged archive, including
-on older servers. A positive cursor without the cutoff returns a restart error
-when that exclusion applies. Restart without a cursor to obtain both fields.
-`include_active: true` or an explicit `current_session_id` allows numeric-only
-continuation. Archive edits retain the existing offset-pagination behavior.
+`exclusions` that applied by default. Empty first pages also return `hints` when
+a diagnostic search finds hidden matches. Each entry has `code`, `message`, and
+`retry_with`, the arguments to change while keeping the rest of your request.
+Counts say `more than N` when a bounded probe has more results, or `at least N`
+for semantic and hybrid searches or when activity filtering or candidate limits
+prevent an exact count. Failed probes add no hint. Default scope already
+includes child sessions.
+
+`next_cursor` is present when another page exists. To continue `search_content`,
+pass `next_cursor` as the numeric `cursor` and echo the returned RFC3339
+`activity_cutoff` unchanged. The cutoff keeps the recent-activity exclusion
+fixed across pages of an unchanged archive, including on older servers. A
+positive cursor without the cutoff returns a restart error when that exclusion
+applies. Restart without a cursor to obtain both fields. `include_active: true`
+or an explicit `current_session_id` allows numeric-only continuation. Archive
+edits retain the existing offset-pagination behavior.
+
+`exclusions.children` reports whether child sessions were excluded, including in
+empty results. It is true for `scope: top` and FTS searches without an exact
+`session_id`. It stays false for `scope: subordinate`, which keeps child
+sessions.
 
 SQLite and PostgreSQL search matches also carry `transcript_revision`, captured
 by the same storage query as the evidence. A `revision_bound` response flag says
@@ -261,7 +323,30 @@ the optional date range, agent, and machine filters. The result has each side's
 cost, tokens, and session count plus the differences. Like `get_usage_summary`,
 it counts one-shot sessions.
 
-`get_activity_report` returns the same totals as `agentsview activity report`:
+`get_session_usage` reports one session's tokens and cost, the same figures as
+[`agentsview session usage`](/docs/session-api/#agentsview-session-usage). Use
+it after `get_activity_report` with `sessions_sort: "cost"` finds an expensive
+session. Pass a full stored ID or a raw UUID as `session_id`. The result has:
+
+- The CLI's JSON fields: `total_output_tokens`, `peak_context_tokens`, `cost`,
+  `has_cost`, `cost_source`, `models`, `unpriced_models`, `subagent_count`,
+  `plan_usage`, and `capture_coverage`.
+- `by_model`: input, output, cache write, and cache read tokens and cost for
+  each model, most expensive first.
+- `breakdown`: one row per request, 20 at a time (maximum 200). Set
+  `breakdown_sort: "cost"` to see the most expensive requests first, and pass
+  `breakdown_next_cursor` back as `breakdown_cursor` for the next page. Pass a
+  row's `message_ordinal` to `get_messages` as `around` to read that turn.
+
+Totals include the subagent sessions the session started. Set `own_only: true`
+to report only its own transcript, like `--own-only`. When any model has no
+known price, `has_cost` is false and `unpriced_models` names those models;
+`by_model` still shows the cost of the priced models. Unlike the CLI, the tool
+does not refresh source files first. It reports the archive as stored, like
+`agentsview session usage --no-sync`. It leaves out the CLI's deprecated
+`cost_usd`, `server_running`, and `refresh_incomplete` fields.
+
+`get_activity_report` returns the same totals as `agentsview report activity`:
 agent minutes, sessions, tokens, and cost, the most agents running at once, and
 breakdowns by project, model, and agent. `preset` is `day` (default), `week`,
 `month`, or `custom` with RFC3339 `from` and `to`. `date` picks the day, week,
@@ -272,13 +357,12 @@ with `sessions_sort: "cost"`; pass `sessions_next_cursor` back as
 
 `get_tool_usage` and `get_quality_signals` use the analytics filters: `from` and
 `to` dates default to the 30 days ending today in UTC, and one-shot and
-automated sessions are excluded unless `include_one_shot` or
-`include_automated` is set. `get_tool_usage` counts tool calls by category,
-agent, and tool name with a weekly trend. `get_quality_signals` reports health
-grades, outcomes, tool failures and retries, edit churn, context pressure, and
-prompt quality, by agent and project. Set `signal`, such as
-`tool_failure_signals` or `edit_churn`, to also get up to `examples` sessions
-(default 5, maximum 20) that show it.
+automated sessions are excluded unless `include_one_shot` or `include_automated`
+is set. `get_tool_usage` counts tool calls by category, agent, and tool name
+with a weekly trend. `get_quality_signals` reports health grades, outcomes, tool
+failures and retries, edit churn, context pressure, and prompt quality, by agent
+and project. Set `signal`, such as `tool_failure_signals` or `edit_churn`, to
+also get up to `examples` sessions (default 5, maximum 20) that show it.
 
 `search_docs` searches the guides published at
 [agentsview.io/docs](https://agentsview.io/docs/) as shipped with this binary,
@@ -311,6 +395,10 @@ read-only, could not write its runtime record, or runs as a process whose
 identity cannot be checked. This lets a writable daemon take over as soon as one
 is available.
 
+When no daemon is visible and another process holds the write lock, the MCP call
+fails with the lock error instead of starting a daemon that could not open the
+archive. The next call checks again.
+
 The MCP server does not open the local SQLite archive directly. This keeps MCP
 reads on the same daemon policy as the desktop app and avoids a long-running MCP
 process holding its own archive handle.
@@ -331,7 +419,7 @@ starts a local archive or reports that the remote corpus was refreshed.
 Contributor wake delivery is currently available on macOS and Linux.
 
 Set `AGENTSVIEW_DISABLE_AUTO_SYNC=1` to skip this automatic lifecycle request.
-Explicit `agentsview sync` commands and existing-history searches remain
+Explicit `agentsview source sync` commands and existing-history searches remain
 available. A disabled or failed lifecycle request does not change archive data;
 the package hook is responsible for reporting the failure without blocking the
 agent session.
@@ -402,7 +490,7 @@ You can also expose PostgreSQL-backed session history through a read-only
 PostgreSQL daemon and point MCP at it:
 
 ```bash
-agentsview pg serve --port 8085
+agentsview replica pg serve --port 8085
 ```
 
 ```json
@@ -445,6 +533,12 @@ configured bearer token and enforces `Authorization: Bearer <token>` on every
 request. If `require_auth` is enabled, loopback HTTP binds also require bearer
 auth so forwarded ports are not accidentally unauthenticated.
 
+## Server Identity (unreleased)
+
+On `main`, the MCP server declares the AgentsView website and icon. The icon is
+included as a PNG data URI, so stdio and HTTP clients can load it without an
+external request. Whether it appears depends on the client.
+
 ## Security Notes
 
 The MCP server can reveal prompts, assistant responses, tool output, file paths,
@@ -459,3 +553,17 @@ project names, and usage totals. Treat it like access to your session archive.
 
 For every flag, see [`agentsview mcp`](/docs/commands/#agentsview-mcp) in the
 CLI reference.
+
+## Find images in Docbank
+
+`get_session_file_references` takes `session_id` and returns the same result as
+`GET /api/v1/sessions/{id}/file-references`. It is available in the full
+profile. Each occurrence includes its message ordinal, optional tool and
+result-event coordinates, SHA-256 digest, and `found`, `not_found`,
+`unavailable`, `limit_exceeded`, or `bytes_not_kept` state. Images dropped by
+the image policy report `bytes_not_kept` with an empty digest. Matches identify
+current files, prior versions, or trash and include an exact version link when
+configured. A disabled integration returns an empty list. See
+[Docbank configuration](/docs/configuration/#find-transcript-images-in-docbank)
+for coverage and limits. Database reads and Docbank requests each have a
+separate five-second budget. Claude pasted images aren't covered yet.

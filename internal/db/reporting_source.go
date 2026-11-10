@@ -18,6 +18,8 @@ type reportingSourceLoadStats struct {
 }
 
 type reportingExportSource struct {
+	localMachineID      string
+	machineAliases      map[string]string
 	activitySessions    []reportingSourceSession
 	activityEvents      []activity.ActivityEvent
 	usageSessions       []activity.SessionMeta
@@ -40,6 +42,9 @@ type reportingSourceSession struct {
 }
 
 type reportingDaySource struct {
+	localMachineID   string
+	machineAliases   map[string]string
+	archiveID        string
 	activitySessions []activity.SessionMeta
 	activityIDs      []string
 	activityEvents   []activity.ActivityEvent
@@ -161,7 +166,7 @@ func (db *DB) loadReportingExportSource(
 	labels := activity.ProjectLabels(allSessions)
 	observations := []export.ProjectIdentityObservation{}
 	archiveScope := export.IdentityScope{}
-	if len(labels) > 0 || export.IsJointReportingSchemaVersion(schemaVersion) {
+	if len(labels) > 0 || schemaVersion == export.ReportingJointSchemaVersion {
 		archiveID, archiveSalt, scopeErr := reportingArchiveScope(ctx, tx)
 		if scopeErr != nil {
 			return source, scopeErr
@@ -180,7 +185,7 @@ func (db *DB) loadReportingExportSource(
 		}
 	}
 	var references map[string]export.ProjectReference
-	if export.IsJointReportingSchemaVersion(schemaVersion) {
+	if schemaVersion == export.ReportingJointSchemaVersion {
 		references, err = db.reportingSessionReferences(ctx, tx, allSessions)
 		if err != nil {
 			return source, err
@@ -238,12 +243,12 @@ func (src reportingExportSource) forDate(
 	usageCandidates := make([]activityReportUsageCandidate, 0, len(src.usageCandidates))
 	usageIDs := make(map[string]struct{}, len(src.usageCandidates))
 	for _, candidate := range src.usageCandidates {
-		if candidate.row.Timestamp < lowerBound || candidate.row.Timestamp > upperBound {
+		if candidate.scan.ts < lowerBound || candidate.scan.ts > upperBound {
 			continue
 		}
 		usageCandidates = append(usageCandidates, candidate)
-		if candidate.row.SessionID != "" {
-			usageIDs[candidate.row.SessionID] = struct{}{}
+		if candidate.scan.sessionID != "" {
+			usageIDs[candidate.scan.sessionID] = struct{}{}
 		}
 	}
 	usageSessions := make([]activity.SessionMeta, 0, len(src.usageSessions))
@@ -287,6 +292,9 @@ func (src reportingExportSource) forDate(
 		}
 	}
 	return reportingDaySource{
+		localMachineID:   src.localMachineID,
+		machineAliases:   src.machineAliases,
+		archiveID:        src.archiveScope.ArchiveID,
 		activitySessions: selectedSessions,
 		activityIDs:      activityIDs,
 		activityEvents:   activityEvents,

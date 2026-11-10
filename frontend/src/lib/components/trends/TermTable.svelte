@@ -1,10 +1,12 @@
 <script lang="ts">
+  import { Table } from "@kenn-io/kit-ui";
+  import { seriesDashArray, type SeriesStyle } from "@kenn-io/kit-ui/utils/palette";
   import { m } from "../../i18n/index.js";
   import type { DbTrendSeries as TrendsSeries } from "../../api/generated/index.js";
 
   interface Props {
     series: TrendsSeries[];
-    colorFor: (term: string, index: number) => string;
+    styleFor: (term: string, index: number) => SeriesStyle;
     activeTerm: string | null;
     normalized: boolean;
     messageCount: number;
@@ -13,7 +15,7 @@
 
   let {
     series,
-    colorFor,
+    styleFor,
     activeTerm,
     normalized,
     messageCount,
@@ -35,7 +37,7 @@
 </script>
 
 <div class="term-table-wrap">
-  <table class="term-table">
+  <Table bare unsorted class="term-table">
     <thead>
       <tr>
         <th>{m.trends_term()}</th>
@@ -44,6 +46,7 @@
     </thead>
     <tbody>
       {#each series as item, index}
+        {@const style = styleFor(item.term, index)}
         <tr
           class:dimmed={activeTerm !== null && activeTerm !== item.term}
           onmouseenter={() => onHover(item.term)}
@@ -51,10 +54,22 @@
         >
           <td>
             <div class="term-name">
-              <span
-                class="swatch"
-                style:background={colorFor(item.term, index)}
-              ></span>
+              {#if style.dash === "solid"}
+                <span class="swatch" style:background={style.color}></span>
+              {:else}
+                <!-- Dashed series show a line sample that matches the chart. -->
+                <svg class="swatch-line" viewBox="0 0 15 4" aria-hidden="true">
+                  <line
+                    x1="0"
+                    y1="2"
+                    x2="15"
+                    y2="2"
+                    stroke={style.color}
+                    stroke-width="2"
+                    stroke-dasharray={seriesDashArray(style.dash, 2)}
+                  />
+                </svg>
+              {/if}
               <span>{item.term}</span>
             </div>
             {#if item.variants.length > 1}
@@ -67,7 +82,7 @@
         </tr>
       {/each}
     </tbody>
-  </table>
+  </Table>
 </div>
 
 <style>
@@ -78,7 +93,7 @@
     background: var(--bg-surface);
   }
 
-  .term-table {
+  .term-table-wrap :global(.term-table) {
     width: 100%;
     border-collapse: collapse;
     font-size: 12px;
@@ -127,6 +142,15 @@
     width: 9px;
     height: 9px;
     border-radius: 999px;
+    flex: 0 0 auto;
+  }
+
+  /* Wider than the dot so the dash shows; negative margins keep the
+     term names aligned. */
+  .swatch-line {
+    width: 15px;
+    height: 4px;
+    margin-inline: -3px;
     flex: 0 0 auto;
   }
 

@@ -309,8 +309,9 @@ func (s analyticsSQL) TopSessionsSQL(f db.AnalyticsFilter, metric string, includ
 				) AS delta_ms
 				FROM messages m2
 				WHERE m2.session_id = s.id
+					AND %[2]s
 			) inner2
-		)`, db.ActiveGapCapMs)
+		)`, db.ActiveGapCapMs, db.ExcludeClaudeHooksSQL("m2.source_subtype"))
 	activeDurationSelectExpr := "COALESCE(" + activeDurationExpr + ", 0)"
 	orderExpr := "s.message_count DESC, s.id ASC"
 	switch metric {
@@ -351,14 +352,26 @@ func (s analyticsSQL) ScanTopSession(rows *sql.Rows) (db.TopSession, error) {
 	return row, nil
 }
 
-func (s analyticsSQL) TrendsSQL() string {
-	return readbase.AnalyticsTrendsSQL(db.DuckDBSystemPrefixSQL("m.content", "m.role"), db.DuckDBQueryDialect())
+// TrendsSQL always sorts. Through the DuckDB driver, reading 175,000 trend
+// rows without ORDER BY took about five times as long as reading them
+// sorted.
+func (s analyticsSQL) TrendsSQL(f, sessionFilter db.AnalyticsFilter, _ bool) (string, []any) {
+	where, args := duckBuildAnalyticsWhere(
+		sessionFilter, "COALESCE(s.started_at, s.created_at)", "s.", true, true)
+	return readbase.AnalyticsTrendsSQL(
+		f, duckAnalyticsMessageWindowPred,
+		db.DuckDBSystemPrefixSQL("m.content", "m.role"), db.DuckDBQueryDialect(),
+		"m.session_id IN (SELECT s.id FROM sessions s WHERE "+where+")", args, true)
 }
 
 func (s analyticsSQL) FormatTime(v any) string { return formatDBTime(v) }
 
 func (s analyticsSQL) PopulateFrustrationMarkers(ctx context.Context, rows []db.SignalRow, sessions []readbase.AnalyticsSession) error {
-	return s.store.duckPopulateFrustrationMarkers(ctx, rows)
+	versions := make(map[string]string, len(sessions))
+	for _, session := range sessions {
+		versions[session.ID] = session.PushFingerprint
+	}
+	return s.store.duckPopulateFrustrationMarkers(ctx, rows, versions)
 }
 
 func (s *Store) GetAnalyticsSummary(

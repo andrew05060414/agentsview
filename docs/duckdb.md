@@ -18,20 +18,38 @@ up a PostgreSQL server.
     core extension. Expect rough edges, and treat the Quack remote
     path as suitable for trusted networks only.
 
+Content search matches dialogue for `--in messages` and reasoning for
+`--in thinking` in substring and regex modes. Substring and regex searches
+include reasoning by default; pass `--in messages` to skip it. A regex without a
+literal prefix loads every in-scope body from the selected sources into memory
+before matching and pagination.
+
+A mirror written before dialogue storage (schema version 20 or older) rejects
+reads with a schema compatibility error naming `messages.dialogue_text`. Run
+`agentsview replica duckdb push` to rebuild it before serving it with a newer
+binary.
+
+Commit lookups return the copied links and prompts.
+The first push after upgrading rebuilds the mirror to copy existing commit
+links. Serve requires that rebuild before opening an older mirror.
+A deleted session remains visible as a missing record. Project filters use the
+project saved with its links in SQLite, including after a rebuild or a deletion
+before the first push.
+
 ## Quick Start
 
 ```bash
 # Mirror local SQLite into ~/.agentsview/sessions.duckdb
-agentsview duckdb push
+agentsview replica duckdb push
 
 # Check mirror state
-agentsview duckdb status
+agentsview replica duckdb status
 
 # Serve the read-only web UI from the mirror
-agentsview duckdb serve
+agentsview replica duckdb serve
 
 # Keep the mirror current in the foreground
-agentsview duckdb push --watch
+agentsview replica duckdb push --watch
 ```
 
 `duckdb push` accepts the same project-filter and foreground watcher flags as
@@ -55,7 +73,7 @@ watcher cleanly.
 pushes to a remote Quack endpoint. If `[duckdb].url` or
 `AGENTSVIEW_DUCKDB_URL` is configured, push fails immediately with an error
 telling you to unset it for pushes and expose the mirror remotely with
-`agentsview duckdb quack serve` instead. `url` is read-side only, configuring
+`agentsview replica duckdb quack serve` instead. `url` is read-side only, configuring
 `duckdb status` and `duckdb serve`; `token` and `allow_insecure` also
 configure `duckdb quack serve`.
 
@@ -70,6 +88,16 @@ and `duckdb serve`.
 proxy and TLS flags) and is read-only in the same way — no uploads, file
 watching, or local sync.
 
+Local `duckdb serve` keeps finished Activity ranges in memory and past days a
+client opens on disk, so reopening them is quick, including after a restart.
+Finished Usage results stay in memory for the same mirror file and custom
+pricing, with up to 64 selections and 64 MiB per read kind.
+Disk reports are reused with the same mirror file, binary, and custom pricing.
+They live under `$CACHE_DIRECTORY/duckdb-activity-reports`, or under
+`agentsview/duckdb-activity-reports` in the user cache directory. Reports no one
+opens for 30 days are removed. Deleting them only slows the next open. If the
+cache directory cannot be created, serve keeps reports in memory only.
+
 ## Quack Remote Access
 
 [Quack](https://duckdb.org/docs/current/core_extensions/quack) is DuckDB's
@@ -79,14 +107,14 @@ web UI on one machine from a mirror that lives on another:
 
 ```bash
 # Machine A: expose the local mirror over loopback Quack
-agentsview duckdb quack serve \
+agentsview replica duckdb quack serve \
   --bind quack:127.0.0.1:9494 \
   --token "$AGENTSVIEW_DUCKDB_TOKEN"
 
 # Machine B (or another terminal): serve the UI from that endpoint
 AGENTSVIEW_DUCKDB_URL='quack:127.0.0.1:9494' \
 AGENTSVIEW_DUCKDB_TOKEN="$AGENTSVIEW_DUCKDB_TOKEN" \
-agentsview duckdb serve
+agentsview replica duckdb serve
 ```
 
 The client `url` uses the native `quack:HOST:PORT` form. The Quack extension
@@ -185,7 +213,7 @@ Environment variables override the config file:
   rather than the FTS5 index that local SQLite serving uses, so content search
   is slower on large archives.
 - **No Windows ARM64 support** — the upstream `duckdb-go-bindings` ship no
-  prebuilt DuckDB library for `windows/arm64`, so `agentsview duckdb`
+  prebuilt DuckDB library for `windows/arm64`, so `agentsview replica duckdb`
   subcommands report a clear error on that platform. Everything SQLite-backed
   works normally. On all other platforms the DuckDB driver is linked into the
   standard binary (which grows it considerably — this is expected).
@@ -210,10 +238,8 @@ Environment variables override the config file:
   changed since the rebuild began. When `--full` discards an unfinished
   rebuild, the push mode line says `discarded an unfinished rebuild`. A
   rebuild that ended with session errors resumes only while the mirror still
-  needs a rebuild. A manual push also resumes it when other processes have the
-  mirror open and the push has to fall back to a rebuild. The reported reason
-  then names those processes. Otherwise the push deletes the rebuild file after
-  the incremental update runs.
+  needs a rebuild. Otherwise the push deletes the rebuild file and retries
+  the failed sessions through an incremental update.
 - **One rebuild at a time** — a push holds a lock beside the rebuild file
   from the moment it reads the file until the swap. While another push holds
   it, a watch-mode push waits for a later cycle and a manual push fails. A
@@ -258,17 +284,17 @@ Environment variables override the config file:
   serve` and `duckdb quack serve` open the mirror with DuckDB's read-only
   access mode, and read-only handles coexist across processes. A push can
   therefore always inspect a served mirror; only DuckDB's exclusive WRITE
-  lock conflicts. While serve processes hold the file, an incremental
-  push cannot acquire write access: an explicit `duckdb push` falls back
-  to a full rebuild (rebuild file plus atomic rename, which never opens the
-  destination for writing), while the automatic pushes of `duckdb push
-  --watch` defer instead (logging the deferral) so a long-running serve
-  does not turn every changed batch into a full-archive rebuild. A
-  deferred push does not advance the mirror's push cutoff, so once the
-  serve process releases the file the next push catches up on everything
-  that changed in the meantime. A push that finds the mirror held
-  READ-WRITE fails with an error naming the holder: that is either
-  another push in flight or a serve process built before serve went
+  lock conflicts. While readers hold the mirror, both manual and watched
+  pushes update a standby file, checkpoint it, and swap it into place. Serve
+  adopts the replacement on its next poll. The first publication copies the
+  mirror and its WAL, requiring space for one extra mirror. Later publications
+  reuse the retired file at `<mirror-name>.spare` in the work directory and
+  catch it up through its own push cursors. A rebuild removes the standby;
+  ordinary in-place pushes keep it for reuse. If readers still hold the
+  standby, the push returns an error. Watch mode retries the pending batch;
+  a manual push can be rerun once readers release it. A push that finds the
+  mirror held READ-WRITE fails with an error naming the holder: that is
+  either another push in flight or a serve process built before serve went
   read-only — upgrading such a serve process needs a one-time restart.
   Leftover `<mirror-path>.agentsview-mirror` sidecar files from older
   development builds are inert and can be deleted. On POSIX platforms,

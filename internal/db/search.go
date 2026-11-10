@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"regexp"
 	"sort"
@@ -304,16 +305,17 @@ func stripLeadingSystemReminderBlocks(content string) (string, bool) {
 // SearchResult holds a session-level match with the best-ranked snippet.
 type SearchResult struct {
 	// WebURL is a client-derived browser link, never persisted.
-	WebURL         string  `json:"web_url,omitempty"`
-	SessionID      string  `json:"session_id"`
-	Project        string  `json:"project"`
-	Agent          string  `json:"agent"`
-	Machine        string  `json:"machine"`
-	Name           string  `json:"name"`
-	Ordinal        int     `json:"ordinal"`
-	SessionEndedAt string  `json:"session_ended_at"`
-	Snippet        string  `json:"snippet"`
-	Rank           float64 `json:"rank"`
+	WebURL         string   `json:"web_url,omitempty"`
+	SessionID      string   `json:"session_id"`
+	Project        string   `json:"project"`
+	Agent          string   `json:"agent"`
+	Machine        string   `json:"machine"`
+	SourceMachines []string `json:"source_machines,omitempty" doc:"Contributing hosted device machine IDs; omitted for sessions without hosted provenance."`
+	Name           string   `json:"name"`
+	Ordinal        int      `json:"ordinal"`
+	SessionEndedAt string   `json:"session_ended_at"`
+	Snippet        string   `json:"snippet"`
+	Rank           float64  `json:"rank"`
 }
 
 // SearchFilter specifies search parameters.
@@ -333,6 +335,26 @@ type SearchPage struct {
 	NextCursor int            `json:"next_cursor,omitempty"`
 }
 
+// hasFTSColumnFilter reports whether query contains a colon outside FTS quotes.
+func hasFTSColumnFilter(query string) bool {
+	quoted := false
+	for i := 0; i < len(query); i++ {
+		switch query[i] {
+		case '"':
+			if quoted && i+1 < len(query) && query[i+1] == '"' {
+				i++
+				continue
+			}
+			quoted = !quoted
+		case ':':
+			if !quoted {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Search performs FTS5 full-text search across messages, grouped by session,
 // plus a LIKE-based search on session display names and first messages.
 //
@@ -340,8 +362,8 @@ type SearchPage struct {
 //
 //  1. FTS branch — message content matches. ROW_NUMBER() picks the single
 //     best-ranked message per session (rank ASC, ordinal ASC, rowid ASC).
-//     The outer JOIN messages_fts includes a MATCH clause to prevent segment
-//     duplicates. Ordinal is the matched message's ordinal (≥ 0).
+//     After pagination, a rowid lookup with MATCH builds each snippet without
+//     segment duplicates. Ordinal is the matched message's ordinal (≥ 0).
 //
 //  2. Name branch — display_name / first_message LIKE matches that are NOT
 //     already covered by the FTS branch. Ordinal is -1 (no specific message
@@ -366,14 +388,20 @@ func (db *DB) Search(
 	// (e.g. "…T12:00:00Z" vs "…T12:00:00.123Z"). SQLite NULLs sort smaller
 	// than any value, so julianday(NULL) DESC naturally places NULLs last.
 	orderBy := "rank ASC, match_pos ASC, julianday(session_ended_at) DESC, session_id ASC"
+	matchPosSQL := "instr(LOWER(m.content), LOWER(best.best_query))"
 	if f.Sort == "recency" {
 		orderBy = "julianday(session_ended_at) DESC, session_id ASC"
+		matchPosSQL = "0"
 	}
 
-	// innerWhere is used in three places: the ROW_NUMBER inner subquery,
-	// the outer MATCH re-filter, and the NOT IN subquery for the name branch.
+	// innerWhere is used in the ROW_NUMBER inner subquery and the NOT IN
+	// subquery for the name branch.
+	matchSQL := "messages_fts.rendered MATCH ?"
+	if hasFTSColumnFilter(f.Query) {
+		matchSQL = "messages_fts MATCH ?"
+	}
 	innerWhere := []string{
-		"messages_fts MATCH ?",
+		matchSQL,
 		"s2.deleted_at IS NULL",
 		"m2.is_system = 0",
 		SystemPrefixSQL("m2.content", "m2.role"),
@@ -412,51 +440,28 @@ func (db *DB) Search(
 	}
 	likePattern := "%" + escapeLike(plainQuery) + "%"
 
-	// Build args in the order the SQL placeholders appear.
-	// Position 0 (? AS best_query in the ROW_NUMBER SELECT) is
-	// prepended after this block — see args2 below.
-	//
-	//  pos | SQL clause                                  | value
-	//  ----+---------------------------------------------+------------
-	//   0  | SELECT ? AS best_query (ROW_NUMBER)         | plainQuery  ← prepended in args2
-	//   1  | WHERE messages_fts MATCH ? (ROW_NUMBER)     | ftsArgs[0] (f.Query)
-	//  [1+]| AND s2.project = ? (if project set)         | ftsArgs[1] (f.Project)
-	//   2  | WHERE messages_fts MATCH ? (outer JOIN)     | f.Query
-	//   3  | WHEN COALESCE(display_name,session_name) LIKE ? (CASE) | likePattern
-	//   4  | WHEN s.first_message LIKE ? (CASE)          | likePattern
-	//   5  | WHERE COALESCE(display_name,session_name) LIKE ? (name WHERE) | likePattern
-	//   6  | WHERE s.first_message LIKE ? (name WHERE)   | likePattern
-	//  [7] | AND s.project = ? (name branch, optional)   | f.Project
-	//   8  | WHERE messages_fts MATCH ? (NOT IN)         | ftsArgs[0]
-	//  [8+]| AND s2.project = ? (NOT IN, if set)         | ftsArgs[1]
-	//   9  | LIMIT ? OFFSET ?                            | f.Limit+1, f.Cursor
-	args := make([]any, 0, len(ftsArgs)*2+6+len(nameProjectArgs))
-	args = append(args, ftsArgs...)          // (1) ROW_NUMBER WHERE
-	args = append(args, f.Query)             // (2) outer MATCH re-filter
-	args = append(args, likePattern)         // (3) CASE COALESCE(display_name,session_name) LIKE
-	args = append(args, likePattern)         // (4) CASE first_message LIKE
-	args = append(args, likePattern)         // (5) name WHERE COALESCE(display_name,session_name) LIKE
-	args = append(args, likePattern)         // (6) name WHERE first_message LIKE
-	args = append(args, nameProjectArgs...)  // (7) optional name branch project
-	args = append(args, ftsArgs...)          // (8) NOT IN WHERE
-	args = append(args, f.Limit+1, f.Cursor) // (9) LIMIT / OFFSET
+	// Relevance pages come from a walk over the matches in rank order when
+	// it can stop early; see walkSearchRanks. Recency pages rank every match
+	// inside the query, and so do project and date filters: most matches
+	// fall outside them, so the walk would read nearly all of them.
+	// The walk and the page query share one snapshot: a sync that edits a
+	// walked message between them would leave its snippet NULL.
+	tx, err := db.getReader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return SearchPage{}, fmt.Errorf("starting search read: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var walk *searchRankWalk
+	if f.Sort != "recency" && f.Project == "" && f.DateFrom == "" && f.DateTo == "" {
+		walk, err = walkSearchRanks(ctx, tx, ftsQuery.table, innerWhereSQL, ftsArgs, f.Cursor+f.Limit+1)
+		if err != nil {
+			return SearchPage{}, err
+		}
+	}
 
-	query := fmt.Sprintf(`
-		SELECT session_id, project, agent, machine, name,
-			session_ended_at, ordinal, snippet, rank, match_pos
-		FROM (
-			-- FTS branch: message content matches
-			SELECT m.session_id, s.project, s.agent, s.machine,
-				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
-				COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
-				best.best_ordinal AS ordinal,
-				snippet(messages_fts, 0, '<mark>', '</mark>',
-					'...', %d) AS snippet,
-				best.best_rank AS rank,
-				instr(LOWER(m.content), LOWER(best.best_query))
-					AS match_pos
-			FROM (
-				SELECT session_id, best_rowid, best_ordinal, best_rank, best_query
+	var args []any
+	withSQL := "WITH "
+	bestSQL := `SELECT session_id, best_rowid, best_ordinal, best_rank, best_query
 				FROM (
 					SELECT m2.session_id,
 						messages_fts.rowid AS best_rowid,
@@ -471,22 +476,45 @@ func (db *DB) Search(
 					FROM messages_fts
 					JOIN messages m2 ON messages_fts.rowid = m2.id
 					JOIN sessions s2 ON m2.session_id = s2.id
-					WHERE %s
+					WHERE ` + innerWhereSQL + `
 				)
-				WHERE rn = 1
-			) AS best
-			JOIN messages_fts ON messages_fts.rowid = best.best_rowid
-			JOIN messages m ON m.id = best.best_rowid
-			JOIN sessions s ON m.session_id = s.id
-			WHERE messages_fts MATCH ?
+				WHERE rn = 1`
+	ftsSessionsSQL := `SELECT m2.session_id
+					FROM messages_fts
+					JOIN messages m2 ON messages_fts.rowid = m2.id
+					JOIN sessions s2 ON m2.session_id = s2.id
+					WHERE ` + innerWhereSQL
+	bestArgs := append([]any{plainQuery}, ftsArgs...)
+	ftsSessionsArgs := ftsArgs
+	includeNames := true
+	if walk != nil {
+		withSQL, args = walk.bestRowsSQL()
+		bestSQL = "SELECT session_id, best_rowid, best_ordinal, best_rank, ? AS best_query FROM best_rows"
+		bestArgs = []any{plainQuery}
+		ftsSessionsSQL = "SELECT session_id FROM best_rows"
+		ftsSessionsArgs = nil
+		// Name-only rows rank 0.0, after every message match, so they reach
+		// the page only when the walk read every match.
+		includeNames = walk.complete
+	}
+	args = append(args, bestArgs...)
 
+	nameBranchSQL := ""
+	if includeNames {
+		args = append(args, likePattern)        // CASE COALESCE(display_name,session_name) LIKE
+		args = append(args, likePattern)        // CASE first_message LIKE
+		args = append(args, likePattern)        // name WHERE COALESCE(display_name,session_name) LIKE
+		args = append(args, likePattern)        // name WHERE first_message LIKE
+		args = append(args, nameProjectArgs...) // optional name branch project and dates
+		args = append(args, ftsSessionsArgs...) // NOT IN WHERE
+		nameBranchSQL = fmt.Sprintf(`
 			UNION ALL
 
 			-- Name branch: display_name / session_name / first_message matches not in FTS branch
 			SELECT s.id, s.project, s.agent, s.machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
-				-1 AS ordinal,
+				-1 AS ordinal, NULL AS best_rowid,
 				CASE
 					WHEN COALESCE(s.display_name, s.session_name) LIKE ? ESCAPE '\'
 						THEN COALESCE(s.display_name, s.session_name, '')
@@ -508,36 +536,60 @@ func (db *DB) Search(
 				)
 				%s
 				AND s.id NOT IN (
-					SELECT m2.session_id
-					FROM messages_fts
-					JOIN messages m2 ON messages_fts.rowid = m2.id
-					JOIN sessions s2 ON m2.session_id = s2.id
-					WHERE %s
-				)
+					%s
+				)`, nameProjectClause, ftsSessionsSQL)
+	}
+	args = append(args, f.Limit+1, f.Cursor) // LIMIT / OFFSET
+	args = append(args, f.Query)             // paged snippet MATCH
+
+	// Relevance ordering needs match_pos before pagination. Recency ordering
+	// does not, so it avoids scanning every matching message for the position.
+	// Materialize the ordered page before evaluating snippet().
+	query := fmt.Sprintf(`
+		%spage AS MATERIALIZED (
+		SELECT session_id, project, agent, machine, name,
+			session_ended_at, ordinal, best_rowid, snippet, rank, match_pos
+		FROM (
+			-- FTS branch: message content matches
+			SELECT m.session_id, s.project, s.agent, s.machine,
+				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
+				COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
+				best.best_ordinal AS ordinal, best.best_rowid,
+				NULL AS snippet,
+				best.best_rank AS rank,
+				%s AS match_pos
+			FROM (
+				%s
+			) AS best
+			JOIN messages m ON m.id = best.best_rowid
+			JOIN sessions s ON m.session_id = s.id
+			%s
 		)
 		ORDER BY %s
-		LIMIT ? OFFSET ?`,
+		LIMIT ? OFFSET ?
+		)
+		SELECT session_id, project, agent, machine, name,
+			session_ended_at, ordinal,
+			CASE WHEN best_rowid IS NULL THEN snippet ELSE (
+				SELECT snippet(messages_fts, -1, '<mark>', '</mark>', '...', %d)
+				FROM messages_fts
+				WHERE messages_fts.rowid = page.best_rowid AND %s
+			) END AS snippet,
+			rank, match_pos
+		FROM page
+		ORDER BY %s`,
+		withSQL,
+		matchPosSQL,
+		bestSQL,
+		nameBranchSQL,
+		orderBy, // ORDER BY (%s)
 		snippetTokenLength,
-		innerWhereSQL,     // ROW_NUMBER inner WHERE (%s at rn subquery)
-		nameProjectClause, // optional project filter for name branch (%s)
-		innerWhereSQL,     // NOT IN subquery WHERE (%s)
-		orderBy,           // ORDER BY (%s)
+		matchSQL,
+		orderBy,
 	)
 	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
 
-	// Replace the ROW_NUMBER inner subquery's ? for best_query with args
-	// re-ordered: the first innerWhere param (f.Query) was already included in
-	// ftsArgs above at position (1); best_query needs a second copy of f.Query
-	// injected at the right position. Re-build args with the extra copy.
-	//
-	// The inner subquery's SELECT has `? AS best_query` before the WHERE, so
-	// its ? comes before innerWhere's ?s. Rebuild:
-	args2 := make([]any, 0, len(args)+1)
-	args2 = append(args2, plainQuery) // best_query: plain text for instr()
-	args2 = append(args2, args...)
-	args = args2
-
-	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return SearchPage{}, fmt.Errorf("searching: %w", err)
 	}

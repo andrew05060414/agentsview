@@ -10,6 +10,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"log"
 	pathpkg "path"
 	"path/filepath"
 	"sort"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/lockctx"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -235,7 +237,8 @@ func scanSessionRowWithSource(rs rowScanner, includeSource bool) (Session, error
 }
 
 // Version 6 stores per-call tool observations for effectiveness rates.
-const CurrentQualitySignalVersion = 6
+// Version 7 stops calls without retained input from counting as retries.
+const CurrentQualitySignalVersion = 7
 
 // QualitySignals groups persisted deterministic quality-signal
 // columns for API callers while keeping the database representation
@@ -332,10 +335,12 @@ func (s *Session) UnmarshalJSON(data []byte) error {
 //nolint:recvcheck // Value encoding and pointer decoding intentionally implement distinct interfaces.
 type Session struct {
 	// WebURL is a client-derived browser link, never persisted.
-	WebURL                string   `json:"web_url,omitempty"`
-	ID                    string   `json:"id"`
-	Project               string   `json:"project"`
-	Machine               string   `json:"machine"`
+	WebURL  string `json:"web_url,omitempty"`
+	ID      string `json:"id"`
+	Project string `json:"project"`
+	Machine string `json:"machine"`
+	// SourceMachines lists contributing hosted device identities, derived on read.
+	SourceMachines        []string `json:"source_machines,omitempty" doc:"Contributing hosted device machine IDs; omitted for sessions without hosted provenance."`
 	Agent                 string   `json:"agent"`
 	AgentLabel            string   `json:"agent_label,omitempty"`
 	Entrypoint            string   `json:"entrypoint,omitempty"`
@@ -568,6 +573,7 @@ func (db *DB) DecodeCursor(s string) (SessionCursor, error) {
 
 // SessionFilter specifies how to query sessions.
 type SessionFilter struct {
+	ExclusionCounts *bool // nil omits the summary; true includes child counts
 	// IDs selects rows directly. Nil preserves discovery defaults; an empty
 	// non-nil slice matches nothing. Raw IDs expand over literal tilde suffixes.
 	IDs []string
@@ -697,9 +703,10 @@ func buildCanonicalRootWhere(includeOrphans bool) string {
 
 // SessionPage is a page of session results.
 type SessionPage struct {
-	Sessions   []Session `json:"sessions"`
-	NextCursor string    `json:"next_cursor,omitempty"`
-	Total      int       `json:"total"`
+	ExclusionCounts *SessionExclusionCounts `json:"exclusion_counts,omitempty"`
+	Sessions        []Session               `json:"sessions"`
+	NextCursor      string                  `json:"next_cursor,omitempty"`
+	Total           int                     `json:"total"`
 }
 
 type SidebarSessionIndexRow struct {
@@ -710,6 +717,7 @@ type SidebarSessionIndexRow struct {
 	Project            string   `json:"project"`
 	ProjectAssigned    bool     `json:"project_assigned,omitempty"`
 	Machine            string   `json:"machine"`
+	SourceMachines     []string `json:"source_machines,omitempty" doc:"Contributing hosted device machine IDs; omitted for sessions without hosted provenance."`
 	Agent              string   `json:"agent"`
 	AgentLabel         string   `json:"agent_label,omitempty"`
 	Entrypoint         string   `json:"entrypoint,omitempty"`
@@ -764,7 +772,14 @@ func (db *DB) ListSessions(
 	// Total count applies filters but not cursor. To avoid
 	// re-counting on every pagination request, newer cursors carry
 	// the first-page total and we reuse it here.
-	if total <= 0 {
+	var exclusions *SessionExclusionCounts
+	if f.WantsExclusionCounts() {
+		var err error
+		total, exclusions, err = CountSessionExclusions(ctx, db.getReader(), f, dialect)
+		if err != nil {
+			return SessionPage{}, fmt.Errorf("counting session exclusions: %w", err)
+		}
+	} else if total <= 0 {
 		countQuery := "SELECT COUNT(*) FROM sessions WHERE " + where
 		if err := db.getReader().QueryRowContext(
 			ctx, countQuery, args...,
@@ -810,7 +825,19 @@ func (db *DB) ListSessions(
 		return SessionPage{}, err
 	}
 
-	return BuildSessionPage(sessions, total, f, rs, db.EncodeCursor), nil
+	exclusions.LoadChildren(ctx, db.getReader(), f, dialect, total)
+	page := BuildSessionPage(sessions, total, f, rs, db.EncodeCursor)
+	page.ExclusionCounts = exclusions
+	return page, nil
+}
+
+// HasVisibleSession reports whether the default sidebar has a session to show.
+func (db *DB) HasVisibleSession(ctx context.Context) (bool, error) {
+	where, args := buildSessionBaseFilter(SessionFilter{ExcludeAutomated: true})
+	var exists bool
+	err := db.getReader().QueryRowContext(ctx,
+		"SELECT EXISTS(SELECT 1 FROM sessions WHERE "+where+" AND "+buildCanonicalRootWhere(true)+")", args...).Scan(&exists)
+	return exists, err
 }
 
 // GetSidebarSessionIndex returns the skinny session rows needed by
@@ -964,8 +991,8 @@ func sidebarRootPageQuery(f SessionFilter, cur SessionCursor, predicates sidebar
 			SELECT id, id FROM root_candidates
 			UNION
 			SELECT t.root_id, s.id
-			FROM sessions s
-			JOIN tree t ON s.parent_session_id = t.id
+			FROM tree t
+			CROSS JOIN sessions s ON s.parent_session_id = t.id
 			WHERE ` + predicates.treeMemberWhere + `
 		)
 		` + sidebarStarredRootCTE(f.Starred) + `,
@@ -984,6 +1011,80 @@ func sidebarRootPageQuery(f SessionFilter, cur SessionCursor, predicates sidebar
 	args := append([]any{}, predicates.rootArgs...)
 	args = append(args, pageBuilder.Args()...)
 	return query, args
+}
+
+func sidebarStarredRootCountQuery(predicates sidebarPredicates) string {
+	return `
+		WITH RECURSIVE root_candidates(id) AS (
+			SELECT id
+			FROM sessions
+			WHERE ` + predicates.rootWhere + `
+			  AND ` + predicates.canonicalRootWhere + `
+		),
+		tree(root_id, id) AS (
+			SELECT id, id FROM root_candidates
+			UNION
+			SELECT t.root_id, s.id
+			FROM tree t
+			CROSS JOIN sessions s ON s.parent_session_id = t.id
+			WHERE ` + predicates.treeMemberWhere + `
+		),
+		eligible_roots(id) AS (
+			SELECT DISTINCT t.root_id
+			FROM tree t
+			JOIN starred_sessions ss ON ss.session_id = t.id
+		)
+		SELECT COUNT(*) FROM eligible_roots`
+}
+
+func sidebarTreePageQuery(predicates sidebarPredicates, cteParts []string) string {
+	return `
+		WITH RECURSIVE root_page(id, ord) AS (
+			` + strings.Join(cteParts, "\n") + `
+		),
+		tree(id, ord) AS (
+			SELECT id, ord FROM root_page
+			UNION
+			SELECT s.id, t.ord
+			FROM tree t
+			CROSS JOIN sessions s ON s.parent_session_id = t.id
+			WHERE ` + predicates.treeMemberWhere + `
+		),
+		ranked_tree(id, ord) AS (
+			SELECT id, MIN(ord) AS ord
+			FROM tree
+			GROUP BY id
+		)
+		SELECT
+			s.id,
+			s.parent_session_id,
+			s.relationship_type,
+			s.project,
+			EXISTS (
+				SELECT 1 FROM session_project_assignments spa
+				WHERE spa.session_id = s.id
+			) AS project_assigned,
+			s.machine,
+			s.agent,
+			s.agent_label,
+			s.entrypoint,
+			s.session_kind,
+			COALESCE(s.display_name, s.session_name) AS display_name,
+			s.started_at,
+			s.ended_at,
+			s.created_at,
+			s.termination_status,
+			s.message_count,
+			s.user_message_count,
+			s.transcript_revision,
+			s.is_automated,
+			INSTR(COALESCE(s.first_message, ''), '<teammate-message') > 0
+		FROM sessions s
+		JOIN ranked_tree t ON s.id = t.id
+		ORDER BY
+			t.ord ASC,
+			` + sidebarActivityExprSQLiteS + ` DESC,
+			s.id DESC`
 }
 
 func (db *DB) getSidebarSessionIndexPage(
@@ -1005,27 +1106,7 @@ func (db *DB) getSidebarSessionIndexPage(
 	}
 	if total <= 0 {
 		if f.Starred {
-			countQuery := `
-				WITH RECURSIVE root_candidates(id) AS (
-					SELECT id
-					FROM sessions
-					WHERE ` + predicates.rootWhere + `
-					  AND ` + predicates.canonicalRootWhere + `
-				),
-				tree(root_id, id) AS (
-					SELECT id, id FROM root_candidates
-					UNION
-					SELECT t.root_id, s.id
-					FROM sessions s
-					JOIN tree t ON s.parent_session_id = t.id
-					WHERE ` + predicates.treeMemberWhere + `
-				),
-				eligible_roots(id) AS (
-					SELECT DISTINCT t.root_id
-					FROM tree t
-					JOIN starred_sessions ss ON ss.session_id = t.id
-				)
-				SELECT COUNT(*) FROM eligible_roots`
+			countQuery := sidebarStarredRootCountQuery(predicates)
 			if err := db.getReader().QueryRowContext(
 				ctx, countQuery, predicates.rootArgs...,
 			).Scan(&total); err != nil {
@@ -1098,53 +1179,7 @@ func (db *DB) getSidebarSessionIndexPage(
 		treeArgs = append(treeArgs, root.id, i)
 	}
 
-	treeQuery := `
-		WITH RECURSIVE root_page(id, ord) AS (
-			` + strings.Join(cteParts, "\n") + `
-		),
-		tree(id, ord) AS (
-			SELECT id, ord FROM root_page
-			UNION
-			SELECT s.id, t.ord
-			FROM sessions s
-			JOIN tree t ON s.parent_session_id = t.id
-			WHERE ` + predicates.treeMemberWhere + `
-		),
-		ranked_tree(id, ord) AS (
-			SELECT id, MIN(ord) AS ord
-			FROM tree
-			GROUP BY id
-		)
-		SELECT
-			s.id,
-			s.parent_session_id,
-			s.relationship_type,
-			s.project,
-			EXISTS (
-				SELECT 1 FROM session_project_assignments spa
-				WHERE spa.session_id = s.id
-			) AS project_assigned,
-			s.machine,
-			s.agent,
-			s.agent_label,
-			s.entrypoint,
-			s.session_kind,
-			COALESCE(s.display_name, s.session_name) AS display_name,
-			s.started_at,
-			s.ended_at,
-			s.created_at,
-			s.termination_status,
-			s.message_count,
-			s.user_message_count,
-			s.transcript_revision,
-			s.is_automated,
-			INSTR(COALESCE(s.first_message, ''), '<teammate-message') > 0
-		FROM sessions s
-		JOIN ranked_tree t ON s.id = t.id
-		ORDER BY
-			t.ord ASC,
-			` + sidebarActivityExprSQLiteS + ` DESC,
-			s.id DESC`
+	treeQuery := sidebarTreePageQuery(predicates, cteParts)
 
 	rows, err = db.getReader().QueryContext(ctx, treeQuery, treeArgs...)
 	if err != nil {
@@ -1399,13 +1434,13 @@ func (db *DB) PurgeExcludedSessions(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := purgeExcludedSessionsTx(ctx, tx); err != nil {
+	if _, err := purgeExcludedSessionsTx(ctx, tx, false); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func purgeExcludedSessionsTx(ctx context.Context, tx *sql.Tx) (int64, error) {
+func purgeExcludedSessionsTx(ctx context.Context, tx *sql.Tx, permanentDelete bool) (int64, error) {
 	const excluded = `EXISTS (
 		SELECT 1 FROM excluded_sessions excluded
 		WHERE excluded.id = sessions.id OR (
@@ -1420,6 +1455,9 @@ func purgeExcludedSessionsTx(ctx context.Context, tx *sql.Tx) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if err := retainTrailerProjectsTx(ctx, tx, ids); err != nil {
+		return 0, fmt.Errorf("retaining excluded trailer projects: %w", err)
+	}
 	children, err := sessionIDsTx(ctx, tx, `id IN (
 		SELECT tc.subagent_session_id FROM tool_calls tc
 		WHERE tc.session_id IN (SELECT id FROM sessions WHERE `+excluded+`)
@@ -1430,6 +1468,12 @@ func purgeExcludedSessionsTx(ctx context.Context, tx *sql.Tx) (int64, error) {
 	for _, id := range ids {
 		if err := deleteSessionMessagesTx(tx, id); err != nil {
 			return 0, fmt.Errorf("pre-deleting excluded session %s messages: %w", id, err)
+		}
+		if permanentDelete {
+			// Preserve page links only when the user permanently deletes the thread.
+			if err := excludeSessionIDTx(ctx, tx, id, sql.NullString{}); err != nil {
+				return 0, fmt.Errorf("recording excluded session deletion: %w", err)
+			}
 		}
 	}
 	if err := deleteSessionAnnotationsTx(ctx, tx, excluded); err != nil {
@@ -1473,12 +1517,19 @@ func (db *DB) DeleteParserExcludedSessions(ctx context.Context, ids []string) (i
 		if id == "" {
 			continue
 		}
+		if err := db.checkArchiveSessionProvenanceTx(ctx, tx, SessionBatchWrite{Session: Session{ID: id}}); err != nil {
+			return 0, fmt.Errorf("checking parser-excluded session ownership: %w", err)
+		}
 		if err := deleteSessionMessagesTx(tx, id); err != nil {
 			return 0, fmt.Errorf(
 				"pre-deleting parser-excluded session %s messages: %w",
 				id, err,
 			)
 		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM commit_links WHERE session_id=?", id); err != nil {
+			return 0, fmt.Errorf("deleting parser-excluded commit links: %w", err)
+		}
+
 		res, err := tx.ExecContext(ctx,
 			"DELETE FROM sessions WHERE id = ?", id,
 		)
@@ -1678,6 +1729,10 @@ func (db *DB) upsertSession(ctx context.Context,
 		return sessionUpsertResult{}, fmt.Errorf("beginning session upsert: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := db.checkArchiveSessionProvenanceTx(ctx, tx, SessionBatchWrite{Session: s}); err != nil {
+		return sessionUpsertResult{}, err
+	}
+
 	result, err := upsertSessionExec(
 		ctx,
 		tx.ExecContext,
@@ -1715,7 +1770,9 @@ func upsertSessionExec(
 	s Session,
 	reviveSourceMissing bool,
 ) (sessionUpsertResult, error) {
-	_ = ValidateAndSanitize(&s, nil, nil)
+	if _, err := ValidateAndSanitizeContext(ctx, &s, nil, nil); err != nil {
+		return sessionUpsertResult{}, err
+	}
 
 	// Check exclusion/trash state under the write lock to avoid a race with
 	// concurrent DeleteSession/EmptyTrash/RestoreSession.
@@ -2987,10 +3044,10 @@ func (db *DB) SetSessionDataVersionsContext(
 
 // SetExistingSessionDataVersions atomically stamps every listed session that
 // already exists, ignoring IDs that have not been inserted yet.
-func (db *DB) SetExistingSessionDataVersions(ids []string, version int) error {
-	return db.setSessionDataVersions(
-		context.Background(), ids, version, false,
-	)
+func (db *DB) SetExistingSessionDataVersions(
+	ctx context.Context, ids []string, version int,
+) error {
+	return db.setSessionDataVersions(ctx, ids, version, false)
 }
 
 func (db *DB) setSessionDataVersions(
@@ -3126,6 +3183,7 @@ type IncrementalInfo struct {
 	AgentLabel           string
 	Entrypoint           string
 	SessionKind          string
+	RecordedGitRemote    string // source-recorded URL, separate from preserved identity
 	FileSize             int64
 	FileMtime            int64
 	NextOrdinal          int
@@ -3247,6 +3305,7 @@ func (db *DB) GetSessionForIncremental(ctx context.Context,
 	var linearParse sql.NullBool
 	err = db.getReader().QueryRow(ctx,
 		`SELECT s.id, s.project, COALESCE(snap.project, ''),
+			COALESCE(snap.recorded_git_remote, ''),
 			s.machine, s.cwd, s.agent_label, s.entrypoint, s.session_kind,
 			file_size, file_mtime,
 			next_ordinal, last_entry_uuid, claude_linear_parse,
@@ -3277,6 +3336,7 @@ func (db *DB) GetSessionForIncremental(ctx context.Context,
 		path, agent,
 	).Scan(
 		&info.ID, &info.Project, &info.SourceProject,
+		&info.RecordedGitRemote,
 		&info.Machine, &info.Cwd,
 		&info.AgentLabel, &info.Entrypoint, &info.SessionKind,
 		&fs, &fm, &info.NextOrdinal, &lastEntryUUID, &linearParse,
@@ -3884,6 +3944,17 @@ type VirtualContainerMemberFreshnessRow struct {
 	VirtualContainerMemberFreshness
 }
 
+const virtualContainerMemberFreshnessQuery = `SELECT file_path, file_mtime, data_version, file_hash,
+ deleted_at IS NOT NULL, agent, project FROM sessions INDEXED BY idx_sessions_file_path
+ WHERE file_path %s ? AND file_path < ? || '$' AND source_missing_at IS NULL
+ ORDER BY file_path, rowid`
+
+// VirtualContainerMemberFreshnessPages returns how many stored member
+// freshness pages this archive has listed.
+func (db *DB) VirtualContainerMemberFreshnessPages() int64 {
+	return db.memberFreshnessPages.Load()
+}
+
 // ListVirtualContainerMemberFreshnessPage returns the freshness signal for
 // stored sessions whose file_path is a virtual member of the shared container
 // at containerPath ("<containerPath>#<sessionID>"), excluding source-missing
@@ -3897,84 +3968,29 @@ type VirtualContainerMemberFreshnessRow struct {
 // into the sync pipeline while peak memory stays one page — never the
 // container's full membership.
 //
-// Two queries per page keep each path's fold complete without materializing
-// the container: a DISTINCT path page rides idx_sessions_file_path ('$' is
-// the ASCII successor of '#', so the half-open range covers exactly the
-// "<containerPath>#" prefix), and the row fetch is bounded to that page's
-// [first, last] interval, so duplicate session rows for one path can never
-// split across pages. Folded in Go rather than GROUP BY: the fold needs
-// MAX(file_mtime), MIN(data_version), and the hash of the newest-mtime row,
-// and SQLite's bare-column-from-the-extreme-row guarantee only holds with
-// exactly one min/max aggregate in the query.
+// One ordered scan rides idx_sessions_file_path, read lazily up to limit
+// paths. '$' is the ASCII successor of '#', so the half-open range covers
+// exactly the "<containerPath>#" prefix. A page ends only when the path
+// changes, keeping each path's fold complete. Duplicates fold in rowid order:
+// MAX(file_mtime), MIN(data_version), and the hash of the first newest-mtime
+// row. SQLite's bare-column-from-the-extreme-row guarantee only holds with
+// exactly one min/max aggregate, so the fold stays in Go.
 func (db *DB) ListVirtualContainerMemberFreshnessPage(
 	ctx context.Context, containerPath, idPrefix, afterPath string, limit int,
 ) ([]VirtualContainerMemberFreshnessRow, bool, error) {
 	if containerPath == "" || limit <= 0 {
 		return nil, true, nil
 	}
-	notMissing := " AND source_missing_at IS NULL"
+	db.memberFreshnessPages.Add(1)
 	lower := containerPath + "#"
 	lowerOp := ">="
 	if afterPath > lower {
 		lower = afterPath
 		lowerOp = ">"
 	}
-	pathRows, err := db.getReader().QueryContext(ctx,
-		"SELECT DISTINCT file_path FROM sessions"+
-			" WHERE file_path "+lowerOp+" ? AND file_path < ? || '$'"+
-			notMissing+
-			" ORDER BY file_path LIMIT ?",
-		lower, containerPath, limit,
-	)
-	if err != nil {
-		return nil, false, fmt.Errorf(
-			"listing container member paths %s: %w", containerPath, err,
-		)
-	}
-	defer pathRows.Close()
-	var paths []string
-	for pathRows.Next() {
-		var path string
-		if err := pathRows.Scan(&path); err != nil {
-			return nil, false, fmt.Errorf(
-				"scanning container member path %s: %w", containerPath, err,
-			)
-		}
-		paths = append(paths, path)
-	}
-	if err := pathRows.Err(); err != nil {
-		return nil, false, err
-	}
-	excluded, err := db.listExcludedContainerMemberPaths(
-		ctx, containerPath, idPrefix, afterPath, limit,
-	)
-	if err != nil {
-		return nil, false, err
-	}
-	done := len(paths) < limit && len(excluded) < limit
-	merged, excludedSet := mergeContainerMemberPaths(paths, excluded)
-	if len(merged) > limit {
-		merged = merged[:limit]
-		done = false
-	}
-	if len(merged) == 0 {
-		return nil, true, nil
-	}
-	paths = paths[:0]
-	for _, path := range merged {
-		if _, ok := excludedSet[path]; !ok {
-			paths = append(paths, path)
-		}
-	}
-	if len(paths) == 0 {
-		return excludedContainerMemberRows(merged), done, nil
-	}
-
 	rows, err := db.getReader().QueryContext(ctx,
-		"SELECT file_path, file_mtime, data_version, file_hash,"+
-			" deleted_at IS NOT NULL, agent, project FROM sessions"+
-			" WHERE file_path >= ? AND file_path <= ?"+notMissing,
-		paths[0], paths[len(paths)-1],
+		fmt.Sprintf(virtualContainerMemberFreshnessQuery, lowerOp),
+		lower, containerPath,
 	)
 	if err != nil {
 		return nil, false, fmt.Errorf(
@@ -3982,7 +3998,8 @@ func (db *DB) ListVirtualContainerMemberFreshnessPage(
 		)
 	}
 	defer rows.Close()
-	members := make(map[string]VirtualContainerMemberFreshness, len(paths))
+	var paths []string
+	members := make(map[string]VirtualContainerMemberFreshness, limit)
 	for rows.Next() {
 		var path string
 		var mtime, version sql.NullInt64
@@ -4003,6 +4020,10 @@ func (db *DB) ListVirtualContainerMemberFreshnessPage(
 		}
 		member, seen := members[path]
 		if !seen {
+			if len(paths) == limit {
+				break
+			}
+			paths = append(paths, path)
 			members[path] = row
 			continue
 		}
@@ -4019,6 +4040,26 @@ func (db *DB) ListVirtualContainerMemberFreshnessPage(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, false, err
+	}
+	// An early page boundary leaves rows open. Release this reader before
+	// querying exclusions so one page uses only one reader connection.
+	if err := rows.Close(); err != nil {
+		return nil, false, err
+	}
+	excluded, err := db.listExcludedContainerMemberPaths(
+		ctx, containerPath, idPrefix, afterPath, limit,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	done := len(paths) < limit && len(excluded) < limit
+	merged, excludedSet := mergeContainerMemberPaths(paths, excluded)
+	if len(merged) > limit {
+		merged = merged[:limit]
+		done = false
+	}
+	if len(merged) == 0 {
+		return nil, true, nil
 	}
 	page := make([]VirtualContainerMemberFreshnessRow, 0, len(merged))
 	for _, path := range merged {
@@ -4111,14 +4152,6 @@ func mergeContainerMemberPaths(
 		merged = append(merged, excluded[j:]...)
 	}
 	return merged, excludedSet
-}
-
-func excludedContainerMemberRows(paths []string) []VirtualContainerMemberFreshnessRow {
-	page := make([]VirtualContainerMemberFreshnessRow, 0, len(paths))
-	for _, path := range paths {
-		page = append(page, VirtualContainerMemberFreshnessRow{Path: path, Excluded: true})
-	}
-	return page
 }
 
 // GetProjectByPath returns the stored project for the newest
@@ -5362,12 +5395,21 @@ func baselineActiveSessionSourcePathsTx(
 			continue
 		}
 		execArgs := append([]any{machine}, args...)
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, baselineActiveSessionSourcePathsQuery(filter), execArgs...); err != nil {
+			return fmt.Errorf("baselining active session source paths: %w", err)
+		}
+	}
+	return nil
+}
+
+func baselineActiveSessionSourcePathsQuery(filter string) string {
+	// Seek the admitted paths instead of scanning every session on the machine.
+	return `
 			INSERT INTO local_session_source_baselines
 				(session_id, machine, agent, file_path)
 			SELECT id, machine, agent, file_path
-			FROM sessions
-			WHERE machine = ? AND `+filter+`
+			FROM sessions INDEXED BY idx_sessions_file_path
+			WHERE machine = ? AND ` + filter + `
 			  AND file_path IS NOT NULL AND deleted_at IS NULL
 			  AND source_missing_at IS NULL
 			ON CONFLICT(session_id) DO UPDATE SET
@@ -5376,13 +5418,7 @@ func baselineActiveSessionSourcePathsTx(
 				file_path = excluded.file_path
 			WHERE local_session_source_baselines.machine IS NOT excluded.machine
 			   OR local_session_source_baselines.agent IS NOT excluded.agent
-			   OR local_session_source_baselines.file_path IS NOT excluded.file_path`,
-			execArgs...,
-		); err != nil {
-			return fmt.Errorf("baselining active session source paths: %w", err)
-		}
-	}
-	return nil
+			   OR local_session_source_baselines.file_path IS NOT excluded.file_path`
 }
 
 // MarkSessionSourceMissing records unavailable source material only while the
@@ -5776,6 +5812,9 @@ func deleteSessionsTx(ctx context.Context, tx *sql.Tx, where string, args ...any
 	if err != nil {
 		return 0, err
 	}
+	if err := retainTrailerProjectsTx(ctx, tx, ids); err != nil {
+		return 0, fmt.Errorf("retaining deleted trailer projects: %w", err)
+	}
 	children, err := sessionIDsTx(ctx, tx, `id IN (
 		SELECT tc.subagent_session_id FROM tool_calls tc
 		WHERE tc.session_id IN (SELECT id FROM sessions WHERE `+where+`)
@@ -5821,7 +5860,7 @@ func deleteSessionsTx(ctx context.Context, tx *sql.Tx, where string, args ...any
 		return 0, err
 	}
 	if threadScope {
-		pages, err := purgeExcludedSessionsTx(ctx, tx)
+		pages, err := purgeExcludedSessionsTx(ctx, tx, true)
 		if err != nil {
 			return 0, err
 		}
@@ -6181,6 +6220,7 @@ func scanSessionRowsWithSource(rows *sql.Rows, includeSource bool) ([]Session, e
 // PruneFilter defines criteria for finding sessions to prune.
 // Filters combine with AND. At least one must be set.
 type PruneFilter struct {
+	Agent        string // exact match
 	Project      string // substring match (LIKE '%x%')
 	MaxMessages  *int   // user messages <= N (nil = no filter)
 	Before       string // ended_at < date (YYYY-MM-DD)
@@ -6189,7 +6229,8 @@ type PruneFilter struct {
 
 // HasFilters reports whether at least one filter is set.
 func (f PruneFilter) HasFilters() bool {
-	return f.Project != "" ||
+	return f.Agent != "" ||
+		f.Project != "" ||
 		f.MaxMessages != nil ||
 		f.Before != "" ||
 		f.FirstMessage != ""
@@ -6212,7 +6253,10 @@ func (db *DB) FindPruneCandidates(ctx context.Context,
 
 	where := "deleted_at IS NULL"
 	args := []any{}
-
+	if f.Agent != "" {
+		where = "agent = ?"
+		args = append(args, f.Agent)
+	}
 	if f.Project != "" {
 		where += ` AND project LIKE ? ESCAPE '\'`
 		args = append(args, "%"+escapeLike(f.Project)+"%")
@@ -6233,12 +6277,35 @@ func (db *DB) FindPruneCandidates(ctx context.Context,
 		args = append(args, escapeLike(f.FirstMessage)+"%")
 	}
 
-	// Exclude sessions that are parents of other sessions.
-	where += ` AND NOT EXISTS (
-		SELECT 1 FROM sessions AS child
-		WHERE child.parent_session_id = sessions.id)`
+	prefix := ""
+	if f.Agent != "" {
+		// Kept sessions protect every ancestor, including through matching rows
+		// and legacy whole-thread trash anchors.
+		prefix = `WITH RECURSIVE matched(id) AS (
+			SELECT id FROM sessions WHERE ` + where + `
+		), protected(id) AS (
+			SELECT id FROM sessions
+			WHERE id NOT IN (SELECT id FROM matched)
+			UNION
+			SELECT s.parent_session_id FROM sessions AS s
+			JOIN protected AS p ON s.id = p.id
+			WHERE s.parent_session_id IS NOT NULL
+			UNION
+			SELECT a.id FROM sessions AS p
+			JOIN protected ON p.id = protected.id
+			JOIN sessions AS a ON a.id = substr(p.id, 1, length(p.id) - 37)
+			WHERE substr(p.id, -37, 1) = '_'
+			  AND a.deleted_at IS NOT NULL
+			  AND a.trash_includes_codex_pages = 1
+		) `
+		where = "id IN (SELECT id FROM matched) AND id NOT IN (SELECT id FROM protected)"
+	} else {
+		where += ` AND NOT EXISTS (
+			SELECT 1 FROM sessions AS child
+			WHERE child.parent_session_id = sessions.id)`
+	}
 
-	query := "SELECT " + sessionPruneCols +
+	query := prefix + "SELECT " + sessionPruneCols +
 		" FROM sessions WHERE " + where + `
 		ORDER BY COALESCE(
 			NULLIF(ended_at, ''),
@@ -6388,6 +6455,9 @@ func (db *DB) RestoreSession(ctx context.Context, id string) (int64, error) {
 		return 0, err
 	}
 	if n > 0 {
+		if err := invalidateRestoredArchiveSourceTx(ctx, tx, id); err != nil {
+			return 0, err
+		}
 		// Restoring a selected file ends the earlier whole-thread trash action.
 		// Other materialized pages keep their own deleted_at values.
 		if _, err := tx.ExecContext(ctx, `UPDATE sessions
@@ -6837,6 +6907,103 @@ func (db *DB) CountSessionsForMirrorScope(
 	return count, nil
 }
 
+// MirrorPushCutoff returns the cutoff a mirror push records as its next
+// window's lower bound. It reads the clock while holding the write lock, so
+// no write transaction is open: every write stamped before the cutoff has
+// committed and is visible to the push's later listing, and every later write
+// is stamped at or after the cutoff. A cutoff read without the lock can fall
+// after the stamp of a write that commits only after the push lists sessions;
+// no later window would list that write.
+//
+// It also waits while the writer is closed for a worker handoff. A sync-worker
+// child writes the archive then, outside this process's write lock, so a
+// cutoff taken during the handoff has the same gap. MirrorPushCutoff returns
+// ctx.Err() if ctx ends first, including while a long write holds the lock.
+func (db *DB) MirrorPushCutoff(ctx context.Context) (string, error) {
+	for {
+		if err := db.WaitForWriter(ctx); err != nil {
+			return "", err
+		}
+		if err := db.lockWriterCtx(ctx); err != nil {
+			return "", err
+		}
+		if !db.writerClosed.Load() {
+			cutoff := time.Now().UTC().Format(mirrorWindowBoundLayout)
+			db.mu.Unlock()
+			return cutoff, nil
+		}
+		db.mu.Unlock()
+	}
+}
+
+// lockWriterCtx takes the write lock, or returns once ctx ends.
+func (db *DB) lockWriterCtx(ctx context.Context) error {
+	if err := lockctx.Lock(ctx, &db.mu); err != nil {
+		return fmt.Errorf("stopped while waiting for an archive write to finish: %w", err)
+	}
+	return nil
+}
+
+// WaitForWriter blocks while the writer is closed for a worker handoff. It
+// returns ctx.Err() if ctx ends first. A write can still fail if a new
+// handoff starts after it returns. A wait that lasts writerHandoffNoticeAfter
+// is logged and reported to the notice set by WithWriterWaitNotice.
+func (db *DB) WaitForWriter(ctx context.Context) error {
+	start := time.Now()
+	announced := false
+	for db.writerClosed.Load() {
+		if !announced && time.Since(start) >= writerHandoffNoticeAfter {
+			announced = true
+			log.Printf("waiting for a local sync to finish before writing the archive")
+			if notice, ok := ctx.Value(writerWaitNoticeKey{}).(func()); ok {
+				notice()
+			}
+		}
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("gave up waiting for the local sync to finish: %w", ctx.Err())
+			}
+			return fmt.Errorf("stopped while waiting for the local sync to finish: %w", ctx.Err())
+		case <-time.After(writerHandoffPollInterval):
+		}
+	}
+	return nil
+}
+
+// RetryAcrossHandoff retries a write rejected by a closed writer, waiting for
+// the worker handoff to finish or ctx to end before trying again.
+func RetryAcrossHandoff[T any](
+	ctx context.Context, local *DB, write func() (T, error),
+) (T, error) {
+	for {
+		value, err := write()
+		if !errors.Is(err, ErrWriterClosed) {
+			return value, err
+		}
+		if err := local.WaitForWriter(ctx); err != nil {
+			return value, err
+		}
+	}
+}
+
+type writerWaitNoticeKey struct{}
+
+// WithWriterWaitNotice returns a context whose WaitForWriter calls notice when
+// a wait for a worker handoff lasts long enough to log. A daemon push uses it
+// to tell its client why the push paused.
+func WithWriterWaitNotice(ctx context.Context, notice func()) context.Context {
+	return context.WithValue(ctx, writerWaitNoticeKey{}, notice)
+}
+
+// writerHandoffPollInterval spaces checks for the end of a worker handoff.
+// Handoffs last seconds to minutes.
+const writerHandoffPollInterval = 50 * time.Millisecond
+
+// writerHandoffNoticeAfter is how long WaitForWriter waits before it logs that
+// it is waiting, so a short handoff stays quiet.
+const writerHandoffNoticeAfter = 5 * time.Second
+
 // normalizeMirrorWindowBound parses an RFC3339Nano timestamp and formats it
 // as ms-precision UTC text matching the sync_marker column format, so the
 // bound compares correctly against trigger-maintained markers.
@@ -6845,8 +7012,11 @@ func normalizeMirrorWindowBound(bound string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parsing mirror window bound %q: %w", bound, err)
 	}
-	return parsed.UTC().Format("2006-01-02T15:04:05.000Z"), nil
+	return parsed.UTC().Format(mirrorWindowBoundLayout), nil
 }
+
+// mirrorWindowBoundLayout matches the trigger-maintained sync_marker text.
+const mirrorWindowBoundLayout = "2006-01-02T15:04:05.000Z"
 
 // SessionProjectsByIDs returns each session's current project keyed by session
 // ID. IDs with no sessions row are absent from the result, so a caller can tell
@@ -6908,8 +7078,10 @@ type SessionMirrorSnapshot struct {
 	Session             Session
 	Messages            []Message
 	Usage               []UsageEvent
+	CommitLinks         []CommitLinkRow
 	Findings            []SecretFinding
 	Pins                []PinnedMessage
+	PlanUsage           *SessionPlanUsage // nil when the session has none
 	UsageFingerprint    string
 	ToolCallFingerprint string
 }
@@ -6933,7 +7105,7 @@ func (db *DB) loadSessionMirrorSnapshot(ctx context.Context, id string, afterSes
 		afterSession()
 	}
 	result := &SessionMirrorSnapshot{Session: *session}
-	if result.Messages, err = allMessagesWithQuerier(ctx, tx, id); err != nil {
+	if result.Messages, err = allMessagesWithQuerier(ctx, tx, id, selectMessageCols); err != nil {
 		return nil, err
 	}
 	if result.Usage, err = usageEventsWithQuerier(ctx, tx, id, 0); err != nil {
@@ -6942,7 +7114,21 @@ func (db *DB) loadSessionMirrorSnapshot(ctx context.Context, id string, afterSes
 	if result.Findings, err = sessionSecretFindingsWithQuerier(ctx, tx, id); err != nil {
 		return nil, err
 	}
+	identities, err := json.Marshal(sessionTrailerIdentities(id))
+	if err != nil {
+		return nil, err
+	}
+	owners, err := resolveTrailerOwners(ctx, tx, `session_id IN (SELECT value FROM json_each(?))`, string(identities))
+	if err != nil {
+		return nil, err
+	}
+	if result.CommitLinks, err = sessionCommitLinkRows(ctx, tx, owners, "l.session_id=?", id); err != nil {
+		return nil, err
+	}
 	if result.Pins, err = pinnedMessagesWithQuerier(ctx, tx, id, ""); err != nil {
+		return nil, err
+	}
+	if result.PlanUsage, err = sessionPlanUsageWithQuerier(ctx, tx, id); err != nil {
 		return nil, err
 	}
 	usage := make(map[string]string, 1)

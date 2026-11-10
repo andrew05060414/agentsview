@@ -4,6 +4,10 @@
 
 export type GetApiV1SessionsParams = {
   /**
+   * Include default-exclusion counts; true also samples hidden children, false counts only one-shot and automated sessions. First page only.
+   */
+  exclusion_counts?: boolean;
+  /**
    * Filter by project
    */
   project?: string;
@@ -12,7 +16,7 @@ export type GetApiV1SessionsParams = {
    */
   exclude_project?: string;
   /**
-   * Filter by machine
+   * Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
    */
   machine?: string;
   /**

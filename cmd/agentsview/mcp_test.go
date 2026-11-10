@@ -20,6 +20,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/kit/daemon"
 )
@@ -93,20 +94,6 @@ func TestMCPListenerAuth(t *testing.T) {
 	_, err = mcpListenerAuth("192.168.1.5:8085", "", false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "auth token")
-}
-
-func TestNewMCPCommand_Wiring(t *testing.T) {
-	t.Parallel()
-	cmd := newMCPCommand()
-	assert.Equal(t, "mcp", cmd.Use)
-	assert.Equal(t, groupData, cmd.GroupID)
-	assert.True(t, cmd.SilenceUsage)
-
-	for _, name := range []string{
-		"http", "http-allow-insecure", "server", "server-token-file", "pg", "profile",
-	} {
-		assert.NotNil(t, cmd.Flags().Lookup(name), "missing flag --%s", name)
-	}
 }
 
 func TestMCPMemoryProfileUsesPluginEnvironment(t *testing.T) {
@@ -290,6 +277,11 @@ func sessionTotalHandler(t *testing.T, total int) http.HandlerFunc {
 }
 
 func TestMCPDaemonServiceReusesVerifiedDaemon(t *testing.T) {
+	testMCPDaemonServiceReusesVerifiedDaemon(t, false)
+}
+
+func testMCPDaemonServiceReusesVerifiedDaemon(t *testing.T, legacy bool) {
+	t.Helper()
 	dir := runtimeTestDir(t)
 	forbidStartBackgroundServeForTransport(t, "MCP must reuse the running daemon")
 	host, port, pings := newMCPCacheDaemon(t, map[string]http.HandlerFunc{
@@ -299,12 +291,21 @@ func TestMCPDaemonServiceReusesVerifiedDaemon(t *testing.T) {
 		},
 	})
 	writeDaemonRuntimeForTest(t, dir, host, port, "test", false)
+	if legacy {
+		path, err := runtimeStore(dir).Path(os.Getpid())
+		require.NoError(t, err)
+		require.NoError(t, os.Rename(path, filepath.Join(dir, filepath.Base(path))))
+	}
 	svc := newMCPDaemonService(config.Config{DataDir: dir, AuthToken: "test-token"})
 
-	for range 3 {
+	for i := range 3 {
 		result, err := svc.List(t.Context(), service.ListFilter{})
 		require.NoError(t, err)
 		assert.Equal(t, 1, result.Total)
+		if legacy && i == 0 {
+			// A record at the new location must not replace the cached evidence.
+			writeDaemonRuntimeForTest(t, dir, host, port, "replacement", false)
+		}
 	}
 	assert.Equal(t, int32(1), pings.Load(), "only the first call discovers the daemon")
 }
@@ -554,7 +555,7 @@ func TestMCPDaemonServiceRecoversAfterCachedListenerFailure(t *testing.T) {
 	host, port = splitTestServerURL(t, readOnly.URL)
 	writeDaemonRuntimeForTest(t, readOnlyDir, host, port, "test", true)
 	oldList := listDaemonRuntimeRecords
-	listDaemonRuntimeRecords = func(store daemon.RuntimeStore) ([]daemon.RuntimeRecord, error) {
+	listDaemonRuntimeRecords = func(store daemonRuntimeStore) ([]daemon.RuntimeRecord, error) {
 		records, err := store.List()
 		if err != nil {
 			return nil, err
@@ -576,6 +577,27 @@ func TestMCPDaemonServiceRecoversAfterCachedListenerFailure(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 9, result.Total)
 	assert.Equal(t, 1, readOnlyRequests)
+}
+
+func TestMCPDaemonFileReferencesUsesServingCapability(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			dir := runtimeTestDir(t)
+			forbidStartBackgroundServeForTransport(t, "use the serving daemon")
+			backend := daemonRouteTestServer(t, map[string]http.HandlerFunc{
+				"/api/v1/version": func(w http.ResponseWriter, r *http.Request) {
+					assert.NoError(t, json.MarshalWrite(w, map[string]any{"api_version": 12, "docbank_enabled": enabled}))
+				},
+			})
+			host, port := splitTestServerURL(t, backend.URL)
+			writeDaemonRuntimeForTest(t, dir, host, port, "test", false)
+			cfg := config.Config{DataDir: dir}
+			if !enabled {
+				cfg.Integrations.Docbank = config.DocbankIntegration{URL: "https://example.com", APIKeyEnv: "DOCBANK_TEST_KEY"}
+			}
+			assert.Equal(t, enabled, service.SupportsFileReferences(newMCPDaemonService(cfg)))
+		})
+	}
 }
 
 func TestMCPDaemonServiceLateFailurePreservesReplacement(t *testing.T) {
@@ -689,4 +711,38 @@ func splitTestServerURL(t *testing.T, raw string) (string, int) {
 	_, err = fmt.Sscanf(portText, "%d", &port)
 	require.NoError(t, err)
 	return host, port
+}
+
+func TestMCPDaemonServiceFrictionCapabilityFollowsReadOnlyDaemon(t *testing.T) {
+	tests := []struct {
+		name     string
+		readable bool
+	}{
+		{name: "archive or PostgreSQL daemon", readable: true},
+		{name: "mirror without friction tables", readable: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ping := daemon.NewPingHandler(daemon.PingHandlerOptions{Service: daemonService, Version: "test"})
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/ping" {
+					ping.ServeHTTP(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"api_version":%d,"data_version":1,"read_only":true,"friction_readable":%t}`,
+					server.APIVersion, tt.readable)
+			}))
+			t.Cleanup(ts.Close)
+			dir := daemonRuntimeDir(t)
+			host, port := splitTestServerURL(t, ts.URL)
+			writeDaemonRuntimeForTest(t, dir, host, port, "test", true)
+			svc := newMCPDaemonService(config.Config{DataDir: dir})
+			assert.Equal(t, tt.readable, service.SupportsFriction(svc))
+		})
+	}
+	t.Run("no daemon yet", func(t *testing.T) {
+		svc := newMCPDaemonService(config.Config{DataDir: daemonRuntimeDir(t)})
+		assert.True(t, service.SupportsFriction(svc), "the daemon started on demand is an archive daemon")
+	})
 }

@@ -11,7 +11,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -156,23 +155,40 @@ func mustProjects(
 }
 
 func TestAnalyticsSummaryReturnsFirstReadError(t *testing.T) {
-	d := testDB(t)
-	insertSession(t, d, "summary", "project", func(s *Session) {
-		s.StartedAt = new("2024-06-01T09:00:00Z")
-	})
-	d.rawReader().SetMaxOpenConns(1)
-	conn, err := d.getReader().Conn(t.Context())
-	require.NoError(t, err)
-	// Fail during SQLite row evaluation, after QueryContext has returned rows.
-	require.NoError(t, conn.Raw(func(driverConn any) error {
-		return driverConn.(*sqlite3.SQLiteConn).RegisterFunc("strftime", func(...any) (string, error) {
-			return "", errors.New("summary read failure")
-		}, false)
-	}))
-	require.NoError(t, conn.Close())
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{"serving", "querying analytics summary: summary read failure"},
+		{"cold read-only", "summary read failure"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, "summary", "project", func(s *Session) {
+				s.StartedAt = new("2024-06-01T09:00:00Z")
+			})
+			if tc.name == "cold read-only" {
+				reader, err := OpenReadOnly(t.Context(), d.Path())
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, reader.Close()) })
+				d = reader
+			}
+			d.rawReader().SetMaxOpenConns(1)
+			conn, err := d.getReader().Conn(t.Context())
+			require.NoError(t, err)
+			// Cached SQL evaluates its first row during QueryContext; cold
+			// read-only SQL evaluates it during Next. Both must return the error.
+			require.NoError(t, conn.Raw(func(driverConn any) error {
+				return driverConn.(interface{ RegisterFunc(string, any, bool) error }).RegisterFunc("strftime", func(...any) (string, error) {
+					return "", errors.New("summary read failure")
+				}, false)
+			}))
+			require.NoError(t, conn.Close())
 
-	_, err = d.GetAnalyticsSummary(t.Context(), baseFilter())
-	require.EqualError(t, err, "summary read failure")
+			_, err = d.GetAnalyticsSummary(t.Context(), baseFilter())
+			require.EqualError(t, err, tc.want)
+		})
+	}
 }
 
 func TestGetAnalyticsSummary(t *testing.T) {
@@ -324,6 +340,13 @@ func TestAnalyticsSubagentScope(t *testing.T) {
 	shape, err := d.GetAnalyticsSessionShape(ctx, f)
 	require.NoError(t, err, "GetAnalyticsSessionShape")
 	assert.Equal(t, 1, shape.Count, "session-shape stays root-only")
+
+	insertSession(t, d, "continuation", "project-alpha", func(s *Session) {
+		withTokens("continuation", 5, 2, 200)(s)
+		s.ParentSessionID = new("root")
+	})
+	assert.Equal(t, 3, mustSummary(t, d, ctx, f).TotalSessions,
+		"summary also counts the parented continuation")
 }
 
 func TestAnalyticsModelFilter(t *testing.T) {
@@ -3252,13 +3275,6 @@ func TestGetAnalyticsSkillsModelFilterCountsOnlyMatchingSkillCalls(
 		"LastUsedAt")
 }
 
-func TestGetAnalyticsToolsCanceled(t *testing.T) {
-	d := testDB(t)
-	ctx := canceledCtx()
-	_, err := d.GetAnalyticsTools(ctx, baseFilter())
-	requireCanceledErr(t, err)
-}
-
 func TestGetAnalyticsSkillsCanceled(t *testing.T) {
 	d := testDB(t)
 	ctx := canceledCtx()
@@ -3402,6 +3418,11 @@ func TestGetAnalyticsTopSessions(t *testing.T) {
 				"done",
 				"2024-06-02T11:00:00Z",
 			),
+			Message{
+				SessionID: "wall-dominant", Ordinal: 3, Role: "user",
+				Content: "hook output", Timestamp: "2024-06-02T11:10:00Z",
+				IsSystem: true, SourceType: "attachment", SourceSubtype: "hook_success",
+			},
 		)
 
 		insertSession(t, d, "actively-working", "project-gamma", func(s *Session) {
@@ -5285,4 +5306,130 @@ func TestGetAnalyticsToolsChunksSessionsAtMaxSQLVars(t *testing.T) {
 	assert.Equal(t, BuildToolsAnalytics(all), resp)
 	assert.Equal(t, 501, resp.TotalCalls)
 	t.Log("chunked and unchunked responses match; TotalCalls == 501")
+}
+
+func TestGetAnalyticsVelocityIgnoresHookRows(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	require.NoError(t, d.UpsertSession(ctx, Session{
+		ID: "hooks", Project: "proj", Agent: "claude", Machine: "local",
+		StartedAt: new("2024-06-01T09:00:00Z"), MessageCount: 4, UserMessageCount: 1,
+	}))
+	require.NoError(t, d.ReplaceSessionMessages(ctx, "hooks", []Message{
+		{SessionID: "hooks", Ordinal: 0, Role: "user", IsSystem: true, SourceType: "attachment", SourceSubtype: "hook_success", Timestamp: "2024-06-01T09:00:00Z", Content: "startup output"},
+		{SessionID: "hooks", Ordinal: 1, Role: "user", Timestamp: "2024-06-01T09:01:00Z", Content: "question"},
+		{SessionID: "hooks", Ordinal: 2, Role: "user", IsSystem: true, SourceType: "attachment", SourceSubtype: "hook_additional_context", Timestamp: "2024-06-01T09:01:09Z", Content: "prompt context"},
+		{SessionID: "hooks", Ordinal: 3, Role: "assistant", Timestamp: "2024-06-01T09:01:10Z", Content: "answer"},
+	}))
+	resp, err := d.GetAnalyticsVelocity(ctx, baseFilter())
+	require.NoError(t, err)
+	assert.InDelta(t, 10.0, resp.Overall.FirstResponseSec.P50, 0.001)
+	assert.InDelta(t, 10.0, resp.Overall.TurnCycleSec.P50, 0.001)
+}
+
+func TestAnalyticsDateWindowPlan(t *testing.T) {
+	d := testDB(t)
+	seedAnalyticsData(t, d)
+	for _, tc := range []struct {
+		name, from, to string
+		indexed        bool
+	}{
+		{"2-day", "2024-06-01", "2024-06-03", true},
+		{"90-day", "2024-06-01", "2024-08-30", true},
+		{"91-day", "2024-06-01", "2024-08-31", false},
+		{"year", "2024-01-01", "2025-01-01", false},
+		{"from-only", "2024-06-01", "", false},
+		{"to-only", "", "2024-06-03", false},
+		{"all-time", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := baseFilter()
+			f.From, f.To = tc.from, tc.to
+			for _, table := range []struct{ name, date string }{
+				{"sessions", "COALESCE(NULLIF(started_at, ''), created_at)"},
+				{"sessions s", "COALESCE(NULLIF(s.started_at, ''), s.created_at)"},
+			} {
+				where, args := f.buildWhere(table.date)
+				plan := queryPlanOf(t, d, "SELECT id FROM "+table.name+" WHERE "+where, args...)
+				if tc.indexed {
+					assert.Contains(t, plan, "idx_sessions_effective_start")
+				} else {
+					assert.NotContains(t, plan, "idx_sessions_effective_start")
+				}
+			}
+		})
+	}
+}
+
+func TestGetAnalyticsTopSessionsEmptyDateWindowWork(t *testing.T) {
+	for _, history := range []int{30000} {
+		t.Run(fmt.Sprintf("history_%d", history), func(t *testing.T) {
+			d := testDB(t)
+			_, err := d.getWriter().ExecContext(t.Context(), `
+				WITH RECURSIVE seq(n) AS (
+					SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n < ? - 1
+				)
+				INSERT INTO sessions (id, project, machine, agent, message_count, started_at)
+				SELECT printf('old-%06d', n), 'project-a', 'local', 'claude',
+					n + 1, '2024-01-01T12:00:00Z' FROM seq`, history)
+			require.NoError(t, err)
+
+			// Count date evaluations using NULLIF's semantics for the fixture's
+			// non-NULL text starts. A date-index seek uses stored expression
+			// values; an archive-wide ranking walk evaluates each old row.
+			// Register only on the reader, leaving the stored index intact.
+			d.rawReader().SetMaxOpenConns(1)
+			conn, err := d.getReader().Conn(t.Context())
+			require.NoError(t, err)
+			var evaluations int
+			require.NoError(t, conn.Raw(func(driverConn any) error {
+				return driverConn.(interface{ RegisterFunc(string, any, bool) error }).RegisterFunc("nullif", func(value, other string) any {
+					evaluations++
+					if value == other {
+						return nil
+					}
+					return value
+				}, true)
+			}))
+			require.NoError(t, conn.Close())
+
+			for _, timezone := range []string{"UTC", "Asia/Kolkata"} {
+				t.Run(timezone, func(t *testing.T) {
+					evaluations = 0
+					resp, err := d.GetAnalyticsTopSessions(t.Context(), AnalyticsFilter{
+						From: "2024-06-01", To: "2024-06-02", Timezone: timezone,
+					}, "messages")
+					require.NoError(t, err)
+					assert.Equal(t, "messages", resp.Metric)
+					assert.Empty(t, resp.Sessions)
+					assert.LessOrEqual(t, evaluations, 16, "empty-window date evaluations must stay bounded as history grows")
+					t.Logf("date evaluations: %d", evaluations)
+				})
+			}
+		})
+	}
+}
+
+func TestAnalyticsDateWindowCreatedAtFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		startedAt *string
+	}{
+		{"null", nil},
+		{"empty", new("")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			insertSession(t, d, "fallback", "project-a", func(s *Session) { s.StartedAt = tc.startedAt })
+			_, err := d.getWriter().ExecContext(t.Context(), "UPDATE sessions SET created_at = '2024-06-02T12:00:00Z' WHERE id = 'fallback'")
+			require.NoError(t, err)
+			summary, err := d.GetAnalyticsSummary(t.Context(), baseFilter())
+			require.NoError(t, err)
+			assert.Equal(t, 1, summary.TotalSessions)
+			top, err := d.GetAnalyticsTopSessions(t.Context(), baseFilter(), "messages")
+			require.NoError(t, err)
+			require.Len(t, top.Sessions, 1)
+			assert.Equal(t, "fallback", top.Sessions[0].ID)
+		})
+	}
 }

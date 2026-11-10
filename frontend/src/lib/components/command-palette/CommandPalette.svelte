@@ -21,6 +21,8 @@
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { stripIdPrefix } from "../../utils/resume.js";
   import { normalizeMessagePreview } from "../../utils/messages.js";
+  import { EmbeddingsService, type VectorBuildStatus } from "../../api/generated/index.js";
+  import SearchByMeaningControl from "../shared/SearchByMeaningControl.svelte";
   import SemanticSetupHelp from "./SemanticSetupHelp.svelte";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
   import RangePicker from "../shared/RangePicker.svelte";
@@ -30,6 +32,18 @@
     SearchMode,
   } from "../../stores/search.svelte.js";
 
+  let hintStatus = $state<VectorBuildStatus | null>(null);
+  $effect(() => {
+    if (searchStore.mode !== "fulltext") return;
+    hintStatus = null;
+    const controller = new AbortController();
+    void EmbeddingsService.getApiV1EmbeddingsStatus({}, { signal: controller.signal })
+      .then((status) => {
+        if (!controller.signal.aborted) hintStatus = status;
+      })
+      .catch(() => {});
+    return () => controller.abort();
+  });
   let inputRef: HTMLInputElement | undefined = $state(undefined);
   let project = $state(sessions.filters.project);
   let selectedIndex: number = $state(0);
@@ -45,10 +59,10 @@
   // mechanism). This ensures stale results and in-flight requests are always
   // cancelled even when the caller bypasses close().
   onDestroy(() => {
+    searchStore.endSession();
     searchStore.clear();
     searchStore.resetSort();
     searchStore.resetRange();
-    searchStore.reportedModes.clear();
   });
 
   // Most Chinese, Japanese, and Korean words are one or two characters long,
@@ -70,7 +84,7 @@
           (s) =>
             s.project.toLowerCase().includes(q) ||
             (s.display_name?.toLowerCase().includes(q) ?? false) ||
-            (s.first_message?.toLowerCase().includes(q) ?? false),
+            (sessions.view(s).first_message?.toLowerCase().includes(q) ?? false),
         )
         .slice(0, 10);
     }
@@ -270,7 +284,7 @@
         value={inputValue}
         oninput={handleInput}
       />
-      <KbdBadge keys={["⎋"]} ariaLabel="Escape" />
+      <KbdBadge keys={["⎋"]} joiner="compact" ariaLabel="Escape" />
     </div>
 
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -322,6 +336,9 @@
             onclick={() => { searchStore.setSort("recency"); selectedIndex = 0; }}
           >{m.command_palette_recency()}</button>
         </div>
+      {/if}
+      {#if searchStore.mode !== "fulltext" && !searchStore.error}
+        <a class="palette-server-settings" href="https://agentsview.io/docs/semantic-search/#named-embeddings-servers" target="_blank" rel="noreferrer">{m.command_palette_semantic_setup_local_link()}</a>
       {/if}
     </div>
 
@@ -400,7 +417,7 @@
       {:else}
         <div class="palette-section-label">{m.command_palette_recent_sessions()}</div>
         {#each recentSessions as session, i}
-          {@const preview = session.display_name ?? normalizeMessagePreview(session.first_message)}
+          {@const preview = session.display_name ?? normalizeMessagePreview(sessions.view(session).first_message)}
           <button
             class="palette-item"
             class:selected={i === selectedIndex}
@@ -419,11 +436,15 @@
           </button>
         {/each}
       {/if}
+      {#if showSearchResults && !searchStore.isSearching && !searchStore.error && searchStore.mode === "fulltext"}
+        <div class="meaning-hint"><SearchByMeaningControl status={hintStatus} hint onchange={() => { hintStatus = null; searchStore.setMode("semantic"); }} /></div>
+      {/if}
     </div>
   </div>
 </div>
 
 <style>
+  .meaning-hint { padding: 8px 16px; }
   .palette-overlay {
     position: fixed;
     /* kit-ui-check-ignore: top-aligned command-palette overlay with palette-owned focus handling; kit-ui Modal's centered dialog chrome does not apply — adopting kit-ui CommandPalette wholesale is tracked as a follow-up */
@@ -580,6 +601,11 @@
     display: flex;
     justify-content: center;
     margin-top: 8px;
+  }
+
+  .palette-server-settings {
+    font-size: 11px;
+    color: var(--text-secondary);
   }
 
   .palette-sort {

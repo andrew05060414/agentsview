@@ -12,6 +12,7 @@ afterEach(() => {
   component = undefined;
   document.body.innerHTML = "";
   sessions.machineLabels = {};
+  sessions.details.clear();
 });
 
 describe("SessionItem identity", () => {
@@ -23,6 +24,8 @@ describe("SessionItem identity", () => {
     final_failure_streak: 0,
     has_peak_context_tokens: false,
     has_total_output_tokens: false,
+    peak_context_tokens: 0,
+    total_output_tokens: 0,
     mid_task_compaction_count: 0,
     outcome: "",
     outcome_confidence: "",
@@ -52,6 +55,19 @@ describe("SessionItem identity", () => {
     flushSync();
   }
 
+  it("updates a mounted row when its title arrives", () => {
+    mountSession({ first_message: null, is_index_only: true });
+    const row = document.querySelector(".session-item");
+    sessions.details.set("session", {
+      ...baseSession,
+      is_automated: false,
+      first_message: "Loaded title",
+    });
+    flushSync();
+    expect(document.querySelector(".session-item")).toBe(row);
+    expect(document.querySelector(".session-name")?.textContent).toBe("Loaded title");
+  });
+
   it("renders the session label and entrypoint badge", () => {
     sessions.machineLabels = { "installation-a": "Workstation A" };
     mountSession({
@@ -80,6 +96,14 @@ describe("SessionItem identity", () => {
     const agentTag = document.querySelector<HTMLElement>(".agent-tag");
     expect(agentTag?.textContent).toBe("Qwen Code");
     expect(agentTag?.title).toBe("Qwen Code");
+  });
+
+  it("shows all hosted source devices instead of the projection machine", () => {
+    sessions.machineLabels = { "raw-device:61": "Laptop", "raw-device:62": "Desktop" };
+    mountSession({ machine: "hosted", source_machines: ["raw-device:61", "raw-device:62"] });
+
+    const badge = document.querySelector<HTMLElement>(".machine-tag");
+    expect(badge?.textContent).toBe("Laptop, Desktop");
   });
 
   it("uses the registry label for a whitespace-only override", () => {

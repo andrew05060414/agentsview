@@ -69,7 +69,7 @@ func inPlaceholders(keys []string) (string, []any) {
 // *db.DB): the stream of embedding-unit documents — individual user
 // messages and runs of contiguous assistant messages.
 type UnitSource interface {
-	ScanEmbeddableUnits(ctx context.Context, since string, includeAutomated bool,
+	ScanEmbeddableUnits(ctx context.Context, since string, includeAutomated bool, maxRunRunes int,
 		fn func(db.EmbeddableUnit) error) (string, error)
 }
 
@@ -80,7 +80,7 @@ type sessionJournalSource interface {
 	GetDatabaseID(context.Context) (string, error)
 	SessionDeletionPublicationRevision(context.Context) (int64, error)
 	LoadSessionDeletionChanges(context.Context, int64, int64) ([]string, error)
-	ScanEmbeddableUnitsForSession(context.Context, string, bool, func(db.EmbeddableUnit) error) error
+	ScanEmbeddableUnitsForSession(context.Context, string, bool, int, func(db.EmbeddableUnit) error) error
 }
 
 const (
@@ -124,9 +124,9 @@ type RefreshStats struct {
 // source_uuid "dup#2" at its first occurrence would otherwise collide with
 // source_uuid "dup" at its second occurrence.
 func DocKey(kind, sessionID, sourceUUID string, ordinal, occurrence int) string {
-	uuidPrefix, ordinalPrefix := "u:", "o:"
+	uuidPrefix, ordinalPrefix := userUUIDKeyPrefix, userOrdinalKeyPrefix
 	if kind == "run" {
-		uuidPrefix, ordinalPrefix = "r:", "ro:"
+		uuidPrefix, ordinalPrefix = runUUIDKeyPrefix, runOrdinalKeyPrefix
 	}
 	session := escapeDocKeyComponent(sessionID)
 	if sourceUUID != "" {
@@ -137,6 +137,27 @@ func DocKey(kind, sessionID, sourceUUID string, ordinal, occurrence int) string 
 		return uuidPrefix + session + ":" + uuid
 	}
 	return ordinalPrefix + session + ":" + strconv.Itoa(ordinal)
+}
+
+// The kind prefixes DocKey starts every key with.
+const (
+	userUUIDKeyPrefix    = "u:"
+	userOrdinalKeyPrefix = "o:"
+	runUUIDKeyPrefix     = "r:"
+	runOrdinalKeyPrefix  = "ro:"
+)
+
+// DocKeySessionPrefixes returns the prefixes of every key DocKey builds for
+// sessionID, one per kind prefix. A key starts with one of them exactly when
+// DocKey built it for sessionID: the escaped session holds no ':', so the
+// ':' after it ends the session component. Stores sorted by doc key use
+// them to read only one session's key ranges.
+func DocKeySessionPrefixes(sessionID string) [4]string {
+	session := escapeDocKeyComponent(sessionID) + ":"
+	return [4]string{
+		userUUIDKeyPrefix + session, userOrdinalKeyPrefix + session,
+		runUUIDKeyPrefix + session, runOrdinalKeyPrefix + session,
+	}
 }
 
 // escapeDocKeyComponent percent-encodes the characters DocKey uses as
@@ -172,8 +193,10 @@ func contentHash(content string) string {
 // archive (since="") and additionally deletes mirror rows (and their
 // vectors, via store.DeleteVectors) whose identity was not seen in the
 // scan; full=false scans only sessions newer than the stored watermark
-// (metadata-table key "refresh_watermark") and only upserts, leaving that
-// reconciliation to a subsequent full refresh. includeAutomated
+// (metadata-table key "refresh_watermark"), each one whole. For sessions
+// that emit a non-deleted unit, it deletes mirror rows the scan did not see,
+// so run pieces whose boundaries moved drop out; other sessions wait for a
+// subsequent full refresh or journal reconciliation. includeAutomated
 // is passed through to src.ScanEmbeddableUnits: false excludes automated
 // sessions from the scan entirely, so their mirror rows are absent (and, in
 // full mode, reconciled away) rather than merely unembedded. Either mode
@@ -186,11 +209,11 @@ func contentHash(content string) string {
 // rows and vectors immediately.
 //
 // When src also exposes the archive's session deletion journal
-// (sessionJournalSource), an incremental refresh reconciles every session
-// journaled since the stored revision: it rescans each one whole, whatever
-// its ended_at, and deletes that session's mirror rows the scan did not
-// observe, so permanently deleted sessions drop out and reinserted ones are
-// republished. It runs as a full refresh instead when the stored revision is
+// (sessionJournalSource), an incremental refresh also reconciles every
+// session journaled since the stored revision: it rescans each one whole,
+// whatever its ended_at, and deletes that session's mirror rows the scan did
+// not observe, so permanently deleted sessions drop out and reinserted ones
+// are republished. It runs as a full refresh instead when the stored revision is
 // missing, belongs to another archive, or is ahead of the journal. After a
 // successful refresh it stores the journal revision and archive id captured
 // before the scan. The watermark advances to the opaque value returned by
@@ -301,7 +324,8 @@ func (ix *Index) Refresh(
 		visited[u.SessionID] = struct{}{}
 		return nil
 	}
-	nextWatermark, err := src.ScanEmbeddableUnits(ctx, since, includeAutomated, visitUnit)
+	runCap := RunMaxRunes(ix.split.MaxRunes)
+	nextWatermark, err := src.ScanEmbeddableUnits(ctx, since, includeAutomated, runCap, visitUnit)
 	if err != nil {
 		return RefreshStats{}, fmt.Errorf("scanning embeddable units: %w", err)
 	}
@@ -313,7 +337,7 @@ func (ix *Index) Refresh(
 		if _, ok := visited[id]; ok {
 			continue
 		}
-		if err := journal.ScanEmbeddableUnitsForSession(ctx, id, includeAutomated, visitUnit); err != nil {
+		if err := journal.ScanEmbeddableUnitsForSession(ctx, id, includeAutomated, runCap, visitUnit); err != nil {
 			return RefreshStats{}, fmt.Errorf("rescanning journaled session %s: %w", id, err)
 		}
 	}
@@ -334,22 +358,27 @@ func (ix *Index) Refresh(
 	}
 	stats.Deleted += finalized
 
-	// Journaled sessions were scanned whole above, so their mirror rows the
-	// scan did not see belong to a deleted session or a vanished identity.
+	// Every visited session was scanned whole, so its unseen keys are
+	// obsolete: a deleted session, a vanished identity, or a run piece whose
+	// boundaries moved when an earlier message changed length. Journaled
+	// sessions that emitted no units still need their old rows removed.
 	for _, id := range changed {
-		deleted, err := ix.reconcileDeletions(ctx, seen, id)
-		if err != nil {
-			return RefreshStats{}, err
-		}
-		stats.Deleted += deleted
+		visited[id] = struct{}{}
 	}
-
 	if full {
 		deleted, err := ix.reconcileDeletions(ctx, seen, "")
 		if err != nil {
 			return RefreshStats{}, err
 		}
 		stats.Deleted += deleted
+	} else {
+		for id := range visited {
+			deleted, err := ix.reconcileDeletions(ctx, seen, id)
+			if err != nil {
+				return RefreshStats{}, err
+			}
+			stats.Deleted += deleted
+		}
 	}
 
 	// The watermark is settled before the journal cursor, so a failed write

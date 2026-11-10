@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/update"
 
 	"github.com/danielgtaylor/huma/v2"
+	"golang.org/x/sync/errgroup"
 )
 
 func (s *Server) registerMetadataRoutes() {
@@ -31,6 +33,11 @@ type statsInput struct {
 	BoolIncludeInput
 }
 
+type machinesInput struct {
+	BoolIncludeInput
+	Machine string `query:"machine" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400."`
+}
+
 type sessionStatsInput struct {
 	BoolIncludeInput
 	Since                 string   `query:"since" doc:"Start of window"`
@@ -39,6 +46,7 @@ type sessionStatsInput struct {
 	IncludeProjects       []string `query:"include_project" doc:"Restrict to these projects"`
 	ExcludeProjects       []string `query:"exclude_project" doc:"Exclude these projects"`
 	Timezone              string   `query:"timezone" doc:"IANA timezone name"`
+	OutcomesOnly          bool     `query:"outcomes_only" doc:"Compute only outcome_stats; other sections are zero-valued"`
 	IncludeGitOutcomes    bool     `query:"include_git_outcomes" doc:"Include git-derived outcome stats"`
 	IncludeGitHubOutcomes bool     `query:"include_github_outcomes" doc:"Include GitHub PR outcome stats"`
 }
@@ -48,9 +56,10 @@ type projectsResponse struct {
 }
 
 type machinesResponse struct {
-	Machines       []string          `json:"machines"`
-	MachineLabels  map[string]string `json:"machine_labels"`
-	MachineAliases map[string]string `json:"machine_aliases"`
+	Machines         []string          `json:"machines" doc:"Picker catalog filtered by visibility flags"`
+	ResolvedMachines []string          `json:"resolved_machines,omitempty" doc:"Canonical IDs for the machine selector, independent of catalog visibility"`
+	MachineLabels    map[string]string `json:"machine_labels"`
+	MachineAliases   map[string]string `json:"machine_aliases"`
 }
 
 func (s *Server) machineAliases(ctx context.Context) (map[string]string, error) {
@@ -102,6 +111,7 @@ func (s *Server) humaGetSessionStats(
 		IncludeProjects:        in.IncludeProjects,
 		ExcludeProjects:        in.ExcludeProjects,
 		Timezone:               in.Timezone,
+		OutcomesOnly:           in.OutcomesOnly,
 		IncludeGitOutcomes:     in.IncludeGitOutcomes,
 		IncludeGitHubOutcomes:  in.IncludeGitHubOutcomes,
 		GHToken:                githubToken,
@@ -134,21 +144,39 @@ func (s *Server) humaListProjects(
 
 func (s *Server) humaListMachines(
 	ctx context.Context,
-	in *statsInput,
+	in *machinesInput,
 ) (*jsonOutput[machinesResponse], error) {
-	machines, err := s.db.GetMachines(ctx, !in.IncludeOneShot, !in.IncludeAutomated)
-	if err != nil {
+	// The labels, aliases, and machine list are independent reads.
+	var labels, aliases map[string]string
+	var machines []string
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		var err error
+		labels, err = s.db.GetMachineLabels(groupCtx)
+		return err
+	})
+	group.Go(func() error {
+		var err error
+		aliases, err = s.machineAliases(groupCtx)
+		return err
+	})
+	group.Go(func() error {
+		var err error
+		machines, err = s.db.GetMachines(groupCtx, !in.IncludeOneShot, !in.IncludeAutomated)
+		return err
+	})
+	if err := group.Wait(); err != nil {
 		return nil, serverError(err)
 	}
-	labels, err := s.db.GetMachineLabels(ctx)
-	if err != nil {
-		return nil, serverError(err)
+	var resolved []string
+	if strings.TrimSpace(in.Machine) != "" {
+		machine, err := db.ResolveMachineFilterWithMetadata(ctx, s.db, in.Machine, labels, aliases)
+		if err != nil {
+			return nil, serverError(err)
+		}
+		resolved = strings.Split(machine, ",")
 	}
-	aliases, err := s.machineAliases(ctx)
-	if err != nil {
-		return nil, serverError(err)
-	}
-	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines, MachineLabels: labels, MachineAliases: aliases}}, nil
+	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines, ResolvedMachines: resolved, MachineLabels: labels, MachineAliases: aliases}}, nil
 }
 
 func (s *Server) humaListBranches(
@@ -178,6 +206,7 @@ func (s *Server) humaGetVersion(
 	_ *emptyInput,
 ) (*jsonOutput[VersionInfo], error) {
 	version := s.version
+	version.DocbankEnabled = s.cfg.Integrations.Docbank.Enabled()
 	if database, ok := s.db.(*db.DB); ok {
 		var err error
 		version.ArchiveOnly, err = database.IsArchiveOnly(ctx)
@@ -187,10 +216,20 @@ func (s *Server) humaGetVersion(
 	}
 	version.InsightGenerationAvailable = supportsInsightGeneration(s.db)
 	_, version.SessionStatsAvailable = s.db.(*db.DB)
+	version.FrictionAvailable = s.frictionRunner != nil
+	_, version.FrictionReadable = s.db.(db.FrictionReader)
+	version.FrictionBuildAllowed = version.FrictionAvailable && s.frictionRunAllowed(ctx)
 	if restrictedIngress(ctx) {
+		// The restricted allowlist has no friction routes.
 		version.ReadOnly = true
 		version.InsightGenerationAvailable = false
 		version.SessionStatsAvailable = false
+		version.FrictionAvailable = false
+		version.FrictionReadable = false
+		version.FrictionBuildAllowed = false
+	} else {
+		version.KataAvailable = s.kataConn().LastReady()
+		version.FrictionAutoFile = s.frictionAutoFileOn()
 	}
 	return &jsonOutput[VersionInfo]{Body: version}, nil
 }

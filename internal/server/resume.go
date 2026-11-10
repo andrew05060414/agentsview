@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/shellquote"
 )
 
 // resumeRequest is the JSON body for POST /api/v1/sessions/{id}/resume.
@@ -43,19 +44,21 @@ type resumeResponse struct {
 // resumeAgents maps agent type strings to their resume command templates.
 // The %s placeholder is replaced with the (quoted) session ID. TraeX ships the
 // traex, traecli, and trae-cli aliases; the shortest is used. The Augure Code
-// agent's command is the vendor's own `augure resume` CLI, not the agent id.
+// agent's command is the vendor's own `augure resume` CLI, not the agent id,
+// and Open Interpreter installs as `interpreter`.
 var resumeAgents = map[string]string{
-	"claude":      "claude --resume %s",
-	"codex":       "codex resume %s",
-	"traex":       "traex resume %s",
-	"augure-code": "augure resume %s",
-	"copilot":     "copilot --resume=%s",
-	"cursor":      "cursor agent --resume %s",
-	"gemini":      "gemini --resume %s",
-	"opencode":    "opencode --session %s",
-	"amp":         "amp --resume %s",
-	"kiro":        "kiro-cli chat --resume-id %s",
-	"pi":          "pi --session %s",
+	"claude":           "claude --resume %s",
+	"codex":            "codex resume %s",
+	"traex":            "traex resume %s",
+	"augure-code":      "augure resume %s",
+	"open-interpreter": "interpreter resume %s",
+	"copilot":          "copilot --resume=%s",
+	"cursor":           "cursor agent --resume %s",
+	"gemini":           "gemini --resume %s",
+	"opencode":         "opencode --session %s",
+	"amp":              "amp --resume %s",
+	"kiro":             "kiro-cli chat --resume-id %s",
+	"pi":               "pi --session %s",
 }
 
 const syntheticModel = "<synthetic>"
@@ -65,7 +68,8 @@ func resumeCommand(agent, tmpl, rawID, model string) string {
 		// A second file sharing a session id is stored under a derived id; the CLI resumes the original.
 		rawID = parser.BaseSessionID(rawID)
 	}
-	if agent == "codex" || agent == "traex" || agent == "augure-code" {
+	codexFormat := parser.IsCodexFormatAgent(parser.AgentType(agent))
+	if codexFormat {
 		// Codex stores a revert page as <thread>_<rollout>; the CLI resumes the thread.
 		rawID = parser.CodexThreadIDFromSessionKey(rawID)
 	}
@@ -76,18 +80,17 @@ func resumeCommand(agent, tmpl, rawID, model string) string {
 	if model == "" {
 		return cmd
 	}
-	switch agent {
-	case "claude":
+	switch {
+	case agent == "claude":
 		cmd += " --model " + shellQuote(model)
-	case "codex", "traex", "augure-code":
+	case codexFormat:
 		cmd += " -m " + shellQuote(model)
 	}
 	return cmd
 }
 
 func resumeAgentNeedsModel(agent string) bool {
-	return agent == "claude" || agent == "codex" || agent == "traex" ||
-		agent == "augure-code"
+	return agent == "claude" || parser.IsCodexFormatAgent(parser.AgentType(agent))
 }
 
 func primaryResumeModel(counts []db.ModelCount) string {
@@ -228,23 +231,19 @@ func claudeMessagePointWindowsScript(
 	b.WriteString("try { ")
 	if cwd != "" {
 		b.WriteString("Set-Location -LiteralPath ")
-		b.WriteString(powerShellSingleQuote(cwd))
+		b.WriteString(shellquote.PowerShell(cwd))
 		b.WriteString("; ")
 	}
 	b.WriteString("Get-Content -Raw -Encoding UTF8 -LiteralPath ")
-	b.WriteString(powerShellSingleQuote(promptPath))
+	b.WriteString(shellquote.PowerShell(promptPath))
 	b.WriteString(" | & 'claude'")
 	if skipPermissions {
 		b.WriteString(" --dangerously-skip-permissions")
 	}
 	b.WriteString(" } finally { Remove-Item -LiteralPath ")
-	b.WriteString(powerShellSingleQuote(promptPath))
+	b.WriteString(shellquote.PowerShell(promptPath))
 	b.WriteString(" -Force -ErrorAction SilentlyContinue }")
 	return b.String()
-}
-
-func powerShellSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 func powerShellEncodedCommand(script string) string {

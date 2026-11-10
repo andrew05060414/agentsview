@@ -31,7 +31,7 @@ type dagEntryIflow struct {
 // (sliding-window snapshots), not conversation forks, so fork
 // splitting is intentionally not applied.
 func parseIflowSession(
-	path, project, machine string,
+	ctx context.Context, path, project, machine string,
 ) ([]ParseResult, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -67,7 +67,7 @@ func parseIflowSession(
 	)
 	allHaveUUID = true
 
-	lr := newLineReader(f, maxLineSize)
+	lr := newLineReaderContext(ctx, f, maxLineSize)
 	defer releaseLineReader(lr)
 	for {
 		line, ok := lr.next()
@@ -151,6 +151,7 @@ func parseIflowSession(
 	}
 
 	return parseLinearIflow(
+		ctx,
 		entries, sessionID, project, machine,
 		parentSessionID, fileInfo, subagentMap,
 		globalStart, globalEnd,
@@ -159,13 +160,14 @@ func parseIflowSession(
 
 // parseLinearIflow processes entries sequentially without DAG awareness.
 func parseLinearIflow(
+	ctx context.Context,
 	entries []dagEntryIflow,
 	sessionID, project, machine, parentSessionID string,
 	fileInfo FileInfo,
 	subagentMap map[string]string,
 	globalStart, globalEnd time.Time,
 ) ([]ParseResult, error) {
-	messages, startedAt, endedAt := extractMessagesIflow(entries)
+	messages, startedAt, endedAt := extractMessagesIflow(ctx, entries)
 	startedAt = earlierTime(globalStart, startedAt)
 	endedAt = laterTime(globalEnd, endedAt)
 
@@ -335,7 +337,7 @@ func mergeIflowBurst(
 // extractMessagesIflow converts dagEntryIflow into ParsedMessages, applying
 // the same filtering and content extraction as the original linear
 // parser.
-func extractMessagesIflow(entries []dagEntryIflow) (
+func extractMessagesIflow(ctx context.Context, entries []dagEntryIflow) (
 	[]ParsedMessage, time.Time, time.Time,
 ) {
 	var (
@@ -362,7 +364,8 @@ func extractMessagesIflow(entries []dagEntryIflow) (
 		}
 
 		content := gjson.Get(e.line, "message.content")
-		text, _, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(context.Background(), content)
+		text, thinkingText, dialogueText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(ctx, content)
+		dialogue := new(dialogueText)
 
 		// Convert command/skill invocation XML into readable
 		// text (e.g. "/roborev-fix 450"). If the content
@@ -371,6 +374,7 @@ func extractMessagesIflow(entries []dagEntryIflow) (
 		if e.entryType == "user" {
 			if cmdText, ok := extractCommandText(text); ok {
 				text = cmdText
+				dialogue = new(cmdText)
 			} else if isCommandEnvelope(text) {
 				continue
 			}
@@ -390,6 +394,8 @@ func extractMessagesIflow(entries []dagEntryIflow) (
 			Role:          RoleType(e.entryType),
 			Content:       text,
 			Timestamp:     e.timestamp,
+			DialogueText:  dialogue,
+			ThinkingText:  thinkingText,
 			HasThinking:   hasThinking,
 			HasToolUse:    hasToolUse,
 			ContentLength: len(text),

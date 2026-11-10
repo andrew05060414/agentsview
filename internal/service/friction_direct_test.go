@@ -1,0 +1,121 @@
+package service_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/service"
+)
+
+func seedServiceDigest(t *testing.T, d *db.DB, date string) {
+	t.Helper()
+	require.NoError(t, d.SaveFrictionDigest(t.Context(), db.FrictionDigest{
+		Date: date, Timezone: "UTC", RulesVersion: "friction-v1",
+		BuiltAt: time.Date(2026, 9, 15, 1, 0, 0, 0, time.UTC), Revision: 1,
+		SnapshotJSON: []byte("{}"), SummaryJSON: []byte("{\n  \"schema_version\": 1\n}\n"),
+		Markdown: []byte("# Friction Log — " + date + "\n"), MarkdownSHA256: "s", RunID: "r",
+	}, nil, []db.FrictionPatternUpdate{
+		{Fingerprint: "fl1:" + date, Kind: "error", Title: "t", Date: date, SubjectID: "claude:s1", Ordinal: new(2), Occurrences: 1},
+	}))
+}
+
+func TestDirectFrictionService(t *testing.T) {
+	d := dbtest.OpenTestDB(t)
+	svc := service.NewDirectBackend(d, nil)
+	require.True(t, service.SupportsFriction(svc))
+	require.True(t, service.SupportsFriction(service.NewReadOnlyBackend(d)))
+	fs := svc.(service.FrictionService)
+
+	_, err := fs.FrictionDigest(t.Context(), "")
+	require.ErrorIs(t, err, service.ErrFrictionDigestNotFound)
+
+	seedServiceDigest(t, d, "2026-09-13")
+	seedServiceDigest(t, d, "2026-09-14")
+	tests := []struct {
+		name, in, wantDate string
+		wantErr            error
+	}{
+		{"latest_by_default", "", "2026-09-14", nil},
+		{"explicit", "2026-09-13", "2026-09-13", nil},
+		{"missing", "2026-01-01", "", service.ErrFrictionDigestNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			view, err := fs.FrictionDigest(t.Context(), tt.in)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantDate, view.Date)
+			assert.Equal(t, 1, view.Revision)
+			assert.Equal(t, "# Friction Log — "+tt.wantDate+"\n", view.Markdown)
+			assert.JSONEq(t, `{"schema_version":1}`, string(view.Summary))
+		})
+	}
+	t.Run("invalid_date", func(t *testing.T) {
+		_, err := fs.FrictionDigest(t.Context(), "tomorrow")
+		require.Error(t, err)
+	})
+
+	t.Run("digests_range", func(t *testing.T) {
+		items, err := fs.FrictionDigests(t.Context(), "2026-09-14", "2026-09-30")
+		require.NoError(t, err)
+		require.Len(t, items, 1)
+		assert.Equal(t, "2026-09-14", items[0].Date)
+	})
+
+	patternTests := []struct {
+		name   string
+		filter service.FrictionPatternFilter
+		want   int
+	}{
+		{"all", service.FrictionPatternFilter{}, 2},
+		{"since", service.FrictionPatternFilter{Since: "2026-09-14"}, 1},
+		{"limit", service.FrictionPatternFilter{Limit: 1}, 1},
+	}
+	for _, tt := range patternTests {
+		t.Run("patterns_"+tt.name, func(t *testing.T) {
+			page, err := fs.FrictionPatterns(t.Context(), tt.filter)
+			require.NoError(t, err)
+			assert.Len(t, page.Patterns, tt.want)
+		})
+	}
+}
+
+func TestDirectFrictionReadsRejectMalformedFilters(t *testing.T) {
+	fs := service.NewDirectBackend(dbtest.OpenTestDB(t), nil).(service.FrictionService)
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"digests_bad_date", func() error { _, err := fs.FrictionDigests(t.Context(), "2026-9-01", ""); return err }},
+		{"digests_reversed_range", func() error { _, err := fs.FrictionDigests(t.Context(), "2026-09-30", "2026-09-01"); return err }},
+		{"findings_bad_date", func() error {
+			_, err := fs.FrictionFindings(t.Context(), service.FrictionFindingFilter{Date: "2026-9-01"})
+			return err
+		}},
+		{"findings_bad_kind", func() error {
+			_, err := fs.FrictionFindings(t.Context(), service.FrictionFindingFilter{Kind: "nope"})
+			return err
+		}},
+		{"patterns_bad_since", func() error {
+			_, err := fs.FrictionPatterns(t.Context(), service.FrictionPatternFilter{Since: "last-week"})
+			return err
+		}},
+		{"patterns_limit_over_max", func() error {
+			_, err := fs.FrictionPatterns(t.Context(), service.FrictionPatternFilter{Limit: 5000})
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Error(t, tt.call())
+		})
+	}
+}

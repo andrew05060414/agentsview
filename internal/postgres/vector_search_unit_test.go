@@ -60,6 +60,25 @@ func TestHNSWEfSearch(t *testing.T) {
 	}
 }
 
+func TestKNNExhausted(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		rows, limit, cap int
+		want             bool
+	}{
+		{"short uncapped scan", 10, 200, 200, true},
+		{"full uncapped scan", 200, 200, 200, false},
+		{"capped index scan", 1000, 1600, 1000, false},
+		{"capped index scan below its cap", 640, 1600, 1000, true},
+		{"sequential scan past the cap", 1200, 1600, 1000, true},
+		{"full sequential scan past the cap", 1600, 1600, 1000, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, knnExhausted(tc.rows, tc.limit, tc.cap))
+		})
+	}
+}
+
 func TestSemanticUnavailableError(t *testing.T) {
 	s := &Store{}
 
@@ -85,7 +104,7 @@ func TestStoreVectorSearcherWiring(t *testing.T) {
 	assert.False(t, s.HasSemantic(), "searcher cleared")
 }
 
-func TestStoreSemanticReadinessPreservesNegotiationReason(t *testing.T) {
+func TestStoreSemanticReadinessReportsUnavailableReasonAndReadyWithoutCounts(t *testing.T) {
 	s := &Store{}
 	s.SetSemanticUnavailableReason("no compatible embeddings generation")
 
@@ -98,5 +117,6 @@ func TestStoreSemanticReadinessPreservesNegotiationReason(t *testing.T) {
 	status, err = s.SemanticReadiness(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, "ready", status.State)
-	assert.Empty(t, status.Reason)
+	assert.Equal(t, "counts_unavailable", status.Reason)
+	assert.Empty(t, status.Generation)
 }

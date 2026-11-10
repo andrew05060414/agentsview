@@ -91,6 +91,7 @@ type vscodeCopilotResponseItem struct {
 	Value             string         `json:"value,omitempty"`
 	ToolID            string         `json:"toolId,omitempty"`
 	ToolCallID        string         `json:"toolCallId,omitempty"`
+	Presentation      string         `json:"presentation,omitempty"`
 	InvocationMessage jsontext.Value `json:"invocationMessage,omitempty"`
 	PastTenseMessage  jsontext.Value `json:"pastTenseMessage,omitempty"`
 	ToolName          string         `json:"toolName,omitempty"`
@@ -153,7 +154,7 @@ func (p *vscodeCopilotProvider) parseSession(
 	}
 
 	sess, msgs, err := parseVSCodeCopilotData(
-		data, path, project, machine,
+		data, path, project, machine, AgentVSCodeCopilot,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -179,7 +180,7 @@ func (p *vscodeCopilotProvider) parseSession(
 // data. Used by both VSCode Copilot and Positron parsers since
 // the formats are identical.
 func parseVSCodeCopilotData(
-	data []byte, path, project, machine string,
+	data []byte, path, project, machine string, agent AgentType,
 ) (*ParsedSession, []ParsedMessage, error) {
 	var session vscodeCopilotSession
 	if err := json.Unmarshal(data, &session); err != nil {
@@ -203,6 +204,11 @@ func parseVSCodeCopilotData(
 	startedAt := session.CreationDate.Time()
 
 	for _, req := range session.Requests {
+		userUUID, assistantUUID := "", ""
+		if req.RequestID != "" && (agent == AgentVSCodeCopilot || agent == AgentPositron) {
+			userUUID = string(agent) + ":user:" + req.RequestID
+			assistantUUID = string(agent) + ":assistant:" + req.RequestID
+		}
 		// User message
 		text := strings.TrimSpace(req.Message.Text)
 		if text != "" {
@@ -214,6 +220,7 @@ func parseVSCodeCopilotData(
 			messages = append(messages, ParsedMessage{
 				Ordinal:       ordinal,
 				Role:          RoleUser,
+				SourceUUID:    userUUID,
 				Content:       text,
 				Timestamp:     req.Timestamp.Time(),
 				ContentLength: len(text),
@@ -261,6 +268,7 @@ func parseVSCodeCopilotData(
 		messages = append(messages, ParsedMessage{
 			Ordinal:       ordinal,
 			Role:          RoleAssistant,
+			SourceUUID:    assistantUUID,
 			Content:       displayContent,
 			Timestamp:     req.Timestamp.Time(),
 			HasToolUse:    hasToolUse,
@@ -400,12 +408,30 @@ func parseVSCodeCopilotResponse(
 	var textParts []string
 	var toolCalls []ParsedToolCall
 
+	items := make([]vscodeCopilotResponseItem, 0, len(raw))
 	for _, r := range raw {
 		var item vscodeCopilotResponseItem
 		if err := json.Unmarshal(r, &item); err != nil {
 			continue
 		}
+		items = append(items, item)
+	}
 
+	// VS Code can persist one tool call as two invocations that share a
+	// toolCallId: a hidden extension placeholder and the built-in tool it
+	// delegates to (copilot_fetchWebPage, then vscode_fetchWebPage_internal).
+	// Keep one call per ID so tool_use_id stays unique within the message,
+	// preferring the visible invocation, which carries the input.
+	visibleCall := map[string]bool{}
+	for _, item := range items {
+		if item.Kind == "toolInvocationSerialized" &&
+			item.ToolID != "" && item.Presentation != "hidden" {
+			visibleCall[item.ToolCallID] = true
+		}
+	}
+	seenCall := map[string]bool{}
+
+	for _, item := range items {
 		switch item.Kind {
 		case "toolInvocationSerialized":
 			if item.ToolID != "" {
@@ -421,6 +447,12 @@ func parseVSCodeCopilotResponse(
 					item.PastTenseMessage,
 					item.ToolSpecificData,
 				)
+				if id := tc.ToolUseID; id != "" {
+					if seenCall[id] || (item.Presentation == "hidden" && visibleCall[id]) {
+						continue
+					}
+					seenCall[id] = true
+				}
 				toolCalls = append(toolCalls, tc)
 			}
 		case "prepareToolInvocation":

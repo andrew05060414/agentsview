@@ -11,10 +11,17 @@ import {
   SessionsService,
   InsightsService,
   ImportService,
+  FrictionService,
   type DbSessionTiming as SessionTiming,
   type ImporterImportStats as ImportStats,
 } from "./generated/index.js";
-import { ApiError, getAuthToken, getGeneratedBase, isRemoteConnection } from "./runtime.js";
+import {
+  ApiError,
+  type ApiRequestOptions,
+  getAuthToken,
+  getGeneratedBase,
+  isRemoteConnection,
+} from "./runtime.js";
 import { reportTelemetry } from "../utils/telemetry.js";
 import type { BrowserHost } from "./browserHost.js";
 
@@ -66,7 +73,11 @@ function streamSyncSSE(
       ({ event, data }) => {
         if (event === "progress") onProgress?.(JSON.parse(data));
         if (event === "done") return JSON.parse(data);
-        if (event === "error") throw new Error(JSON.parse(data).error ?? "Sync failed");
+        if (event === "error") {
+          // The stream already returned 200, so the failure carries only its code.
+          const failure = JSON.parse(data);
+          throw Object.assign(new Error(failure.error ?? "Sync failed"), { code: failure.code });
+        }
       },
       "Sync stream ended without done event",
     ),
@@ -273,11 +284,21 @@ export async function downloadInsightExport(insightId: number): Promise<void> {
   );
 }
 
+/** Download a stored Friction Log digest as Markdown with remote auth headers. */
+export async function downloadFrictionDigestMarkdown(date: string): Promise<void> {
+  await downloadAuthenticatedExport(
+    FrictionService.getGetApiV1FrictionDigestsByDateMdUrl({ date }),
+    () => FrictionService.getApiV1FrictionDigestsByDateMd({ date }),
+    `friction-log-${date}.md`,
+    "friction_markdown",
+  );
+}
+
 async function downloadAuthenticatedExport(
   url: string,
   request: () => Promise<Response>,
   fallbackFilename: string,
-  format: "html" | "insight_html",
+  format: "html" | "insight_html" | "friction_markdown",
 ): Promise<void> {
   reportTelemetry("export_run", { format });
   const token = getAuthToken();
@@ -380,11 +401,13 @@ async function readImportResponse(
   );
 }
 
-// The browser window is shared, so Sign in and a new Sync wait for the previous run's close.
-let claudeAIClosing: Promise<void> = Promise.resolve();
+// The browser window is shared, so Sign in and a new Sync wait until the
+// previous run has closed it. A run takes its turn before awaiting anything,
+// so a stopped run still finishes closing before a retry starts.
+let claudeAIOwner: Promise<void> = Promise.resolve();
 
 export async function connectClaudeAI(host: BrowserHost): Promise<void> {
-  await claudeAIClosing;
+  await claudeAIOwner;
   await host.connect();
 }
 
@@ -393,15 +416,28 @@ export async function syncClaudeAI(
   cb?: ImportCallbacks,
   signal?: AbortSignal,
 ): Promise<ImportStats> {
+  // Sync outlives the import dialog, so the selected server can change
+  // mid-run. Pin every request to the server the run started on, so a late
+  // browser response never relays chat contents to the new server.
+  const token = getAuthToken();
+  const server: ApiRequestOptions = {
+    baseUrl: getGeneratedBase(),
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  };
+  const previous = claudeAIOwner;
+  let release!: () => void;
+  claudeAIOwner = new Promise((resolve) => {
+    release = resolve;
+  });
   const controller = new AbortController();
   const abort = () => controller.abort();
   signal?.addEventListener("abort", abort, { once: true });
   if (signal?.aborted) abort();
   try {
-    await claudeAIClosing;
+    await previous;
     const response = await ImportService.postApiV1ImportClaudeAiSync(
       host ? undefined : { browser: "chrome" },
-      { signal: controller.signal },
+      { ...server, signal: controller.signal },
     );
     let fail: (error: unknown) => void = () => {};
     const failed = new Promise<never>((_, reject) => {
@@ -427,7 +463,7 @@ export async function syncClaudeAI(
                   retry_after: fetched.retryAfter,
                   error: fetched.error,
                 },
-                { signal: controller.signal },
+                { ...server, signal: controller.signal },
               );
             })().catch((error) => {
               fail(error);
@@ -440,7 +476,13 @@ export async function syncClaudeAI(
   } finally {
     signal?.removeEventListener("abort", abort);
     abort();
-    if (host) claudeAIClosing = host.close().catch(() => {}); // Cleanup failure must preserve the sync outcome.
+    // Cleanup failure must preserve the sync outcome.
+    if (host)
+      void host
+        .close()
+        .catch(() => {})
+        .finally(release);
+    else release();
   }
 }
 

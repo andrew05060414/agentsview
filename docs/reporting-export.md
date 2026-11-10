@@ -23,16 +23,49 @@ Digest ranges are inclusive, require both bounds, and may contain at most 31
 dates.
 
 Version 3 is the default. Hour, day, and digest commands also accept
-`--schema-version 4` for joint cells and `--schema-version 5` to keep
-contributions with different repository evidence separate. Versions 1 and 2 are
-no longer available. Any other value is rejected before the archive is opened or
-output is written. Integrations pinned to an older version must update to
-version 3 and refresh their saved digests.
+`--schema-version 5` for joint cells. Versions 1, 2, and 4 are no longer
+available. Any other value is rejected before the archive is opened or output is
+written. Integrations pinned to version 1 or 2 must update to version 3, and
+integrations pinned to version 4 must update to version 5. Both must refresh
+their saved digests.
 
 Each successful command writes exactly one canonical JSON document followed by
 one newline. Diagnostics go to stderr. A malformed or future period, an open
 hour, a reversed or oversized digest range, or an unavailable archive produces a
 non-zero exit.
+
+## Report an archive that contains several machines
+
+Use `--schema-version 5 --by-machine` on hour, day, and digest exports when
+several archives may contain copies of the same sessions:
+
+```bash
+agentsview export day --schema-version 5 --by-machine 2026-07-28
+```
+
+Each hour adds `local_machine_id` and a `machines` object. Its keys are the
+originating machine identities, and each value is a complete schema 5 hour
+without nested machine metadata. The local identity comes from the archive's
+recorded installation, not its display label. Recorded machine aliases resolve
+to their canonical identities. Run `agentsview source sync` first if the archive has
+not recorded its installation identity.
+
+All machine snapshots use the same read transaction, bucket resolution, project
+selection, pricing, and usage-survivor selection as the combined hour. The local
+machine remains present even in quiet hours, so a downstream report can replace
+an earlier nonempty copy. Machine membership and each machine's content
+participate in the hour digest. Day and digest commands therefore discover
+machine-only changes too.
+
+Usage without a session machine, including standalone Cursor billing, uses
+`archive:<archive_id>`. This identifies the archive that supplied the data; it
+does not prove that two different archives' account-wide billing is distinct. Do
+not treat it as a machine identity or merge it with a named machine.
+
+Downstream integrations can select one snapshot per originating machine and UTC
+hour before adding totals. Removing a whole overlapping archive would also
+remove activity from machines that have no other reporter. Existing exports
+without `--by-machine` keep their output unchanged.
 
 ## Discover the reporting range
 
@@ -102,7 +135,7 @@ The v3 hour shape is:
 ```
 
 Version 3 contains exactly twelve consecutive five-minute activity buckets.
-Version 4 declares the bucket duration explicitly and permits other resolutions.
+Version 5 declares the bucket duration explicitly and permits other resolutions.
 Activity separates interactive sessions, subagents, and automated sessions.
 Subagents take precedence over automation, so an automated child belongs only to
 the subagent category. Totals and all model, agent, and project breakdowns carry
@@ -161,24 +194,25 @@ ordered closed-hour documents, and a `digest` only when all 24 hours are
 present. `agentsview export hour H` is constructed by the same day reader and
 emits byte-for-byte the canonical hour element contained by `export day D`.
 
-## Joint bucket cells (version 4)
+## Joint bucket cells (version 5)
 
-Version 4 keeps version 3's accounting rules and adds a `joint` object to every
+Version 5 keeps version 3's accounting rules and adds a `joint` object to every
 hour. Independent project, model and agent breakdowns cannot answer a combined
 filter such as "model A on project B". Joint cells retain those relationships
 without exporting session identifiers, titles, messages or tool content.
 
 ```sh
-agentsview export day --schema-version 4 2026-07-28
-agentsview export day --schema-version 4 --bucket 1m 2026-07-28
-agentsview export hour --schema-version 4 --project-key <project-key> 2026-07-28-13
-agentsview export digest --schema-version 4 --project-key <project-key> \
+agentsview export day --schema-version 5 2026-07-28
+agentsview export day --schema-version 5 --bucket 1m 2026-07-28
+agentsview export hour --schema-version 5 --project-key <project-key> 2026-07-28-13
+agentsview export digest --schema-version 5 --project-key <project-key> \
   --from 2026-07-01 --to 2026-07-28
 ```
 
-Repeat `--project-key` to include more projects. Get the archive-scoped keys
-from the project breakdowns or a session export's project map. No keys means the
-whole archive, including unattributed usage. An explicit key selects only that
+Repeat `--project-key` to include more projects. Get the keys from the project
+breakdowns or `joint.projects` of an unscoped export; a session export's project
+map uses label keys, which do not select these groups. No keys means the whole
+archive, including unattributed usage. An explicit key selects only that
 project; an unknown key produces an empty replacement, not an error. An empty
 key is invalid. Version 3 rejects project selection.
 
@@ -188,11 +222,12 @@ accepts any positive whole-minute duration that divides one hour, such as `1m`,
 limit. Version 3 rejects explicit bucket selection and retains its original
 bytes. Invalid durations fail before the archive is opened.
 
-Every v4 hour, day and digest document carries `bucket_seconds`, including empty
-documents. Every hour in a day uses that duration. Bucket starts align to the
-UTC hour, and activity always includes `3600 / bucket_seconds` buckets; joint
-cells remain sparse. The five-minute inactivity gap cap is independent of bucket
-size. One-minute exports still use the same activity and accounting rules.
+Every version 5 hour, day and digest document carries `bucket_seconds`,
+including empty documents. Every hour in a day uses that duration. Bucket starts
+align to the UTC hour, and activity always includes `3600 / bucket_seconds`
+buckets; joint cells remain sparse. The five-minute inactivity gap cap is
+independent of bucket size. One-minute exports still use the same activity and
+accounting rules.
 
 The selected scope applies to the **whole hour**, including existing totals,
 breakdowns and per-device bucket maxima. The exporter chooses canonical usage
@@ -216,17 +251,30 @@ whole archive). `joint.cells` is a sparse array with these fields:
 
 ### Project identity evidence
 
+For Codex-format sessions, sync retains the repository URL recorded in session
+metadata. It can identify a session even after its checkout has been removed.
+After upgrading to data version 138, the next sync reparses readable Codex,
+TraeX, and Augure Code sources to recover previously omitted URLs. A recovered
+URL replaces a stored identity that had no remote or was ambiguous. It does not
+replace a remote that sync already found in the checkout. Sessions whose sources
+are unavailable keep their stored evidence. The archive stores the recovered URL
+separately from any preserved checkout identity, so later appends reuse it after
+a restart. Full archive rebuilds also retain recovered URLs. Repaired sessions
+no longer leave obsolete ambiguity in the project catalog; ambiguity supported
+by another session remains.
+
 `joint.projects` maps each nonempty cell project key to a safe `display_label`,
 `resolution`, and an `identity` when resolved. It is part of the hour's digest,
 read from the same SQLite transaction as the activity and usage. It contains no
 session identifiers or raw filesystem paths. Empty hours have an empty catalog;
 standalone usage has no project identity.
 
-The cell key identifies an archive-scoped display label, **not a repository**.
-Different repositories can have the same label. A `resolved` entry means every
-session contributing activity or canonical usage under that key in the hour has
-a matching source-label snapshot and the same resolved project identity. Missing
-snapshots or mismatched labels produce `unknown`; conflicting identities or
+A display label is **not a repository**: different repositories can share one.
+Each cell key identifies a label together with its contributors' saved evidence,
+as described in [Project contributions](#project-contributions). A `resolved`
+entry means every session contributing activity or canonical usage under that
+key in the hour has a matching source-label snapshot and the same resolved
+project identity. Missing snapshots or mismatched labels produce `unknown`;
 ambiguous snapshots produce `ambiguous`. Neither carries an identity. A known
 repository never supplies identity for another session with missing evidence.
 Resolution covers the whole project key in the hour, even when its cells use
@@ -249,14 +297,13 @@ batches once per day export, then builds each hour's catalog from its actual
 contributors; it does not query the archive once per hour or inspect live
 checkouts.
 
-### Project contributions (version 5)
+### Project contributions
 
-Request `--schema-version 5` when a report needs to distinguish repositories
-that share a project name, or to select only activity with verified identity.
-Version 5 uses the same fields and accounting rules as version 4. It partitions
-activity and usage by each contributing session's saved identity before building
-project breakdowns and joint cells. `new_projects` still counts project names,
-not groups, and sessions without a project stay out of `by_project`.
+Version 5 partitions activity and usage by each contributing session's saved
+identity before building project breakdowns and joint cells. This keeps
+repositories that share a project name apart and lets a report select only
+activity with verified identity. `new_projects` counts project names, not
+groups, and sessions without a project stay out of `by_project`.
 
 For example, two sessions named `api` can produce separate entries: ten minutes
 with a verified repository, and five minutes with missing evidence. Selecting
@@ -277,10 +324,6 @@ concurrency. Usage deduplication and cost allocation still happen before
 selection. Display labels remain labels and never establish identity. Standalone
 usage stays unattributed. Exports contain no session IDs or raw checkout paths
 and never inspect live checkouts or modify the archive.
-
-Versions 3 and 4 remain available with their existing semantics. When moving to
-version 5, obtain new project keys and refresh saved digests; old label keys do
-not select the new groups.
 
 Version 5 keys follow the archive's saved evidence. When a sync, resync, or
 upgrade changes a session's saved identity, its contributions move to a
@@ -344,7 +387,7 @@ overlapping export scopes as independent sources.
 
 Old parser corrections, project changes, pricing changes and deletions can
 change a closed hour. Re-export and replace it when its digest changes; closing
-an hour does not freeze its meaning. Version 4 does not add a history checkpoint
+an hour does not freeze its meaning. Version 5 does not add a history checkpoint
 or a deletion journal. Digest screening still computes full day exports before
 returning identities, and a single-hour command still reads the corresponding
 day. Joint export adds aggregation and output proportional to the populated
@@ -466,9 +509,15 @@ independent concurrency peaks for each category. It retains the complete Claude
 snapshot selection and web-search charging introduced in version 2. Versions 1
 and 2 are no longer emitted.
 
-Version 4 adds scoped joint cells and selectable bucket duration. Version 5
-separates contributions by saved repository evidence. Version 3 remains the
+Version 5 adds scoped joint cells and selectable bucket duration, and separates
+project contributions by saved repository evidence. Version 3 remains the
 default.
+
+Version 5 replaces version 4, which is no longer emitted. Version 4 grouped
+every contribution under one project label, so a session with missing or
+different evidence hid a known repository's activity. Its label keys do not
+select version 5 groups. Integrations moving from version 4 must obtain new
+project keys and refresh saved digests.
 
 Integrations should request and require their intended `schema_version`, reject
 unknown fields, and verify the canonical content digest before accepting an

@@ -517,6 +517,42 @@ func TestModelRatesCostForTokensScopedAggregateUsesBaseRate(t *testing.T) {
 	assert.Equal(t, money.Money{Microdollars: 300_000}, cost)
 }
 
+func TestPricingResolverRecordResolvedCountsMatchesIndividualRecords(t *testing.T) {
+	rows := []EffectivePricingRow{{
+		ModelPattern: "priced-model",
+		Rates: ModelRates{
+			InputPerMTok: money.MustParseDollars("1"),
+			Source:       PricingRowSourceFetched,
+			Bands:        []PricingBand{{AboveInputTokens: 200_000, InputPerMTok: money.MustParseDollars("2")}},
+		},
+	}}
+	for _, model := range []string{"priced-model", "unknown-model"} {
+		t.Run(model, func(t *testing.T) {
+			individual := NewPricingResolver(rows)
+			counts := NewPricingResolver(rows)
+			lookup := individual.Lookup(model)
+			for range 2 {
+				individual.RecordResolvedReported("reported-model", model, lookup)
+				individual.RecordResolvedComputedRequest("reported-model", model, lookup, 100, 0, 0)
+			}
+			for range 3 {
+				individual.RecordResolvedComputedRequest("reported-model", model, lookup, 200_001, 0, 0)
+			}
+			for range 4 {
+				individual.RecordResolvedComputedAggregate("reported-model", model, lookup)
+			}
+			counts.RecordResolvedCounts("reported-model", model, lookup, 2, 2, 4, nil)
+			counts.RecordResolvedCounts("reported-model", model, lookup, 0, 3, 0, new(200_000))
+			counts.RecordResolvedCounts("unused-model", model, lookup, 0, 0, 0, nil)
+			want, err := individual.BuildBlock()
+			require.NoError(t, err)
+			got, err := counts.BuildBlock()
+			require.NoError(t, err)
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
 func TestPricingResolverBuildBlockPricingBandsAndApplicationCounts(t *testing.T) {
 	baseUpdatedAt := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
 	bandUpdatedAt := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
@@ -1362,6 +1398,8 @@ func TestPricingResolverDependencyFingerprint(t *testing.T) {
 			fetched("kimi-x", "3"),
 			fetched("kimi-y:cloud", "6"),
 			fetched("kimi-y", "3"),
+			fetched("gpt-5.6-luna", "0.2"),
+			fetched("gpt-5.6-luna@priority", "0.4"),
 			custom("genai-gamma", "7"),
 		}
 	}
@@ -1377,6 +1415,7 @@ func TestPricingResolverDependencyFingerprint(t *testing.T) {
 		"genai-alpha":       {reported: "genai-alpha", canonical: "genai-alpha"},
 		"genai-alpha:cloud": {reported: "genai-alpha:cloud", canonical: "genai-alpha:cloud"},
 		"genai-gamma":       {reported: "genai-gamma", canonical: "genai-gamma"},
+		"priority":          {provider: pricingpkg.OpenAIPriorityProviderID, reported: "gpt-5.6-luna", canonical: "gpt-5.6-luna"},
 	}
 	usesModelA := []string{"model-a", "alias-a", "billed", "tier"}
 
@@ -1469,6 +1508,14 @@ func TestPricingResolverDependencyFingerprint(t *testing.T) {
 			rows[genAIIndex].GenAI = genAIDocument("2", "2", "3")
 			return rows
 		}, nil},
+		{"priority rate", func(rows []EffectivePricingRow) []EffectivePricingRow {
+			index := slices.IndexFunc(rows, func(row EffectivePricingRow) bool {
+				return row.ModelPattern == "gpt-5.6-luna@priority"
+			})
+			require.NotEqual(t, -1, index, "the priority row belongs to this fixture")
+			rows[index].Rates.InputPerMTok = money.MustParseDollars("0.6")
+			return rows
+		}, []string{"priority"}},
 		{"custom rate removed exposes genai", func(rows []EffectivePricingRow) []EffectivePricingRow {
 			return rows[:len(rows)-1]
 		}, []string{"genai-gamma"}},

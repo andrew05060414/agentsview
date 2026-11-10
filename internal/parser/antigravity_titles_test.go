@@ -14,9 +14,9 @@ import (
 
 func TestAntigravityTitleCacheExpiresMatchingMarkers(t *testing.T) {
 	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
-	priorNow := antigravityTitleNow
-	antigravityTitleNow = func() time.Time { return now }
-	t.Cleanup(func() { antigravityTitleNow = priorNow })
+	priorNow := sqliteTitleNow
+	sqliteTitleNow = func() time.Time { return now }
+	t.Cleanup(func() { sqliteTitleNow = priorNow })
 	store := filepath.Join(t.TempDir(), AntigravitySummariesDBName)
 	conn, err := sql.Open("sqlite3", store)
 	require.NoError(t, err)
@@ -106,14 +106,13 @@ func TestAntigravityStoreSummariesWithWorkspace(t *testing.T) {
 	require.Contains(t, summaries, targetID)
 
 	s := summaries[targetID]
-	assert.Equal(t, "Synthetic Task Title", s.Title)
 	assert.Equal(t, filepath.Clean(filepath.FromSlash("d:/synthetic-workspace")), s.Cwd)
 	assert.Equal(t, "synthetic_workspace", s.Project)
 	assert.Equal(t, parentID, s.ParentConversationID)
 
-	// Verify applyAntigravitySummary populates ParsedSession
+	// The parse-time hook applies the title and the workspace metadata together.
 	sess := &ParsedSession{ID: "antigravity:" + targetID}
-	applyAntigravitySummary(t.Context(), sess, antigravitySource{Root: root, ID: targetID})
+	applyAntigravityTitle(t.Context(), sess, antigravitySource{Root: root, ID: targetID})
 	assert.Equal(t, "Synthetic Task Title", sess.SessionName)
 	assert.True(t, sess.SessionNamePresent)
 	assert.Equal(t, filepath.Clean(filepath.FromSlash("d:/synthetic-workspace")), sess.Cwd)

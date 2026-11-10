@@ -18,13 +18,20 @@ import (
 
 func newSessionExportCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:          "export <id>",
-		Short:        "Stream the raw source JSONL for a session (local only)",
+		Use:   "export <id>",
+		Short: "Export provider-specific source content for a local session",
+		Long: "Export provider-specific source content for one locally archived session. " +
+			"Aider emits the selected run as Markdown; Windsurf and Trae reconstruct session JSON; supported shared or database sources emit only the selected session as JSONL. " +
+			"Other file sources are copied as bytes. " +
+			"Local source access is required, and usage-only archives cannot export it. " +
+			"--server, --pg, --json, and --format are rejected. " +
+			"Use the top-level export group for normalized archive reports.",
+		Example:      "  agentsview session export <id> > session-export.out",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.Flags().Changed("server") {
-				return errors.New("session export: local-only command; --server not supported")
+				return cliUsageError(errors.New("session export: local-only command; --server not supported"), "omit --server and run this command on the host that owns the local archive")
 			}
 			if err := rejectFormatFlags(
 				cmd, "session export", "raw bytes",
@@ -32,9 +39,9 @@ func newSessionExportCommand() *cobra.Command {
 				return err
 			}
 			if pgReadRequested(cmd) {
-				return errors.New("session export: local-only command; --pg not supported")
+				return cliUsageError(errors.New("session export: local-only command; --pg not supported"), "omit --pg and run this command on the host that owns the local archive")
 			}
-			cfg, err := config.LoadPFlags(cmd.Flags())
+			cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 			if err != nil {
 				return fmt.Errorf("loading config: %w", err)
 			}
@@ -136,7 +143,7 @@ func newSessionExportCommand() *cobra.Command {
 			case string(parser.AgentWindsurf):
 				if dbPath, sessionID, ok := parser.SplitWindsurfVirtualPath(storedPath); ok {
 					err := parser.WriteWindsurfSessionJSON(
-						cmd.OutOrStdout(), dbPath, sessionID,
+						cmd.Context(), cmd.OutOrStdout(), dbPath, sessionID,
 					)
 					if errors.Is(err, os.ErrNotExist) {
 						return fmt.Errorf(

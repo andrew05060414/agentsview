@@ -291,6 +291,24 @@ describe("load", () => {
     expect(activity.lastUpdatedAt).toBe(stampedAt);
   });
 
+  it("clears the cached report after an invalid machine filter", async () => {
+    const diagnostic = 'unknown machine "Workstation"; known machines: id-a';
+    activity.setMachine("Workstation");
+    api.getActivityReport.mockResolvedValueOnce(makeReport());
+    await activity.load();
+    expect(activity.report).not.toBeNull();
+
+    api.getActivityReport.mockRejectedValueOnce(
+      new ApiError(400, diagnostic, "invalid_machine_filter"),
+    );
+    await activity.load({ background: true });
+
+    expect(activity.report).toBeNull();
+    expect(activity.error).toBe(diagnostic);
+    expect(activity.loading).toBe(false);
+    expect(activity.machine).toBe("Workstation");
+  });
+
   it("recomputes rolling custom ranges before refreshing", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
@@ -467,6 +485,45 @@ describe("session paging", () => {
     expect(activity.sessionsListVersion).toBe(startVersion + 2);
   });
 
+  it("keeps sorting by the requested column when a sort replaces a stale report", async () => {
+    activity.report = makeReport({ report_id: "stale-report" });
+    const generation = activity.reportGeneration;
+    api.getActivitySessions.mockResolvedValueOnce({
+      report_id: "fresh-report",
+      sessions: [{ session_id: "a-title" }],
+      total: 2,
+      refresh_required: true,
+      report: makeReport({
+        report_id: "fresh-report",
+        by_session: [{ session_id: "a-title" }] as Report["by_session"],
+      }),
+    });
+
+    expect(await activity.loadSessionPage({ sort: "session", direction: "asc" })).toBe(true);
+
+    expect(activity.report?.report_id).toBe("fresh-report");
+    expect(activity.reportGeneration).toBe(generation + 1);
+    expect(activity.sessionsSort).toBe("session");
+    expect(activity.sessionsDirection).toBe("asc");
+
+    api.getActivitySessions.mockResolvedValueOnce({
+      report_id: "fresh-report",
+      sessions: [{ session_id: "priciest" }],
+      total: 2,
+    });
+
+    expect(await activity.loadSessionPage({ sort: "cost", direction: "desc" })).toBe(true);
+
+    expect(api.getActivitySessions).toHaveBeenLastCalledWith(
+      "fresh-report",
+      expect.objectContaining({ sort: "cost", direction: "desc" }),
+      expect.any(AbortSignal),
+    );
+    expect(activity.report?.by_session).toEqual([{ session_id: "priciest" }]);
+    expect(activity.sessionsSort).toBe("cost");
+    expect(activity.sessionsDirection).toBe("desc");
+  });
+
   it("keeps the loaded rows when a cursor page fails", async () => {
     activity.report = makeReport({
       report_id: "signed-report",
@@ -541,6 +598,46 @@ describe("session paging", () => {
 });
 
 describe("loadFilterOptions", () => {
+  it("loads machine choices after a rejected selector without clearing it", async () => {
+    activity.hydrateFromUrl({ machine: "unknown" });
+    api.getMachines
+      .mockRejectedValueOnce(new ApiError(400, "unknown machine", "invalid_machine_filter"))
+      .mockResolvedValueOnce({ machines: ["id-a"] });
+
+    await activity.loadFilterOptions();
+
+    expect(activity.machine).toBe("unknown");
+    expect(activity.machines).toEqual(["id-a"]);
+    expect(api.getMachines).toHaveBeenCalledTimes(2);
+    expect(api.getMachines.mock.lastCall?.[0]).toEqual({
+      include_one_shot: true,
+      include_automated: true,
+    });
+  });
+
+  it("resolves a whole machine URL label containing a comma to its ID", async () => {
+    await activity.loadFilterOptions();
+    activity.hydrateFromUrl({ machine: "Work, Linux" });
+    api.getMachines.mockResolvedValueOnce({
+      machines: ["id-a"],
+      resolved_machines: ["id-a"],
+    });
+
+    await activity.loadFilterOptions();
+
+    expect(api.getMachines.mock.lastCall?.[0]).toEqual({
+      include_one_shot: true,
+      include_automated: true,
+      machine: "Work, Linux",
+    });
+    expect(activity.machine).toBe("id-a");
+    expect(routerMod.router.replaceParams).toHaveBeenLastCalledWith({
+      preset: "day",
+      date: activity.date,
+      machine: "id-a",
+    });
+  });
+
   it("fetches options with one-shot + automated included and stores them", async () => {
     api.getProjects.mockResolvedValueOnce({
       projects: [{ name: "proj-a", count: 1 }],
@@ -562,6 +659,26 @@ describe("loadFilterOptions", () => {
     expect(activity.projects).toEqual([{ name: "proj-a", count: 1 }]);
     expect(activity.agents).toEqual([{ name: "claude", count: 2 }]);
     expect(activity.machines).toEqual(["laptop", "desktop"]);
+  });
+
+  it("requests every list before any of them answers", async () => {
+    let releaseProjects!: (value: { projects: [] }) => void;
+    api.getProjects.mockReturnValueOnce(
+      new Promise((resolve) => {
+        releaseProjects = resolve;
+      }),
+    );
+    api.getAgents.mockResolvedValueOnce({ agents: [{ name: "claude", count: 2 }] });
+    api.getMachines.mockResolvedValueOnce({ machines: ["laptop"] });
+
+    const loading = activity.loadFilterOptions();
+
+    expect(api.getAgents).toHaveBeenCalledTimes(1);
+    expect(api.getMachines).toHaveBeenCalledTimes(1);
+    releaseProjects({ projects: [] });
+    await expect(loading).resolves.toBe(true);
+    expect(activity.agents).toEqual([{ name: "claude", count: 2 }]);
+    expect(activity.machines).toEqual(["laptop"]);
   });
 
   it("fetches once across repeated calls", async () => {
@@ -848,12 +965,6 @@ describe("freshness state", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("markNewData is a no-op before the first report loads", () => {
-    expect(activity.lastUpdatedAt).toBeNull();
-    activity.markNewData();
-    expect(activity.hasNewData).toBe(false);
   });
 
   it("does not stamp lastUpdatedAt when a load fails", async () => {

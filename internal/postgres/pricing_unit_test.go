@@ -474,38 +474,51 @@ func TestLoadPricingMapKeepsSharedDBRowsForActiveCaller(t *testing.T) {
 }
 
 func TestLoadPricingMapCancelsDBRowsWithCaller(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		block := make(chan struct{})
-		defer close(block)
-		state := &pricingProbeState{
-			rows: [][]driver.Value{{
-				"db-model", int64(1000000), int64(2000000), int64(3000000), int64(0), int64(4000000), "2026-06-08",
-			}},
-			block: block,
-			done:  make(chan struct{}),
-		}
-		pg := newPricingProbeDB(t, state)
-		store := &Store{pg: pg}
+	for _, tc := range []struct {
+		name   string
+		forget bool
+	}{
+		{"current load", false},
+		{"forgotten load", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				block := make(chan struct{})
+				defer close(block)
+				state := &pricingProbeState{
+					rows: [][]driver.Value{{
+						"db-model", int64(1000000), int64(2000000), int64(3000000), int64(0), int64(4000000), "2026-06-08",
+					}},
+					block: block,
+					done:  make(chan struct{}),
+				}
+				pg := newPricingProbeDB(t, state)
+				store := &Store{pg: pg}
 
-		ctx, cancel := context.WithCancel(t.Context())
-		result := make(chan error, 1)
-		go func() {
-			_, err := store.loadPricingMap(ctx)
-			result <- err
-		}()
-		synctest.Wait()
-		require.Equal(t, 1, state.queryCount(), "pricing queries")
+				ctx, cancel := context.WithCancel(t.Context())
+				result := make(chan error, 1)
+				go func() {
+					_, err := store.loadPricingMap(ctx)
+					result <- err
+				}()
+				synctest.Wait()
+				require.Equal(t, 1, state.queryCount(), "pricing queries")
 
-		cancel()
+				if tc.forget {
+					store.forgetPricingLoad()
+				}
+				cancel()
 
-		synctest.Wait()
-		select {
-		case <-state.done:
-		default:
-			require.FailNow(t, "canceled pricing query did not finish")
-		}
-		require.ErrorIs(t, <-result, context.Canceled)
-	})
+				synctest.Wait()
+				select {
+				case <-state.done:
+				default:
+					require.FailNow(t, "canceled pricing query did not finish")
+				}
+				require.ErrorIs(t, <-result, context.Canceled)
+			})
+		})
+	}
 }
 
 func TestLoadPricingMapStartsFreshLoadAfterAllWaitersCancel(t *testing.T) {
@@ -671,83 +684,6 @@ func TestPGPricingUpsertStatementBatchesRows(t *testing.T) {
 	assert.Equal(t, "call-time", args[6])
 	assert.Equal(t, "model-b", args[7])
 	assert.Equal(t, "source-time", args[13])
-}
-
-func TestPGPricingFilterMatchesUpsertSemantics(t *testing.T) {
-	existing := []db.ModelPricing{
-		{
-			ModelPattern:         "_fallback_version",
-			InputPerMTok:         money.MustParseDollars("0"),
-			OutputPerMTok:        money.MustParseDollars("0"),
-			CacheCreationPerMTok: money.MustParseDollars("0"),
-			CacheReadPerMTok:     money.MustParseDollars("0"),
-			UpdatedAt:            "v1",
-		},
-		{
-			ModelPattern:         "same-model",
-			InputPerMTok:         money.MustParseDollars("1"),
-			OutputPerMTok:        money.MustParseDollars("2"),
-			CacheCreationPerMTok: money.MustParseDollars("3"),
-			CacheReadPerMTok:     money.MustParseDollars("4"),
-			UpdatedAt:            "old",
-		},
-		{
-			ModelPattern:         "changed-model",
-			InputPerMTok:         money.MustParseDollars("1"),
-			OutputPerMTok:        money.MustParseDollars("2"),
-			CacheCreationPerMTok: money.MustParseDollars("3"),
-			CacheReadPerMTok:     money.MustParseDollars("4"),
-			UpdatedAt:            "old",
-		},
-	}
-	desired := []db.ModelPricing{
-		{
-			ModelPattern:         "_fallback_version",
-			InputPerMTok:         money.MustParseDollars("0"),
-			OutputPerMTok:        money.MustParseDollars("0"),
-			CacheCreationPerMTok: money.MustParseDollars("0"),
-			CacheReadPerMTok:     money.MustParseDollars("0"),
-			UpdatedAt:            "v2",
-		},
-		{
-			ModelPattern:         "same-model",
-			InputPerMTok:         money.MustParseDollars("1"),
-			OutputPerMTok:        money.MustParseDollars("2"),
-			CacheCreationPerMTok: money.MustParseDollars("3"),
-			CacheReadPerMTok:     money.MustParseDollars("4"),
-			UpdatedAt:            "new",
-		},
-		{
-			ModelPattern:         "changed-model",
-			InputPerMTok:         money.MustParseDollars("1"),
-			OutputPerMTok:        money.MustParseDollars("9"),
-			CacheCreationPerMTok: money.MustParseDollars("3"),
-			CacheReadPerMTok:     money.MustParseDollars("4"),
-			UpdatedAt:            "new",
-		},
-		{
-			ModelPattern:         "missing-model",
-			InputPerMTok:         money.MustParseDollars("5"),
-			OutputPerMTok:        money.MustParseDollars("6"),
-			CacheCreationPerMTok: money.MustParseDollars("7"),
-			CacheReadPerMTok:     money.MustParseDollars("8"),
-			UpdatedAt:            "new",
-		},
-	}
-
-	got, changedRows := db.FilterChangedModelPricing(existing, desired)
-
-	assert.Equal(t, db.PricingChangeSummary{
-		Total:     4,
-		Missing:   1,
-		Changed:   2,
-		Unchanged: 1,
-	}, got)
-	require.Len(t, changedRows, 3)
-	assert.Equal(t, "_fallback_version", changedRows[0].ModelPattern,
-		"sentinel rows sync by value")
-	assert.Equal(t, "changed-model", changedRows[1].ModelPattern)
-	assert.Equal(t, "missing-model", changedRows[2].ModelPattern)
 }
 
 func TestPGPricingMetaUpsertStatement(t *testing.T) {

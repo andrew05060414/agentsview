@@ -30,6 +30,64 @@ func seedSearchSession(t *testing.T, d *DB, id, project string, msgs [][2]string
 	require.NoError(t, d.ReplaceSessionMessages(t.Context(), id, out), "ReplaceSessionMessages")
 }
 
+func TestSearchContentThinkingDedupeMatches(t *testing.T) {
+	for _, mode := range []string{"substring", "regex"} {
+		for _, tc := range []struct {
+			name      string
+			content   string
+			thinking  string
+			dialogue  *string
+			pattern   string
+			locations []string
+		}{
+			{"codebuddy", "Answer", "needle", nil, "needle", []string{"thinking"}},
+			{"codebuddy_literal_marker", "The literal marker is [Thinking]", "needle", nil, "needle", []string{"thinking"}},
+			{"multiple_inline_blocks", "[Thinking]\nab\n[/Thinking]\n[Thinking]\ncd\n[/Thinking]\nanswer", "ab\n\ncd", nil, "cd", []string{"message"}},
+			{"shared_start", strings.Repeat("shared ", 12) + "answer", strings.Repeat("shared ", 12) + "reasoningneedle", nil, "reasoningneedle", []string{"thinking"}},
+			{"projected_dialogue", "answerneedle [Thinking]\nanswerneedle\n[/Thinking]", "answerneedle", new("answerneedle"), "answerneedle", []string{"message", "thinking"}},
+		} {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				d := testDB(t)
+				seedSearchSession(t, d, "s1", "proj", nil)
+				insertMessages(t, d, Message{
+					SessionID: "s1", Ordinal: 0, Role: "assistant",
+					Content: tc.content, ThinkingText: tc.thinking, DialogueText: tc.dialogue,
+				})
+				for _, sources := range []struct {
+					name    string
+					sources []string
+				}{
+					{"default", nil},
+					{"messages_and_thinking", []string{"messages", "thinking"}},
+					{"thinking_only", []string{"thinking"}},
+				} {
+					t.Run(sources.name, func(t *testing.T) {
+						pattern := tc.pattern
+						if mode == "regex" && tc.name == "shared_start" {
+							// Both fields pass the literal-prefix prefilter, but
+							// only reasoning matches the complete expression.
+							pattern = "shared.*reasoningneedle"
+						}
+						got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+							Pattern: pattern, Mode: mode, Sources: sources.sources,
+						})
+						require.NoError(t, err)
+						locations := tc.locations
+						if sources.name == "thinking_only" {
+							locations = []string{"thinking"}
+						}
+						require.Len(t, got.Matches, len(locations))
+						for i, location := range locations {
+							assert.Equal(t, location, got.Matches[i].Location)
+							assert.Contains(t, got.Matches[i].Snippet, tc.pattern)
+						}
+					})
+				}
+			})
+		}
+	}
+}
+
 func TestSearchContentSubstringMessages(t *testing.T) {
 	d := testDB(t)
 	seedSearchSession(t, d, "s1", "proj", [][2]string{
@@ -359,6 +417,46 @@ func TestSearchContentFTS(t *testing.T) {
 	assert.Equal(t, "message", got.Matches[0].Location, "fts match Location")
 }
 
+func TestSearchContentFTSContentColumnFilter(t *testing.T) {
+	for _, mode := range []string{"fts", "hybrid"} {
+		t.Run(mode, func(t *testing.T) {
+			d := testDB(t)
+			requireFTS(t, d)
+			seedSearchSession(t, d, "column-filter", "proj", nil)
+			insertMessages(t, d, Message{
+				SessionID: "column-filter", Role: "assistant",
+				Content: "needle [Thinking] hiddenneedle", DialogueText: new("needle"),
+			})
+			if mode == "hybrid" {
+				d.SetVectorSearcher(&fakeVectorSearcher{})
+			}
+			for _, tc := range []struct {
+				pattern string
+				want    int
+				wantErr bool
+			}{
+				{`"needle" AND content:needle`, 1, false},
+				{`"hiddenneedle" AND content:hiddenneedle`, 0, false},
+				{`"absent") OR (hiddenneedle`, 0, true},
+			} {
+				t.Run(tc.pattern, func(t *testing.T) {
+					page, err := d.SearchContent(t.Context(), ContentSearchFilter{
+						Pattern: tc.pattern, Mode: mode, Sources: []string{"messages"},
+					})
+					if tc.wantErr {
+						var inputErr *SearchInputError
+						require.ErrorAs(t, err, &inputErr)
+						assert.Contains(t, inputErr.Error(), "invalid FTS query")
+						return
+					}
+					require.NoError(t, err)
+					assert.Len(t, page.Matches, tc.want)
+				})
+			}
+		})
+	}
+}
+
 func TestSearchContentTermsAcrossExchange(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "terms-main", "proj", func(s *Session) {
@@ -431,6 +529,37 @@ func TestSearchContentTermsRequiresOneExchange(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, got.Matches,
 		"terms in different exchanges of one session must not match")
+}
+
+func TestSearchContentTermsKeepsWholeExchangeAroundOneHit(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "terms-one-hit", "proj", func(s *Session) {
+		s.UserMessageCount = 2
+	})
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "terms-one-hit", []Message{
+		{SessionID: "terms-one-hit", Ordinal: 0, Role: "user", Content: "unrelated opener"},
+		{SessionID: "terms-one-hit", Ordinal: 1, Role: "assistant", Content: "unrelated reply"},
+		{SessionID: "terms-one-hit", Ordinal: 2, Role: "user", Content: "first question"},
+		{SessionID: "terms-one-hit", Ordinal: 3, Role: "assistant", Content: "the deploy step"},
+		{SessionID: "terms-one-hit", Ordinal: 4, Role: "assistant", Content: "closing remark"},
+	}))
+
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "deploy", Mode: "terms", Limit: 50, IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Matches, 1)
+	assert.Equal(t, 2, got.Matches[0].Ordinal)
+	assert.Equal(t, [2]int{2, 4}, got.Matches[0].OrdinalRange,
+		"the match covers every message of its exchange, not only the hit")
+
+	split, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "question remark", Mode: "terms", Limit: 50, IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, split.Matches, 1,
+		"terms in different messages of one exchange still match")
+	assert.Equal(t, [2]int{2, 4}, split.Matches[0].OrdinalRange)
 }
 
 func TestSearchContentTermsIgnoresAssistantPrelude(t *testing.T) {
@@ -624,6 +753,49 @@ func TestSearchContentFTSPhraseSnippetFallsBackToFirstToken(t *testing.T) {
 	assert.Contains(t, got.Matches[0].Snippet, "foo-bar")
 }
 
+// TestSearchContentFTSBooleanSnippetCentersOnMatchedOperand places each
+// matching operand past the opening snippet window, after text that holds a
+// non-matching operand, a negated operand, or an operator word.
+func TestSearchContentFTSBooleanSnippetCentersOnMatchedOperand(t *testing.T) {
+	d := testDB(t)
+	if !d.HasFTS(t.Context()) {
+		t.Skip("fts5 not available")
+	}
+	filler := strings.Repeat("filler ", 40)
+	for _, tc := range []struct {
+		name, query, body, want string
+	}{
+		{"later OR operand", `"alpha" OR "beta"`, "Order notes " + filler + "beta closes", "beta closes"},
+		{"OR phrase", `"absent" OR "fix bug"`, filler + "fix bug closes", "fix bug closes"},
+		{"negated operand", `"alpha" NOT "beta" OR "gamma"`, "beta opens " + filler + "gamma closes", "gamma closes"},
+		{"unsatisfied AND", `"alpha" AND "beta" OR "gamma"`, "alpha opens " + filler + "gamma closes", "gamma closes"},
+		// SQLite matches tokens, not substrings: the phrase matches across
+		// punctuation and a stemmed word matches its inflections.
+		{"negated phrase across punctuation", `"alpha" NOT "foo bar" OR "gamma"`, "alpha opens foo-bar " + filler + "gamma closes", "gamma closes"},
+		{"negated stem", `"alpha" NOT "runs" OR "gamma"`, "alpha opens running " + filler + "gamma closes", "gamma closes"},
+		{"OR phrase across punctuation", `"absent" OR "foo bar"`, filler + "foo-bar closes", "foo-bar closes"},
+		// A star inside quotes is punctuation, not a prefix marker.
+		{"negated quoted star", `"alpha" NOT "beta*"`, "betamax opens " + filler + "alpha closes", "alpha closes"},
+		{"quoted star OR", `"beta*" OR "gamma"`, "betamax opens " + filler + "gamma beta closes", "gamma beta closes"},
+		{"quoted star alone", `"beta*" OR "absent"`, "betamax opens " + filler + "beta closes", "beta closes"},
+		// Phrase joins and column filters fall back to substring centering.
+		{"phrase join", `"foo" + "bar" OR "baz"`, filler + "foo bar closes", "foo bar closes"},
+		{"column filter", `"needle" AND content:needle OR "absent"`, filler + "needle closes", "needle closes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := strings.ReplaceAll(tc.name, " ", "-")
+			seedSearchSession(t, d, id, "proj", [][2]string{{"user", tc.body}})
+			got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+				Pattern: tc.query, Mode: "fts", SessionID: id,
+				Sources: []string{"messages"}, Limit: 50,
+			})
+			require.NoError(t, err)
+			require.Len(t, got.Matches, 1)
+			assert.Contains(t, got.Matches[0].Snippet, tc.want)
+		})
+	}
+}
+
 func TestSearchContentFTSInvalidQuery(t *testing.T) {
 	d := testDB(t)
 	if !d.HasFTS(t.Context()) {
@@ -790,24 +962,28 @@ func TestSearchContentToolResultDedup(t *testing.T) {
 
 func TestSearchContentCursorPagination(t *testing.T) {
 	d := testDB(t)
-	seedSearchSession(t, d, "pg", "proj", [][2]string{
-		{"user", "alpha NEEDLE one"},
-		{"user", "beta NEEDLE two"},
-		{"user", "gamma NEEDLE three"},
-	})
-	first, err := d.SearchContent(t.Context(), ContentSearchFilter{
-		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"}, Limit: 2,
-	})
-	require.NoError(t, err, "SearchContent page1")
-	require.Len(t, first.Matches, 2, "page1 matches")
-	require.Equal(t, 2, first.NextCursor, "page1 cursor")
-	second, err := d.SearchContent(t.Context(), ContentSearchFilter{
-		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"},
-		Limit: 2, Cursor: first.NextCursor,
-	})
-	require.NoError(t, err, "SearchContent page2")
-	require.Len(t, second.Matches, 1, "page2 matches")
-	require.Equal(t, 0, second.NextCursor, "page2 cursor")
+	insertSession(t, d, "pg", "proj", func(s *Session) { s.UserMessageCount = 2 })
+	insertMessages(t, d,
+		Message{SessionID: "pg", Ordinal: 0, Role: "user", Content: "alpha NEEDLE one"},
+		Message{SessionID: "pg", Ordinal: 1, Role: "user", Content: "beta NEEDLE two"},
+		Message{SessionID: "pg", Ordinal: 2, Role: "user", Content: "gamma NEEDLE three"},
+	)
+	for _, mode := range []string{"substring", "fts"} {
+		first, err := d.SearchContent(t.Context(), ContentSearchFilter{
+			Pattern: "NEEDLE", Mode: mode, Sources: []string{"messages"}, Limit: 2,
+		})
+		require.NoError(t, err, "SearchContent page1")
+		require.Len(t, first.Matches, 2, "page1 matches")
+		require.Equal(t, 2, first.NextCursor, "page1 cursor")
+		second, err := d.SearchContent(t.Context(), ContentSearchFilter{
+			Pattern: "NEEDLE", Mode: mode, Sources: []string{"messages"},
+			Limit: 2, Cursor: first.NextCursor,
+		})
+		require.NoError(t, err, "SearchContent page2")
+		require.Len(t, second.Matches, 1, "page2 matches")
+		require.Equal(t, 0, second.NextCursor, "page2 cursor")
+		assert.ElementsMatch(t, []int{0, 1, 2}, []int{first.Matches[0].Ordinal, first.Matches[1].Ordinal, second.Matches[0].Ordinal})
+	}
 }
 
 func TestSearchContentMultiSourceWithProjectFilter(t *testing.T) {
@@ -1160,7 +1336,9 @@ func TestSearchContentToolResultEventsDerived(t *testing.T) {
 		(session_id, tool_call_message_ordinal, tool_use_id, source, status,
 		 content, content_length, timestamp, event_index)
 		VALUES ('evorph', 7, 'tux', 'stdout', 'success',
-		 'ORPHHIT event content', 21, '2026-05-20T12:00:00Z', 0)`)
+		 'ORPHHIT event content', 21, '2026-05-20T12:00:00Z', 0),
+		 ('boss', 7, 'top-orphan', 'stdout', 'success',
+		 'TOPORPH', 7, '2026-05-20T12:00:00Z', 0)`)
 	require.NoError(t, err, "insert orphan event")
 
 	seedUnitSession(t, d, "evrun", nil, []Message{
@@ -1192,6 +1370,21 @@ func TestSearchContentToolResultEventsDerived(t *testing.T) {
 	assert.True(t, m.Subordinate, "session lineage still applies")
 	assert.Equal(t, "subagent", m.Relationship, "Relationship from sessions join")
 	assert.Equal(t, "boss", m.ParentSessionID, "ParentSessionID from sessions join")
+
+	for _, mode := range []string{"substring", "regex"} {
+		page, err := d.SearchContent(t.Context(), ContentSearchFilter{
+			Pattern: "ORPHHIT", Mode: mode, Scope: "subordinate", Sources: []string{"tool_result"}, Limit: 1,
+		})
+		require.NoError(t, err)
+		require.Len(t, page.Matches, 1)
+		assert.Equal(t, "evorph", page.Matches[0].SessionID)
+		page, err = d.SearchContent(t.Context(), ContentSearchFilter{
+			Pattern: "TOPORPH", Mode: mode, Scope: "top", Sources: []string{"tool_result"}, Limit: 1,
+		})
+		require.NoError(t, err)
+		require.Len(t, page.Matches, 1)
+		assert.Equal(t, "boss", page.Matches[0].SessionID)
+	}
 
 	ev, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "EVHIT", Mode: "substring",

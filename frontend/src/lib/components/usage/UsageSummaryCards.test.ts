@@ -1,4 +1,9 @@
 // @vitest-environment jsdom
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({
+  reportErrorShown: vi.fn(),
+  reportTelemetry: vi.fn(),
+}));
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { usage } from "../../stores/usage.svelte.js";
@@ -91,6 +96,7 @@ function cardSub(label: string): string | undefined {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   if (component) {
     unmount(component);
     component = undefined;
@@ -109,6 +115,43 @@ afterEach(() => {
 });
 
 describe("UsageSummaryCards", () => {
+  it.each([
+    { current: 3, prior: 1, expected: "+200% vs prior" },
+    { current: 3, prior: 0, expected: "+0% vs prior" },
+    { current: 1, prior: 2, expected: "-50% vs prior" },
+  ])(
+    "compares $current dollars with $prior prior dollars",
+    async ({ current, prior, expected }) => {
+      const data = summary();
+      data.totals.totalCost = testMoney(current);
+      data.comparison = {
+        priorFrom: "2026-06-30",
+        priorTo: "2026-06-30",
+        priorTotalCost: testMoney(prior),
+        deltaPct: 0,
+      };
+      usage.summary = data;
+      component = mount(UsageSummaryCards, { target: document.body });
+      await tick();
+
+      expect(cardSub("Total Cost")).toBe(expected);
+    },
+  );
+
+  it("reports the analytics kind for a displayed summary failure", async () => {
+    const { UsageService } = await import("../../api/generated/index.js");
+    vi.mocked(reportErrorShown).mockClear();
+    usage.summary = null;
+    vi.spyOn(UsageService, "getApiV1UsageSummary").mockRejectedValueOnce(
+      new Error("Summary failed"),
+    );
+    component = mount(UsageSummaryCards, { target: document.body });
+    await usage.fetchSummary({ loadComparison: false });
+    await tick();
+    expect(document.querySelector(".error-bar")?.textContent).toContain("Summary failed");
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics");
+  });
+
   it("uses the selected token types for aggregate token cards", async () => {
     usage.summary = summary();
     usage.mode = "token";

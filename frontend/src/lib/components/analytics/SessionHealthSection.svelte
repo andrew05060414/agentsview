@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Card } from "@kenn-io/kit-ui";
+  import { Card, TableHeaderCell, TableSort } from "@kenn-io/kit-ui";
   import { analytics } from "../../stores/analytics.svelte.js";
   import { scoreToGrade } from "../../utils/grade.js";
   import GradeDistribution
@@ -7,7 +7,18 @@
   import OutcomeDistribution
     from "./OutcomeDistribution.svelte";
   import HealthTrend from "./HealthTrend.svelte";
+  import PanelStatus from "./PanelStatus.svelte";
   import { m } from "../../i18n/index.js";
+
+  import type { DbSignalsAgentRow, DbSignalsProjectRow } from "../../api/generated/index.js";
+
+  const healthColumns = {
+    sessions: { value: (row: DbSignalsAgentRow | DbSignalsProjectRow) => row.session_count, firstDirection: "desc" as const },
+    score: { value: (row: DbSignalsAgentRow | DbSignalsProjectRow) => row.avg_health_score, firstDirection: "desc" as const },
+    completed: { value: (row: DbSignalsAgentRow | DbSignalsProjectRow) => row.completed_rate, firstDirection: "desc" as const },
+  };
+  const agentSort = new TableSort<DbSignalsAgentRow>({ name: row => row.agent, ...healthColumns });
+  const projectSort = new TableSort<DbSignalsProjectRow>({ name: row => row.project, ...healthColumns });
 
   const signals = $derived(analytics.signals);
   const visible = $derived(
@@ -24,6 +35,15 @@
   }
 </script>
 
+{#snippet status()}
+  <PanelStatus
+    hasData
+    pending={analytics.querying.signals}
+    error={analytics.errors.signals}
+    onRetry={() => analytics.fetchSignals()}
+  />
+{/snippet}
+
 {#if visible && signals}
   <div class="health-section">
     <div class="section-header">
@@ -38,6 +58,7 @@
         })}
       </span>
     </div>
+    {@render status()}
 
     <div class="health-summary-cards">
       <Card level="default" padding="none" class="card">
@@ -146,16 +167,14 @@
             <table>
             <thead>
               <tr>
-                <th>{m.analytics_col_agent()}</th>
-                <th class="num">{m.analytics_col_sessions()}</th>
-                <th class="num">{m.analytics_session_health_avg_score()}</th>
-                <th class="num">{m.analytics_session_health_completed()}</th>
+                <TableHeaderCell label={m.analytics_col_agent()} sort={agentSort} column="name" />
+                <TableHeaderCell label={m.analytics_col_sessions()} sort={agentSort} column="sessions" numeric />
+                <TableHeaderCell label={m.analytics_session_health_avg_score()} sort={agentSort} column="score" numeric />
+                <TableHeaderCell label={m.analytics_session_health_completed()} sort={agentSort} column="completed" numeric />
               </tr>
             </thead>
             <tbody>
-              {#each [...signals.by_agent].sort(
-                (a, b) => b.session_count - a.session_count,
-              ) as row}
+              {#each agentSort.sort([...signals.by_agent].sort((a, b) => b.session_count - a.session_count)) as row}
                 <tr>
                   <td>{row.agent}</td>
                   <td class="num">{row.session_count}</td>
@@ -181,16 +200,14 @@
             <table>
             <thead>
               <tr>
-                <th>{m.analytics_col_project()}</th>
-                <th class="num">{m.analytics_col_sessions()}</th>
-                <th class="num">{m.analytics_session_health_avg_score()}</th>
-                <th class="num">{m.analytics_session_health_completed()}</th>
+                <TableHeaderCell label={m.analytics_col_project()} sort={projectSort} column="name" />
+                <TableHeaderCell label={m.analytics_col_sessions()} sort={projectSort} column="sessions" numeric />
+                <TableHeaderCell label={m.analytics_session_health_avg_score()} sort={projectSort} column="score" numeric />
+                <TableHeaderCell label={m.analytics_session_health_completed()} sort={projectSort} column="completed" numeric />
               </tr>
             </thead>
             <tbody>
-              {#each [...signals.by_project].sort(
-                (a, b) => b.session_count - a.session_count,
-              ) as row}
+              {#each projectSort.sort([...signals.by_project].sort((a, b) => b.session_count - a.session_count)) as row}
                 <tr>
                   <td>{row.project}</td>
                   <td class="num">{row.session_count}</td>
@@ -210,6 +227,16 @@
         </div>
       </Card>
     </div>
+  </div>
+{:else if analytics.errors.signals}
+  <!-- Hidden while loading, since an empty result hides the section. -->
+  <div class="health-section">
+    <div class="section-header">
+      <h3 class="section-title">{m.analytics_session_health_title()}</h3>
+    </div>
+    <Card level="default" padding="none">
+      {@render status()}
+    </Card>
   </div>
 {/if}
 
@@ -290,14 +317,18 @@
     width: 100%;
     border-collapse: collapse;
   }
-  th {
+  .mini-table :global(th) {
     text-align: left;
+    background: transparent;
+    box-shadow: none;
+    font-size: inherit;
     padding: 4px 0;
     color: var(--text-muted);
     font-weight: 500;
     border-bottom: 1px solid var(--border-muted);
   }
-  th.num, td.num {
+  .mini-table :global(th.kit-th--numeric),
+  td.num {
     text-align: right;
   }
   td {

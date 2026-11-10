@@ -11,6 +11,7 @@
   } from "../../stores/read-progress.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
+  import { sessionMachineDisplay } from "../../utils/machines.js";
   import { agentColor as getAgentColor, agentLabel, entrypointBadge } from "../../utils/agents.js";
   import {
     normalizeMessagePreview,
@@ -101,11 +102,8 @@
     getAgentColor(session.agent),
   );
 
-  let showMachine = $derived(
-    !compact &&
-    !!session.machine &&
-    session.machine !== "local",
-  );
+  const machineDisplay = $derived(sessionMachineDisplay(session, sessions.machineLabels));
+  let showMachine = $derived(!compact && machineDisplay.ids.some((id) => id !== "local"));
 
   let hasUnread = $derived.by(() => {
     const candidates = groupSessions && !expanded
@@ -121,7 +119,7 @@
   /** Whether this session is a team member (received a <teammate-message>). */
   let isTeamSession = $derived(
     session.is_teammate
-      ?? session.first_message?.includes("<teammate-message")
+      ?? sessions.view(session).first_message?.includes("<teammate-message")
       ?? false,
   );
 
@@ -135,7 +133,7 @@
     if (name) {
       return { text: name, isShell: false };
     }
-    let msg = session.first_message ?? "";
+    let msg = sessions.view(session).first_message ?? "";
     if (msg.includes("<teammate-message")) {
       msg = msg
         .replace(/<teammate-message[^>]*>/g, "")
@@ -271,7 +269,7 @@
   function startRename() {
     renameValue =
       session.display_name
-      ?? normalizeMessagePreview(session.first_message)
+      ?? normalizeMessagePreview(sessions.view(session).first_message)
       ?? "";
     renaming = true;
     closeContextMenu();
@@ -555,8 +553,8 @@
         {/if}
       {/if}
       {#if showMachine}
-        <span class="machine-tag" title={session.machine}>
-          {truncate(sessions.machineLabel(session.machine), 18)}
+        <span class="machine-tag" title={machineDisplay.title}>
+          {truncate(machineDisplay.label, 18)}
         </span>
       {/if}
     </div>

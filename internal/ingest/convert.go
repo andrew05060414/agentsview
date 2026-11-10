@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"slices"
+	"time"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
@@ -77,7 +78,7 @@ func ConvertMessagesContext(
 		if err != nil {
 			return nil, err
 		}
-		if IsCodexFormatAgent(agent) {
+		if parser.IsCodexFormatAgent(agent) {
 			for j := range toolCalls {
 				for k := range toolCalls[j].ResultEvents {
 					db.PrepareToolResultEvent(&toolCalls[j].ResultEvents[k])
@@ -92,6 +93,7 @@ func ConvertMessagesContext(
 			SessionID: sessionID, Ordinal: message.Ordinal,
 			Role: string(message.Role), Content: message.Content,
 			ThinkingText: message.ThinkingText,
+			DialogueText: message.DialogueText,
 			Timestamp:    timeutil.Format(message.Timestamp),
 			HasThinking:  message.HasThinking, HasToolUse: message.HasToolUse,
 			ContentLength: message.ContentLength, IsSystem: message.IsSystem,
@@ -135,6 +137,64 @@ func ConvertUsageEventsContext(
 	}
 	stats, err := db.ValidateAndSanitizeContext(ctx, nil, nil, events)
 	return events, stats, err
+}
+
+// ConvertPlanUsage converts a session's plan usage and live-capture
+// coverage into its plan usage row, or nil when the parser reported
+// neither.
+func ConvertPlanUsage(
+	usage *parser.ParsedPlanUsage, coverage *parser.ParsedCaptureCoverage,
+) *db.SessionPlanUsage {
+	if usage == nil && coverage == nil {
+		return nil
+	}
+	var row db.SessionPlanUsage
+	if usage != nil {
+		row = db.SessionPlanUsage{
+			HasPlanUsage:    true,
+			DataAsOf:        planUsageTime(usage.DataAsOf),
+			DataStatus:      db.SanitizeUTF8(usage.DataStatus),
+			UsageSource:     db.SanitizeUTF8(usage.UsageSource),
+			WeeklyPercent:   usage.WeeklyPercent,
+			FiveHourPercent: usage.FiveHourPercent,
+			Credits:         sanitizedStringPtr(usage.Credits),
+			Final:           usage.Final,
+			OutcomeKind:     db.SanitizeUTF8(usage.OutcomeKind),
+			OutcomeAt:       planUsageTime(usage.OutcomeAt),
+			CountedUnder:    db.SanitizeUTF8(usage.CountedUnder),
+		}
+		for _, g := range usage.Groups {
+			row.Groups = append(row.Groups, db.SessionPlanUsageGroup{
+				Model:             db.SanitizeUTF8(g.Model),
+				ReasoningEffort:   db.SanitizeUTF8(g.ReasoningEffort),
+				Speed:             db.SanitizeUTF8(g.Speed),
+				ProductExperience: db.SanitizeUTF8(g.ProductExperience),
+				WeeklyPercent:     g.WeeklyPercent,
+				FiveHourPercent:   g.FiveHourPercent,
+				Credits:           sanitizedStringPtr(g.Credits),
+			})
+		}
+	}
+	if coverage != nil {
+		row.HasCoverage = true
+		row.LastCaptureAt = planUsageTime(coverage.LastCaptureAt)
+		row.UncapturedTurns = coverage.UncapturedTurns
+	}
+	return &row
+}
+
+func planUsageTime(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func sanitizedStringPtr(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	return new(db.SanitizeUTF8(*s))
 }
 
 // ConvertToolCallsContext converts parsed tool calls into normalized rows.
@@ -213,11 +273,6 @@ func ConvertToolResultsContext(
 	return results, ctx.Err()
 }
 
-// IsCodexFormatAgent reports agents using Codex rollout result identity rules.
-func IsCodexFormatAgent(agent parser.AgentType) bool {
-	return agent == parser.AgentCodex || agent == parser.AgentTraeX || agent == parser.AgentAugureCode
-}
-
 // NextParsedOrdinal returns the resume ordinal after the final parsed row.
 func NextParsedOrdinal(current int, messages []parser.ParsedMessage) int {
 	if len(messages) == 0 {
@@ -227,10 +282,18 @@ func NextParsedOrdinal(current int, messages []parser.ParsedMessage) int {
 }
 
 // LastParsedSourceUUID returns the last available source UUID for resumption.
+//
+// A deferred hook record keeps its native source UUID on the
+// stored message, but that identity is not part of the ordinary entry chain,
+// so it never becomes the resume cursor. A batch without another source UUID
+// keeps the current cursor.
 func LastParsedSourceUUID(
 	current string, messages []parser.ParsedMessage,
 ) string {
 	for _, message := range slices.Backward(messages) {
+		if parser.IsClaudeHookSubtype(message.SourceSubtype) {
+			continue
+		}
 		if message.SourceUUID != "" {
 			return message.SourceUUID
 		}

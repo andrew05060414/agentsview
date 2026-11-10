@@ -13,7 +13,7 @@ type activityReportSessionsInput struct {
 	ReportID      string           `path:"report_id" required:"true" doc:"Signed Activity report ID"`
 	Limit         int              `query:"limit" minimum:"0" maximum:"500" doc:"Maximum session rows"`
 	Cursor        string           `query:"cursor" doc:"Opaque page cursor"`
-	Sort          string           `query:"sort" enum:"agent_minutes,cost,first_active,project,agent" doc:"Session sort"`
+	Sort          string           `query:"sort" enum:"agent_minutes,cost,first_active,project,agent,session,model" doc:"Session sort"`
 	Direction     string           `query:"direction" enum:"asc,desc" doc:"Sort direction"`
 	BucketStart   optionalIntParam `query:"bucket_start" minimum:"0" doc:"First timeline bucket in the half-open range"`
 	BucketEnd     optionalIntParam `query:"bucket_end" minimum:"1" doc:"Exclusive end of the timeline bucket range"`
@@ -56,6 +56,14 @@ func (s *Server) humaActivityReportSessions(
 	if err != nil {
 		return nil, internalError("activity report source probe error", err)
 	}
+	// A page request against a stale report gets a replacement report whose
+	// first page keeps the requested sort and direction, so a sort that lands
+	// after a sync still sorts. The bucket range is dropped: a replacement
+	// report starts a new generation, and clients clear their range selection
+	// with it.
+	refreshPage := activity.SessionPageOptions{
+		Limit: in.Limit, Sort: activity.SessionSort(in.Sort), Direction: in.Direction,
+	}
 	if currentProbe != reportToken.Probe {
 		artifacts, buildErr := s.buildActivityArtifacts(
 			ctx, artifactStore, selection, currentProbe, nil,
@@ -64,7 +72,7 @@ func (s *Server) humaActivityReportSessions(
 			return nil, internalError("activity report refresh rebuild error", buildErr)
 		}
 		refreshed, prepareErr := s.prepareActivityReport(
-			selection, tokenStore, artifacts, currentProbe,
+			selection, tokenStore, artifacts, currentProbe, refreshPage,
 		)
 		if prepareErr != nil {
 			return nil, internalError("activity report refresh error", prepareErr)
@@ -91,7 +99,7 @@ func (s *Server) humaActivityReportSessions(
 		}
 		if digest != reportToken.Digest {
 			refreshed, prepareErr := s.prepareActivityReport(
-				selection, tokenStore, artifacts, currentProbe,
+				selection, tokenStore, artifacts, currentProbe, refreshPage,
 			)
 			if prepareErr != nil {
 				return nil, internalError("activity report refresh error", prepareErr)

@@ -31,6 +31,24 @@ func (p PGConfig) ValidateRawDerivation(requireAuth bool) error {
 	return nil
 }
 
+// ValidatePGRawDerivation reads only the deployment authentication policy used
+// by hosted raw readers and workers. Direct PG connections do not use the
+// server's token file or model settings.
+func (c Config) ValidatePGRawDerivation(p PGConfig) error {
+	if p.RawDerivation || p.RawTenant != "" {
+		if active, err := deploymentVarsActive("AGENTSVIEW_REQUIRE_AUTH"); err != nil {
+			return err
+		} else if active {
+			if v, set, err := lookupEnvBool("AGENTSVIEW_REQUIRE_AUTH"); err != nil {
+				return err
+			} else if set {
+				c.RequireAuth = v
+			}
+		}
+	}
+	return p.ValidateRawDerivation(c.RequireAuth)
+}
+
 func (p PGConfig) RawWorkerBounds() (poll, attempt, attempts int) {
 	poll, attempt, attempts = p.RawPollSeconds, p.RawAttemptSeconds, p.RawMaxAttempts
 	if poll == 0 {

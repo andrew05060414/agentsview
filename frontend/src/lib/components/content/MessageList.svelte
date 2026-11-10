@@ -1,5 +1,8 @@
 <script lang="ts">
+  import { fileReferences } from "../../stores/file-references.svelte.js";
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { onDestroy, tick, untrack } from "svelte";
+  import { SvelteSet } from "svelte/reactivity";
   import { Button, EmptyState } from "@kenn-io/kit-ui";
   // kit-ui-check-ignore: MessageList uses the local TanStack wrapper for pinned-message scroll reconciliation and per-session measurement cache resets; kit-ui VirtualList does not expose those controls yet.
   import type { Virtualizer } from "@tanstack/virtual-core";
@@ -12,6 +15,7 @@
   import { cancelScrollReconcile, createVirtualizer } from "../../virtual/createVirtualizer.svelte.js";
   import MessageContent from "./MessageContent.svelte";
   import CompactBoundaryDivider from "./CompactBoundaryDivider.svelte";
+  import EmptyMessagesRow from "./EmptyMessagesRow.svelte";
   import SystemBoundaryCard from "../system/SystemBoundaryCard.svelte";
   import ToolCallGroup from "./ToolCallGroup.svelte";
   import type { DbMessage as Message } from "../../api/generated/index.js";
@@ -37,6 +41,14 @@
     keepsAnswerBeforeTrailingTools,
     projectSessionScope,
   } from "../../search/session-scope.js";
+
+  $effect(() => {
+    const id = messages.sessionId;
+    const revision = messages.loadedRevision;
+    if (fileReferences.enabled) untrack(() => void fileReferences.track(id, revision));
+  });
+
+  onDestroy(() => fileReferences.reset());
 
   let containerRef: HTMLDivElement | undefined = $state(undefined);
   let containerScrollTop = $state(0);
@@ -109,6 +121,9 @@
         if (!item) return `${sid}-${index}`;
         if (item.kind === "tool-group") {
           return `${sid}-tg-${item.ordinals[0]}`;
+        }
+        if (item.kind === "empty-group") {
+          return `${sid}-eg-${item.ordinals[0]}`;
         }
         return `${sid}-m-${item.message.ordinal}`;
       },
@@ -216,7 +231,12 @@
         continue;
       }
 
-      for (const ordinal of visibleToolGroupOrdinals(row.index)) {
+      // A closed empty row stands for all its members; an open one has a
+      // card per member, so only cards on screen count as read.
+      const groupOrdinals = item.kind === "empty-group" && !emptyGroupOpen(item)
+        ? item.ordinals
+        : visibleToolGroupOrdinals(row.index);
+      for (const ordinal of groupOrdinals) {
         visibleOrdinals.add(ordinal);
         maxVisibleOrdinal = maxVisibleOrdinal === null
           ? ordinal
@@ -525,6 +545,47 @@
     return new Promise((r) => requestAnimationFrame(() => r()));
   }
 
+  // Ordinals of empty messages whose collapsed row is open. Ordinals are
+  // per session, so a session change closes every row.
+  const openEmptyOrdinals = new SvelteSet<number>();
+  $effect(() => {
+    void messages.sessionId;
+    untrack(() => openEmptyOrdinals.clear());
+  });
+
+  function setEmptyGroupOpen(ordinals: number[], open: boolean) {
+    for (const ordinal of ordinals) {
+      if (open) openEmptyOrdinals.add(ordinal);
+      else openEmptyOrdinals.delete(ordinal);
+    }
+  }
+
+  function emptyGroupOpen(item: DisplayItem): boolean {
+    return item.ordinals.some((ordinal) => openEmptyOrdinals.has(ordinal));
+  }
+
+  // A click on a card inside an open empty row selects that card's message.
+  function clickedEmptyMemberOrdinal(
+    item: DisplayItem,
+    target: EventTarget | null,
+  ): number | undefined {
+    if (item.kind !== "empty-group" || !(target instanceof Element)) return undefined;
+    const card = target.closest<HTMLElement>("[data-message-ordinal]");
+    const ordinal = Number(card?.dataset.messageOrdinal);
+    return item.ordinals.includes(ordinal) ? ordinal : undefined;
+  }
+
+  // Distance from the top of a display row to the card of `ordinal` inside an
+  // open empty row, so a jump lands on that card instead of the row's top.
+  function emptyMemberOffset(index: number, ordinal: number): number {
+    const item = itemAt(index);
+    if (!containerRef || item?.kind !== "empty-group") return 0;
+    const row = containerRef.querySelector<HTMLElement>(`.virtual-row[data-index="${index}"]`);
+    const card = row?.querySelector<HTMLElement>(`[data-message-ordinal="${ordinal}"]`);
+    if (!row || !card) return 0;
+    return card.getBoundingClientRect().top - row.getBoundingClientRect().top;
+  }
+
   function displayIndexOf(ordinal: number): number {
     const ascIndex = displayItemsAsc.findIndex((item) => item.ordinals.includes(ordinal));
     if (ascIndex < 0) return -1;
@@ -580,9 +641,14 @@
       return;
     }
     if (!instance) return;
-    // getOffsetForIndex initializes scrollOffset through TanStack's private getter.
-    const offset = instance.getOffsetForIndex(index, "start")?.[0];
-    if (offset === undefined) return;
+    // getOffsetForIndex reads a measurement cache that stays stale after a count change until
+    // TanStack's private getMeasurements() rebuilds it; getTotalSize() runs that rebuild publicly.
+    // getOffsetForIndex also initializes scrollOffset through TanStack's private getter.
+    instance.getTotalSize();
+    const rowOffset = instance.getOffsetForIndex(index, "start")?.[0];
+    if (rowOffset === undefined) return;
+    const memberOffset = emptyMemberOffset(index, jump.ordinal);
+    const offset = rowOffset + memberOffset;
     const previousOffset = untrack(() => jump.offset);
     jump.offset = offset;
     if (Math.abs(offset - (instance.scrollOffset ?? 0)) <= 1) return;
@@ -591,7 +657,8 @@
       endScrollOwnership(jump.reqId);
       return;
     }
-    instance.scrollToIndex(index, { align: "start" });
+    if (memberOffset > 0) instance.scrollToOffset(offset);
+    else instance.scrollToIndex(index, { align: "start" });
   });
 
   function endScrollOwnership(reqId = lastScrollRequest): number {
@@ -632,6 +699,22 @@
       await messages.ensureOrdinalLoaded(ordinal);
       if (!isCurrent() || !targetHolds()) return endScrollOwnership(reqId);
       // Loading needs one frame for Svelte and another for resize observation.
+      await raf();
+      if (!isCurrent()) return endScrollOwnership(reqId);
+      await raf();
+      if (!isCurrent() || !targetHolds()) return endScrollOwnership(reqId);
+    }
+
+    // A message inside a collapsed empty row has no card until the row opens.
+    const emptyGroup = displayItemsAsc.find(
+      (item) => item.kind === "empty-group" && item.ordinals.includes(ordinal),
+    );
+    if (emptyGroup && !emptyGroupOpen(emptyGroup)) {
+      setEmptyGroupOpen(emptyGroup.ordinals, true);
+      // Let the opened row render and be measured before the jump scrolls
+      // into it. A row that grows above the scroll position makes the
+      // virtualizer shift the scroll by the growth, past the target card.
+      await tick();
       await raf();
       if (!isCurrent()) return endScrollOwnership(reqId);
       await raf();
@@ -710,7 +793,7 @@
   function latestDisplaySignature(): string {
     const item = displayItemsAsc[displayItemsAsc.length - 1];
     if (!item) return "";
-    if (item.kind === "tool-group") {
+    if (item.kind !== "message") {
       return item.messages
         .map((m) => `${m.ordinal}:${m.content_length}:${m.timestamp}`)
         .join("|");
@@ -881,17 +964,19 @@
 {:else if messages.loading && messages.messages.length === 0}
   <EmptyState title={m.message_list_loading()} />
 {:else if sessions.activeSessionNotFound && messages.messages.length === 0}
-  <EmptyState
-    title={m.message_list_session_not_found()}
-    description={m.message_list_session_not_found_hint()}
-  >
-    {#snippet icon()}
-      <CircleQuestionMarkIcon size="36" strokeWidth="1.5" aria-hidden="true" />
-    {/snippet}
-    <Button size="sm" onclick={() => void sessions.retryActiveSession()}>
-      {m.message_list_session_not_found_retry()}
-    </Button>
-  </EmptyState>
+  <div class="missing-session" {@attach errorTelemetry("session")}>
+    <EmptyState
+      title={m.message_list_session_not_found()}
+      description={m.message_list_session_not_found_hint()}
+    >
+      {#snippet icon()}
+        <CircleQuestionMarkIcon size="36" strokeWidth="1.5" aria-hidden="true" />
+      {/snippet}
+      <Button size="sm" onclick={() => void sessions.retryActiveSession()}>
+        {m.message_list_session_not_found_retry()}
+      </Button>
+    </EmptyState>
+  </div>
 {:else}
   <SessionFindView
     items={displayItemsAsc}
@@ -923,10 +1008,10 @@
             data-index={row.index}
             style="position: absolute; top: 0; left: 0; width: 100%; transform: translateY({row.start}px);"
             use:measureElement={virtualizer.instance}
-            onclick={() => {
+            onclick={(event) => {
               const sel = window.getSelection();
               if (sel && sel.toString().length > 0) return;
-              ui.selectOrdinal(item.ordinals[0]!);
+              ui.selectOrdinal(clickedEmptyMemberOrdinal(item, event.target) ?? item.ordinals[0]!);
             }}
           >
             {#if item.kind !== "tool-group" && readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)}
@@ -943,6 +1028,12 @@
                 divider={readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)
                   ? readProgressDivider
                   : undefined}
+              />
+            {:else if item.kind === "empty-group"}
+              <EmptyMessagesRow
+                messages={item.messages}
+                open={emptyGroupOpen(item)}
+                onToggle={(open) => setEmptyGroupOpen(item.ordinals, open)}
               />
             {:else if item.message.is_compact_boundary}
               <CompactBoundaryDivider message={item.message} />
@@ -967,6 +1058,10 @@
 {/if}
 
 <style>
+  .missing-session {
+    display: contents;
+  }
+
   .message-list-scroll {
     flex: 1;
     overflow-y: auto;
@@ -1019,6 +1114,11 @@
 
   .layout-compact :global(.message) {
     padding: 6px 12px;
+    border-radius: 0;
+  }
+
+  /* Pattern mode keeps the full bar width, which the line patterns need. */
+  :global(:root:not([data-message-role-patterns])) .layout-compact :global(.message) {
     border-left-width: 2px;
     border-radius: 0;
   }
@@ -1065,15 +1165,20 @@
   }
 
   .layout-stream :global(.message) {
-    border-left: none;
     border-radius: 0;
     padding: 16px 24px;
+  }
+
+  /* Stream hides the role header, so pattern mode keeps the patterned bar
+     as the role marker. */
+  :global(:root:not([data-message-role-patterns])) .layout-stream :global(.message) {
+    border-left: none;
   }
 
   .layout-stream :global(.message.is-user) {
     background: color-mix(
       in srgb,
-      var(--accent-blue) 5%,
+      var(--role-user-accent) 5%,
       transparent
     ) !important;
   }

@@ -23,10 +23,17 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 
+	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/apiclient"
+	"go.kenn.io/agentsview/internal/archivesource"
+	"go.kenn.io/agentsview/internal/codexcloud"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/friction/filing"
+	"go.kenn.io/agentsview/internal/friction/review"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/kata"
+	"go.kenn.io/agentsview/internal/kept"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
 	"go.kenn.io/agentsview/internal/rawsync"
@@ -41,6 +48,7 @@ import (
 
 // VersionInfo holds build-time version metadata.
 type VersionInfo struct {
+	DocbankEnabled             bool   `json:"docbank_enabled,omitempty"`
 	Version                    string `json:"version"`
 	Commit                     string `json:"commit"`
 	BuildDate                  string `json:"build_date"`
@@ -48,15 +56,31 @@ type VersionInfo struct {
 	ArchiveOnly                bool   `json:"archive_only,omitempty"`
 	InsightGenerationAvailable bool   `json:"insight_generation_available"`
 	SessionStatsAvailable      bool   `json:"session_stats_available"`
-	APIVersion                 int    `json:"api_version"`
-	DataVersion                int    `json:"data_version"`
+	FrictionAvailable          bool   `json:"friction_available"`
+	// FrictionReadable reports that this store serves the Friction Log
+	// read routes; mirrors without friction tables omit it.
+	FrictionReadable bool `json:"friction_readable,omitempty"`
+	// FrictionBuildAllowed reports that this request may start a build:
+	// the server has a friction runner and accepts runs from this caller.
+	FrictionBuildAllowed bool `json:"friction_build_allowed"`
+	// FrictionAutoFile reports that this hub files Friction Log patterns to
+	// Kata automatically.
+	FrictionAutoFile bool `json:"friction_auto_file,omitempty"`
+	KataAvailable    bool `json:"kata_available"`
+	APIVersion       int  `json:"api_version"`
+	DataVersion      int  `json:"data_version"`
 }
 
 // APIVersion is shared by HTTP version reporting and local daemon discovery.
 // Bump it when a client-visible contract cannot be decoded safely by an older
 // CLI or daemon.
 const (
-	APIVersion = 12
+	APIVersion = 15
+	// KataAPIVersion is the first daemon API that serves /api/v1/kata/status.
+	KataAPIVersion = 14
+	// FrictionAPIVersion is the first daemon API that serves
+	// /api/v1/friction digests, findings, patterns and runs.
+	FrictionAPIVersion = 13
 	// ScopedWatchPushAPIVersion is the first daemon API that accepts bounded
 	// watcher batches and their authoritative recovery scope on push requests.
 	ScopedWatchPushAPIVersion = 7
@@ -82,6 +106,7 @@ const (
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
+	modelGroups          service.ModelGroups
 	mu                   gosync.RWMutex
 	cfg                  config.Config
 	activeDisabledAgents []parser.AgentType
@@ -91,10 +116,12 @@ type Server struct {
 	settingsApplyMu   gosync.Mutex
 	// onDemandReconfigureMu serializes source updates to onDemandEngine.
 	onDemandReconfigureMu gosync.Mutex
+	// pushTurn lets one archive push run at a time.
+	pushTurn              pushTurn
 	db                    db.Store
 	activityReports       *activityReportCache
 	assetCache            *assetCache
-	activityReportFlights *activityReportBuildGroup
+	activityReportFlights *kept.Flights[activity.CandidateArtifacts]
 	engine                *sync.Engine
 	onDemandEngine        *sync.Engine
 	sessions              service.SessionService
@@ -137,8 +164,11 @@ type Server struct {
 	// (e.g. "/agentsview"). When set, all routes are served
 	// under this prefix and a <base href> tag is injected
 	// into the SPA's index.html.
-	basePath string
-	idle     *IdleTracker
+	basePath      string
+	idle          *IdleTracker
+	persistDaemon func() error
+
+	ingestionFreshness IngestionFreshness
 
 	// sessionMutationNotify, when set, is called after a route changes a
 	// session's lifecycle (trash, restore, permanent delete), so consumers
@@ -158,22 +188,14 @@ type Server struct {
 	// default; enabled by the hidden serve --pprof flag.
 	pprofEnabled bool
 
-	// embeddingsManager, when set, backs the /api/v1/embeddings/...
-	// build lifecycle routes. Nil (the default) leaves those routes
-	// unregistered, e.g. when semantic search is not configured.
-	embeddingsManager EmbeddingsManager
-	embeddingsStores  map[string]EmbeddingsManager
+	// embeddingsRuntime coordinates live setup and access to embedding managers.
+	embeddingsRuntime EmbeddingsRuntime
 
 	// embeddingsUnavailableReason, when non-empty, replaces the generic
 	// "embeddings manager not available" 501 message on the embeddings
 	// routes with a cause-specific one (e.g. vector serving disabled at
 	// startup because vectors.write.lock was held).
 	embeddingsUnavailableReason string
-
-	// embeddingsIncludeAutomatedDefault is the daemon's configured
-	// [vector].include_automated scope, applied to HTTP build requests
-	// that leave include_automated unset.
-	embeddingsIncludeAutomatedDefault bool
 
 	// vectorPushSource, when set, supplies the local vectors.db active
 	// generation to the daemon's pg push handler. Nil leaves the vector
@@ -187,7 +209,9 @@ type Server struct {
 
 	// localSyncRunner, when set, backs the foreground local-sync HTTP handler
 	// with the worker-backed pass instead of running SyncThenRun in process.
-	localSyncRunner LocalSyncRunner
+	localSyncRunner        LocalSyncRunner
+	archiveSources         *archivesource.Manager
+	onDemandArchiveSources *archivesource.Manager
 
 	// localResyncRunner, when set, backs the foreground full-resync HTTP handler
 	// with the worker-backed build-and-swap instead of an in-process resync.
@@ -207,12 +231,19 @@ type Server struct {
 
 	artifactExchangeRunner ArtifactExchangeRunner
 	rawSyncTenant          string
-	rawSyncDeviceAuth      RawSyncDeviceAuth
-	rawSyncCustody         RawSyncCustody
-	rawSyncStatus          RawSyncStatusReader
-	rawSyncSchemaOnly      bool
-	rawSyncUploads         RawSyncUploads
-	rawSyncJobHealth       RawSyncJobHealth
+	frictionRunner         *review.Runner
+	// kata is the optional Kata spoke connection; never nil after New.
+	kata              *kata.Conn
+	frictionExclusive func(func() error) error
+	// constructed is set when New returns; see WithFriction.
+	constructed       bool
+	rawSyncDeviceAuth RawSyncDeviceAuth
+	rawSyncCustody    RawSyncCustody
+	rawSyncStatus     RawSyncStatusReader
+	codexCloudStatus  *codexcloud.StatusBoard
+	rawSyncSchemaOnly bool
+	rawSyncUploads    RawSyncUploads
+	rawSyncJobHealth  RawSyncJobHealth
 
 	ensurePricing func(context.Context, *db.DB) error
 }
@@ -254,20 +285,25 @@ func New(
 	// returns db.ErrReadOnly without an engine, while read APIs such as stats
 	// still need the local handle. Non-SQLite stores use the generic read-only
 	// backend.
+	modelGroups := service.NewModelGroups(cfg.ModelAliases)
+	backendOptions := []service.DirectBackendOption{
+		service.WithModelGroups(modelGroups), service.WithConfiguredDocbank(cfg),
+	}
 	var sessions service.SessionService
 	if local, ok := database.(*db.DB); ok {
 		local.SetArchiveContent(cfg.ArchiveContent)
-		sessions = service.NewDirectBackend(local, engine)
+		sessions = service.NewDirectBackend(local, engine, backendOptions...)
 	} else {
-		sessions = service.NewReadOnlyBackend(database)
+		sessions = service.NewReadOnlyBackend(database, backendOptions...)
 	}
 
 	s := &Server{
 		cfg:                       cfg,
+		modelGroups:               modelGroups,
 		activeDisabledAgents:      append([]parser.AgentType(nil), cfg.DisabledAgents...),
 		db:                        database,
 		activityReports:           newActivityReportCache(),
-		activityReportFlights:     newActivityReportBuildGroup(),
+		activityReportFlights:     &kept.Flights[activity.CandidateArtifacts]{},
 		engine:                    engine,
 		sessions:                  sessions,
 		mux:                       http.NewServeMux(),
@@ -283,6 +319,22 @@ func New(
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.kata == nil {
+		// Only a local SQLite archive with no PG push target is its own hub.
+		// pg serve passes its own hub Conn; read-only replicas are not hubs.
+		_, local := database.(*db.DB)
+		hub := local && filing.EligibleHost(false, cfg.HasPGPushTarget())
+		s.kata = kata.NewConn(kata.ConfigFrom(cfg.Kata, hub))
+	}
+	eligibility := "disabled"
+	if kataCfg := s.kata.Config(); kataCfg.Enabled {
+		if kataCfg.Hub {
+			eligibility = "hub"
+		} else {
+			eligibility = "not_hub"
+		}
+	}
+	log.Printf("kata: hub eligibility %s", eligibility)
 	if s.version.APIVersion == 0 {
 		s.version.APIVersion = APIVersion
 	}
@@ -291,6 +343,8 @@ func New(
 	}
 	s.assetCache = newAssetCache()
 	s.routes()
+	s.constructed = true
+	s.installAutoFile()
 	return s
 }
 
@@ -550,6 +604,29 @@ func WithGenerateStreamFunc(f insight.GenerateStreamFunc) Option {
 	}
 }
 
+// WithFriction attaches the Friction Log review runner. A nil runner leaves
+// the feature unavailable. exclusive serializes on-demand runs with the
+// scheduled catch-up job; nil runs them directly.
+func WithFriction(runner *review.Runner, exclusive func(func() error) error) Option {
+	return func(s *Server) {
+		s.frictionRunner = runner
+		s.frictionExclusive = exclusive
+		// Within New the job may already be running, so New installs
+		// automatic filing once the Kata connection exists.
+		if s.constructed {
+			s.installAutoFile()
+		}
+	}
+}
+
+// installAutoFile gives the friction job its automatic filing pass. Every
+// field the pass reads must be set first.
+func (s *Server) installAutoFile() {
+	if s.frictionRunner != nil {
+		s.frictionRunner.SetAfterCatchUp(s.autoFileFriction)
+	}
+}
+
 // WithInsightLogDrainTimeouts overrides SSE insight log stream drain timeouts.
 // Zero or negative values keep the production defaults.
 func WithInsightLogDrainTimeouts(drain, stopWait time.Duration) Option {
@@ -561,6 +638,17 @@ func WithInsightLogDrainTimeouts(drain, stopWait time.Duration) Option {
 			s.insightLogStopWaitTimeout = stopWait
 		}
 	}
+}
+
+// IngestionFreshness tracks the local archive catch-up obligation.
+type IngestionFreshness interface {
+	EnsureFresh(context.Context) bool
+	Pending() bool
+}
+
+// WithIngestionFreshness waits for local ingestion before archive operations.
+func WithIngestionFreshness(f IngestionFreshness) Option {
+	return func(s *Server) { s.ingestionFreshness = f }
 }
 
 func WithIdleTracker(t *IdleTracker) Option {
@@ -638,6 +726,12 @@ func WithLocalSyncRunner(r LocalSyncRunner) Option {
 	return func(s *Server) { s.localSyncRunner = r }
 }
 
+// WithArchiveSources shares the daemon's attached-archive manager with manual
+// sync requests that include local sources.
+func WithArchiveSources(manager *archivesource.Manager) Option {
+	return func(s *Server) { s.archiveSources = manager }
+}
+
 // LocalResyncRunner runs the daemon's foreground full resync, streaming progress
 // to the optional callback and returning the resulting stats. When injected, the
 // resync HTTP handler routes through it (the worker-backed build-and-swap)
@@ -688,7 +782,7 @@ func (s *Server) humaConfig() huma.Config {
 		"application/json": jsonFormat,
 		"json":             jsonFormat,
 	}
-	cfg.Info.Description = "HTTP API for browsing, searching, syncing, and managing local agent sessions. Responses carry X-Agentsview-Archive-Stale: true while a required archive rebuild is pending; GET /api/v1/sync/status reports its state."
+	cfg.Info.Description = "HTTP API for browsing, searching, syncing, and managing local agent sessions. Responses carry X-Agentsview-Archive-Stale: true while a required archive rebuild or idle catch-up is incomplete; GET /api/v1/sync/status reports its state."
 	cfg.OpenAPIPath = "/api/openapi"
 	cfg.DocsPath = ""
 	cfg.SchemasPath = ""
@@ -903,7 +997,7 @@ func (s *Server) Handler() http.Handler {
 				ServeHTTP(w, r)
 		})
 	}
-	h = s.idle.Wrap(h)
+	h = s.idle.Wrap(h, s.basePath)
 	return h
 }
 
@@ -919,10 +1013,16 @@ func archiveFreshnessProbe(path string) bool {
 func (s *Server) archiveStaleMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			if !archiveFreshnessProbe(r.URL.Path) && s.archiveStale() {
+			probe := archiveFreshnessProbe(r.URL.Path)
+			pending := false
+			if !probe && s.ingestionFreshness != nil &&
+				(r.Method != http.MethodPost || (r.URL.Path != "/api/v1/resync" && (r.URL.Path != "/api/v1/sync" || !archiveWriteRequest(r)))) {
+				pending = !s.ingestionFreshness.EnsureFresh(r.Context())
+			}
+			if !probe && (s.archiveStale() || pending) {
 				w.Header().Set(apiclient.ArchiveStaleHeader, "true")
 				// Session sync returns its stale-archive conflict through the route.
-				if archiveWriteRequest(r) && r.URL.Path != "/api/v1/sessions/sync" {
+				if s.archiveStale() && archiveWriteRequest(r) && r.URL.Path != "/api/v1/sessions/sync" {
 					if local, ok := s.db.(*db.DB); ok && local.WriterClosed() {
 						response := writerClosedResponse(w.Header().Add, true)
 						writeError(w, response.Status, response.Message)
@@ -952,7 +1052,7 @@ func archiveWriteRequest(r *http.Request) bool {
 		return !startupOnly
 	case "/api/v1/recall/import":
 		return r.URL.Query().Get("dry_run") != "true"
-	case "/api/v1/settings", "/api/v1/recall/query", "/api/v1/settings/worktree-mappings/preview", "/api/v1/data/strip-images/preview", "/api/v1/memory/refresh", "/api/v1/raw-sync/tokens":
+	case "/api/v1/daemon/persist", "/api/v1/settings", "/api/v1/recall/query", "/api/v1/commits/sessions", "/api/v1/settings/worktree-mappings/preview", "/api/v1/data/strip-images/preview", "/api/v1/memory/refresh", "/api/v1/raw-sync/tokens":
 		return false
 	}
 	for _, prefix := range []string{"/api/v1/config/", "/api/v1/telemetry/", "/api/v1/remote-sync/", "/api/v1/embeddings/", "/api/v1/raw-sync/uploads", "/api/v1/import/claude-ai/sync/results/"} {
@@ -987,6 +1087,13 @@ func cspMiddleware(
 		next.ServeHTTP(w, r)
 	})
 }
+
+// holdFirstPaintScriptHash allows the one inline script in the SPA's
+// index.html: frontend/src/hold-first-paint.js, which the Vite build inlines
+// verbatim so the page stays hidden until its stylesheets and fonts load.
+// The fallback page for backend-only builds inlines the same bytes. It is the
+// base64 SHA-256 of that file's bytes.
+const holdFirstPaintScriptHash = "'sha256-Eym3PxQdYuGzQsfi2PA2bxFhXVJD9GuQ/Ig3m6m3of8='"
 
 // buildCSPPolicy constructs the Content-Security-Policy string.
 //
@@ -1028,7 +1135,7 @@ func buildCSPPolicy(
 
 	return fmt.Sprintf(
 		"default-src %[1]s; "+
-			"script-src %[1]s; "+
+			"script-src %[1]s %[3]s; "+
 			"connect-src 'self' http: https: ws: wss:; "+
 			"img-src %[1]s data: blob:; "+
 			"style-src %[1]s 'unsafe-inline' https://fonts.googleapis.com; "+
@@ -1036,7 +1143,7 @@ func buildCSPPolicy(
 			"object-src 'none'; "+
 			"base-uri %[2]s; "+
 			"frame-ancestors 'none'",
-		resourceSrc, baseURI,
+		resourceSrc, baseURI, holdFirstPaintScriptHash,
 	)
 }
 
@@ -1360,7 +1467,7 @@ func localInterfaceIPs() map[string]bool {
 
 // ListenAndServe starts the HTTP server.
 func (s *Server) ListenAndServe() error {
-	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
+	addr := net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port))
 	listenCtx := context.Background()
 	if s.baseCtx != nil {
 		listenCtx = s.baseCtx
@@ -1371,7 +1478,7 @@ func (s *Server) ListenAndServe() error {
 			Network: daemon.NetworkTCP,
 			Address: addr,
 		},
-		daemon.WithRuntimeStore(daemon.RuntimeStore{Dir: s.dataDir}),
+		daemon.WithRuntimeStore(daemon.RuntimeStore{Dir: config.RuntimeDir(s.dataDir)}),
 	)
 	if err != nil {
 		return err
@@ -1426,10 +1533,9 @@ func (s *Server) Serve(ln net.Listener) error {
 	return srv.Serve(ln)
 }
 
-// Shutdown gracefully shuts down the HTTP server, then closes the
-// server-owned on-demand sync engine (if one was lazily created) so
-// its pending debounced signal recomputes flush while the DB is
-// still open. Injected engines are closed by their owner.
+// Shutdown gracefully shuts down the HTTP server, stops its on-demand archive
+// drain, then closes its on-demand engine so pending signal recomputes flush
+// while the DB is still open. Injected managers and engines keep their owner.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.RLock()
 	srv := s.httpSrv
@@ -1449,10 +1555,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	for range shutdownCount {
 		err = errors.Join(err, <-shutdownErrors)
 	}
+	s.chrome.shutdown()
 	s.mu.Lock()
 	engine := s.onDemandEngine
 	s.onDemandEngine = nil
+	attachments := s.onDemandArchiveSources
+	s.onDemandArchiveSources = nil
 	s.mu.Unlock()
+	if attachments != nil {
+		attachments.Close()
+	}
 	if engine != nil {
 		engine.Close()
 	}
@@ -1733,3 +1845,8 @@ func logMiddleware(next http.Handler) http.Handler {
 
 // WithRawSyncTenant binds every raw credential/token identity before route work.
 func WithRawSyncTenant(tenant string) Option { return func(s *Server) { s.rawSyncTenant = tenant } }
+
+// WithDaemonPersistence installs the writable local daemon's lifetime publisher.
+func WithDaemonPersistence(publish func() error) Option {
+	return func(s *Server) { s.persistDaemon = publish }
+}

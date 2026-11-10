@@ -27,7 +27,7 @@ func (s *Server) registerImportRoutes() {
 	group.UseSimpleModifier(func(op *huma.Operation) {
 		if op.Method == http.MethodPost && op.Path == "/api/v1/import/claude-ai/sync" {
 			if response := op.Responses["409"]; response != nil {
-				response.Description = "Before streaming, code claude_ai_chrome_host_required reports a disconnected Chrome host; claude_ai_sync_running reports that Chrome Sync is already running."
+				response.Description = "Before streaming, code claude_ai_chrome_host_required reports a disconnected Chrome host; claude_ai_sync_running reports that Chrome Sync is already running; claude_ai_config_invalid reports an invalid [agents.claude-ai] table in config.toml."
 			}
 		}
 	})
@@ -48,9 +48,8 @@ func (s *Server) registerImportRoutes() {
 			return s.humaSyncClaudeAI(ctx, in, &results)
 		}, func(op *huma.Operation) {
 			op.Middlewares = append(op.Middlewares, func(ctx huma.Context, next func(huma.Context)) {
-				// Read the parameter the way Huma binds it. net/url takes the
-				// first of repeated keys, but Huma's parser can pick a later
-				// one, so ?browser&browser=chrome would skip this check.
+				// Huma binds the first value and treats a valueless key as
+				// "true", so this matches the browser field the handler sees.
 				if ctx.Query("browser") == "chrome" {
 					localChrome(ctx, next)
 					return
@@ -136,8 +135,11 @@ func (s *Server) humaSyncClaudeAI(ctx context.Context, in *claudeAISyncInput, re
 	if !ok {
 		return nil, apiError(http.StatusNotImplemented, "sync requires a local archive")
 	}
+	if err := s.cfg.ClaudeAI.Err; err != nil {
+		return nil, apiErrorWithCode(http.StatusConflict, "claude_ai_config_invalid", err.Error())
+	}
 	if in.Browser == "chrome" && !s.chrome.Connected() {
-		return nil, apiErrorWithCode(http.StatusConflict, "claude_ai_chrome_host_required", "Run agentsview chrome setup and keep Chrome open, then Sync again")
+		return nil, apiErrorWithCode(http.StatusConflict, "claude_ai_chrome_host_required", "Run agentsview source chrome setup, restart AgentsView, and keep Chrome open, then Sync again")
 	}
 	if in.Browser == "chrome" && !s.chrome.syncMu.TryLock() {
 		return nil, apiErrorWithCode(http.StatusConflict, "claude_ai_sync_running", "Chrome Sync is already running")
@@ -174,9 +176,9 @@ func (s *Server) humaSyncClaudeAI(ctx context.Context, in *claudeAISyncInput, re
 				return response, err
 			}
 		}
-		stats, err := importer.SyncClaudeAI(ctx, store, fetch, &importer.ImportCallbacks{
+		stats, err := importer.SyncClaudeAI(ctx, store, fetch, s.cfg.ClaudeAI.Organizations, &importer.ImportCallbacks{
 			SerializeWrite: func(write func() error) error {
-				return s.serializeArchiveWrite(ctx, write)
+				return s.SerializeArchiveWrite(ctx, write)
 			},
 			OnProgress: func(stats importer.ImportStats) {
 				if !stream.SendJSON("progress", stats) {
@@ -290,11 +292,15 @@ func (s *Server) importClaudeAIFromFileWithCallbacks(
 	}
 	defer cleanup()
 	var stats importer.ImportStats
-	err = s.serializeArchiveWrite(ctx, func() error {
+	err = s.SerializeArchiveWrite(ctx, func() error {
 		var importErr error
 		stats, importErr = importer.ImportClaudeAIWithOptions(ctx, s.db, reader, cb, opts)
 		return importErr
 	})
+	// Refresh after every import attempt; even a failed import can commit title-only changes counted as skipped.
+	if s.broadcaster != nil {
+		s.broadcaster.Emit("sessions")
+	}
 	if err != nil {
 		if errors.Is(err, db.ErrWriterClosed) {
 			return importer.ImportStats{}, writerClosedError(s.archiveStale())
@@ -429,12 +435,16 @@ func (s *Server) importChatGPTFromFile(
 	}
 	defer cleanup()
 	var stats importer.ImportStats
-	err = s.serializeArchiveWrite(ctx, func() error {
+	err = s.SerializeArchiveWrite(ctx, func() error {
 		var importErr error
 		stats, importErr = importer.ImportChatGPTWithOptions(ctx, s.db, dir,
 			filepath.Join(s.cfg.DataDir, "assets"), cb, opts)
 		return importErr
 	})
+	// Refresh after every import attempt; even a failed import can commit title-only changes counted as skipped.
+	if s.broadcaster != nil {
+		s.broadcaster.Emit("sessions")
+	}
 	if err != nil {
 		if errors.Is(err, db.ErrWriterClosed) {
 			return importer.ImportStats{}, writerClosedError(s.archiveStale())

@@ -6,15 +6,23 @@ import type { GetApiV1SearchContentScope } from "./getApiV1SearchContentScope.ts
 
 export type GetApiV1SearchContentParams = {
   /**
-   * Pattern to search for
+   * Pattern to search for; mutually exclusive with concepts
    */
-  pattern: string;
+  pattern?: string;
+  /**
+   * Two to five semantic concepts that must all have evidence in one session; repeatable and mutually exclusive with pattern
+   */
+  concepts?: string[];
   /**
    * Search mode
    */
   mode?: GetApiV1SearchContentMode;
   /**
-   * Semantic/hybrid/terms result scope: top, all, or subordinate (default all)
+   * Return hybrid keyword matches when semantic search is unavailable
+   */
+  allow_keyword_fallback?: boolean;
+  /**
+   * Result scope: top, all, or subordinate (blank lexical scope keeps sidebar child filtering)
    */
   scope?: GetApiV1SearchContentScope;
   /**
@@ -38,7 +46,7 @@ export type GetApiV1SearchContentParams = {
    */
   exclude_project?: string;
   /**
-   * Filter by machine
+   * Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400.
    */
   machine?: string;
   /**

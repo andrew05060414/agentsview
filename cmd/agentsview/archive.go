@@ -16,11 +16,14 @@ import (
 
 func newArchiveCommand() *cobra.Command {
 	command := &cobra.Command{Use: "archive", Short: "Retain original session files, reparse them, and move a complete archive", GroupID: groupData}
+	command.Long = "Retain and verify original provider sources so they can be reparsed or moved with their archive identities."
+	command.Example = "  agentsview archive sources\n" +
+		"  agentsview archive verify --help"
 	var captureRoots []string
 	var identityFrom string
 	var writersStopped bool
 	captureCmd := &cobra.Command{Use: "capture DESTINATION", Short: "Copy source files and consistent databases into a new portable capture", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.LoadReadOnly()
+		cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 		if err != nil {
 			return err
 		}
@@ -52,7 +55,7 @@ func newArchiveCommand() *cobra.Command {
 			return errors.New("--spec is required")
 		}
 		if seed {
-			cfg, err := config.LoadReadOnly()
+			cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 			if err != nil {
 				return err
 			}
@@ -80,7 +83,7 @@ func newArchiveCommand() *cobra.Command {
 	var ids []string
 	var budget int64
 	reparseCmd := &cobra.Command{Use: "reparse", Short: "Reparse selected accepted sources and publish the complete batch atomically", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		cfg, err := config.LoadReadOnly()
+		cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 		if err != nil {
 			return err
 		}
@@ -102,7 +105,7 @@ func newArchiveCommand() *cobra.Command {
 		})
 	}}
 	sourcesCmd := &cobra.Command{Use: "sources", Short: "List accepted generations and parse status", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		cfg, err := config.LoadReadOnly()
+		cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 		if err != nil {
 			return err
 		}
@@ -131,7 +134,7 @@ func newArchiveCommand() *cobra.Command {
 		}
 	}}
 	backupCmd := &cobra.Command{Use: "backup REPOSITORY", Short: "Back up the stopped archive to a Docbank repository", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.LoadReadOnly()
+		cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 		if err != nil {
 			return err
 		}
@@ -206,7 +209,7 @@ func writeArchiveJSON(w io.Writer, value any) error {
 }
 
 func withRawArchive(cmd *cobra.Command, run func(*rawarchive.Archive) error) (retErr error) {
-	cfg, err := config.LoadReadOnly()
+	cfg, err := config.LoadReadOnlyFor(config.ScopeLocal)
 	if err != nil {
 		return err
 	}

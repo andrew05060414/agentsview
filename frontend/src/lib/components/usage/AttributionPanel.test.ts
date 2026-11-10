@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({
+  reportErrorShown: vi.fn(),
+  reportTelemetry: vi.fn(),
+}));
 import { mount, tick, unmount } from "svelte";
 import type { DbTopSessionEntry, UsageSummaryResponse } from "../../api/generated/index";
 import { testMoney } from "../../test/money.js";
@@ -23,7 +28,8 @@ import AttributionPanel from "./AttributionPanel.svelte";
 import { sessions } from "../../stores/sessions.svelte.js";
 import { settings } from "../../stores/settings.svelte.js";
 import { usage } from "../../stores/usage.svelte.js";
-import { usageChartColorMaps } from "../../utils/usageChartColors.js";
+import type { SeriesStyle } from "@kenn-io/kit-ui/utils/palette";
+import { usageChartStyleMaps } from "../../utils/usageChartStyles.js";
 
 function summaryWithAgents(agents: string[]): UsageSummaryResponse {
   return {
@@ -109,13 +115,17 @@ function summaryWithModels(): UsageSummaryResponse {
   return summary;
 }
 
-function mountPanel(colorMap?: ReadonlyMap<string, string>) {
+function solid(color: string): SeriesStyle {
+  return { color, fill: "solid", dash: "solid", marker: "circle" };
+}
+
+function mountPanel(styleMap?: ReadonlyMap<string, SeriesStyle>) {
   const groupBy = usage.toggles.attribution.groupBy;
   usage.mergeKnownProjects((usage.attributionSummary ?? usage.summary)?.projectTotals ?? [], {});
   return mount(AttributionPanel, {
     target: document.body,
     props: {
-      colorMap: colorMap ?? usageChartColorMaps(usage.summary, settings.chartPalette)[groupBy],
+      styleMap: styleMap ?? usageChartStyleMaps(usage.summary, settings.chartPalette)[groupBy],
     },
   });
 }
@@ -284,6 +294,73 @@ describe("AttributionPanel colors", () => {
     document.body.innerHTML = "";
   });
 
+  it.each([
+    ["cost", "list", ".list-cost"],
+    ["token", "treemap", ".rail-cost"],
+  ] as const)(
+    "shows Plan usage, not zero, for a plan-only model in %s %s",
+    async (mode, view, cell) => {
+      const summary = summaryWithModels();
+      summary.modelTotals[1]!.planOnlySessions = 2;
+      summary.modelTotals.push({
+        model: "plan-only-model",
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(0),
+        planOnlySessions: 3,
+      });
+      usage.summary = summary;
+      usage.mode = mode;
+      usage.toggles.attribution.groupBy = "model";
+      usage.toggles.attribution.view = view;
+
+      const component = mountPanel();
+      await tick();
+
+      const cells = Array.from(document.querySelectorAll(cell), (el) => el.textContent?.trim());
+      expect(cells).toEqual(
+        mode === "cost" ? ["$8.00", "$4.00", "Plan usage"] : ["90", "60", "Plan usage"],
+      );
+      void unmount(component);
+    },
+  );
+
+  // A tokenless row with a reported cost keeps its cost in cost mode; in
+  // token mode it has no tokens to show, so its plan-only chats name it.
+  it.each([
+    ["cost", ["$8.00", "$4.00", "$2.00"], ["57.1%", "28.6%", "14.3%"]],
+    ["token", ["90", "60", "Plan usage"], ["60.0%", "40.0%", ""]],
+  ] as const)(
+    "shows a tokenless model with a reported cost and plan-only sessions in %s mode",
+    async (mode, values, shares) => {
+      const summary = summaryWithModels();
+      summary.modelTotals.push({
+        model: "shared-model",
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheCreationTokens: 0,
+        cacheReadTokens: 0,
+        cost: testMoney(2),
+        planOnlySessions: 1,
+      });
+      usage.summary = summary;
+      usage.mode = mode;
+      usage.toggles.attribution.groupBy = "model";
+      usage.toggles.attribution.view = "list";
+
+      const component = mountPanel();
+      await tick();
+
+      const text = (selector: string) =>
+        Array.from(document.querySelectorAll(selector), (el) => el.textContent?.trim());
+      expect(text(".list-cost")).toEqual(values);
+      expect(text(".list-pct")).toEqual(shares);
+      void unmount(component);
+    },
+  );
+
   it("keeps colliding model rows distinct", async () => {
     usage.summary = summaryWithModels();
     usage.toggles.attribution.groupBy = "model";
@@ -336,6 +413,40 @@ describe("AttributionPanel colors", () => {
     unmount(component);
   });
 
+  it("offers the label scale only in treemap view and applies the choice", async () => {
+    usage.summary = summaryWithAgents(["claude", "codex"]);
+    usage.mode = "cost";
+    usage.toggles.attribution.groupBy = "agent";
+    usage.toggles.attribution.view = "treemap";
+    usage.setAttributionLabelScale("linear");
+
+    const component = mountPanel();
+    await tick();
+    const scaleGroup = () =>
+      document.querySelector<HTMLElement>('[role="group"][aria-label="Label size scale"]');
+    const labelSizes = () =>
+      [...document.querySelectorAll<SVGTextElement>(".tile-label")].map(
+        (label) => label.style.fontSize,
+      );
+    const linearSizes = labelSizes();
+
+    const log = [...scaleGroup()!.querySelectorAll("button")].find(
+      (button) => button.textContent?.trim() === "Log",
+    )!;
+    log.click();
+    await tick();
+
+    expect(usage.toggles.attribution.labelScale).toBe("log");
+    expect(log.getAttribute("aria-pressed")).toBe("true");
+    expect(labelSizes()).not.toEqual(linearSizes);
+
+    usage.setAttributionView("list");
+    await tick();
+    expect(scaleGroup()).toBeNull();
+    usage.setAttributionLabelScale("sqrt");
+    unmount(component);
+  });
+
   it("attributes only output tokens when Output is selected", async () => {
     const summary = summaryWithAgents(["codex"]);
     summary.agentTotals[0]!.inputTokens = 750_000;
@@ -360,8 +471,8 @@ describe("AttributionPanel colors", () => {
     usage.toggles.attribution.groupBy = "model";
     usage.toggles.attribution.view = "list";
     const supplied = new Map([
-      ["gpt-5.6-sol", "#123456"],
-      ["claude-opus-5", "#abcdef"],
+      ["gpt-5.6-sol", solid("#123456")],
+      ["claude-opus-5", solid("#abcdef")],
     ]);
 
     const component = mountPanel(supplied);
@@ -382,6 +493,34 @@ describe("AttributionPanel colors", () => {
     );
     expect(tileColors).toEqual(["#123456", "#abcdef"]);
     expect(railColors).toEqual(["rgb(18, 52, 86)", "rgb(171, 205, 239)"]);
+    unmount(component);
+  });
+
+  it("fills a patterned series with its pattern and shows it in the swatches", async () => {
+    usage.summary = summaryWithModels();
+    usage.toggles.attribution.groupBy = "model";
+    usage.toggles.attribution.view = "treemap";
+    const supplied = new Map<string, SeriesStyle>([
+      ["gpt-5.6-sol", solid("#123456")],
+      ["claude-opus-5", { ...solid("#abcdef"), fill: "hatch" }],
+    ]);
+
+    const component = mountPanel(supplied);
+    await tick();
+
+    const tiles = Array.from(document.querySelectorAll<SVGRectElement>(".tile rect"));
+    expect(tiles[0]!.getAttribute("fill")).toBe("#123456");
+    const patternRef = tiles[1]!.getAttribute("fill")!.match(/^url\(#(.+)\)$/)?.[1];
+    const pattern = patternRef ? document.getElementById(patternRef) : null;
+    expect(pattern?.tagName.toLowerCase()).toBe("pattern");
+    expect(pattern?.querySelector("rect")?.getAttribute("fill")).toBe("#abcdef");
+
+    const railStyles = Array.from(document.querySelectorAll<HTMLElement>(".rail-dot")).map(
+      (dot) => dot.getAttribute("style") ?? "",
+    );
+    expect(railStyles[0]).not.toContain("gradient");
+    expect(railStyles[1]).toContain("repeating-linear-gradient");
+    expect(railStyles[1]).toContain("#abcdef");
     unmount(component);
   });
 
@@ -441,6 +580,25 @@ describe("AttributionPanel job groups", () => {
     usageServiceMocks.getApiV1UsageTopSessions.mockResolvedValue([]);
     document.body.innerHTML = "";
     vi.restoreAllMocks();
+  });
+
+  it("reports the analytics kind for a displayed project error", async () => {
+    usage.selectedProjectKey = "pl1:sha256:first";
+    usageServiceMocks.getApiV1UsageTopSessions.mockRejectedValueOnce(new Error("Project failed"));
+    const component = mountPanel();
+    try {
+      await tick();
+      document
+        .querySelector<HTMLElement>(".list-row")!
+        .dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+      await tick();
+      await vi.waitFor(() => expect(usage.errors.zoom).toBe("Project failed"));
+      await tick();
+      expect(document.querySelector(".empty")?.textContent).toBe("Project failed");
+      expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics");
+    } finally {
+      await unmount(component);
+    }
   });
 
   it.each(["with a summary", "after the summary fails on a date change"])(

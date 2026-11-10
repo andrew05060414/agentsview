@@ -18,6 +18,22 @@ reader connections so quick reads always get one. Each holder uses one reader
 connection at a time. Validate input before acquiring a permit. Release it
 before waiting for another bulk reader or doing host git/GitHub lookups.
 
+The archive writer and its serving reader pool cache up to 64 prepared SQL
+statements per connection. This avoids compiling repeated import, project
+attribution, session, and transcript queries. The cache stays in memory and
+closes with its connection. The serving pool retains at most four connections.
+Cold read-only opens and standalone schema probes use their existing uncached
+connections.
+
+Reconciliation spools and Codex staging databases also cache up to 64 prepared
+statements per connection. Writable vector indexes use the same limit with the
+cgo driver; the modernc driver keeps its existing configuration. These caches
+close with their connections and do not change the stored data.
+
+The startup worker snapshots freshness for digest-capable providers while it
+holds the archive write lock, before the daemon opens the archive; later passes
+query live state.
+
 A parser upgrade normally requires a full resync. A parser change that needs a
 full resync must build a fresh database, sync source files, copy orphaned
 sessions from the old database, and swap the files atomically. Preserve sessions
@@ -62,6 +78,106 @@ threshold only triggers a passive checkpoint after a commit, so a large
 transaction or a pinned reader can push the WAL past it (249 MiB was observed).
 Before closing the replacement, the build runs a checked truncate checkpoint.
 The swap installs only the main file, so a failed checkpoint or close aborts it.
+
+Codex forks keep accepting available messages when their replay parent is
+unavailable. Each full fork write records parent turn membership and per-message
+source origins in `codex_fork_state`, in the same transaction as the transcript
+and usage. Rebuilds copy this provenance with retained orphan sessions. Forks
+use full parses so optional parser checkpoints cannot leave provenance behind.
+
+A fork whose parent was read previously uses that saved evidence to remove the
+inherited prefix and keep child usage accurate. Without that evidence, the
+fallback transcript stays visible and may include copied parent messages. Sync
+warns about this uncertainty and withholds unverified token usage. The original
+token metadata stays in local provenance for later reconciliation. Saved
+messages and tool results absent from a shortened source remain archived.
+Retained historical usage events also survive.
+
+Reconciliation matches storage-normalized message content and consumes each
+occurrence once, including when a TraeX record emits several messages. Restored
+tool results obey the current category and archive-content policies. Retained
+messages keep their activity bounds and supply the child preview; retained usage
+events follow the final child identity and message ordinals. Restored metadata
+continues to survive full parses until it returns in the source itself. Codex
+forks with archived tool calls use staging even when the source shrinks below
+the size threshold. They load message and call metadata separately, then
+reconcile and spool result bodies one archived message at a time. Restored
+source events keep their order around shared events. Raw summary participation
+remains distinct from sanitized text, so a cleared result cannot revive older
+output. Spawn links also survive when their output records disappear.
+Summary-only saved results keep their text and lengths when the source still
+contains the call but omits its output. Blocked results retain their permitted
+length metadata across repeated staged writes, including imported events whose
+raw summary participation is unknown. Local provenance records imported events
+observed contributing readable text, so an update from one agent retains other
+agents' length contributions. Each hint includes its archived event position,
+agent, source, status, timestamp, and length. Artifact message replacements
+clear these hints in the same transaction, since even unchanged event metadata
+cannot prove that replacement content contributes. Other fork provenance
+survives. Raw nullable metadata stays unchanged. Blank unknown content
+establishes no participation. Archived calls without provider IDs use occurrence
+keys to publish their staged summaries, events, findings, and failure signals.
+Archive copies retain existing raw result digests and participation flags;
+absent fields remain unknown. Returning native output can therefore match its
+saved event after a preservation rebuild.
+
+Each saved message keeps its original ordered turn-context prefix, including
+turns that emitted no message. Prefixes share storage across snapshots and only
+referenced prefixes survive a write. Replay classification uses that source
+evidence rather than merged archive order. Pre-turn replay leaves the transcript
+and preview when the parent returns. Known source occurrences claim their
+matches before legacy rows. A matching shortened snapshot keeps the saved
+context when it contains every incoming turn in order; changed contexts use the
+current source. Retained context evidence keeps history preservation enabled
+across resolved refreshes until the source supplies it again. One reconciliation
+shares context-containment results for common prefixes. Content matches also
+preserve whether a record appeared before or inside a turn. A missing turn ID
+alone cannot identify pre-turn replay as an idless child. Saved prefixes claim
+matching content before less specific occurrence matches, so identical idless
+parent and child messages keep their separate usage. A returning longer prefix
+must keep the nearest named turn to claim saved usage. A different boundary
+keeps the occurrences separate until ownership can be established; identical
+content and timestamps alone cannot transfer usage. When fewer identical legacy
+occurrences return, their ownership remains unknown: keep those rows and their
+uncounted usage separately instead of assigning parent usage to a child.
+Repeating the same source does not add more occurrences.
+
+Independently imported usage events survive resolved refreshes and rebuilds.
+Their non-summary usage adds to message totals, and context uses the highest
+measurement from either source. Retained history keeps chronological activity
+bounds even when its only remaining rows are usage events. Ordinal-only usage
+reconciliation reads message metadata without result bodies. Matched usage
+references do not require archived result payloads. If a source omits a
+referenced message, retain that message and load its results one message at a
+time. Restored usage also follows source entries emitted before their archived
+counterpart is reconciled.
+
+Archived result events without recorded raw digests remain separate occurrences.
+Sanitized or blocked display text cannot establish provider identity, including
+during image projection. Returning source events with real digests still
+deduplicate across retries; unknown historical occurrences remain alongside them
+when their identity cannot be proved.
+
+If the parent never appears, available messages continue updating across
+retries, restarts, and rebuilds. Usage for unverified messages remains
+unavailable. If the parent later appears, reconciliation removes only confirmed
+inherited turns and restores child usage, including retained child messages
+absent from the current source. Rows without source evidence stay preserved,
+with unverifiable usage withheld until returning source records establish its
+ownership. The stale parser version continues to request a parent lookup until
+the source can be parsed with its parent. A successful rebuild still installs
+while those retries remain queued.
+
+When an Antigravity CLI source yields a retryable low-fidelity transcript, sync
+and rebuild preserve any saved history and leave it stale for retry. A new
+session can use the fallback, but later fallback changes are held until a
+high-fidelity parse succeeds. A rebuild still installs, even when these
+preserved sessions are its only work. The sync still reports them as failures,
+so the request returns an error and attached archive sources do not drain until
+a high-fidelity parse succeeds.
+
+A daemon startup whose only unfinished work is queued fork retries still counts
+as complete for draining attached archive sources.
 
 The `raw_archive_*` tables record retained captures, root identities, accepted
 sources and deletion evidence. Seed import and restore permanently enable
@@ -121,6 +237,43 @@ bounded body reads resolve project evidence in their own SQLite snapshot; body
 reads also pin the database generation and message revision. This local contract
 does not widen raw artifacts or mirror schemas.
 
+Visible conversation exports use the existing `messages.dialogue_text` field.
+They do not use message search's fallback to rendered content: a NULL projection
+is an explicit coverage gap and an empty projection means no dialogue. Keep
+selected-text digests and lengths in the conversation index, and publish a new
+revision when dialogue alone changes. The writable-open upgrade initializes
+those fields from archived messages without reparsing or replacing message IDs.
+Copies preserve both projections and apply content policy to both.
+
+Keep a known dialogue projection even when it equals display content; NULL also
+represents unclassified messages and cannot carry both meanings. Storage writes
+such a copy once: `db.StoredDialogue` decides the value every backend writes.
+When the dialogue equals `content` and `thinking_text` is empty, backends store
+NULL, which every search already reads as `content` through
+`COALESCE(dialogue_text, content)`. A message with thinking text keeps its copy,
+because search treats NULL dialogue beside thinking text as a legacy row whose
+content still contains the thinking.
+
+- SQLite sets `messages.dialogue_is_content` on those rows, and message readers
+  restore the projection from `content`. SQL that needs the full projection
+  outside search reads `sqliteDialogueExprM` or `sqliteDialogueExprBare`. The
+  writable open that adds the column moves existing copies in the same
+  transaction; it leaves the full-text update triggers out of that UPDATE,
+  because the indexed text does not change.
+- Hosted `raw_message_dialogue` stores an empty `dialogue_text` with
+  `is_content` set, and payload loads restore it from the payload's content.
+- PostgreSQL, ClickHouse, and DuckDB mirrors keep no marker. PostgreSQL and
+  ClickHouse rewrite existing copies once from schema setup, guarded by the
+  `dialogue_dedupe_v1` and `agentsview_dialogue_deduplicated` metadata keys.
+  The ClickHouse mutation must write `''` beneath the NULL; an UPDATE to plain
+  NULL keeps the old string under the null mask. DuckDB schema version 24
+  rebuilds the mirror.
+
+Data version 146 reparses providers with dialogue classification in place,
+including the shared Codex parser. Retained sources that cannot be reparsed keep
+their content and classification gaps; export itself never reads the original
+source.
+
 ### Claude subagent sources
 
 Joined local subagent writes record contributing transcript paths with the
@@ -133,42 +286,39 @@ the archive; S3 materializations do not record temporary paths.
 ### Claude persisted tool results
 
 Claude Code (and iCodeMate CLI, which shares its transcript layout and parser)
-moves a large tool output to a side file in the session's `tool-results`
-folder and leaves a placeholder in the transcript. The parser inlines the side
-file while it exists, so the first sync archives the full output. Once Claude
-Code deletes the side file after its cleanup period, a later full parse sees
-only the placeholder. The parser marks exactly the tool_result block that
-genuinely tried and failed to resolve a `persistedOutputPath`
+moves a large tool output to a side file in the session's `tool-results` folder
+and leaves a placeholder in the transcript. The parser inlines the side file
+while it exists, so the first sync archives the full output. Once Claude Code
+deletes the side file after its cleanup period, a later full parse sees only the
+placeholder. The parser marks exactly the tool_result block that genuinely tried
+and failed to resolve a `persistedOutputPath`
 (`parser.ParsedToolResult.PersistedOutputUnresolved`; never derived from the
 placeholder text's own shape). `ingest.ReconcileProviderHistory`
-(`internal/ingest/history.go`) restores each flagged current event from the
-one archived event whose `tool_use_id`, source, and timestamp all match —
-never by array position, so a dedup collapse or a retry/branch reorder can
-never pair the wrong occurrence; no unique match leaves the event untouched,
-and a later, unflagged occurrence of the same `tool_use_id` is never
-overwritten. Restoration only happens when the archive held real text; that
-text, its length, and its raw digest are restored. When the archive held
-only a length without text (the `transcripts`/`usage` archive-content
-policies, or a blocked category), the event is left alone: "blank content,
-kept length" already means something else to every reader of
-`tool_result_events` (a deduped summary, re-derived from its one
-content-bearing event), and restoring a bare length would reproduce that
+(`internal/ingest/history.go`) restores each flagged current event from the one
+archived event whose `tool_use_id`, source, and timestamp all match — never by
+array position, so a dedup collapse or a retry/branch reorder can never pair the
+wrong occurrence; no unique match leaves the event untouched, and a later,
+unflagged occurrence of the same `tool_use_id` is never overwritten. Restoration
+only happens when the archive held real text; that text, its length, and its raw
+digest are restored. When the archive held only a length without text (the
+`transcripts`/`usage` archive-content policies, or a blocked category), the
+event is left alone: "blank content, kept length" already means something else
+to every reader of `tool_result_events` (a deduped summary, re-derived from its
+one content-bearing event), and restoring a bare length would reproduce that
 same shape for an unrelated reason with no way to tell the two apart later.
-Accepted limit: once such an event's side file ages out, its archived
-length cannot be recovered on a later reparse; the event keeps whatever
-length its current placeholder text itself resolves to, not the archived
-length.
+Accepted limit: once such an event's side file ages out, its archived length
+cannot be recovered on a later reparse; the event keeps whatever length its
+current placeholder text itself resolves to, not the archived length.
 
 This is the same provider-history dispatcher every other agent's archive
 preservation already goes through, gated by `ingest.IsClaudeFormatTranscript`
 (the agent and a `.jsonl` path, covering both Claude Code and iCodeMate CLI;
 `ingest.IsClaudeFormatAgent` alone would also match iCodeMate's unrelated
 VSCode-extension storage path), so hosted Postgres mirrors reach it with no
-separate wiring. `internal/sync/engine.go`'s
-`reconcileProviderHistoryContext` checks cheaply, over the parsed messages and
-before any store read, whether anything is flagged before loading the
-archived session. Rebuilds read the old archive, and S3 Claude sessions follow
-the same rule.
+separate wiring. `internal/sync/engine.go`'s `reconcileProviderHistoryContext`
+checks cheaply, over the parsed messages and before any store read, whether
+anything is flagged before loading the archived session. Rebuilds read the old
+archive, and S3 Claude sessions follow the same rule.
 
 ### Codex deletion scope
 
@@ -243,14 +393,16 @@ failed transfer leaves the thread and its pins intact.
 Four SQLite-only tables support local Codex imports: `parser_checkpoints` holds
 resume metadata, `parser_checkpoint_blobs` holds cursor and hash state,
 `session_signal_state` holds the incremental signal reducer, and
-`tool_call_occurrence_agent_state` holds per-agent result coordinates. The last
-table is populated lazily when a call receives a late result. Other providers do
-not maintain Codex signal state. Full writes commit the signal seed with the
-content and bind it to the stored transcript revision inside SQLite. A failed
-seed rolls back the content; there is no post-commit revision read. During a
-full resync, the disposable replacement archive defers the tool-call ID and
-result metadata indexes until after the bulk load. Rebuilding them must succeed
-before the replacement can be installed.
+`tool_call_occurrence_agent_state` holds per-agent result coordinates. Claude
+uses the first two tables for hash-only checkpoints, trusting bytes before the
+128 KiB tail anchor as append-only. The last table is populated lazily when a
+call receives a late result. Other providers do not maintain Codex signal state.
+Full writes commit the signal seed with the content and bind it to the stored
+transcript revision inside SQLite. A failed seed rolls back the content; there
+is no post-commit revision read. During a full resync, the disposable
+replacement archive defers the tool-call ID and result metadata indexes until
+after the bulk load. Rebuilding them must succeed before the replacement can be
+installed.
 
 Codex result events also retain a raw-content digest and whether the raw event
 participates in the summary. These local fields distinguish events that become
@@ -297,6 +449,49 @@ Transcript-only and usage-only writes omit parser checkpoints because resumable
 hash state can contain raw trailing transcript bytes. They retain staged parsing
 but publish projected messages and tool metadata without staged output. Late
 result updates use the same projection as newly inserted messages.
+
+## Attached archive source state
+
+Ordinary installations can read fixed Docbank backup snapshots through
+`internal/archivesource`. See the
+[configuration guide](../configuration.md#history-from-a-saved-archive) for the
+user contract and limits. Archive-only installations cannot attach sources.
+
+The compact index under `archive-sources/` is disposable. It contains accepted
+source metadata, not messages. Rebuild it from the verified saved application
+database. Do not migrate that saved database or adopt its runtime identity. Key
+a directory attachment by its archive ID, never by catalog bytes; a changed
+catalog re-registers sources under the same attachment and keeps completion.
+
+`archive_attachments` and `archive_attachment_sources` track membership and
+per-source completion targets. `archive_source_bindings` binds original
+archive/device/root/source identity to an immutable manifest.
+`archive_session_provenance` binds each namespaced session to that source.
+Publish provenance and content in the same ordinary or staged write transaction;
+ordinary ingestion must refuse IDs owned by an attached source. Completion
+follows successful parsing and scratch cleanup. Global parser markers do not
+clear unfinished attachment work.
+
+Validate ownership of kept and parser-excluded results, including ordinary
+remote imports, and run exclusion policies before staging freshness versions or
+changing session metadata. A collision in one DAG branch must leave all existing
+branches unchanged. Repeat ownership checks in content write and exclusion
+transactions.
+
+Restoring an attached session invalidates source completion in every matching
+attachment and updates pending counts in the restore transaction. The next drain
+reparses the restored row even if an upgrade completed while it was trashed.
+Restores take no sync lock, so they write a fresh completion marker, and a
+source completes only if the marker it read before parsing is unchanged.
+
+Rebuilds copy registrations and ownership bindings before parsing, and copy
+session provenance with retained rows. Available sources run as contributors
+against the replacement database. Initially offline or detached sources,
+including empty mount directories with no archive layout, retain their previous
+content and completion. Corrupt archives and missing pinned snapshots in
+available repositories fail preparation. After a contributor starts, a failed
+read discards the replacement; only repository-writer contention waits and
+retries. Keep explicit column lists when carrying these tables forward.
 
 ## Archive Content Policy
 
@@ -471,6 +666,17 @@ default as the `[pg]` config key, and an explicit `false` opts out.
 
 ## Backend Parity
 
+Automatic repository project naming belongs to the writable SQLite archive.
+`repository_project_names` retains choices derived from producer-recorded
+remotes and source snapshots; explicit folder rules and session assignments win.
+Identity writes apply names in the same transaction and retain source snapshot
+labels. Metadata copies preserve the registry, and rebuilds reapply it after
+restoring snapshots. The metadata-only `db repair-projects` command uses the
+same resolver. Updates advance session publication timestamps and reconcile
+identity observations, so replica reads consume the corrected project without
+their own naming inference. Hosted raw derivation does not consume this local
+archive registry.
+
 Reporting project-label keys are not repository identities. The reporting
 catalog must resolve every contributing session from the same read transaction;
 aggregate catalogs that ignore unknown observations cannot supply that evidence.
@@ -495,11 +701,17 @@ Keep identity-only corrections in the reporting digest. The wire contract is in
   `internal/readbase.Sessions`, with required backend SQL and typed scanners.
   `readbase.ReadOnlyStubs` owns unsupported archive writes; `MirrorStubs` adds
   mirror curation and insight stubs. `HostedStore` keeps explicit forwards.
+- Published `hostedRead` operations keep physical queries, alias/link/pin
+  hydration and cursors in one read-only repeatable-read transaction. Borrowed
+  views share runtime locks and configuration, never pool ownership. Their
+  pricing loads run synchronously on that transaction and stay view-local;
+  detached pricing singleflight belongs only to owning stores. Source probes
+  retain their separate live revision fence.
 - All four backends share activity report assembly and session usage selection
   in `internal/activity`. Explicit inputs supply usage, candidate streams,
-  message counts and project maps; SQL, pricing, caches and read lifetimes stay
-  in each backend. Daily usage query strategies and aggregation loops remain
-  per backend.
+  message counts and project maps; SQL, pricing, caches and read lifetimes
+  stay in each backend. Daily usage query strategies and aggregation loops
+  remain per backend.
 
 ### Usage cache divergence
 
@@ -518,21 +730,30 @@ PostgreSQL-native optimization in
 The usage cache filename is derived from its format version and the archive
 `database_id`. A format or database-ID change selects a new generation; it does
 not migrate or rewrite the archive. Facts contain only message- and
-usage-event-derived data. Aggregate fingerprints additionally bake the exact
-session `agent` and `started_at`, because those fields affect deduplication and
-day bucketing. All other session metadata and filters come from the archive read
-snapshot. Do not widen or narrow this live/baked boundary implicitly.
+usage-event-derived data. Aggregate fingerprints bake session `agent`,
+`started_at`, `project`, `machine`, `git_branch`, `group_key`, the cron label
+derived from `session_name`, `is_automated`, and `user_message_count`. Those
+fields determine deduplication, day bucketing, grouping, and the filter
+dimensions of stored day totals. Journaled changes rebuild the session's rows
+and totals; a separately named trigger journals `session_name` changes on
+grouped sessions so older writers' trigger rebuilds leave it in place. Warm
+daily reads filter totals in SQL and read per-session rows for authoritative
+costs and dedup exceptions. Warm Top sessions rank session or group units in
+cache SQL and use installed group labels. Only returned individual sessions load
+archive names. Session counts group ordinary daily rows in SQL and add surviving
+owners. Termination and `active_since` filters still use the archive snapshot.
+Do not widen or narrow this live/baked boundary implicitly.
 
 The cache format version is also the extractor compatibility version. Bump
 `usageCacheFormatVersion` whenever fact extraction, `priceUsageFact`, web-search
 fees, deduplication, rollup semantics, or query-time model canonicalization
-change. Catalog and user-pricing changes are covered per session instead: each
-rollup install records the distinct
+change. Each rollup install records the distinct
 `(provider, reported model, canonical model)` lookups its daily rows used, and a
-read re-resolves only those against the current catalog. A price change
-therefore rebuilds just the sessions whose lookups resolve differently, while
-`updated_at`-only refreshes rebuild nothing. Do not add a write-only
-extractor-version metadata key.
+full-path read re-resolves only those against the current catalog. A catalog
+digest change sends reads through that path until a coverage pass claims the
+timezone with the new digest. The pass rebuilds only sessions whose lookups
+resolve differently; `updated_at`-only refreshes rebuild nothing. Do not add a
+write-only extractor-version metadata key.
 
 Deduplication groups are classified per group at rollup build time. A group is
 finalized into daily rows only when its resolution provably cannot vary with the
@@ -554,8 +775,8 @@ rollup installs of every other session holding a changed identity; rollup
 installation re-verifies inside its transaction that no finalized identity
 gained an outside member and, when one did, reclassifies against the newly
 committed facts rather than failing the caller. A finalized daily row must never
-survive gaining a sibling. The daemon requeues invalidated sessions after
-commit and rebuilds their rollups; CLI writes leave rebuilding to the request.
+survive gaining a sibling. The daemon requeues invalidated sessions after commit
+and rebuilds their rollups; CLI writes leave rebuilding to the request.
 
 Treat a usage-cache file as identifiable only after both its SQLite
 `application_id` and `usage_cache_metadata.cache_kind` match. Filename matching
@@ -571,13 +792,30 @@ persistent cache storage is unavailable or the current generation is
 incompatible, use the same schema and query path in a process-owned temporary
 file and warn that the cache will rebuild after restart.
 
+SQLite Activity reports read usage from `usage_facts`. Their hourly buckets and
+Copilot session-cost allocation need each row, which daily rollups drop. Before
+taking its bulk read, a report captures every live session with usage inside its
+padded usage bounds and fills their facts, the way the Usage page does. It then
+reads the candidate sessions' token facts, plus Claude snapshot peers from other
+captured sessions, through parallel cache reads, and runs the shared survivor
+selection and pricing on them. `activityReportUsage`, the raw archive row path,
+stays as the tests' oracle; reports must match it exactly.
+
 Usage reads are exact. A cold aggregate request fills facts, builds the required
-timezone rollups, then reads them in one pinned cache transaction. Verify every
-candidate session's facts fingerprint, exact baked metadata, per-session pricing
-identity, resolved rate hashes, and Cursor high-water mark. A result is no older
-than the archive snapshot captured when the read began, and may be newer for a
-session whose facts were refilled meanwhile. A session confirmed deleted during
-fill is dropped from the request. `cached_at` is diagnostic only.
+timezone rollups, then reads them in one pinned cache transaction. Without a
+trusted timezone claim, verify every candidate session's facts fingerprint,
+exact baked metadata, per-session pricing identity, resolved rate hashes, and
+Cursor high-water mark. With a trusted claim, refresh journaled sessions and
+invalidated installs, and verify coverage and concurrent installs in the pinned
+cache transaction. Covered daily totals read ordinary usage from day totals and
+load only window exception owners and matching authoritative sessions. Covered
+Top sessions skip discovery; other window reads use date indexes. Without a
+claim, enabled backfill starts coverage. After conflicts, daily totals and Top
+sessions retry once with a fresh journal capture; further conflicts and other
+reads use the full path. A result is no older than the archive snapshot captured
+when the read began, and may be newer for a session whose facts were refilled
+meanwhile. A session confirmed deleted during fill is dropped from the request.
+`cached_at` is diagnostic only.
 
 The layers are kept apart so a live archive cannot veto a read. A fill reads one
 session's facts and that session's source version inside a single archive read
@@ -591,6 +829,37 @@ their own mutation notification and appear in the next aggregation, so staleness
 of a few seconds is expected and intended. Do not reintroduce a whole-snapshot
 recheck against the archive: validating a snapshot against a source that changes
 one session at a time livelocks the request.
+
+Refills retain token-message histories when the archive generation proves the
+existing messages unchanged, the install revision matches, and no activity-only
+facts or usage events exist. They seek past the saved message ordinal and
+normalize only appended messages. Message triggers maintain
+`sessions.usage_generation`. Edits and deletes rotate the generation. A
+backdated fact timestamp, an appended activity-only fact, an edit, a deletion,
+or a usage event falls back to complete extraction. Claude suffix replacement
+and late Codex usage updates also use complete extraction.
+
+Full resync suspends the generation insert trigger,
+`messages_usage_generation_insert`, in the replacement archive during the bulk
+load. Any row trigger on `messages` makes SQLite stage every multi-row insert
+through a temporary table. With the search triggers already dropped, this
+trigger alone added about half to message insert time on a synthetic
+400,000-message resync. While it is suspended, an insert before an existing
+ordinal does not rotate the generation, and new sessions get none. Before the
+swap, `RebuildBulkImportIndexes` must reinstall the trigger and give every
+session a new generation in one transaction. A failed restore aborts the swap
+like a failed index rebuild. This discards only append prefixes cached from the
+replacement during the load: the replacement has a new database ID, so it starts
+with an empty usage cache. Live archives never suspend the trigger.
+
+Full extractions compare facts in bounded batches against one read-only cache
+snapshot and spool only changed or new rows. Comparison requires the expected
+install revision; installation checks that revision again. Complete per-session
+fact counts remove obsolete tails, and identity invalidation compares the
+complete cache before and after install. Each fact kind uses its own fixed index
+range, so a token-message append keeps activity and event rows at their existing
+positions. Existing mixed sessions move their activity and event rows once, on
+their next refill.
 
 Timezone rollup identity includes both the resolved zone name and its rule
 fingerprint. Cache-generation retirement cancels detached work immediately but
@@ -609,15 +878,21 @@ SQLite keeps paired candidates in memory per session and range start, with
 separate limits of 200,000 candidates and 4,096 entries. A full cache measured
 64.3 MiB of resident Go heap on Windows amd64, using the post-GC
 `runtime.MemStats.HeapInuse` delta for 200,000 candidates across 4,096 entries,
-with 36-byte session IDs, 24-byte models, and append-grown slices. Empty sessions
-use only the entry budget. A week report then a month report keep separate
-entries for their range starts. Entries run to `max(EffectiveEnd, RangeEnd)` and
-remain valid while the transcript revision and session creation time match.
-Reader swaps clear the entries and reject stores from earlier generations.
-Reports exceeding the entry limit reuse retained hits and store up to the cap.
-Reports exceeding the candidate budget skip storing new entries. Warm reads
-still load session revisions and merge the per-session candidates in SQLite's
-microsecond order.
+with 36-byte session IDs, 24-byte models, and append-grown slices. Each entry
+also keeps the window's counted user and assistant messages. A report counts
+messages from those entries and from its own pairing scan of the other sessions,
+so it never reads messages a second time. The scan's counted messages live only
+for that build, outside the budgets. Every counted message except a session's
+last starts a candidate, so the candidate budget bounds them too. They add about
+57 bytes each: on Linux amd64 a full cache grew from 48.3 MiB to 59.3 MiB. Empty
+sessions use only the entry budget. A week report then a month report keep
+separate entries for their range starts. Entries run to
+`max(EffectiveEnd, RangeEnd)` and remain valid while the transcript revision and
+session creation time match. Reader swaps clear the entries and reject stores
+from earlier generations. Reports exceeding the entry limit reuse retained hits
+and store up to the cap. Reports exceeding the candidate budget skip storing new
+entries. Warm reads still load session revisions and merge the per-session
+candidates in SQLite's microsecond order.
 
 Activity session selection checks terminal tool-execution events even when a
 session's `ended_at` predates the report. Keep the partial
@@ -631,15 +906,57 @@ for existing archives. PostgreSQL push must also detect its absence before
 taking the schema-current fast path. Creating the index scans existing tool
 results and can delay that first startup; it does not require a session resync.
 
+SQLite pairs activity and counts messages in one read of every timestamped
+message in selected sessions through `idx_messages_velocity` on
+`(session_id, ordinal, role, timestamp, content_length, model, is_system, source_subtype)`.
+The index covers that read, so it never loads message rows, which carry
+kilobytes of content, thinking, and dialogue text. On a 1.7 million message test
+archive the index takes 99 MiB, 10 MiB more than its older five-column form, and
+a busy week's pairing reads 41 MiB instead of 1.8 GiB. Writable opens widen the
+older form after column migrations and log that startup is waiting; the rebuild
+took about 6 s on that archive and needs no parser resync. Read-only opens use
+whichever form the archive has. PostgreSQL keeps the five-column index.
+
+The terminal candidates query names `idx_messages_assistant_model` with
+`INDEXED BY` for its prior-model lookup. The wider velocity index also covers
+that lookup, and SQLite can otherwise choose it and step back through every
+earlier message of a transcript that records no model.
+
+SQLite keeps completed Activity reports in memory with a 128 MiB estimated-size
+budget. Entries use `database_id` and `usage_pricing_revision` as their version.
+The `usage_session_changes` journal invalidates an entry when a selected session
+or an in-window Claude peer changes; a changed project identity map also
+invalidates it. Partial reports, read-only archives, and reports filtered by
+active, stale, or unclean termination status bypass this cache.
+
+PostgreSQL keeps ongoing Activity reports' ordered transcript metadata and raw
+usage inputs in memory with a 128 MiB estimated-size budget. The usage
+change journal invalidates changed sessions and their matching snapshot peers.
+Each visit selects sessions, pairs messages against the current clock, selects
+usage snapshots, and prices the surviving rows again. Message counts reuse the
+pairing read; tool events are read fresh. Journal replacement and unavailable or
+regressed revisions rebuild the inputs. Large change sets use a full read, and
+inputs above the budget aren't retained. Hosted stores and transaction views use
+their existing reads.
+
+### PostgreSQL push preparation indexes
+
+`idx_sessions_data_version`, `idx_sessions_parentless_workers`, and
+`idx_sessions_source_missing` bound the parser-version check and empty repair
+queries. Owner preparation installs missing indexes automatically. Each first
+build scans `sessions` and blocks writes until installation commits. Restricted
+publishers keep writing before owner installation, using the existing queries
+until the indexes are available.
+
 ### Usage archive indexes
 
 The usage cache discovers bounded-window candidates through
 `idx_messages_usage_timestamp` and `idx_messages_activity_timestamp`, then
 extracts each selected session through the index-only
 `idx_messages_usage_session_covering` scan. The global activity index is for
-usage-cache candidate discovery, not the Activity report; that report continues
-to avoid a global timestamp scan. Keep these indexes narrow except for the
-single session-keyed covering index that carries `token_usage`.
+usage-cache candidate discovery, not the Activity report; Activity pairing
+continues to avoid a global timestamp scan. Keep these indexes narrow except for
+the single session-keyed covering index that carries `token_usage`.
 
 Discovery collects distinct session IDs per bounded timestamp range before
 checking `sessions`, so each session is looked up once per range.
@@ -654,7 +971,9 @@ to mutate the archive from a read-only command.
 Full resync drops these indexes in the temporary database during the bulk load
 (the FTS trade: one post-load build instead of per-row B-tree maintenance) and
 must rebuild them before the swap; a failed rebuild aborts the swap because
-read-only opens require the indexes.
+read-only opens require the indexes. The same drop and rebuild suspend and
+restore the usage generation insert trigger; see
+[Usage cache divergence](#usage-cache-divergence).
 
 ### Sidebar tree index
 
@@ -665,11 +984,19 @@ after column migrations, and startup `PRAGMA optimize` gathers its statistics.
 Bulk imports retain the index, and widening it needs no parser resync. Read-only
 opens use whichever form the archive has until a writable open widens it.
 
+SQLite's recursive session-tree steps, including unpaged sidebar and session
+list queries with children, put the tree first with `CROSS JOIN` so each queued
+row seeks its children. When few sessions have parents, startup statistics
+otherwise move a sessions scan outside that per-node lookup.
+
 PostgreSQL keeps `idx_sessions_parent` on `parent_session_id` alone. The wider
-SQLite index exists because, without it, SQLite builds a temporary
-`is_automated` index on every recursive step of the child lookup. PostgreSQL
-never builds temporary indexes, so it filters `is_automated` while it uses the
-parent-only index.
+SQLite index lets each recursive child lookup seek both `parent_session_id` and
+`is_automated` instead of filtering rows found by parent alone. PostgreSQL
+filters `is_automated` while it uses the parent-only index.
+
+Hosted PostgreSQL sidebar pages resolve contextual raw parent links and legacy
+parent edges once per statement. Root orphan checks and recursive child joins
+use that query-local edge set without changing parent identity or visibility.
 
 ### Dashboard metadata index
 
@@ -683,9 +1010,60 @@ resync is required.
 Writable opens and completed bulk index builds run `PRAGMA optimize = 0x10012`.
 This considers all archive tables and limits the statistics samples. Statistics
 must cover competing indexes too: analyzing only the metadata index can leave
-SQLite choosing an older index that still reads message bodies. Full resync
-defers this index during import and rebuilds it before the replacement archive
-is installed. Read-only opens do not create indexes or collect statistics.
+SQLite choosing an older index that still reads message bodies. After optimize,
+the writer raises small `*_fts_data` row estimates and reloads statistics so
+FTS5 segment deletes keep using rowid searches as an empty archive grows. Full
+resync defers this index during import and rebuilds it before the replacement
+archive is installed. Read-only opens do not create indexes or collect
+statistics.
+
+### Substring search index
+
+Substring and regex content search narrow their message and thinking branches
+with two FTS5 tables that use the built-in `trigram` tokenizer:
+`message_trigram_fts` over `COALESCE(dialogue_text, content)` and
+`thinking_trigram_fts` over `thinking_text`. Both read from the
+`message_trigram_source` view and store `detail='none'` and `columnsize=0`, so
+they hold only message IDs per three-character sequence, about a fifth of the
+indexed text. Each field gets its own table because a `detail='none'` table
+cannot filter by column; `detail='column'` measured nearly three times larger.
+
+The index only narrows candidates. A search intersects the listed IDs for the
+pattern's sequences, up to 32 of them, and the existing `LIKE` still decides
+every row. The tokenizer folds case for every script while `LIKE` folds only
+ASCII, so the index returns a superset and results stay identical to a scan.
+Patterns shorter than three characters, single-session searches, and branches
+where the index lists more than a quarter of the messages in the scope's
+sessions keep the scan. A capped count of the listed IDs makes that choice; it
+stops as soon as the share is passed. Tool input and tool result branches are
+not indexed.
+
+Terms search uses `message_trigram_fts` under the same share rule per term. When
+the index lists any term, the query starts from the messages it lists for the
+first such term. It finds each message's exchange from the nearest eligible user
+message at or before it and the next one after, checks the other terms against
+that exchange's messages, and joins bodies only for the page. When the index
+lists no term, the session prefilter finds the sessions where each term occurs
+and the query groups every message of those sessions into exchanges. Both
+queries must return the same rows; `TestSearchContentTermsAnchorMatchesScan`
+compares them.
+
+Triggers keep both tables current on message insert, delete, and edits to
+`content`, `dialogue_text`, or `thinking_text`. Bulk session deletes remove a
+session's entries in one statement each and suspend `messages_trigram_ad`, as
+they do for the other FTS indexes. `DropFTS` and `RebuildFTS` drop and rebuild
+the index with the other FTS tables during a full resync, and searches scan
+while it is absent. Claude.ai and ChatGPT imports drop it on the live archive,
+so a search that chose index filters before the drop gets a missing-table error;
+it reruns once and scans.
+
+The first writable open after column migrations builds the index once for an
+existing archive, before HTTP readiness, and logs that startup is waiting for
+the message scan. Tokenizing costs about 2.7 times the porter FTS index, near 30
+MB of message text per second. Read-only opens use the index when present and
+scan otherwise. Hand-built legacy schemas in tests must drop
+`message_trigram_source` and the index before rebuilding or narrowing
+`messages`, because the view and triggers name its columns.
 
 ### Transcript usage identity
 
@@ -698,6 +1076,14 @@ must compare the same fields so incremental and resync paths agree. A no-op
 message replacement preserves existing secret findings; changed transcript
 content clears them for a fresh scan.
 
+### PostgreSQL usage change journal
+
+PostgreSQL's usage change journal tracks session, usage, pricing, Cursor usage,
+and project identity writes, including changes to source archives. Installation
+requires `CREATE` on the schema and `TRIGGER` on the watched tables in addition
+to normal table access. See [PostgreSQL Sync](../pg-sync.md) for installation
+locks. CockroachDB has no journal.
+
 ### PostgreSQL usage comparisons
 
 PostgreSQL stores usage timestamps in UTC with microsecond precision, while
@@ -709,10 +1095,11 @@ row IDs. The SQLite archive and the usage cache keep the original text and
 order.
 
 A metadata-only push therefore leaves unchanged messages, tool calls and usage
-events in place. A change to any accounting field still replaces the session's
-mirrored rows. A malformed local timestamp keeps its original text in the
-comparison, so it never matches PostgreSQL and the push reports the session as
-an error.
+events in place. When the transcript matches, accounting changes replace only
+usage events. A changed transcript replaces messages and their tool calls and
+results from the first changed message. A malformed local timestamp keeps its
+original text in the comparison, so it never matches PostgreSQL and the push
+reports the session as an error.
 
 ### Tool result summaries
 
@@ -744,6 +1131,9 @@ column and must join the events table to recover the text.
 - Replace whole sessions during incremental updates and gate them with
   per-session fingerprints. Do not add per-table, per-column, or diff-based
   updates.
+- When readers hold the mirror, catch up and swap a reusable standby using its
+  own cursors. Bootstrap it from the main file and WAL, retry while it is
+  held, and discard it after a full rebuild.
 - Keep Quack read-only. `duckdb push` writes the local mirror; it never writes
   to a remote DuckDB service.
 - Replace a file only after identifying it as an agentsview DuckDB mirror. Fail
@@ -767,11 +1157,18 @@ own metadata, which is why the docs below call the database a mirror.
   ClickHouse schema or data-version change. Design decisions live in
   [ClickHouse push and serve](../internal/clickhouse-mirror.md).
 - Keep push order per batch: insert dependents, then
-  `DELETE ... WHERE session_id IN (...) AND push_version < v`, then session
-  rows. Store every ClickHouse push cursor and version in the mirror's
+  `DELETE ... WHERE session_id IN (...) AND push_version < v` limited to keys
+  with no row at `v` or later (`vanishedRowsDeleteSQL`), then session rows.
+  Do not delete older rows whose key the push rewrote; `final=1` reads
+  already collapse them, and deleting them writes patch rows. Store every ClickHouse push cursor and version in the mirror's
   `sync_metadata`. Never store ClickHouse sync state in SQLite.
 - Every mirrored table is `ReplacingMergeTree(push_version)`. Every connection
-  sets `final = 1`. Do not write `FINAL` in query text. `OpenForAdmin`
+  sets `final = 1` and, unless the URL sets it, `max_threads = 8`. Do not
+  write `FINAL` in query text. `clickhouse serve` keeps a separate 4-connection
+  pool for the session list, sidebar filters, and one-session reads
+  (`pageQueryContext`); dashboard, Usage, report, and search scans use the
+  main pool (`queryContext`), sized by the URL's `max_open_conns` (default
+  12). `OpenForAdmin`
   bootstraps through the server `default` database; do not ping a DSN-path
   database that does not exist yet.
 - Derived tables (`usage_messages`, `terminal_event_snapshots`) are
@@ -781,12 +1178,24 @@ own metadata, which is why the docs below call the database a mirror.
   `usage_messages` rows count at or above it, because messages land before the
   session row is published, and `terminal_event_snapshots` rows match it
   exactly. A materialized view runs inside the insert and reads joined tables
-  in full, so filter a joined table to the inserted block's sessions. Views
-  never see deletes; `deleteMirrorSessions` clears the derived tables. Startup
-  backfills record completion in `sync_metadata` only after finishing, never
-  modify source tables, and must stay safe to repeat. See the
+  in full, so filter a joined table to the inserted block's sessions. Create
+  and update long-lived views through `ensureView`, which replaces the query of
+  a view an older release created. Views never see deletes;
+  `deleteMirrorSessions` clears the derived tables. Startup backfills record
+  completion in `sync_metadata` only after finishing, never modify source
+  tables, and must stay safe to repeat. See the
   [Activity report reads](../internal/clickhouse-mirror.md#activity-report-reads)
   design section.
+- `clickhouse push` stores per-session dashboard facts on `sessions`
+  (`dashboard_facts_version` and the `fact_*` columns) and copies each tool
+  call's message timestamp and model onto `tool_calls` (`message_facts` marks
+  those rows). Reads use them only on rows at `dashboardFactsVersion` and scan
+  messages for every other row, so results match the scan. A fact must count
+  exactly what the scan it replaces counts; change a definition only with a
+  version bump, which makes each archive's next push a full push. SQLite,
+  PostgreSQL, and DuckDB still scan; this is a ClickHouse storage-layout
+  difference. See
+  [Dashboard facts](../internal/clickhouse-mirror.md#dashboard-facts).
 - Activity report queries receive the selected session IDs as the
   `activity_candidate_ids` external table on the request context. Do not
   rebuild candidate discovery inside later queries, and never materialize a

@@ -4,6 +4,7 @@ import { mount, tick, unmount } from "svelte";
 // @ts-ignore
 import SkillTrend from "./SkillTrend.svelte";
 import { analytics } from "../../stores/analytics.svelte.js";
+import { AnalyticsService } from "../../api/generated/index.js";
 import { settings } from "../../stores/settings.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 
@@ -164,6 +165,31 @@ describe("SkillTrend", () => {
     await unmount(component);
   });
 
+  it("draws legend and lines in color-blind safe colors when chosen", async () => {
+    settings.chartPalette = "colorblind";
+    const component = mountWithData();
+    await tick();
+
+    const legendColorBySkill = Object.fromEntries(
+      [...document.querySelectorAll<HTMLElement>(".legend-chip")].map((chip) => [
+        chip.querySelector(".legend-name")?.textContent?.trim(),
+        chip.querySelector<HTMLElement>(".legend-key")?.style.background,
+      ]),
+    );
+    // Petroff's six-color sequence, in skill name order.
+    expect(legendColorBySkill).toEqual({
+      commit: "rgb(87, 144, 252)",
+      deploy: "rgb(248, 156, 32)",
+      review: "rgb(228, 37, 54)",
+    });
+    const lineColors = [...document.querySelectorAll<SVGPathElement>(".series-line")].map(
+      (line) => line.style.stroke,
+    );
+    expect(new Set(lineColors)).toEqual(new Set(Object.values(legendColorBySkill)));
+
+    await unmount(component);
+  });
+
   it("keeps a Matplotlib survivor color stable when a series is hidden", async () => {
     settings.chartPalette = "matplotlib";
     const component = mountWithData();
@@ -293,30 +319,49 @@ describe("SkillTrend", () => {
     await unmount(component);
   });
 
-  it("requests granularity changes through the shared picker", async () => {
-    const fetchSpy = vi.spyOn(analytics, "fetchSkills").mockResolvedValue("ok");
+  it("requests granularity through the picker and hides the previous trend after failure", async () => {
     const component = mountWithData();
-    await tick();
-
-    const monthBtn = [...document.querySelectorAll<HTMLButtonElement>(".trend-header button")].find(
-      (b) => b.textContent?.trim() === "Month",
-    );
-    expect(monthBtn).toBeTruthy();
-    monthBtn!.click();
-    await tick();
-
-    expect(fetchSpy).toHaveBeenCalledOnce();
-    expect(fetchSpy).toHaveBeenCalledWith("month");
-
-    await unmount(component);
+    const data = analytics.skills!;
+    const read = vi.spyOn(AnalyticsService, "getApiV1AnalyticsSkills").mockResolvedValue(data);
+    await analytics.fetchSkills("week");
+    const fetchSpy = vi.spyOn(analytics, "fetchSkills");
+    read.mockRejectedValueOnce(new Error("Month failed"));
+    try {
+      await tick();
+      const monthBtn = [
+        ...document.querySelectorAll<HTMLButtonElement>(".trend-header button"),
+      ].find((b) => b.textContent?.trim() === "Month");
+      expect(monthBtn).toBeTruthy();
+      monthBtn!.click();
+      await vi.waitFor(() => expect(document.body.textContent).toContain("Month failed"));
+      expect(fetchSpy).toHaveBeenCalledExactlyOnceWith("month");
+      expect(monthBtn!.classList).toContain("active");
+      expect(document.querySelector(".chart")).toBeNull();
+    } finally {
+      await analytics.fetchSkills("week");
+      await unmount(component);
+    }
   });
 
-  it("renders empty state", async () => {
+  it("shows an empty message only after receiving empty results", async () => {
     analytics.skills = skillsResponse([]);
+    const data = analytics.skills;
+    analytics.skills = null;
     const component = mount(SkillTrend, { target: document.body });
     await tick();
 
+    expect(document.querySelector(".loading")).not.toBeNull();
+    analytics.skills = data;
+    await tick();
     expect(document.body.textContent).toContain("No skill usage data");
+    expect(document.querySelector(".loading")).toBeNull();
+
+    analytics.errors.skills = "request failed";
+    await tick();
+    expect(document.body.textContent).toContain("No skill usage data");
+    analytics.skills = null;
+    await tick();
+    expect(document.body.textContent).not.toContain("No skill usage data");
 
     await unmount(component);
   });
@@ -333,10 +378,10 @@ describe("SkillTrend", () => {
     await tick();
 
     expect(document.body.textContent).toContain("Failed to load");
-    document.querySelector<HTMLButtonElement>(".retry-btn")!.click();
+    document.querySelector<HTMLButtonElement>(".error button")!.click();
     await tick();
 
-    expect(retrySpy).toHaveBeenCalledOnce();
+    expect(retrySpy).toHaveBeenCalledExactlyOnceWith();
 
     await unmount(component);
   });

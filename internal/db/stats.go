@@ -10,11 +10,12 @@ import (
 
 // Stats holds database-wide statistics.
 type Stats struct {
-	SessionCount    int     `json:"session_count"`
-	MessageCount    int     `json:"message_count"`
-	ProjectCount    int     `json:"project_count"`
-	MachineCount    int     `json:"machine_count"`
-	EarliestSession *string `json:"earliest_session"`
+	SessionCount         int     `json:"session_count"`
+	MessageCount         int     `json:"message_count"`
+	ProjectCount         int     `json:"project_count"`
+	MachineCount         int     `json:"machine_count"`
+	EarliestSession      *string `json:"earliest_session"`
+	EarliestAccountUsage *string `json:"earliest_account_usage,omitempty"`
 }
 
 // rootSessionFilter is the WHERE clause shared by session list
@@ -77,6 +78,26 @@ func (db *DB) FileBackedSessionCountForSource(
 	ctx context.Context, machine, idPrefix string,
 ) (int, error) {
 	return db.fileBackedSessionCount(ctx, machine, idPrefix, true)
+}
+
+// FileBackedSessionCountForArchiveSource counts protected sessions belonging to
+// one accepted source, regardless of which attachment originally imported it.
+func (db *DB) FileBackedSessionCountForArchiveSource(
+	ctx context.Context, provenance ArchiveSourceProvenance,
+) (int, error) {
+	source := provenance.Source
+	args := []any{source.ArchiveID, source.DeviceID, source.RootID, source.SourceKey, provenance.ManifestID}
+	args = append(args, nonSourceBackedAgentArgs()...)
+	var count int
+	err := db.getReader().QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM archive_session_provenance p JOIN sessions ON sessions.id=p.session_id
+		WHERE p.archive_id=? AND p.device_id=? AND p.root_id=? AND p.source_key=? AND p.manifest_id=?
+		AND agent NOT IN (`+nonSourceBackedAgentPlaceholders()+`)
+		AND `+rootSessionFilter, args...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("counting archive source file sessions: %w", err)
+	}
+	return count, nil
 }
 
 // RebuildAgentExclusion names an agent whose sessions leave the protected
@@ -189,8 +210,8 @@ func (db *DB) fileBackedSessionCount(
 	return count, nil
 }
 
-// GetStats returns database statistics, counting only root
-// sessions with messages (matching the session list filter).
+// GetStats counts sessions with the sidebar's canonical root rule.
+// Other totals exclude subagents and forks, and include continuations.
 func (db *DB) GetStats(
 	ctx context.Context,
 	excludeOneShot, excludeAutomated bool,
@@ -206,20 +227,24 @@ func (db *DB) GetStats(
 	if excludeAutomated {
 		filter += " AND is_automated = 0"
 	}
-	// Sidebar polling needs all totals for the same rows. Aggregate them
-	// together so each refresh visits the filtered sessions only once.
-	query := `SELECT COUNT(*), COALESCE(SUM(message_count), 0),
+	billingStart := "NULL"
+	if db.hasCursorUsageTable(ctx) {
+		billingStart = "(SELECT MIN(occurred_at) FROM cursor_usage_events)"
+	}
+	count, args := StatsRootCountSQL(SQLiteQueryDialect(), excludeOneShot, excludeAutomated)
+	query := `SELECT ` + count + `, COALESCE(SUM(message_count), 0),
 		COUNT(DISTINCT project), COUNT(DISTINCT machine),
-		MIN(COALESCE(NULLIF(started_at, ''), created_at))
+		MIN(COALESCE(NULLIF(started_at, ''), created_at)), ` + billingStart + `
 		FROM sessions WHERE ` + filter
 
 	var s Stats
-	err := db.getReader().QueryRowContext(ctx, query).Scan(
+	err := db.getReader().QueryRowContext(ctx, query, args...).Scan(
 		&s.SessionCount,
 		&s.MessageCount,
 		&s.ProjectCount,
 		&s.MachineCount,
 		&s.EarliestSession,
+		&s.EarliestAccountUsage,
 	)
 	if err != nil {
 		return Stats{}, fmt.Errorf("fetching stats: %w", err)

@@ -21,6 +21,24 @@ created timestamp. A schema-version change builds a fresh mirror, validates it,
 and swaps it into place atomically. `EnsureSchema` initializes fresh mirrors; it
 is not an in-place production migration path.
 
+## Mirror writes
+
+Full and incremental pushes replace complete sessions in the existing
+session-batch transactions. Sessions, messages, tool calls, result events, and
+usage events use native appenders with a shared 1 MiB payload flush bound. An
+oversized row is flushed alone, without truncation. These limits do not bound
+the existing whole-session source load.
+
+Errors and cancellation roll back the whole transaction; chunks never commit
+independently.
+
+The generated full-mirror benchmark checks stored row counts outside its timed
+`Push` calls. Run it with:
+
+```bash
+go test -tags fts5 ./internal/duckdb -run '^$' -bench '^BenchmarkMirrorPush$' -benchtime=1x -count=3
+```
+
 Search currently keeps substring/regex fallback behavior. The DuckDB FTS
 extension is available locally in the pinned runtime, but BM25 lookup does not
 resolve through Quack-attached catalogs, so indexed DuckDB search is deferred

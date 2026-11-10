@@ -32,12 +32,8 @@ type Mirror interface {
 type MirrorPushOptions struct {
 	Projects        []string
 	ExcludeProjects []string
-	// Automatic marks a watch-mode or daemon-driven push, keeping its cost
-	// bounded by the changed batch: when reader processes block the
-	// incremental push's write open, automatic pushes defer (a successful
-	// no-op with Diagnostics.Deferred set) instead of running an
-	// O(archive) rebuild on every changed batch, and they skip
-	// archive-scale diagnostics. Explicit pushes leave it unset.
+	// Automatic marks a watch-mode or daemon-driven push. It skips
+	// archive-scale diagnostics and defers on rebuild-lock contention.
 	Automatic bool
 }
 
@@ -50,6 +46,10 @@ type MirrorPushResult struct {
 	Errors         int
 	Duration       time.Duration
 	Diagnostics    MirrorPushDiagnostics
+	// ArchiveRebuilt reports that a daemon push's sync rebuilt the archive
+	// before the push ran. The next push of every mirror then runs in full,
+	// so a deferred push need not keep a --full request.
+	ArchiveRebuilt bool
 }
 
 type mirrorPushResultJSON MirrorPushResult
@@ -91,10 +91,8 @@ type MirrorPushDiagnostics struct {
 	// because the local in-scope curation state's fingerprint matched what
 	// was already recorded in the mirror.
 	CurationRefreshed bool
-	// Deferred reports that the push touched nothing because reader
-	// processes hold the mirror and the caller opted into
-	// MirrorPushOptions.Automatic; DeferredReason carries the explanation.
-	// No cutoff or mirror state advances on a deferred push.
+	// Deferred reports that an automatic push yielded to another publisher.
+	// DeferredReason carries the explanation. No mirror state advances.
 	Deferred       bool
 	DeferredReason string
 }
@@ -107,6 +105,11 @@ type MirrorSessionCounts struct {
 
 // MirrorPushProgress is reported after each attempted session.
 type MirrorPushProgress struct {
+	// Phase is PushPhaseWaiting while a daemon push waits for another push
+	// to finish, PushPhaseRebuilt once when its sync rebuilt the archive,
+	// PushPhaseWaitingForSync while it waits for a local sync to finish, and
+	// "" otherwise.
+	Phase         string
 	SessionsDone  int
 	SessionsTotal int
 	MessagesDone  int

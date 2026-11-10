@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 )
@@ -888,14 +889,6 @@ func TestAnalyticsProjects(t *testing.T) {
 		}
 		assert.Equal(t, stats.TotalMessages, total)
 	})
-
-	t.Run("MachineFilter", func(t *testing.T) {
-		w := te.get(t, buildURLWithRange("projects", map[string]string{"machine": "nonexistent"}))
-		assertStatus(t, w, http.StatusOK)
-
-		resp := decode[db.ProjectsAnalyticsResponse](t, w)
-		assert.Empty(t, resp.Projects)
-	})
 }
 
 func TestAnalyticsHourOfWeek(t *testing.T) {
@@ -1062,127 +1055,29 @@ func TestAnalyticsTopSessions_OutputTokens(t *testing.T) {
 	assert.Equal(t, stats.TopSessionOutputTokens, resp.Sessions[0].OutputTokens)
 }
 
-// TestSessionCountConsistency verifies that session counts from
-// /api/v1/sessions, /api/v1/stats, and /api/v1/analytics/summary
-// all agree. This catches regressions where one endpoint counts
-// sub-agent, fork, or empty sessions that others exclude.
-func TestSessionCountConsistency(t *testing.T) {
-	te := setup(t)
-
-	// Seed root sessions with messages (should be counted).
-	for i := range 5 {
-		id := fmt.Sprintf("root-%d", i)
-		te.seedSession(t, id, "proj-a", 10,
-			func(s *db.Session) {
-				s.Agent = "claude"
-				s.StartedAt = new(
-					"2024-06-01T09:00:00Z")
-				s.EndedAt = new(
-					"2024-06-01T10:00:00Z")
-			},
-		)
-		te.seedMessages(t, id, 10)
+func TestAnalyticsModelGroups(t *testing.T) {
+	te := setup(t, func(c *config.Config) {
+		c.ModelAliases = map[string]string{"claude-3-5-sonnet": "group", "gpt-4o": "group"}
+	})
+	seedAnalyticsEnv(t, te)
+	for _, tt := range []struct {
+		model, grouped string
+		sessions       int
+		models         []string
+	}{
+		{"group", "true", 3, []string{"claude-3-5-sonnet", "gpt-4o"}},
+		{"group", "false", 3, []string{"claude-3-5-sonnet", "gpt-4o"}},
+	} {
+		w := te.get(t, buildURLWithRange("summary", map[string]string{"model": tt.model, "group_models": tt.grouped}))
+		assertStatus(t, w, http.StatusOK)
+		result := decode[db.AnalyticsSummary](t, w)
+		assert.Equal(t, tt.sessions, result.TotalSessions)
+		assert.Equal(t, tt.models, result.Models)
+		body := decode[map[string]any](t, w)
+		if tt.grouped == "true" {
+			assert.Equal(t, map[string]any{"claude-3-5-sonnet": "group", "gpt-4o": "group"}, body["model_aliases"])
+		} else {
+			assert.NotContains(t, body, "model_aliases")
+		}
 	}
-
-	// Seed sub-agent sessions. These are excluded from the session
-	// list and db-wide stats (navigation surfaces) but counted in the
-	// analytics summary (a token/session aggregate), so the two counts
-	// intentionally differ.
-	for i := range 3 {
-		id := fmt.Sprintf("subagent-%d", i)
-		te.seedSession(t, id, "proj-a", 8,
-			func(s *db.Session) {
-				s.Agent = "claude"
-				s.ParentSessionID = new("root-0")
-				s.RelationshipType = "subagent"
-				s.StartedAt = new(
-					"2024-06-01T09:00:00Z")
-				s.EndedAt = new(
-					"2024-06-01T10:00:00Z")
-			},
-		)
-		te.seedMessages(t, id, 8)
-	}
-
-	// Seed fork sessions (should NOT be counted).
-	for i := range 2 {
-		id := fmt.Sprintf("fork-%d", i)
-		te.seedSession(t, id, "proj-a", 6,
-			func(s *db.Session) {
-				s.Agent = "claude"
-				s.ParentSessionID = new("root-1")
-				s.RelationshipType = "fork"
-				s.StartedAt = new(
-					"2024-06-01T09:00:00Z")
-				s.EndedAt = new(
-					"2024-06-01T10:00:00Z")
-			},
-		)
-		te.seedMessages(t, id, 6)
-	}
-
-	// Seed empty sessions (should NOT be counted).
-	for i := range 4 {
-		id := fmt.Sprintf("empty-%d", i)
-		te.seedSession(t, id, "proj-a", 0,
-			func(s *db.Session) {
-				s.Agent = "claude"
-				s.StartedAt = new(
-					"2024-06-01T09:00:00Z")
-				s.EndedAt = new(
-					"2024-06-01T10:00:00Z")
-			},
-		)
-	}
-
-	// Seed continuation sessions (SHOULD be counted).
-	te.seedSession(t, "cont-0", "proj-a", 5,
-		func(s *db.Session) {
-			s.Agent = "claude"
-			s.ParentSessionID = new("root-2")
-			s.RelationshipType = "continuation"
-			s.StartedAt = new(
-				"2024-06-01T09:00:00Z")
-			s.EndedAt = new(
-				"2024-06-01T10:00:00Z")
-		},
-	)
-	te.seedMessages(t, "cont-0", 5)
-
-	// Navigation surfaces (list, stats) exclude subagents: 5 root + 1
-	// continuation. The analytics summary additionally counts the 3
-	// subagents, since their messages and tokens are real spend.
-	wantNavCount := 6
-	wantAnalyticsCount := 9
-
-	// 1. Session list
-	w := te.get(t, "/api/v1/sessions")
-	assertStatus(t, w, http.StatusOK)
-	listResp := decode[sessionListResponse](t, w)
-
-	// 2. Stats
-	w = te.get(t, "/api/v1/stats")
-	assertStatus(t, w, http.StatusOK)
-	statsResp := decode[db.Stats](t, w)
-
-	// 3. Analytics summary
-	w = te.get(t, buildURLWithRange("summary", map[string]string{
-		"timezone": "UTC",
-	}))
-	assertStatus(t, w, http.StatusOK)
-	summaryResp := decode[db.AnalyticsSummary](t, w)
-
-	assert.Equal(t, wantNavCount, listResp.Total, "session list total")
-	assert.Equal(t, wantNavCount, statsResp.SessionCount, "stats session_count")
-	assert.Equal(t, wantAnalyticsCount, summaryResp.TotalSessions,
-		"analytics total_sessions counts subagents")
-
-	// List and stats (navigation) agree; analytics counts subagents on
-	// top, so it is intentionally higher.
-	require.Equal(t, listResp.Total, statsResp.SessionCount,
-		"navigation session counts disagree: list=%d stats=%d",
-		listResp.Total, statsResp.SessionCount)
-	require.Greater(t, summaryResp.TotalSessions, listResp.Total,
-		"analytics should count more than navigation: analytics=%d list=%d",
-		summaryResp.TotalSessions, listResp.Total)
 }

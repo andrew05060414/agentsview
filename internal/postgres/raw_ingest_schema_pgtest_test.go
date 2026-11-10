@@ -15,13 +15,15 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/db"
 )
 
 func TestEnsureSchemaCreatesRawIngestCustodyTables(t *testing.T) {
 	pgURL := testPGURL(t)
 	cleanSchemaTestPG(t, pgURL)
 	t.Cleanup(func() { cleanSchemaTestPG(t, pgURL) })
-	pg, err := Open(pgURL, schemaTestSchema, true)
+	pg, err := Open(t.Context(), pgURL, schemaTestSchema, true)
 	require.NoError(t, err)
 	defer pg.Close()
 
@@ -71,7 +73,7 @@ func TestRawIngestSchemaUsesTenantScopedKeys(t *testing.T) {
 	pgURL := testPGURL(t)
 	cleanSchemaTestPG(t, pgURL)
 	t.Cleanup(func() { cleanSchemaTestPG(t, pgURL) })
-	pg, err := Open(pgURL, schemaTestSchema, true)
+	pg, err := Open(t.Context(), pgURL, schemaTestSchema, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, pg.Close()) })
 	require.NoError(t, EnsureSchema(t.Context(), pg, schemaTestSchema))
@@ -141,7 +143,7 @@ func TestRawIngestSchemaEnforcesCaptureAndObjectCustody(t *testing.T) {
 	pgURL := testPGURL(t)
 	cleanSchemaTestPG(t, pgURL)
 	t.Cleanup(func() { cleanSchemaTestPG(t, pgURL) })
-	pg, err := Open(pgURL, schemaTestSchema, true)
+	pg, err := Open(t.Context(), pgURL, schemaTestSchema, true)
 	require.NoError(t, err)
 	defer pg.Close()
 	require.NoError(t, EnsureSchema(t.Context(), pg, schemaTestSchema))
@@ -219,7 +221,7 @@ func TestSyncEnsureSchemaCreatesRawCustodyOnLegacyFastPath(t *testing.T) {
 	pgURL := testPGURL(t)
 	cleanSchemaTestPG(t, pgURL)
 	t.Cleanup(func() { cleanSchemaTestPG(t, pgURL) })
-	pg, err := Open(pgURL, schemaTestSchema, true)
+	pg, err := Open(t.Context(), pgURL, schemaTestSchema, true)
 	require.NoError(t, err)
 	defer pg.Close()
 	require.NoError(t, EnsureSchema(t.Context(), pg, schemaTestSchema))
@@ -253,55 +255,103 @@ func TestSyncEnsureSchemaCreatesRawCustodyOnLegacyFastPath(t *testing.T) {
 	require.NoError(t, rows.Close())
 }
 
-// TestSyncEnsureSchemaFastPathToleratesRestrictedRole pins the restricted-role
-// push path: a privileged role provisioned the schema, including the raw
-// custody tables, but the push role cannot CREATE. PostgreSQL still checks
-// CREATE for CREATE TABLE IF NOT EXISTS, so the fast path must skip raw
-// custody DDL on SQLSTATE 42501 rather than fail every push.
 func TestSyncEnsureSchemaFastPathToleratesRestrictedRole(t *testing.T) {
 	pgURL := testPGURL(t)
 	const schema = "agentsview_raw_privilege_test"
 	const role = "agentsview_raw_restricted"
 	const rolePassword = "agentsview_raw_restricted_pw"
 
-	admin, err := Open(pgURL, schema, true)
+	admin, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open admin")
 	t.Cleanup(func() { _ = admin.Close() })
-	_, err = admin.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	_, err = admin.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
 	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(t.Context(), admin, schema))
 	require.True(t, pushSchemaCurrent(t.Context(), admin),
 		"fixture must exercise the schema-current sync fast path")
 
-	_, _ = admin.Exec(`DROP OWNED BY ` + role)
-	_, _ = admin.Exec(`DROP ROLE IF EXISTS ` + role)
-	_, err = admin.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD '` + rolePassword + `'`)
+	_, _ = admin.ExecContext(t.Context(), `DROP OWNED BY `+role)
+	_, _ = admin.ExecContext(t.Context(), `DROP ROLE IF EXISTS `+role)
+	_, err = admin.ExecContext(t.Context(), `CREATE ROLE `+role+` LOGIN PASSWORD '`+rolePassword+`'`)
 	require.NoError(t, err, "create restricted role")
 	t.Cleanup(func() {
-		_, _ = admin.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
-		_, _ = admin.Exec(`DROP OWNED BY ` + role)
-		_, _ = admin.Exec(`DROP ROLE IF EXISTS ` + role)
+		_, _ = admin.ExecContext(context.WithoutCancel(t.Context()), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+		_, _ = admin.ExecContext(context.WithoutCancel(t.Context()), `DROP OWNED BY `+role)
+		_, _ = admin.ExecContext(context.WithoutCancel(t.Context()), `DROP ROLE IF EXISTS `+role)
 	})
 	for _, grant := range []string{
 		`GRANT USAGE ON SCHEMA ` + schema + ` TO ` + role,
 		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ` + schema + ` TO ` + role,
 		`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ` + schema + ` TO ` + role,
 	} {
-		_, err = admin.Exec(grant)
+		_, err = admin.ExecContext(t.Context(), grant)
 		require.NoError(t, err, grant)
 	}
 
 	restrictedURL, err := url.Parse(pgURL)
 	require.NoError(t, err)
 	restrictedURL.User = url.UserPassword(role, rolePassword)
-	restricted, err := Open(restrictedURL.String(), schema, true)
+	restricted, err := Open(t.Context(), restrictedURL.String(), schema, true)
 	require.NoError(t, err, "Open restricted")
 	t.Cleanup(func() { _ = restricted.Close() })
 
+	indexes := []string{"idx_sessions_data_version", "idx_sessions_parentless_workers", "idx_sessions_source_missing"}
+	for _, index := range indexes {
+		_, err = admin.ExecContext(t.Context(), `DROP INDEX `+index)
+		require.NoError(t, err)
+	}
+	_, err = admin.ExecContext(t.Context(), `DROP TRIGGER trg_sessions_automation_audit ON sessions;
+ DROP INDEX idx_sessions_automation_audit; ALTER TABLE sessions DROP COLUMN automation_audit_hash;
+ INSERT INTO sessions(id,machine,project,agent,first_message,user_message_count) VALUES
+ ('restricted-stale','host','project','codex','Warmup',1), ('restricted-stable','host','project','codex','Explain this function.',1)`)
+	require.NoError(t, err)
+	for _, full := range []bool{false, true} {
+		var progress automatedAuditPGProgress
+		var verdicts []automationVerdictPG
+		if full {
+			verdicts, err = auditAutomatedFullPG(t.Context(), restricted, db.SnapshotAutomationClassifier(), &progress, "xmin")
+		} else {
+			verdicts, err = auditAutomatedMatchingHashPG(t.Context(), restricted, db.SnapshotAutomationClassifier(), &progress, "xmin", nil)
+		}
+		require.NoError(t, err)
+		require.Len(t, verdicts, 1, "full=%t: unchanged fallback verdicts must be discarded before write-back", full)
+		assert.Equal(t, "restricted-stale", verdicts[0].id)
+	}
+	// Usage-only publication keeps verdicts while discarding prompt evidence.
+	_, err = admin.ExecContext(t.Context(), `INSERT INTO sessions(id,machine,project,agent,session_kind,user_message_count,is_automated,prompt_evidence_discarded) VALUES
+ ('automated','host','project','claude','',1,true,true),
+ ('interactive','host','project','claude','',1,false,true),
+ ('empty-full','host','project','claude','',1,true,false),
+ ('codex-headless','host','project','codex','headless',2,true,true),
+ ('codex-interactive','host','project','codex','',2,false,true),
+ ('headless-full','host','project','codex','headless',2,true,false)`)
+	require.NoError(t, err)
+	for _, hash := range []string{db.ClassifierHash(), "old-classifier"} {
+		_, err = admin.ExecContext(t.Context(), `UPDATE sessions SET is_automated = TRUE WHERE id IN ('empty-full', 'headless-full')`)
+		require.NoError(t, err)
+		_, err = admin.ExecContext(t.Context(), `UPDATE sync_metadata SET value = $1 WHERE key = $2`, hash, db.ClassifierHashKey)
+		require.NoError(t, err)
+		require.NoError(t, backfillIsAutomatedPG(t.Context(), restricted))
+		for id, want := range map[string]bool{"automated": true, "interactive": false, "empty-full": false, "codex-headless": true, "codex-interactive": false, "headless-full": false} {
+			var got bool
+			require.NoError(t, restricted.QueryRowContext(t.Context(), `SELECT is_automated FROM sessions WHERE id = $1`, id).Scan(&got))
+			assert.Equal(t, want, got, "hash=%s id=%s", hash, id)
+		}
+	}
 	syncer := &Sync{pg: restricted, schema: schema}
 	require.NoError(t, syncer.EnsureSchema(t.Context()),
-		"restricted push role must not fail on raw custody DDL")
+		"restricted preparation must tolerate index and raw custody DDL permissions")
 	assert.True(t, syncer.schemaDone)
+	for _, index := range indexes {
+		assert.False(t, pgHasIndex(t.Context(), admin, index), "restricted publisher cannot install %s", index)
+	}
+	var automated bool
+	require.NoError(t, restricted.QueryRowContext(t.Context(), `SELECT is_automated FROM sessions WHERE id='restricted-stale'`).Scan(&automated))
+	assert.True(t, automated)
+	require.NoError(t, EnsureSchema(t.Context(), admin, schema))
+	progress, err := backfillIsAutomatedPGWithProgress(t.Context(), restricted)
+	require.NoError(t, err)
+	assert.Zero(t, progress.RowsPrefetched, "owner installation enables incremental restricted publication")
 	writable, err := CanWriteRawSyncSchema(t.Context(), restricted, schema)
 	require.NoError(t, err)
 	assert.True(t, writable,
@@ -314,21 +364,21 @@ func TestCanWriteRawSyncSchemaRequiresExactRuntimePrivileges(t *testing.T) {
 	const role = "agentsview_raw_runtime"
 	const rolePassword = "agentsview_raw_runtime_pw"
 
-	admin, err := Open(pgURL, schema, true)
+	admin, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open admin")
 	t.Cleanup(func() { _ = admin.Close() })
-	_, err = admin.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	_, err = admin.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
 	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(t.Context(), admin, schema))
 
-	_, _ = admin.Exec(`DROP OWNED BY ` + role)
-	_, _ = admin.Exec(`DROP ROLE IF EXISTS ` + role)
-	_, err = admin.Exec(`CREATE ROLE ` + role + ` LOGIN PASSWORD '` + rolePassword + `'`)
+	_, _ = admin.ExecContext(t.Context(), `DROP OWNED BY `+role)
+	_, _ = admin.ExecContext(t.Context(), `DROP ROLE IF EXISTS `+role)
+	_, err = admin.ExecContext(t.Context(), `CREATE ROLE `+role+` LOGIN PASSWORD '`+rolePassword+`'`)
 	require.NoError(t, err, "create runtime role")
 	t.Cleanup(func() {
-		_, _ = admin.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
-		_, _ = admin.Exec(`DROP OWNED BY ` + role)
-		_, _ = admin.Exec(`DROP ROLE IF EXISTS ` + role)
+		_, _ = admin.ExecContext(context.WithoutCancel(t.Context()), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+		_, _ = admin.ExecContext(context.WithoutCancel(t.Context()), `DROP OWNED BY `+role)
+		_, _ = admin.ExecContext(context.WithoutCancel(t.Context()), `DROP ROLE IF EXISTS `+role)
 	})
 	for _, grant := range []string{
 		`GRANT USAGE ON SCHEMA ` + schema + ` TO ` + role,
@@ -343,14 +393,14 @@ func TestCanWriteRawSyncSchemaRequiresExactRuntimePrivileges(t *testing.T) {
 		`GRANT INSERT ON ` + schema + `.raw_ingest_jobs TO ` + role,
 		`GRANT USAGE ON SEQUENCE ` + schema + `.raw_ingest_jobs_id_seq TO ` + role,
 	} {
-		_, err = admin.Exec(grant)
+		_, err = admin.ExecContext(t.Context(), grant)
 		require.NoError(t, err, grant)
 	}
 
 	restrictedURL, err := url.Parse(pgURL)
 	require.NoError(t, err)
 	restrictedURL.User = url.UserPassword(role, rolePassword)
-	restricted, err := Open(restrictedURL.String(), schema, true)
+	restricted, err := Open(t.Context(), restrictedURL.String(), schema, true)
 	require.NoError(t, err, "Open runtime role")
 	t.Cleanup(func() { _ = restricted.Close() })
 
@@ -363,7 +413,7 @@ func TestCanWriteRawSyncSchemaRequiresExactRuntimePrivileges(t *testing.T) {
 	assert.False(t, writable, "the prior insert-only job grants disable raw-sync routes")
 	assert.Contains(t, output.String(), "raw-sync routes disabled; missing requirements: SELECT ON raw_ingest_jobs, UPDATE ON raw_ingest_jobs")
 
-	_, err = admin.Exec(`GRANT SELECT, UPDATE ON ` + schema + `.raw_ingest_jobs TO ` + role)
+	_, err = admin.ExecContext(t.Context(), `GRANT SELECT, UPDATE ON `+schema+`.raw_ingest_jobs TO `+role)
 	require.NoError(t, err)
 	writable, err = CanWriteRawSyncSchema(t.Context(), restricted, schema)
 	require.NoError(t, err)
@@ -400,10 +450,10 @@ func TestCanWriteRawSyncSchemaRequiresExactRuntimePrivileges(t *testing.T) {
 				schema + `.` + required.table + ` FROM ` + role
 			grant := `GRANT ` + required.privilege + ` ON ` +
 				schema + `.` + required.table + ` TO ` + role
-			_, err := admin.Exec(revoke)
+			_, err := admin.ExecContext(t.Context(), revoke)
 			require.NoError(t, err, revoke)
 			t.Cleanup(func() {
-				_, cleanupErr := admin.Exec(grant)
+				_, cleanupErr := admin.ExecContext(context.WithoutCancel(t.Context()), grant)
 				require.NoError(t, cleanupErr, grant)
 			})
 
@@ -419,28 +469,28 @@ func TestCanWriteRawSyncSchemaAcceptsSequenceFreeJobIDs(t *testing.T) {
 	pgURL := testPGURL(t)
 	const schema = "agentsview_raw_sequence_free_test"
 
-	pg, err := Open(pgURL, schema, true)
+	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = pg.Close() })
-	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+		_, _ = pg.ExecContext(context.WithoutCancel(t.Context()), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
 	})
 	require.NoError(t, EnsureSchema(t.Context(), pg, schema))
 
 	var sequenceName sql.NullString
-	err = pg.QueryRow(`SELECT pg_get_serial_sequence(
+	err = pg.QueryRowContext(t.Context(), `SELECT pg_get_serial_sequence(
 		$1, 'id'
 	)`, schema+".raw_ingest_jobs").Scan(&sequenceName)
 	require.NoError(t, err)
 	if sequenceName.Valid {
-		_, err = pg.Exec(`ALTER TABLE ` + schema + `.raw_ingest_jobs
+		_, err = pg.ExecContext(t.Context(), `ALTER TABLE `+schema+`.raw_ingest_jobs
 			ALTER COLUMN id SET DEFAULT (
 				EXTRACT(EPOCH FROM clock_timestamp()) * 1000000
 			)::BIGINT`)
 		require.NoError(t, err)
-		_, err = pg.Exec(`DROP SEQUENCE ` + schema + `.raw_ingest_jobs_id_seq`)
+		_, err = pg.ExecContext(t.Context(), `DROP SEQUENCE `+schema+`.raw_ingest_jobs_id_seq`)
 		require.NoError(t, err)
 	}
 
@@ -457,7 +507,7 @@ func TestEnsureRawIngestSchemaPGSerializesConcurrentGuardInstallers(t *testing.T
 	cleanSchemaTestPG(t, pgURL)
 	t.Cleanup(func() { cleanSchemaTestPG(t, pgURL) })
 
-	pg, err := Open(pgURL, schemaTestSchema, true)
+	pg, err := Open(t.Context(), pgURL, schemaTestSchema, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, pg.Close()) })
 	require.NoError(t, EnsureSchema(t.Context(), pg, schemaTestSchema))
@@ -486,10 +536,10 @@ func TestEnsureRawIngestSchemaPGSerializesConcurrentGuardInstallers(t *testing.T
 		"application_name": "raw-guard-b",
 	})
 	require.NoError(t, err)
-	installerA, err := Open(dsnA, schemaTestSchema, true)
+	installerA, err := Open(t.Context(), dsnA, schemaTestSchema, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, installerA.Close()) })
-	installerB, err := Open(dsnB, schemaTestSchema, true)
+	installerB, err := Open(t.Context(), dsnB, schemaTestSchema, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, installerB.Close()) })
 

@@ -5,6 +5,7 @@
     SegmentedControl,
     type SegmentedControlOption,
   } from "@kenn-io/kit-ui";
+  import { seriesSwatchBackground, type SeriesStyle } from "@kenn-io/kit-ui/utils/palette";
   import { scaleLinear } from "d3-scale";
   import { curveLinear, curveMonotoneX } from "d3-shape";
   import {
@@ -16,16 +17,20 @@
   import { formatMoney, moneyFromMicrodollars } from "../../money.js";
   import { sumSelectedTokens } from "../../stores/usageTokenTypes.js";
   import { addDays } from "../../utils/dates.js";
+  import { seriesPaint } from "../../utils/seriesPaint.js";
+  import SeriesPatternDefs from "../shared/SeriesPatternDefs.svelte";
   import type {
     DbDailyUsageEntry,
     UsageSummaryResponse,
   } from "../../api/generated/index";
 
   interface Props {
-    colorMap: ReadonlyMap<string, string>;
+    styleMap: ReadonlyMap<string, SeriesStyle>;
   }
 
-  let { colorMap }: Props = $props();
+  let { styleMap }: Props = $props();
+
+  const uid = $props.id();
 
   // Plot geometry matches the Activity timeline.
   const TOP_PAD = 8;
@@ -40,6 +45,7 @@
   const SVG_H = PLOT_BOTTOM + X_LABEL_H;
   const DAY_MS = 86_400_000;
   const MAX_SERIES = 10;
+  const MIN_SERIES_SHARE = 0.005;
 
   interface Point {
     date: string;
@@ -117,7 +123,7 @@
 
     // Sum the selected value per key across the whole range to find top N.
     const totals = new Map<string, number>();
-    const labels: Record<string, string> = {};
+    const labels: Record<string, string> = Object.create(null);
     let hasBreakdownData = false;
     for (const day of daily) {
       if (groupBy === "project" && day.projectBreakdowns) {
@@ -183,17 +189,20 @@
       return { points, keys: ["total"], maxY: maxY || 1, labels };
     }
 
-    // Pick top N by total value, group the rest as "Other".
+    // Keep visible shares up to the series limit, then group the remainder.
     const ranked = [...totals.entries()]
       .sort((a, b) => b[1] - a[1]);
-    const topKeys = new Set(
-      ranked.slice(0, MAX_SERIES).map(([k]) => k),
-    );
-    const hasOther = ranked.length > MAX_SERIES;
+    // Shares use the visible total in this summary.
+    const windowTotal = ranked.reduce((sum, [, value]) => sum + value, 0);
+    const retained = ranked
+      .filter(([, value]) => value > 0 && value >= windowTotal * MIN_SERIES_SHARE)
+      .slice(0, MAX_SERIES);
+    const topKeys = new Set(retained.map(([key]) => key));
+    const hasOther = ranked.some(([key, value]) => !topKeys.has(key) && value > 0);
 
     const points: Point[] = [];
     for (const day of daily) {
-      const values: Record<string, number> = {};
+      const values: Record<string, number> = Object.create(null);
       let items: Array<{ key: string; value: number }> = [];
 
       if (groupBy === "project" && day.projectBreakdowns) {
@@ -232,9 +241,7 @@
 
     // Build ordered key list: top N by value desc, then
     // __other__ (displayed as "Other" in legend/labels).
-    const keys = ranked
-      .slice(0, MAX_SERIES)
-      .map(([k]) => k);
+    const keys = retained.map(([key]) => key);
     if (hasOther) keys.push("__other__");
 
     let maxY = 0;
@@ -254,7 +261,7 @@
   const legendData = $derived(
     usage.colorSummary === usage.timeSeriesSummary ? seriesData : buildSeries(usage.colorSummary),
   );
-  // Plotted series outside the unselected top ten follow it, then Other once.
+  // Series qualifying within the selected summary follow the reference names, then Other once.
   const legendKeys = $derived.by(() => {
     const named = [...new Set([...legendData.keys, ...seriesData.keys])].filter((key) => key !== "__other__");
     return legendData.keys.includes("__other__") || seriesData.keys.includes("__other__") ? [...named, "__other__"] : named;
@@ -350,10 +357,23 @@
     return PLOT_BOTTOM - (value / scale.max) * PLOT_H;
   }
 
-  function seriesColor(key: string): string {
-    return key === "__other__"
-      ? "var(--text-muted)"
-      : colorMap.get(key) ?? "var(--text-muted)";
+  const MUTED_STYLE: SeriesStyle = {
+    color: "var(--text-muted)",
+    fill: "solid",
+    dash: "solid",
+    marker: "circle",
+  };
+
+  function seriesStyle(key: string): SeriesStyle {
+    return key === "__other__" ? MUTED_STYLE : styleMap.get(key) ?? MUTED_STYLE;
+  }
+
+  function seriesFill(key: string): string {
+    return seriesPaint(uid, seriesStyle(key));
+  }
+
+  function seriesSwatch(key: string): string {
+    return seriesSwatchBackground(seriesStyle(key));
   }
 
   function seriesLabel(key: string): string {
@@ -373,7 +393,7 @@
       const y = yForValue(stacked + value);
       const height = yForValue(stacked) - y;
       stacked += value;
-      return [{ key, y, height, color: seriesColor(key) }];
+      return [{ key, y, height, fill: seriesFill(key) }];
     });
     return {
       idx,
@@ -391,7 +411,7 @@
     const below = seriesData.points.map(() => 0);
     return seriesData.keys.map((key) => ({
       key,
-      color: seriesColor(key),
+      fill: seriesFill(key),
       data: seriesData.points.map((point, i) => {
         const y0 = below[i] ?? 0;
         const y1 = y0 + (point.values[key] ?? 0);
@@ -463,8 +483,10 @@
         key,
         label: seriesLabel(key),
         value: point.values[key] ?? 0,
-        color: seriesColor(key),
+        swatch: seriesSwatch(key),
+        patterned: seriesStyle(key).fill !== "solid",
       }))
+      .filter((row) => row.value > 0)
       .sort((a, b) => b.value - a.value);
   }
 
@@ -685,7 +707,8 @@
           >
             <span
               class="legend-dot"
-              style="background: {seriesColor(key)}"
+              class:patterned={seriesStyle(key).fill !== "solid"}
+              style="background: {seriesSwatch(key)}"
             ></span>
             {seriesLabel(key)}
           </span>
@@ -713,6 +736,7 @@
         height={SVG_H}
       >
         <Layer class="chart-svg" title={chartTitle}>
+          <SeriesPatternDefs scope={uid} styles={seriesData.keys.map(seriesStyle)} />
           {#each yTickValues as value (value)}
             <Line
               x1={yLabelWidth}
@@ -740,7 +764,7 @@
                     y={seg.y}
                     width={cell.w}
                     height={seg.height}
-                    fill={seg.color}
+                    fill={seg.fill}
                   />
                 {/each}
               </g>
@@ -752,7 +776,7 @@
                 x="time"
                 y0="y0"
                 y1="y1"
-                fill={layer.color}
+                fill={layer.fill}
                 curve={areaCurve}
               />
             {/each}
@@ -818,7 +842,11 @@
             {#each tooltipRows(tooltipPoint) as row (row.key)}
               <div class="tooltip-row">
                 <dt>
-                  <span class="tooltip-swatch" style="background: {row.color}"></span>
+                  <span
+                    class="tooltip-swatch"
+                    class:patterned={row.patterned}
+                    style="background: {row.swatch}"
+                  ></span>
                   <span class="tooltip-name">{row.label}</span>
                 </dt>
                 <dd>
@@ -896,6 +924,16 @@
     height: 8px;
     border-radius: 2px;
     flex-shrink: 0;
+  }
+
+  /* Patterned swatches need room to show at least one full pattern tile.
+     Negative margins keep their footprint at the plain swatch's width, so
+     labels stay aligned. */
+  .legend-dot.patterned,
+  .tooltip-swatch.patterned {
+    width: 12px;
+    height: 12px;
+    margin-inline: -2px;
   }
 
   .chart-body {

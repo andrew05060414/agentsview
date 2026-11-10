@@ -112,14 +112,16 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 		planFiles, fallbackFiles...,
 	))
 	result.FilesDiscovered = len(files)
+	changedPaths := make([]string, 0, len(plan.attribution))
+	for path := range plan.attribution {
+		changedPaths = append(changedPaths, path)
+	}
 	if len(files) == 0 {
 		// A title store change alone plans no session files.
 		e.syncMu.Lock()
-		for path := range plan.attribution {
-			e.invalidateAntigravityTitleCache([]string{path})
-		}
-		e.reconcileAntigravityTitlesLocked(ctx, &result.Stats)
-		e.recordAntigravityTitleUpdates(result.Stats)
+		e.invalidateNativeTitleCache(changedPaths)
+		e.reconcileNativeTitlesLocked(ctx, &result.Stats)
+		e.recordNativeTitleUpdates(result.Stats)
 		e.syncMu.Unlock()
 		fallback.applyFailures(&result.Stats)
 		if result.Stats.TitlesUpdated > 0 {
@@ -129,9 +131,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	}
 
 	e.syncMu.Lock()
-	for path := range plan.attribution {
-		e.invalidateAntigravityTitleCache([]string{path})
-	}
+	e.invalidateNativeTitleCache(changedPaths)
 	var stats SyncStats
 	defer func() {
 		if stats.hasSessionChanges() {
@@ -194,6 +194,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 	)
 	fallback.applyFailures(&stats)
 	processErr = errors.Join(processErr, e.finishCodexParentInventoryBatch(processingCtx, &stats))
+	stats.logRetrySummary("sync")
 	if err := affectedSessionIDs.link(ctx, e, &stats); err != nil {
 		stats.RecordFailed()
 		processErr = errors.Join(processErr, err)
@@ -210,7 +211,7 @@ func (e *Engine) SyncChangedPathPlanWithOptionsContext(
 		e.persistSkipCache(ctx)
 	}
 	processingComplete := stats.ProcessingComplete()
-	e.reconcileAntigravityTitlesLocked(ctx, &stats)
+	e.reconcileNativeTitlesLocked(ctx, &stats)
 	e.mu.Lock()
 	e.lastSync = time.Now()
 	e.lastSyncStats = stats

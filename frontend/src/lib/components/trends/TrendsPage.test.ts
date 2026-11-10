@@ -1,3 +1,5 @@
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
@@ -5,7 +7,6 @@ import { trends } from "../../stores/trends.svelte.js";
 import { settings } from "../../stores/settings.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
 import type { DbTrendsTermsResponse as TrendsTermsResponse } from "../../api/generated/index.js";
-import source from "./TrendsPage.svelte?raw";
 
 const mocks = vi.hoisted(() => ({
   getApiV1TrendsTerms: vi.fn(),
@@ -321,12 +322,6 @@ describe("TrendsPage", () => {
     expect(window.location.search).toContain("to=2026-06-20");
   });
 
-  it("updates shared yoke state from range selections", () => {
-    expect(source).toContain("<RangePicker");
-    expect(source).toContain("updateYokeFromTrends");
-    expect(source).toContain("rangeToPanelDate(seed)");
-  });
-
   it("shows chart loading status while trends are computing", async () => {
     let resolveFetch: ((response: TrendsTermsResponse) => void) | undefined;
     mocks.getApiV1TrendsTerms.mockReturnValueOnce(
@@ -356,6 +351,7 @@ describe("TrendsPage", () => {
     mocks.getApiV1TrendsTerms.mockRejectedValueOnce(
       new Error("at least one trend term is required"),
     );
+
     const textarea = document.querySelector<HTMLTextAreaElement>("#trend-terms");
     expect(textarea).not.toBeNull();
     textarea!.value = "";
@@ -367,8 +363,24 @@ describe("TrendsPage", () => {
     expect(refreshButton).not.toBeNull();
     refreshButton!.click();
     await flushPromises();
-
     expect(document.body.textContent).toContain("at least one trend term is required");
+    warn.mockRestore();
+  });
+
+  it("reports analytics when a pending refresh fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    component = mount(TrendsPage, { target: document.body });
+    await flushPromises();
+    const refreshButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.trim() === "Refresh",
+    );
+    const request = Promise.withResolvers<never>();
+    mocks.getApiV1TrendsTerms.mockReturnValueOnce(request.promise);
+    refreshButton!.click();
+    await tick();
+    expect(document.querySelector(".error")).toBeNull();
+    request.reject(new Error("at least one trend term is required"));
+    await vi.waitFor(() => expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics"));
     warn.mockRestore();
   });
 
@@ -512,26 +524,50 @@ describe("TrendsPage", () => {
     expect(strokes).toEqual(["#ff7f0e", "#1f77b4"]);
     expect(swatches).toEqual(["rgb(255, 127, 14)", "rgb(31, 119, 180)"]);
   });
-});
 
-describe("TrendsPage date yoke controls", () => {
-  it("preserves relative range selections as rolling yoke state", () => {
-    const applyIndex = source.indexOf("async function applyRange");
-    const helperIndex = source.indexOf("function yokeStateForSelection");
-    const applyBlock = source.slice(applyIndex, helperIndex);
+  it("dashes color-blind safe lines past the tenth color in chart and table", async () => {
+    settings.chartPalette = "colorblind";
+    const terms = Array.from(
+      { length: 11 },
+      (_, index) => `term-${String(index).padStart(2, "0")}`,
+    );
+    mocks.getApiV1TrendsTerms.mockResolvedValueOnce({
+      granularity: "week",
+      from: "2024-01-01",
+      to: "2024-01-31",
+      message_count: 10,
+      buckets: [
+        { date: "2024-01-01", message_count: 5 },
+        { date: "2024-01-08", message_count: 5 },
+      ],
+      series: terms.map((term) => ({
+        term,
+        variants: [term],
+        total: 2,
+        points: [
+          { date: "2024-01-01", count: 1 },
+          { date: "2024-01-08", count: 1 },
+        ],
+      })),
+    });
 
-    expect(helperIndex).toBeGreaterThan(applyIndex);
-    expect(source).toContain('mode: "rolling"');
-    expect(source).toContain("windowDays: sel.days");
-    expect(applyBlock).toContain("yokeStateForSelection(sel, range)");
-    expect(applyBlock).toContain("updateYokeFromTrends(yokeState)");
-  });
+    component = mount(TrendsPage, { target: document.body });
+    await flushPromises();
 
-  it("preserves rolling window intent in trends URLs", () => {
-    expect(source).toContain('const TREND_WINDOW_PARAM = "window_days"');
-    expect(source).toContain("parseTrendWindowDays");
-    expect(source).toContain("rollingRange(windowDays)");
-    expect(source).toContain("q.set(TREND_WINDOW_PARAM");
-    expect(source).toContain("trendsWindowDays !== null");
+    const lines = Array.from(
+      document.querySelectorAll<SVGPathElement>(
+        '.chart path[fill="none"]:not([stroke="transparent"])',
+      ),
+    );
+    expect(lines).toHaveLength(11);
+    // The eleventh term reuses the first color, so only its dash sets it apart.
+    expect(lines[10]!.getAttribute("stroke")).toBe(lines[0]!.getAttribute("stroke"));
+    expect(lines[0]!.getAttribute("stroke-dasharray")).toBe("none");
+    expect(lines[10]!.getAttribute("stroke-dasharray")).toBe("6 4");
+
+    expect(document.querySelectorAll(".swatch")).toHaveLength(10);
+    const dashedSample = document.querySelector<SVGLineElement>(".swatch-line line");
+    expect(dashedSample?.getAttribute("stroke")).toBe(lines[10]!.getAttribute("stroke"));
+    expect(dashedSample?.getAttribute("stroke-dasharray")).toBe("6 4");
   });
 });

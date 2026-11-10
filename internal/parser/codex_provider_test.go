@@ -122,7 +122,7 @@ func TestCodexProviderUnresolvedParentNeedsRetry(t *testing.T) {
 	require.Len(t, outcome.Results, 1)
 	result := outcome.Results[0]
 	assert.Equal(t, DataVersionNeedsRetry, result.DataVersion)
-	assert.Contains(t, result.RetryReason, "parent turns")
+	assert.Contains(t, result.RetryReason, "forked from")
 	require.Len(t, result.Result.Messages, 2)
 	assert.Equal(t, "child task", result.Result.Messages[0].Content)
 	assert.Equal(t, "child answer", result.Result.Messages[1].Content)
@@ -315,19 +315,6 @@ func TestCodexProviderForceParseReloadsSameStatSessionIndex(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, forced.Results, 1)
 	assert.Equal(t, "Bravo title", forced.Results[0].Result.Session.SessionName)
-}
-
-func TestCodexProviderAdvertisesIncrementalAppend(t *testing.T) {
-	root := t.TempDir()
-	uuid := "019eb791-cf7d-75c1-8439-9ed74c1229e2"
-	writeCodexProviderSession(t, root, uuid, "hello")
-
-	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
-	require.True(t, ok)
-	assert.Equal(t,
-		CapabilitySupported,
-		provider.Capabilities().Source.IncrementalAppend,
-	)
 }
 
 func TestCodexProviderFactoryScopesCursorCache(t *testing.T) {

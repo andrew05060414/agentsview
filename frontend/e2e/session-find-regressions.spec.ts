@@ -1,6 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
 import type { DbMessage as Message } from "../src/lib/api/generated/index.js";
 
+test.afterEach(async ({ page }) => {
+  await page.unrouteAll({ behavior: "wait" });
+});
+
 const SESSION_ID = "test-session-xlarge-5500";
 function message(ordinal: number, content: string, extra: Partial<Message> = {}): Message {
   return {
@@ -44,13 +48,18 @@ async function installMessages(
     const session = await response.json();
     await route.fulfill({ response, json: { ...session, message_count: all.length } });
   });
+  let initialTailFailure = true;
   await page.route(`**/api/v1/sessions/${SESSION_ID}/messages*`, async (route) => {
     const url = new URL(route.request().url());
     const descending = url.searchParams.get("direction") === "desc";
     const from = Number(url.searchParams.get("from") ?? (descending ? all.length - 1 : 0));
     const limit = Number(url.searchParams.get("limit") ?? 1000);
     if (!descending && from >= 1000 && control.failTail) {
-      await route.fulfill({ status: 503, json: { error: "injected history failure" } });
+      // Keep startup recovery out of this manual-retry scenario. Search's
+      // own history load still gets a transient server failure.
+      const status = initialTailFailure ? 400 : 503;
+      initialTailFailure = false;
+      await route.fulfill({ status, json: { error: "injected history failure" } });
       return;
     }
     const messages = descending
@@ -98,7 +107,7 @@ test.describe("session find audit regressions", () => {
             has_tool_use: true,
             has_thinking: true,
             tool_calls: structured
-              ? [{ tool_name: "Bash", category: "Bash", result_content: "ordinary" }]
+              ? [{ call_index: 0, tool_name: "Bash", category: "Bash", result_content: "ordinary" }]
               : undefined,
           }),
         ],
@@ -128,7 +137,9 @@ test.describe("session find audit regressions", () => {
       [
         message(0, "", {
           has_tool_use: true,
-          tool_calls: [{ tool_name: "Bash", category: "Bash", result_content: "needle output" }],
+          tool_calls: [
+            { call_index: 0, tool_name: "Bash", category: "Bash", result_content: "needle output" },
+          ],
         }),
         message(1, "needle prose"),
       ],
@@ -219,7 +230,9 @@ test("searches the displayed image placeholder rather than serialized result met
   await installMessages(page, [
     message(0, "", {
       has_tool_use: true,
-      tool_calls: [{ tool_name: "view_image", category: "", result_content: result }],
+      tool_calls: [
+        { call_index: 0, tool_name: "view_image", category: "", result_content: result },
+      ],
     }),
   ]);
   const input = await find(page);

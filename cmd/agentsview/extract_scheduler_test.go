@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -99,20 +100,20 @@ func TestExtractSchedulerNotifiesDownstreamAfterEveryStartedPass(t *testing.T) {
 	var notified int
 	s.onPassFinished = func() { notified++ }
 
-	started, ok, err := s.tryPassWithLease(t.Context(), extract.PassOptions{})
+	started, ok, err := s.tryPassWithLease(t.Context(), mgr, extract.PassOptions{})
 	assert.False(t, started)
 	assert.True(t, ok)
 	require.NoError(t, err)
 	assert.Zero(t, notified)
 
-	started, ok, err = s.tryPassWithLease(t.Context(), extract.PassOptions{})
+	started, ok, err = s.tryPassWithLease(t.Context(), mgr, extract.PassOptions{})
 	assert.True(t, started)
 	assert.True(t, ok)
 	require.EqualError(t, err, "later extraction failed")
 	assert.Equal(t, 1, notified,
 		"partial commits must refresh downstream indexes despite a later error")
 
-	started, ok, err = s.tryPassWithLease(t.Context(), extract.PassOptions{})
+	started, ok, err = s.tryPassWithLease(t.Context(), mgr, extract.PassOptions{})
 	assert.True(t, started)
 	assert.True(t, ok)
 	require.NoError(t, err)
@@ -248,9 +249,10 @@ func TestExtractSchedulerBackstopSupersedesCatchup(t *testing.T) {
 	}
 }
 
-// blockingPassManager signals when TryPass begins and blocks it until
-// releaseOnce is called, so tests can hold a pass in flight deliberately.
+// blockingPassManager completes the startup pass, then signals and blocks
+// later passes until releaseOnce is called.
 type blockingPassManager struct {
+	passes      int
 	startedOnce sync.Once
 	releasedFn  sync.Once
 	started     chan struct{}
@@ -260,6 +262,10 @@ type blockingPassManager struct {
 func (b *blockingPassManager) TryPass(
 	_ context.Context, _ extract.PassOptions,
 ) (bool, extract.PassResult, error) {
+	b.passes++
+	if b.passes == 1 {
+		return true, extract.PassResult{}, nil
+	}
 	b.startedOnce.Do(func() { close(b.started) })
 	<-b.release
 	return true, extract.PassResult{}, nil
@@ -274,35 +280,41 @@ func (b *blockingPassManager) releaseOnce() {
 // cancels the shared context under a long model-backed extraction, so large
 // backlogs could never complete.
 func TestExtractSchedulerPassHoldsIdleWorkLease(t *testing.T) {
-	mgr := &blockingPassManager{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	idled := make(chan struct{})
-	tracker := server.NewIdleTracker(50*time.Millisecond, func() { close(idled) })
-	s := newExtractScheduler(mgr, 5*time.Millisecond, 0, 0, tracker)
-	ctx := t.Context()
-	go tracker.Run(ctx)
-	go s.Run(ctx)
-	defer s.Stop()
-	// Registered after s.Stop so it runs first: Stop waits for Run, and Run
-	// waits inside the blocked TryPass, so a failure exiting before the
-	// explicit release would deadlock the test.
-	defer mgr.releaseOnce()
+	synctest.Test(t, func(t *testing.T) {
+		mgr := &blockingPassManager{
+			started: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		idled := make(chan struct{})
+		tracker := server.NewIdleTracker(50*time.Millisecond, func() { close(idled) })
+		s := newExtractScheduler(mgr, 5*time.Millisecond, 0, 0, tracker)
+		finished := make(chan struct{}, 2)
+		s.onPassFinished = func() { finished <- struct{}{} }
+		ctx := t.Context()
+		go tracker.Run(ctx)
+		go s.Run(ctx)
+		defer s.Stop()
+		// Registered after s.Stop so it runs first: Stop waits for Run, and Run
+		// waits inside the blocked TryPass, so a failure exiting before the
+		// explicit release would deadlock the test.
+		defer mgr.releaseOnce()
 
-	s.Notify()
-	<-mgr.started
-	select {
-	case <-idled:
-		require.FailNow(t, "daemon idled out while an extraction pass was in flight")
-	case <-time.After(200 * time.Millisecond): //nolint:kennlint // absence check; the blocked extraction pass keeps the daemon from idling
-	}
-	mgr.releaseOnce()
-	select {
-	case <-idled:
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "daemon never idled once the pass completed")
-	}
+		<-finished
+		synctest.Wait() // Let Run release its startup lease before the next notification.
+		s.Notify()
+		<-mgr.started
+		select {
+		case <-idled:
+			require.FailNow(t, "daemon idled out while an extraction pass was in flight")
+		case <-time.After(200 * time.Millisecond):
+		}
+		mgr.releaseOnce()
+		select {
+		case <-idled:
+		case <-time.After(2 * time.Second):
+			require.FailNow(t, "daemon never idled once the pass completed")
+		}
+	})
 }
 
 // TestExtractSchedulerStartsNoPassAfterDraining pins the other half of the
@@ -336,23 +348,25 @@ func TestExtractSchedulerStartsNoPassAfterDraining(t *testing.T) {
 // shorter than the debounce would otherwise reap itself before the
 // lifetime's first pass, every lifetime, and extraction would never run.
 func TestExtractSchedulerStartupPassSurvivesShortIdleTimeout(t *testing.T) {
-	mgr := &fakePassManager{}
-	idled := make(chan struct{})
-	tracker := server.NewIdleTracker(20*time.Millisecond, func() { close(idled) })
-	s := newExtractScheduler(mgr, 100*time.Millisecond, 0, 0, tracker)
-	ctx := t.Context()
-	go tracker.Run(ctx)
-	go s.Run(ctx)
-	defer s.Stop()
+	synctest.Test(t, func(t *testing.T) {
+		mgr := &fakePassManager{}
+		idled := make(chan struct{})
+		tracker := server.NewIdleTracker(20*time.Millisecond, func() { close(idled) })
+		s := newExtractScheduler(mgr, 100*time.Millisecond, 0, 0, tracker)
+		ctx := t.Context()
+		go tracker.Run(ctx)
+		go s.Run(ctx)
+		defer s.Stop()
 
-	waitForSchedulerCondition(t, func() bool { return mgr.callCount() >= 1 },
-		"startup pass never ran: the daemon idled out before the "+
-			"startup debounce elapsed")
-	select {
-	case <-idled:
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "daemon never idled once the startup pass completed")
-	}
+		waitForSchedulerCondition(t, func() bool { return mgr.callCount() >= 1 },
+			"startup pass never ran: the daemon idled out before the "+
+				"startup debounce elapsed")
+		select {
+		case <-idled:
+		case <-time.After(2 * time.Second):
+			require.FailNow(t, "daemon never idled once the startup pass completed")
+		}
+	})
 }
 
 // TestExtractSchedulerCatchupCarriesFailedStartupFullPass pins that a failed
@@ -399,4 +413,80 @@ func TestExtractSchedulerRunsStartupPass(t *testing.T) {
 			"before the backstop interval, so a completed session whose "+
 			"transcript grew between daemon lifetimes is only revisited "+
 			"here")
+}
+
+func TestExtractSchedulerReconcilesOnBatteryAndCarriesFullPass(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		battery, resume, notify    bool
+		backstop, catchup, after   time.Duration
+		wantPasses, wantReconciles []extract.PassOptions
+		wantNotifications          int32
+	}{
+		{name: "resume without sync", battery: true, resume: true, backstop: time.Hour, after: 81 * time.Second, wantPasses: []extract.PassOptions{{Full: true}}, wantReconciles: []extract.PassOptions{{Full: true}}, wantNotifications: 2},
+		{name: "periodic pass consumes recheck", battery: true, resume: true, backstop: 2 * time.Minute, after: 81 * time.Second, wantPasses: []extract.PassOptions{{Full: true}}, wantReconciles: []extract.PassOptions{{Full: true}}, wantNotifications: 2},
+		{name: "notify and tick on battery", battery: true, notify: true, catchup: 5 * time.Minute, after: 201 * time.Second, wantReconciles: []extract.PassOptions{{Full: true}, {Full: true}, {Full: true}}, wantNotifications: 3},
+		{name: "periodic pass preserves sync debounce", notify: true, backstop: 2 * time.Minute, after: 31 * time.Second, wantPasses: []extract.PassOptions{{Full: true}, {Full: true}, {}}, wantNotifications: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				mgr, reconciler := &fakePassManager{}, &fakePassManager{}
+				var battery atomic.Bool
+				battery.Store(tc.battery)
+				s := newExtractScheduler(mgr, 30*time.Second, tc.backstop, tc.catchup, nil)
+				s.onBattery, s.onBatteryMgr = battery.Load, reconciler
+				var notified atomic.Int32
+				s.onPassFinished = func() { notified.Add(1) }
+				go s.Run(t.Context())
+				defer s.Stop()
+				synctest.Sleep(100 * time.Second)
+				synctest.Wait()
+				if tc.battery {
+					require.Zero(t, mgr.callCount())
+					require.Equal(t, []extract.PassOptions{{Full: true}}, reconciler.callsSnapshot())
+				} else {
+					require.Equal(t, []extract.PassOptions{{Full: true}}, mgr.callsSnapshot())
+					require.Zero(t, reconciler.callCount())
+				}
+				require.EqualValues(t, 1, notified.Load())
+				if tc.resume {
+					battery.Store(false)
+				}
+				if tc.notify {
+					for range 5 {
+						s.Notify()
+					}
+					synctest.Wait()
+				}
+				synctest.Sleep(tc.after)
+				synctest.Wait()
+				assert.Equal(t, tc.wantPasses, mgr.callsSnapshot())
+				assert.Equal(t, tc.wantReconciles, reconciler.callsSnapshot())
+				assert.Equal(t, tc.wantNotifications, notified.Load())
+			})
+		})
+	}
+}
+
+func TestExtractSchedulerBatteryShortBackstopReleasesStartupLease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		idled := make(chan struct{})
+		tracker := server.NewIdleTracker(time.Minute, func() { close(idled) })
+		go tracker.Run(ctx)
+		mgr, reconciler := &fakePassManager{}, &fakePassManager{}
+		s := newExtractScheduler(mgr, 30*time.Second, 10*time.Second, 0, tracker)
+		s.onBattery, s.onBatteryMgr = func() bool { return true }, reconciler
+		go s.Run(ctx)
+		defer s.Stop()
+		synctest.Sleep(2 * time.Minute)
+		synctest.Wait()
+		require.Positive(t, reconciler.callCount())
+		select {
+		case <-idled:
+		default:
+			assert.Fail(t, "battery reconciliation kept the startup lease")
+		}
+	})
 }
