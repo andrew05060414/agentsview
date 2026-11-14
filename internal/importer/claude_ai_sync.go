@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"net/url"
 	"slices"
 	"strconv"
@@ -130,7 +131,7 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 				}
 				break
 			}
-			for _, summary := range items {
+			for i, summary := range items {
 				if err := ctx.Err(); err != nil {
 					return stats, err
 				}
@@ -140,12 +141,14 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 					CurrentLeaf jsontext.Value `json:"current_leaf_message_uuid"`
 				}
 				if err := json.Unmarshal(summary, &marker); err != nil || marker.UUID == "" || marker.UpdatedAt == "" {
+					log.Printf("import: claude.ai list item %d of org %s skipped: uuid %q: uuid or updated_at is missing or not a string", offset+i, org.UUID, marker.UUID)
 					stats.Errors++
 					cb.progress(stats)
 					continue
 				}
 				var leaf string
 				if err := json.Unmarshal(marker.CurrentLeaf, &leaf); err != nil || leaf == "" && string(marker.CurrentLeaf) != "null" {
+					log.Printf("import: claude.ai conversation %s skipped: current_leaf_message_uuid is %s, not a message uuid or null", marker.UUID, claudeAILeafKind(marker.CurrentLeaf))
 					stats.Errors++
 					cb.progress(stats)
 					continue
@@ -189,6 +192,27 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 		}
 	}
 	return stats, nil
+}
+
+// claudeAILeafKind names the JSON shape of a list item's current leaf without
+// copying its value into the log.
+func claudeAILeafKind(raw jsontext.Value) string {
+	if len(raw) == 0 {
+		return "absent"
+	}
+	switch raw.Kind() {
+	case '"':
+		return "an empty string"
+	case '0':
+		return "a number"
+	case 't', 'f':
+		return "a boolean"
+	case '{':
+		return "an object"
+	case '[':
+		return "an array"
+	}
+	return "unreadable"
 }
 
 func syncConversation(ctx context.Context, store db.Store, result parser.ParseResult) (importStatus, error) {
