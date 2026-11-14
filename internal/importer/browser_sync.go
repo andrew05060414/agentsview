@@ -32,12 +32,15 @@ func (e *browserHTTPError) Error() string {
 }
 
 type browserSync struct {
-	store      BrowserSyncStore
-	agent      parser.AgentType
-	stats      *ImportStats
-	cb         *ImportCallbacks
-	machine    []string
-	tooLarge   error
+	store    BrowserSyncStore
+	agent    parser.AgentType
+	stats    *ImportStats
+	cb       *ImportCallbacks
+	machine  []string
+	tooLarge error
+	// refused is one conversation the service declined to return. It is
+	// recorded as that conversation's failure and does not end the round.
+	refused    error
 	stop       func(error) bool
 	failedLast bool
 }
@@ -97,6 +100,10 @@ func (s *browserSync) conversation(ctx context.Context, id string, chat browserC
 		}
 		s.stats.record(id, importSkipped, err)
 		if errors.Is(err, s.tooLarge) {
+			s.failedLast = false
+			return nil
+		}
+		if s.refused != nil && errors.Is(err, s.refused) {
 			s.failedLast = false
 			return nil
 		}

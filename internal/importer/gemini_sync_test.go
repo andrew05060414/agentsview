@@ -332,6 +332,32 @@ func TestSyncGeminiStops(t *testing.T) {
 	}
 }
 
+// TestSyncGeminiRefusedConversationsDoNotEndRound checks that Gemini refusing
+// two conversations in a row records two failures and still imports the rest.
+func TestSyncGeminiRefusedConversationsDoNotEndRound(t *testing.T) {
+	const refusedA, refusedB = "c_00000000000000a1", "c_00000000000000a2"
+	refused := func(t *testing.T) []byte {
+		t.Helper()
+		return []byte(")]}'\n\n40\n" + `[["wrb.fr","hNvQHb",null,null,null,[3],"generic"]]`)
+	}
+	list := geminiRequest(geminiListRequest, "", "")
+	fake := &geminiFake{t: t, listAt: 1_790_000_000, status: map[string]int{}, pages: map[string][]byte{
+		list: geminiRPCBody(t, geminiListRPC, []any{nil, nil, []any{
+			[]any{refusedA, "Refused A", nil, nil, nil, []any{1_790_000_000, 0}},
+			[]any{refusedB, "Refused B", nil, nil, nil, []any{1_790_000_000, 0}},
+			[]any{geminiTestChat, "Trip plan", nil, nil, nil, []any{1_790_000_000, 0}},
+		}}),
+		geminiRequest(geminiDetailRequest, refusedA, ""): refused(t),
+		geminiRequest(geminiDetailRequest, refusedB, ""): refused(t),
+	}}
+	fake.turns = []any{geminiSyncTurn("1", "Question", "Answer", 1_790_000_000)}
+	stats, err := SyncGemini(t.Context(), testDB(t), fake.fetch, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Imported)
+	assert.Equal(t, 2, stats.Errors)
+	assert.Len(t, stats.Refusals, 2)
+}
+
 // TestSyncGeminiKeepsPinsInPlace checks that appends and completed replies
 // write in place: stored message IDs and pins survive, even on repeated text.
 func TestSyncGeminiKeepsPinsInPlace(t *testing.T) {

@@ -43,6 +43,9 @@ var ErrGeminiResponseTooLarge = errors.New("response from Gemini exceeds 32 MiB"
 // ErrGeminiAuthRequired reports a missing or expired Gemini browser session.
 var ErrGeminiAuthRequired = errors.New("sign in to Gemini again")
 
+// errGeminiRejected marks one conversation that Gemini refused to return.
+var errGeminiRejected = errors.New("Gemini rejected the request")
+
 var errGeminiFormat = errors.New("this AgentsView version can't read the conversation format Gemini returned. Update AgentsView and try again")
 
 // geminiDetailGap delays each conversation page request by 3 s with jitter,
@@ -79,7 +82,7 @@ func geminiRPCPayload(body []byte, rpc string) (jsontext.Value, error) {
 			}
 			if json.Unmarshal(fields[2], &payload) != nil || payload == "" {
 				// A null payload is Gemini refusing the call.
-				return nil, errors.New("Gemini rejected the request")
+				return nil, errGeminiRejected
 			}
 			value := jsontext.Value(payload)
 			if !value.IsValid() {
@@ -148,7 +151,7 @@ func SyncGemini(ctx context.Context, store BrowserSyncStore, fetch func(context.
 	var formatErr error
 	runner := browserSync{
 		store: store, agent: parser.AgentGeminiApps, stats: &stats, cb: cb, machine: machine,
-		tooLarge: ErrGeminiResponseTooLarge, stop: func(err error) bool {
+		tooLarge: ErrGeminiResponseTooLarge, refused: errGeminiRejected, stop: func(err error) bool {
 			httpErr, _ := errors.AsType[*browserHTTPError](err)
 			return errors.Is(err, ErrGeminiAuthRequired) || httpErr != nil && httpErr.rateLimited
 		},

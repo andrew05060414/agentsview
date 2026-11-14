@@ -1,6 +1,7 @@
 package importer
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	_ "embed"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1030,6 +1032,34 @@ func TestSyncClaudeAIInvalidListLeaf(t *testing.T) {
 			} else {
 				assert.Nil(t, session)
 			}
+		})
+	}
+}
+
+// TestSyncClaudeAIInvalidListLeafLogsReason checks that a list item counted as
+// an error names its conversation and the shape that failed.
+func TestSyncClaudeAIInvalidListLeafLogsReason(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	for _, tt := range []struct{ name, field, reason string }{
+		{"number", `"current_leaf_message_uuid":42,`, "a number"},
+		{"empty", `"current_leaf_message_uuid":"",`, "an empty string"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			buf.Reset()
+			d := testDB(t)
+			summary := strings.Replace(syncSummary, `"current_leaf_message_uuid":"reply",`, tt.field, 1)
+			fetch := syncOneFetch(t, summary, func() (ClaudeAIResponse, error) {
+				require.FailNow(t, "invalid list leaf fetched its detail")
+				return ClaudeAIResponse{}, nil
+			})
+			stats, err := SyncClaudeAI(t.Context(), d, fetch, nil, nil)
+			require.NoError(t, err)
+			assert.Equal(t, 1, stats.Errors)
+			logged := buf.String()
+			assert.Contains(t, logged, "22222222-2222-4222-8222-222222222222")
+			assert.Contains(t, logged, tt.reason)
 		})
 	}
 }
