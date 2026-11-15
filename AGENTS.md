@@ -16,6 +16,7 @@
 | --------------------------------------------------------------------------------------- | ------------------------------------ |
 | Features, bug fixes, tests, or test helpers                                             | `docs/agents/testing.md`             |
 | SQLite, PostgreSQL, CockroachDB, DuckDB, ClickHouse, archive resync, or storage queries | `docs/agents/storage.md`             |
+| Database or Go backend optimizations, including read, sync, and push paths              | `docs/agents/storage.md`             |
 | Watchers, polling, sync scheduling, background work, or memory investigations           | `docs/agents/background-work.md`     |
 | Build commands, toolchains, CI build tags, or dependencies                              | `docs/agents/build.md`               |
 | S3 ingest, `S3Provider`, or `Source.S3Discovery`                                        | `docs/agents/s3-providers.md`        |
@@ -27,6 +28,11 @@ commands. Do not copy their catalogues into this file.
 
 For CI runner selection and caching, read the
 [CI runner policy](docs/agents/build.md#ci-runner-policy).
+
+The `CI gate` job runs on a Namespace profile that uses Namespace's
+[Restricted access level](https://namespace.so/docs/solutions/github-actions/runner-controls/access-levels),
+which disables workload access to Namespace features and APIs. GitHub fork
+approvals, token permissions, and secrets are separate controls.
 
 ## Roborev
 
@@ -43,12 +49,43 @@ For CI runner selection and caching, read the
 1. Commit every turn that changes tracked files. Do not make empty commits. If a
    turn is read-only or changes only ignored files, say that no commit was
    made.
-1. Keep commits focused and use clear conventional commit messages.
+1. Keep commits focused. Write commit messages and pull request titles as
+   [Commit Messages](#commit-messages) requires.
 1. Do not amend, squash, rebase, push, or pull unless the user asks.
-1. Do not add generated-with lines, attribution blocks, validation footers, or
-   command transcripts to commit messages.
+1. End every commit message with a `Co-authored-by:` trailer naming the agent
+   that wrote the change.
+1. End the pull request description with a `Model used:` line, as
+   [Contributing](docs/contributing.md#ai-assisted-contributions) requires.
 1. Deliver changes through pull requests from feature branches. Never merge a
    pull request; merging is the user's decision.
+
+## Commit Messages
+
+Commit subjects must use the Conventional Commits format. Pull requests are
+squash-merged: the PR title becomes the commit subject and the PR description
+becomes the commit body, so PR titles use the same format.
+
+```text
+type(scope): summary
+```
+
+The scope is optional and names the part of the project the change touches. Use
+one of these types:
+
+- `feat`: a new capability users can see or use.
+- `fix`: a bug fix users can notice.
+- `perf`: faster or lighter behavior users can notice.
+- `refactor`, `test`, `docs`, `build`, `ci`, or `chore`: a change that leaves
+  product behavior as it was.
+
+Mark a breaking change with `!` before the colon, as in
+`feat(api)!: remove the v1 endpoints`, and describe the break in a
+`BREAKING CHANGE:` footer at the end of the commit body or PR description.
+
+This format is required. Releases and release notes are generated from these
+messages: the type decides whether a change appears in the notes and under which
+heading, and the version bump follows the largest change since the last release,
+from a breaking change to `feat` to `fix`.
 
 ## Safety
 
@@ -122,8 +159,7 @@ For CI runner selection and caching, read the
 When adding a provider, changing its format or usage/cost accounting, or
 investigating a provider release, new artifact generation, parser bug, or usage
 discrepancy, consult `docs/internal/session-format-sources.md` and reverify or
-update its evidence entry in the same change. Grok remains temporarily excluded
-only until its separately owned format-alignment work lands.
+update its evidence entry in the same change.
 
 ## Project Map
 
@@ -156,11 +192,11 @@ and can mirror data to PostgreSQL, DuckDB, or ClickHouse.
 - Tests must bind loopback (`127.0.0.1:0` or `[::1]:0`, or `httptest`, which
   already does). A wildcard listen (`0.0.0.0`, `[::]`, bare `:0`) makes the
   host firewall prompt for the test binary, and because `go test` relinks it
-  into a fresh temporary directory every run, the prompt returns every run.
-  A test that genuinely needs wildcard bind semantics must call
+  into a fresh temporary directory every run, the prompt returns every run. A
+  test that genuinely needs wildcard bind semantics must call
   `internal/testutil.RequireWildcardListen(t)` first, which skips it on local
-  Windows runs unless `CI=true`. `AGENTSVIEW_TEST_WILDCARD_LISTEN=1`
-  enables these tests; `0` skips them on every platform.
+  Windows runs unless `CI=true`. `AGENTSVIEW_TEST_WILDCARD_LISTEN=1` enables
+  these tests; `0` skips them on every platform.
 - Format Markdown with `mdformat --wrap 80` when `mdformat` and
   `mdformat-tables` are available.
 
@@ -201,3 +237,35 @@ and can mirror data to PostgreSQL, DuckDB, or ClickHouse.
   Verification, or Test plan.
 - Explain what the code does now, why it changed, tradeoffs, limits, and where
   reviewers should look.
+
+## Before opening a pull request
+
+- Build for a use you have. Run the change on your own real data, such as an
+  export, archive, or photo library, and say in the body what it did there. If
+  nothing you use needs it yet, don't open it.
+- Make it useful if nothing after it merges. Don't add code that works only once
+  a later PR lands, or a guard for something `main` can't do yet.
+- Start from what the repo already does. Find the closest command, importer,
+  query, or library it already uses, extend it, and name it in the body. If it
+  can't be extended, say why.
+- Add only what the change uses now. Leave out options, states, paging, flags,
+  and API surface until something calls them.
+- Review your diff as a maintainer would: cut what `main` already does and
+  anything without a caller.
+- When review findings keep landing in the same code, rethink the design there
+  instead of patching each one.
+- Before each push, check that your schema, API, and protocol version numbers
+  are still the next ones free on `main`.
+
+## Pull requests from a fork
+
+This section applies only to PRs opened from a fork. PRs from branches in this
+repository are not limited by it.
+
+- Keep one unreviewed PR per stack. Open the next only after a maintainer has
+  reviewed the one below, even if you were asked to open the whole plan.
+  Review usually reshapes a PR, and everything built on it then has to be
+  rebuilt.
+- Keep at most 10 PRs open. Each one waits for a maintainer, and the ones
+  nobody gets to go stale. At 10, hold the next PR and tell the user. Leave
+  open PRs as they are.

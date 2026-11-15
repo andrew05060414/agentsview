@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"go.kenn.io/agentsview/internal/ctxio"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/storage"
 	"go.kenn.io/kit/atomicfile"
@@ -108,22 +109,130 @@ func rebuildFilePath(path string) string {
 	return filepath.Join(mirrorWorkDirPath(path), filepath.Base(path)+rebuildFileSuffix)
 }
 
+// sparePath names the retired mirror reused by the next held publication.
+func sparePath(path string) string {
+	return filepath.Join(mirrorWorkDirPath(path), filepath.Base(path)+".spare")
+}
+
+// publishHeldMirror catches up the standby using its own cursors. The caller
+// holds the rebuild lock through publication.
+func publishHeldMirror(
+	ctx context.Context, path string, liveProbe MirrorProbe, local *db.DB, machine string,
+	opts storage.MirrorPushOptions, onProgress func(storage.MirrorPushProgress),
+) (result storage.MirrorPushResult, err error) {
+	start := time.Now()
+	defer func() { result.Duration = time.Since(start) }()
+	held, err := OpenReadOnly(ctx, path)
+	if err != nil {
+		return result, err
+	}
+	// Keep writers off the main file and WAL while copying the pair.
+	defer func() { err = errors.Join(err, held.Close()) }()
+	spare := sparePath(path)
+	probe, err := ProbeMirror(ctx, spare)
+	if err != nil {
+		return result, err
+	}
+	through, err := local.SessionDeletionPublicationRevision(ctx)
+	if err != nil {
+		return result, err
+	}
+	var s *Sync
+	if probe.LockConflict || rebuildReason(probe, db.CanonicalPushScope(opts.Projects, opts.ExcludeProjects),
+		db.CurrentDataVersion(), false, through, machine, liveProbe.SourceDatabaseID, liveProbe.SourceArchiveID) == "" {
+		s, err = New(ctx, spare, local, machine, opts)
+		if err != nil {
+			// A held standby must retry after readers adopt the last publication.
+			return result, err
+		}
+	} else {
+		if err := removeRebuildFile(spare); err != nil {
+			return result, err
+		}
+		if err := copyMirrorFile(ctx, path, spare); err != nil {
+			return result, err
+		}
+		if err := copyMirrorFile(ctx, path+".wal", spare+".wal"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return result, err
+		}
+		s, err = New(ctx, spare, local, machine, opts)
+		if err != nil {
+			return result, err
+		}
+		// Opening read-write recovers the copied WAL before reading its cursors.
+		probe = probeOpenMirror(ctx, s.duck)
+	}
+	result, pushErr := s.runIncrementalPush(ctx, opts, probe, onProgress)
+	if result.Errors > 0 {
+		pushErr = errors.Join(pushErr, fmt.Errorf("%d sessions failed to push", result.Errors))
+	}
+	if pushErr == nil {
+		_, pushErr = s.duck.ExecContext(ctx, "CHECKPOINT")
+	}
+	if err := errors.Join(pushErr, s.Close()); err != nil {
+		return result, err
+	}
+	if _, err := os.Stat(spare + ".wal"); !errors.Is(err, fs.ErrNotExist) {
+		if err == nil {
+			err = errors.New("updated mirror still has unsaved changes; replacement canceled")
+		}
+		return result, err
+	}
+	if err := validateMirrorProbe(ctx, spare); err != nil {
+		return result, err
+	}
+	retired := filepath.Join(mirrorWorkDirPath(path), fmt.Sprintf("%s.tmp-%d", filepath.Base(path), time.Now().UnixNano()))
+	if err := os.Link(path, retired); err != nil {
+		return result, err
+	}
+	// Discard the old main's WAL before publication so it cannot replay against
+	// either main. The retired main's cursors replay those changes from SQLite.
+	if err := os.Remove(path + ".wal"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return result, err
+	}
+	if err := swapMirrorFile(spare, path); err != nil {
+		return result, err
+	}
+	if err := atomicfile.Replace(retired, spare); err != nil {
+		log.Printf("duckdbsync: retaining retired mirror for stale temp cleanup: %v", err)
+	}
+	return result, nil
+}
+
+func copyMirrorFile(ctx context.Context, src, dst string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, in.Close()) }()
+	out, err := atomicfile.Create(dst, atomicfile.WithPerm(0o600))
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, out.Abort()) }()
+	if _, err := out.ReadFrom(ctxio.Reader{Context: ctx, Reader: in}); err != nil {
+		return err
+	}
+	return out.Commit()
+}
+
 // rebuildRun describes what a rebuild file is being built for. A file built
 // for a different archive generation, scope, machine, or format may hold
 // rows the current push would not write, so only a matching file resumes.
 type rebuildRun struct {
 	// Reason is why the rebuild started. A resumed rebuild keeps it.
-	Reason           string `json:"reason"`
-	SchemaVersion    int    `json:"schema_version"`
-	DataVersion      int    `json:"data_version"`
-	Scope            string `json:"scope"`
-	Machine          string `json:"machine"`
-	SourceDatabaseID string `json:"source_database_id"`
-	SourceArchiveID  string `json:"source_archive_id"`
+	Reason                    string `json:"reason"`
+	SchemaVersion             int    `json:"schema_version"`
+	FrustrationMarkersVersion int    `json:"frustration_markers_version"`
+	SystemPrefixRulesVersion  string `json:"system_prefix_rules_version"`
+	DataVersion               int    `json:"data_version"`
+	Scope                     string `json:"scope"`
+	Machine                   string `json:"machine"`
+	SourceDatabaseID          string `json:"source_database_id"`
+	SourceArchiveID           string `json:"source_archive_id"`
 	// Errored reports that the rebuild reached the end with session errors.
 	// Such a rebuild resumes only while something else still requires a
-	// rebuild, including readers blocking the incremental push; otherwise
-	// the incremental push handles the failed sessions.
+	// rebuild. Otherwise the incremental push handles the failed sessions.
 	Errored bool `json:"errored,omitempty"`
 }
 
@@ -141,13 +250,15 @@ func newRebuildRun(
 		return rebuildRun{}, fmt.Errorf("reading local archive id: %w", err)
 	}
 	return rebuildRun{
-		Reason:           reason,
-		SchemaVersion:    SchemaVersion,
-		DataVersion:      db.CurrentDataVersion(),
-		Scope:            db.CanonicalPushScope(opts.Projects, opts.ExcludeProjects),
-		Machine:          machine,
-		SourceDatabaseID: databaseID,
-		SourceArchiveID:  archiveID,
+		Reason:                    reason,
+		SchemaVersion:             SchemaVersion,
+		FrustrationMarkersVersion: frustrationMarkersVersion,
+		SystemPrefixRulesVersion:  db.SystemPrefixRulesVersion(),
+		DataVersion:               db.CurrentDataVersion(),
+		Scope:                     db.CanonicalPushScope(opts.Projects, opts.ExcludeProjects),
+		Machine:                   machine,
+		SourceDatabaseID:          databaseID,
+		SourceArchiveID:           archiveID,
 	}, nil
 }
 
@@ -262,8 +373,7 @@ func pendingRebuild(ctx context.Context, path string, current rebuildRun) (*rebu
 		log.Printf("duckdbsync: discarding unfinished rebuild %s with no readable run record: %v", file, readErr)
 		return nil, removeRebuildFile(file)
 	case !run.resumableAs(current):
-		log.Printf("duckdbsync: discarding unfinished rebuild (%s) because the archive, scope, machine, or format changed since it began",
-			run.Reason)
+		log.Printf("duckdbsync: discarding unfinished rebuild (%s) because the archive, scope, machine, or format changed since it began", run.Reason)
 		return nil, removeRebuildFile(file)
 	}
 	return &run, nil
@@ -331,13 +441,13 @@ func buildMirror(
 		return result, err
 	}
 	result.Diagnostics.Full = true
-	return result, nil
+	return result, removeRebuildFile(sparePath(path))
 }
 
 // staleTempFileAge is how old a work-directory .tmp-<digits> rebuild temp
 // file must be before sweepStaleTempFiles removes it. Rebuilds now write the
 // fixed-name rebuild file instead (see rebuildFilePath), so these files only
-// come from older agentsview builds that crashed or were killed mid-rebuild.
+// come from older interrupted rebuilds or interrupted standby swaps.
 //
 // The age is a heuristic, not proof of liveness: pushes are not serialized
 // across processes, so this sweep could in principle run while an older
@@ -536,6 +646,9 @@ func buildMirrorInto(
 			"rebuild failed with %d session push errors", result.Errors,
 		)
 	}
+	if err := s.replaceRetainedCommitLinks(ctx); err != nil {
+		return result, err
+	}
 	identityRevision, err := s.syncProjectIdentityObservations(ctx, 0, true, nil)
 	if err != nil {
 		return result, err
@@ -543,6 +656,15 @@ func buildMirrorInto(
 	mappingRevision, err := s.syncWorktreeMappings(ctx, 0, true)
 	if err != nil {
 		return result, err
+	}
+	// Usage reads stay exact without a rollup, and the next push builds one,
+	// so a failed build does not fail the rebuild.
+	rollupStart := time.Now()
+	if meta, rollupErr := s.buildUsageRollup(ctx); rollupErr != nil {
+		log.Printf("duckdbsync: building the usage rollup failed; usage reads stay correct but slower: %v", rollupErr)
+	} else {
+		log.Printf("duckdbsync: built usage rollup over %d usage rows in %s",
+			meta.SourceRows, time.Since(rollupStart).Round(time.Millisecond))
 	}
 	scope := db.CanonicalPushScope(opts.Projects, opts.ExcludeProjects)
 	if err := s.writeRebuildMetadata(
@@ -721,24 +843,24 @@ func (s *Sync) writeRebuildMetadata(
 	identityRevision, mappingRevision int64,
 ) error {
 	return writeMirrorMetadata(ctx, s.duck, mirrorMetadata{
-		SchemaVersion:    SchemaVersion,
-		DataVersion:      db.CurrentDataVersion(),
-		SourceDatabaseID: snapshot.sourceDatabaseID,
-		SourceArchiveID:  snapshot.sourceArchiveID,
-		Scope:            scope,
-		LastPushCutoff:   snapshot.cutoff,
-		LastPushAt:       time.Now().UTC().Format(time.RFC3339),
-		LastPushMachine:  s.machine,
-		DeletionRevision: snapshot.deletionRevision,
-		IdentityRevision: identityRevision,
-		MappingRevision:  mappingRevision,
+		SchemaVersion:             SchemaVersion,
+		FrustrationMarkersVersion: frustrationMarkersVersion,
+		SystemPrefixRulesVersion:  db.SystemPrefixRulesVersion(),
+		DataVersion:               db.CurrentDataVersion(),
+		SourceDatabaseID:          snapshot.sourceDatabaseID,
+		SourceArchiveID:           snapshot.sourceArchiveID,
+		Scope:                     scope,
+		LastPushCutoff:            snapshot.cutoff,
+		LastPushAt:                time.Now().UTC().Format(time.RFC3339),
+		LastPushMachine:           s.machine,
+		DeletionRevision:          snapshot.deletionRevision,
+		IdentityRevision:          identityRevision,
+		MappingRevision:           mappingRevision,
 	})
 }
 
-// validateBuiltMirror re-probes the freshly built (and now closed) rebuild
-// file read-only before it is swapped into place, so a mirror that failed
-// to write its own metadata or lost rows never replaces a working one.
-func validateBuiltMirror(ctx context.Context, tmpPath string, wantSessions int) error {
+// validateMirrorProbe checks a closed replacement before publication.
+func validateMirrorProbe(ctx context.Context, tmpPath string) error {
 	probe, err := ProbeMirror(ctx, tmpPath)
 	if err != nil {
 		return fmt.Errorf("validating rebuilt duckdb mirror: %w", err)
@@ -753,6 +875,14 @@ func validateBuiltMirror(ctx context.Context, tmpPath string, wantSessions int) 
 			"rebuilt duckdb mirror has schema version %d, want %d",
 			probe.SchemaVersion, SchemaVersion,
 		)
+	}
+	return nil
+}
+
+// validateBuiltMirror also checks that the rebuilt file has every session.
+func validateBuiltMirror(ctx context.Context, tmpPath string, wantSessions int) error {
+	if err := validateMirrorProbe(ctx, tmpPath); err != nil {
+		return err
 	}
 	conn, err := OpenReadOnly(ctx, tmpPath)
 	if err != nil {

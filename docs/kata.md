@@ -1,13 +1,12 @@
 ---
 title: Kata
-description: Connect AgentsView to a Kata issue tracker as an optional spoke
+description: Connect AgentsView to a Kata issue tracker and file Friction Log patterns as issues
 ---
 
-AgentsView can check a connection to a [Kata](https://github.com/kenn-io/kata)
-issue tracker, either through a local daemon or an HTTPS hub. The connection is
-off by default. AgentsView does not file issues yet. Kata owns issue state;
-AgentsView will keep only the link between a Friction Log pattern and its Kata
-issue.
+AgentsView can connect to a [Kata](https://github.com/kenn-io/kata) issue
+tracker, either through a local daemon or an HTTPS hub, and file Friction Log
+patterns as Kata issues. The connection is off by default. Kata owns issue
+state; AgentsView keeps only the link between a pattern and its issue.
 
 ## Configure
 
@@ -30,8 +29,7 @@ timeout = "10s"
 - HTTPS endpoints need `token_env`. Use a dedicated token for AgentsView so its
   writes are attributed to the integration. Under Kata identity mode, the
   token decides attribution and `actor` is ignored.
-- `actor` names AgentsView on the issues it files. It takes effect once issue
-  filing arrives; the connection check does not use it.
+- `actor` names AgentsView on the issues it files.
 - Plain `http://` works only for loopback hosts unless `allow_insecure = true`.
 - The project must already exist in Kata. AgentsView never creates it.
 
@@ -61,8 +59,90 @@ with `AGENTSVIEW_SERVER_TOKEN` or `--server-token-file PATH`.
 Only the AgentsView instance that holds the aggregated archive can file to Kata:
 `pg serve` on a PostgreSQL hub, or a standalone instance that does not push to
 PostgreSQL. A laptop that pushes to a hub reports `not_hub` and never contacts
-Kata, even when it shares the hub's `[kata]` config. Issue filing will arrive
-with the Friction Log Kata integration.
+Kata, even when it shares the hub's `[kata]` config.
+
+## File Friction Log patterns
+
+File a pattern by hand, or let the hub file recent patterns every hour. On the
+hub's Friction Log page, each pattern under **Needs attention** offers **File to
+Kata** and **Link issue** once Kata is ready, and a linked pattern shows its
+issue with **Unlink**. The actions appear only where the server accepts writes,
+the same as **Build now**.
+
+From the command line, pick a pattern's fingerprint from
+`agentsview friction patterns`, then file it from the hub:
+
+```bash
+agentsview friction file <fingerprint> [--dry-run] [--format human|json | --json]
+agentsview friction link <fingerprint> <issue>
+agentsview friction unlink <fingerprint>
+```
+
+- `friction file` first asks Kata for an issue already tagged with the pattern's
+  fingerprint, in the `friction.fingerprint` metadata key. It links one it
+  finds, and creates an issue only when Kata holds none. Filing a pattern
+  again returns its existing link. When Kata holds more than one candidate,
+  filing stops so you can choose one with `friction link`.
+- `--dry-run` prints the issue without contacting Kata.
+- The issue title and body describe the finding the pattern was last seen as,
+  with how often it recurred. Secrets are masked and home directories
+  shortened to `~` before anything leaves the machine. With `public_url` set,
+  the body links to the session and the digest.
+- Corrections, errors, workarounds, deferrals, and patterns can be filed.
+  Frustration quotes the user and interruptions carry no text, so neither is
+  filed.
+- `friction link` records an existing issue, given as a qualified ID such as
+  `agentsview#f001`, a short ID, or a UID. `friction unlink` removes the
+  AgentsView link only; the Kata issue stays as it is.
+
+Pattern reads show the link beside each pattern: the `ISSUE` column of
+`friction patterns`, the `issue` field in the API and MCP results, and the
+digest's `patterns`. Stored digests are not rewritten. Links survive a full
+resync. The same actions are available over HTTP as `POST`, `PUT`, and `DELETE`
+on `/api/v1/friction/patterns/{fingerprint}/issue`; they require auth or a
+localhost request, like `friction run`. A PostgreSQL hub whose database role
+cannot write links refuses them before contacting Kata.
+
+### File patterns automatically
+
+Turn on automatic filing in the hub's configuration, then restart the daemon:
+
+```toml
+[friction.kata]
+auto_file = true
+kinds = ["error", "workaround"] # Optional; empty means every kind that can be filed.
+min_sessions = 2 # Optional; file only patterns seen in at least this many sessions.
+```
+
+- Each hour, after it builds digests, the Friction Log job files unlinked
+  patterns of a chosen kind last seen within `[friction] backfill_days` and
+  seen in at least `min_sessions` sessions (default 2). It uses the same
+  lookup as `friction file`, so it links an issue Kata already holds instead
+  of filing a duplicate.
+- With automatic filing on, the hourly job reopens a linked issue closed as
+  `done` when a signal in a saved digest within `backfill_days` occurred after
+  the close, and comments with the date it recurred.
+- Corrections, `pattern` findings, and deferrals are tracked per session, so
+  each appears in one session only. At the default `min_sessions` they are
+  never filed automatically; set `min_sessions = 1` to file every one of them.
+- One pass files at most 20 new patterns, most frequent first, so turning
+  automatic filing on spreads the backlog over several hours. Patterns waiting
+  to retry do not count toward that limit.
+- While Kata is not ready, the job files nothing and records no failures.
+- After a failed request, the job tries again in 1 hour, then doubles the wait
+  up to 24 hours, even once the pattern is older than `backfill_days`. After
+  14 days of failures, or when Kata rejects the request or holds several
+  candidate issues, the pattern waits for you to file or link it.
+- Unlinking a pattern stops automatic filing for it. Filing or linking it by
+  hand starts it again.
+- If you link a pattern by hand while the job is creating an issue for it, your
+  link wins, and the issue the job created stays in Kata without a link.
+
+A pattern without an issue shows why: a note on the Friction Log page, `(retry)`
+or `(file or link)` in the `ISSUE` column of `friction patterns`, and the
+`filing` field in API and MCP results. An unlinked pattern is shown as paused
+only on the page of a hub that files automatically; `--json` output always
+includes the `filing` state.
 
 ## Limits
 

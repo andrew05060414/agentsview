@@ -31,6 +31,7 @@ const (
 	sessionAliasBackfillStateKey           = "pg_session_alias_backfill_v1"
 	legacyProjectIdentityStateKey          = "project_identity_publication_revision_v2"
 	projectIdentityPublicationStateKey     = "project_identity_publication_revision_v3"
+	commitLinksBackfillStateKey            = "pg_commit_links_backfill_v2"
 	messageDialogueBackfillStateKey        = "pg_message_dialogue_backfill_v1"
 	transcriptRevisionBackfillStateKey     = "pg_transcript_revision_backfill_v1"
 	sessionProvenanceBackfillStateKey      = "pg_session_provenance_backfill_v2"
@@ -93,6 +94,20 @@ func (s *Sync) Push(
 // defaultFullRunSaveTimeout bounds the progress save after a failed full push.
 const defaultFullRunSaveTimeout = 30 * time.Second
 
+// completedDiagnosticPushError marks an error returned after all push phases
+// finished, so PushWithOptions can run finalizers without restoring the run.
+type completedDiagnosticPushError struct{ err error }
+
+func (e *completedDiagnosticPushError) Error() string { return e.err.Error() }
+func (e *completedDiagnosticPushError) Unwrap() error { return e.err }
+
+func markCompletedDiagnosticPush(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &completedDiagnosticPushError{err: err}
+}
+
 // PushWithOptions is Push with per-push options; see storage.PushOptions.
 func (s *Sync) PushWithOptions(
 	ctx context.Context, opts storage.PushOptions,
@@ -101,8 +116,13 @@ func (s *Sync) PushWithOptions(
 	result, err := s.pushWithOptions(ctx, opts, onProgress)
 	run := s.fullRun
 	s.fullRun = nil
+	completedErr, completed := errors.AsType[*completedDiagnosticPushError](err)
+	if completed {
+		err = completedErr.err
+	}
 	switch {
-	case err == nil:
+	case err == nil || errors.Is(err, db.ErrDiagnosticConflict) || completed:
+		err = errors.Join(err, s.replaceRetainedCommitLinks(ctx))
 	case run != nil:
 		// Keep what the run committed since its last checkpoint. The push
 		// may have failed because ctx ended, so save without it, but within
@@ -312,6 +332,14 @@ func (s *Sync) pushWithOptions(
 		)
 		noteFull("backfilling transcript revisions")
 	}
+	var commitLinksBackfillNeeded bool
+	full, commitLinksBackfillNeeded, err = applyBackfillRequirement(ctx, state, commitLinksBackfillStateKey, full)
+	if err != nil {
+		return result, err
+	}
+	if commitLinksBackfillNeeded {
+		noteFull("backfilling commit links")
+	}
 	var messageDialogueBackfillNeeded bool
 	full, messageDialogueBackfillNeeded, err = applyBackfillRequirement(ctx, state, messageDialogueBackfillStateKey, full)
 	if err != nil {
@@ -338,6 +366,7 @@ func (s *Sync) pushWithOptions(
 		transcriptRevisionBackfillStateKey:     transcriptRevisionBackfillNeeded,
 		timestampNormalizationBackfillStateKey: timestampNormalizationBackfillNeeded,
 		messageDialogueBackfillStateKey:        messageDialogueBackfillNeeded,
+		commitLinksBackfillStateKey:            commitLinksBackfillNeeded,
 	} {
 		if needed {
 			backfills = append(backfills, key)
@@ -504,8 +533,12 @@ func (s *Sync) pushWithOptions(
 		return result, err
 	}
 	if err := timedPushSetupStep("cursor usage event sync",
-		func() error { return s.syncCursorUsageEvents(ctx) }); err != nil {
+		func() error { return s.syncCursorUsageEvents(ctx, full) }); err != nil {
 		return result, err
+	}
+	diagnosticErr := s.syncDiagnosticEvents(ctx, full, markerID)
+	if diagnosticErr != nil {
+		log.Printf("pgsync: diagnostic events: %v", diagnosticErr)
 	}
 	// Candidate selection shares ListSessionsForMirrorWindow with the
 	// DuckDB mirror push: sync_marker >= lastPush, inclusive below and
@@ -673,6 +706,9 @@ func (s *Sync) pushWithOptions(
 		); err != nil {
 			return result, err
 		}
+		if err := completeBackfill(ctx, state, commitLinksBackfillStateKey, commitLinksBackfillNeeded, result); err != nil {
+			return result, err
+		}
 		if err := completeBackfill(ctx, state, messageDialogueBackfillStateKey, messageDialogueBackfillNeeded, result); err != nil {
 			return result, err
 		}
@@ -705,7 +741,7 @@ func (s *Sync) pushWithOptions(
 			return result, err
 		}
 		result.Duration = time.Since(start)
-		return result, nil
+		return result, markCompletedDiagnosticPush(diagnosticErr)
 	}
 
 	pushed := make([]db.Session, 0, len(sessions))
@@ -812,6 +848,9 @@ func (s *Sync) pushWithOptions(
 	); err != nil {
 		return result, err
 	}
+	if err := completeBackfill(ctx, state, commitLinksBackfillStateKey, commitLinksBackfillNeeded, result); err != nil {
+		return result, err
+	}
 	if err := completeBackfill(ctx, state, messageDialogueBackfillStateKey, messageDialogueBackfillNeeded, result); err != nil {
 		return result, err
 	}
@@ -851,7 +890,7 @@ func (s *Sync) pushWithOptions(
 		return result, err
 	}
 	result.Duration = time.Since(start)
-	return result, nil
+	return result, markCompletedDiagnosticPush(diagnosticErr)
 }
 
 // runVectorPushPhase runs the vector push phase and wraps its error. With no
@@ -1404,8 +1443,17 @@ func (s *Sync) pushBatchAttempt(
 				return batchResult{}, nil
 			}
 		}
+		imageRows, err := s.local.SessionImageTextRows(ctx, sess.ID)
+		if err != nil {
+			log.Printf("pgsync: reading local image text %s: %v", sess.ID, err)
+			_ = tx.Rollback()
+			*pushed = (*pushed)[:len(*pushed)-n]
+			return batchResult{}, nil
+		}
+		mirrored := sess
+		mirrored.DataVersion = db.MirrorDataVersion(sess.DataVersion, len(imageRows) > 0)
 		if err := s.pushSession(
-			ctx, tx, sess, markerID, legacyMarkerMachines,
+			ctx, tx, mirrored, markerID, legacyMarkerMachines,
 		); err != nil {
 			if errors.Is(err, errSessionOwnershipConflict) {
 				skippedConflicts++
@@ -1447,6 +1495,20 @@ func (s *Sync) pushBatchAttempt(
 			*pushed = (*pushed)[:len(*pushed)-n]
 			return batchResult{}, nil
 		}
+		commitLinksChanged, err := s.pushCommitLinks(ctx, tx, sess.ID)
+		if err != nil {
+			log.Printf("pgsync: commit links %s: %v", sess.ID, err)
+			_ = tx.Rollback()
+			*pushed = (*pushed)[:len(*pushed)-n]
+			return batchResult{}, nil
+		}
+		imageTextChanged, err := s.pushImageText(ctx, tx, sess.ID, imageRows)
+		if err != nil {
+			log.Printf("pgsync: image text %s: %v", sess.ID, err)
+			_ = tx.Rollback()
+			*pushed = (*pushed)[:len(*pushed)-n]
+			return batchResult{}, nil
+		}
 		frictionChanged := false
 		if !frictionUnchanged {
 			frictionChanged, err = s.pushFrictionFindings(ctx, tx, sess.ID)
@@ -1469,11 +1531,22 @@ func (s *Sync) pushBatchAttempt(
 			return batchResult{}, nil
 		}
 
-		// Bump updated_at when messages, secret findings, friction, or
-		// plan usage were rewritten but pushSession was a metadata no-op
-		// (its WHERE clause skips unchanged rows). PG read-mode session
-		// watchers rely on updated_at to surface these changes.
-		if messagesChanged || findingsChanged || frictionChanged || planUsageChanged {
+		sessionTotalChanged, err := s.replaceSessionUsageTotal(ctx, tx, sess.ID)
+		if err != nil {
+			log.Printf(
+				"pgsync: session total %s: %v",
+				sess.ID, err,
+			)
+			_ = tx.Rollback()
+			*pushed = (*pushed)[:len(*pushed)-n]
+			return batchResult{}, nil
+		}
+
+		// Publish findings, commit links, image text, friction, plan usage,
+		// or session total changes to read-mode watchers unless pushMessages
+		// already advanced updated_at.
+		if !messagesChanged && (findingsChanged || commitLinksChanged || imageTextChanged ||
+			frictionChanged || planUsageChanged || sessionTotalChanged) {
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE sessions
 				SET updated_at = NOW()
@@ -1627,6 +1700,9 @@ func (s *Sync) retireSourceArchiveMetadata(
 				)
 			}
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM retained_commit_links WHERE source_archive_id=$1`, archiveID); err != nil {
+		return fmt.Errorf("retiring old archive retained links: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing old archive metadata retirement: %w", err)
@@ -2147,8 +2223,7 @@ func (s *Sync) reconcilePGMissingSessions(
 			return fmt.Errorf("scanning owned pg session for full push reconciliation: %w", err)
 		}
 		ids = append(ids, id)
-		switch agent {
-		case "codex", "traex", "augure-code":
+		if parser.IsCodexFormatAgent(parser.AgentType(agent)) {
 			codexPaths[id] = path
 		}
 	}
@@ -2158,7 +2233,7 @@ func (s *Sync) reconcilePGMissingSessions(
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	return db.QueryChunkedSize(ids, pushComparisonBatchSize, func(chunk []string) error {
+	err = db.QueryChunkedSize(ids, pushComparisonBatchSize, func(chunk []string) error {
 		// Read live presence, including trashed and out-of-scope local rows.
 		// A sync may have added a session since the push listed its candidates.
 		present, err := s.local.SessionProjectsByIDs(ctx, chunk)
@@ -2254,6 +2329,9 @@ func (s *Sync) reconcilePGMissingSessions(
 		if err := rows.Close(); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM commit_links WHERE NOT retained AND session_id = ANY($1)`, deleted); err != nil {
+			return err
+		}
 		for _, id := range deleted {
 			if err := clearSessionVectorsTx(ctx, tx, id); err != nil {
 				return err
@@ -2261,6 +2339,10 @@ func (s *Sync) reconcilePGMissingSessions(
 		}
 		return tx.Commit()
 	})
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Sync) reconcilePGProjectScopeMoves(
@@ -2328,8 +2410,8 @@ func (s *Sync) reconcilePGProjectScopeMoves(
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM sessions
-		WHERE owner_marker = $1 AND id = ANY($2)`, ownerMarker, staleIDs); err != nil {
+		WITH deleted AS (DELETE FROM sessions WHERE owner_marker = $1 AND id = ANY($2) RETURNING id)
+		DELETE FROM commit_links WHERE NOT retained AND session_id IN (SELECT id FROM deleted)`, ownerMarker, staleIDs); err != nil {
 		return nil, fmt.Errorf("deleting pg sessions that moved out of scope: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -2377,7 +2459,8 @@ func deletePGExcludedSessionRows(
 		return nil
 	}
 	if _, err := pg.ExecContext(ctx,
-		`DELETE FROM sessions WHERE id = ANY($1)`,
+		`WITH deleted AS (DELETE FROM sessions WHERE id = ANY($1) RETURNING id)
+		DELETE FROM commit_links WHERE NOT retained AND session_id IN (SELECT id FROM deleted)`,
 		ids,
 	); err != nil {
 		return fmt.Errorf("deleting pg excluded session rows: %w", err)
@@ -3063,6 +3146,15 @@ func (s *Sync) pushMessages(
 		return 0, false, err
 	}
 	defer func() { err = errors.Join(err, snapshot.Close()) }()
+	defer func() {
+		if err == nil && changed {
+			// Every caller must publish message changes to read-mode watchers.
+			_, err = tx.ExecContext(ctx, `UPDATE sessions SET updated_at = NOW() WHERE id = $1`, sessionID)
+			if err != nil {
+				err = fmt.Errorf("bumping message session version: %w", err)
+			}
+		}
+	}()
 	boundary := 0
 	usageChanged := true
 	if !rewriteTranscripts {
@@ -3754,25 +3846,27 @@ func bulkInsertMessages(
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, reasoning_effort, token_usage,
 			context_tokens, output_tokens,
+			usage_output_tokens, usage_web_search_requests,
 			provider_id,
 			has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
 			source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain,
 			is_compact_boundary) VALUES `)
-		args := make([]any, 0, len(batch)*28)
+		args := make([]any, 0, len(batch)*30)
 		for j, m := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*28 + 1
+			p := j*30 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3, p+4,
 				p+5, p+6, p+7, p+8, p+9,
 				p+10, p+11, p+12, p+13, p+14, p+15,
 				p+16, p+17, p+18, p+19, p+20,
 				p+21, p+22, p+23, p+24, p+25, p+26, p+27,
+				p+28, p+29,
 			)
 			ts, err := optionalSQLiteTimestamp(m.Timestamp)
 			if err != nil {
@@ -3787,9 +3881,11 @@ func bulkInsertMessages(
 			// bytes (e.g. raw protobuf fragments), which PG
 			// rejects with SQLSTATE 22021.
 			var dialogue any
-			if m.DialogueText != nil {
-				dialogue = sanitizePG(*m.DialogueText)
+			if stored, _ := db.StoredDialogue(m.Content, m.ThinkingText, m.DialogueText); stored != nil {
+				dialogue = sanitizePG(*stored)
 			}
+			tokenUsage := sanitizePG(string(m.TokenUsage))
+			usageOutputTokens, usageWebSearchRequests := messageUsageCounters(tokenUsage)
 			args = append(args,
 				sessionID, m.Ordinal, sanitizePG(m.Role),
 				sanitizePG(m.Content),
@@ -3798,8 +3894,9 @@ func bulkInsertMessages(
 				m.HasToolUse, m.ContentLength, m.IsSystem,
 				sanitizePG(m.Model),
 				sanitizePG(m.ReasoningEffort),
-				sanitizePG(string(m.TokenUsage)),
+				tokenUsage,
 				m.ContextTokens, m.OutputTokens,
+				usageOutputTokens, usageWebSearchRequests,
 				sanitizePG(m.ProviderID),
 				m.HasContextTokens, m.HasOutputTokens,
 				sanitizePG(m.ClaudeMessageID),
@@ -3913,22 +4010,26 @@ func bulkInsertCursorUsageEvents(
 			input_tokens, output_tokens,
 			cache_write_tokens, cache_read_tokens,
 			charged_microdollars, cursor_token_fee_microdollars,
-			user_id, user_email, is_headless, dedup_key
+			user_id, user_email, is_headless, dedup_key, agent
 		) VALUES `)
-		args := make([]any, 0, len(batch)*13)
+		args := make([]any, 0, len(batch)*14)
 		for j, ev := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*13 + 1
+			p := j*14 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3, p+4, p+5, p+6,
-				p+7, p+8, p+9, p+10, p+11, p+12,
+				p+7, p+8, p+9, p+10, p+11, p+12, p+13,
 			)
 			occurredAt, ok := ParseSQLiteTimestamp(ev.OccurredAt)
 			if !ok {
 				return fmt.Errorf("parsing cursor usage occurred_at %q", ev.OccurredAt)
+			}
+			agent := ev.Agent
+			if agent == "" {
+				agent = "cursor"
 			}
 			args = append(args,
 				occurredAt,
@@ -3944,6 +4045,7 @@ func bulkInsertCursorUsageEvents(
 				sanitizePG(ev.UserEmail),
 				ev.IsHeadless,
 				sanitizePG(ev.DedupKey),
+				sanitizePG(agent),
 			)
 		}
 		b.WriteString(` ON CONFLICT DO NOTHING`)
@@ -4193,6 +4295,74 @@ func bulkInsertSecretFindings(ctx context.Context, tx *sql.Tx, sessionID string,
 	return nil
 }
 
+func (s *Sync) pushSessionWithImageText(ctx context.Context, tx *sql.Tx, sess db.Session, markerID string, legacy []string) error {
+	rows, err := s.local.SessionImageTextRows(ctx, sess.ID)
+	if err != nil {
+		return fmt.Errorf("reading local image text: %w", err)
+	}
+	sess.DataVersion = db.MirrorDataVersion(sess.DataVersion, len(rows) > 0)
+	if err := s.pushSession(ctx, tx, sess, markerID, legacy); err != nil {
+		return err
+	}
+	_, err = s.pushImageText(ctx, tx, sess.ID, rows)
+	return err
+}
+
+// pushImageText replaces a session's image text when the archive's rows
+// differ from the published ones and reports whether it changed them. OCR can
+// finish without any other session change, so the caller advances updated_at.
+func (s *Sync) pushImageText(ctx context.Context, tx *sql.Tx, id string, local []db.ImageTextRow) (bool, error) {
+	rows := make([]db.ImageTextRow, len(local))
+	for i, r := range local {
+		rows[i] = db.ImageTextRow{
+			SessionID: sanitizePG(r.SessionID), SourceKind: sanitizePG(r.SourceKind),
+			MessageOrdinal: r.MessageOrdinal, CallIndex: r.CallIndex, EventIndex: r.EventIndex,
+			ImageIndex: r.ImageIndex, ImageHash: sanitizePG(r.ImageHash),
+			Processor: sanitizePG(r.Processor), Provider: sanitizePG(r.Provider),
+			Model: sanitizePG(r.Model), Revision: sanitizePG(r.Revision), Text: sanitizePG(r.Text),
+		}
+	}
+	published, err := publishedImageText(ctx, tx, id)
+	if err != nil {
+		return false, err
+	}
+	if slices.Equal(published, rows) {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM image_text WHERE session_id=$1`, id); err != nil {
+		return false, fmt.Errorf("deleting pg image text: %w", err)
+	}
+	for _, r := range rows {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO image_text (session_id,source_kind,message_ordinal,call_index,event_index,image_index,image_hash,processor,provider,model,revision,text) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			r.SessionID, r.SourceKind, r.MessageOrdinal, r.CallIndex, r.EventIndex, r.ImageIndex,
+			r.ImageHash, r.Processor, r.Provider, r.Model, r.Revision, r.Text); err != nil {
+			return false, fmt.Errorf("inserting pg image text: %w", err)
+		}
+	}
+	return true, nil
+}
+
+// publishedImageText reads a session's rows in the archive export's order.
+func publishedImageText(ctx context.Context, tx *sql.Tx, id string) ([]db.ImageTextRow, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT session_id,source_kind,message_ordinal,call_index,event_index,image_index,image_hash,processor,provider,model,revision,text
+		FROM image_text WHERE session_id=$1
+		ORDER BY source_kind COLLATE "C",message_ordinal,call_index,event_index,image_index,processor COLLATE "C"`, id)
+	if err != nil {
+		return nil, fmt.Errorf("reading pg image text: %w", err)
+	}
+	defer rows.Close()
+	var out []db.ImageTextRow
+	for rows.Next() {
+		var r db.ImageTextRow
+		if err := rows.Scan(&r.SessionID, &r.SourceKind, &r.MessageOrdinal, &r.CallIndex, &r.EventIndex, &r.ImageIndex,
+			&r.ImageHash, &r.Processor, &r.Provider, &r.Model, &r.Revision, &r.Text); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // normalizeSyncTimestamps ensures schema exists and normalizes
 // local sync state timestamps.
 func (s *Sync) normalizeSyncTimestamps(
@@ -4223,23 +4393,59 @@ func nilIfEmpty(s string) any {
 	return s
 }
 
-func (s *Sync) syncCursorUsageEvents(ctx context.Context) error {
+// cursorUsageHighWaterKeyPrefix, followed by the source archive id, names
+// the sync_metadata row recording the largest local cursor_usage_events id
+// this target holds, as "<id>:<database generation>".
+const cursorUsageHighWaterKeyPrefix = "cursor_usage_max_id:"
+
+// syncCursorUsageEvents sends the account usage rows the target has not
+// received from this archive yet. Local ids only grow within one database
+// generation; a rebuild renumbers them, so a stored id from another
+// generation, or a full push, sends every row again. The dedup index makes
+// rows the target already holds no-ops.
+func (s *Sync) syncCursorUsageEvents(ctx context.Context, full bool) error {
 	// Cursor admin rows are global and unattributed, so project-filtered pushes
 	// cannot sync them honestly.
 	if s.isFiltered() {
 		return nil
 	}
 
-	// The PG push is explicit and on-demand, so it keeps the full-history
-	// load (sinceID 0): the remote dedup index makes re-inserts no-ops and
-	// there is no per-filesystem-event pressure to bound, unlike the DuckDB
-	// automatic push which tracks a high-water id in mirror metadata.
-	events, err := s.local.GetCursorUsageEvents(ctx, 0)
+	localMax, err := s.local.MaxCursorUsageEventID(ctx)
+	if err != nil {
+		return err
+	}
+	if localMax == 0 {
+		return nil
+	}
+	key := cursorUsageHighWaterKeyPrefix + s.archiveID
+	var sinceID int64
+	if !full {
+		var stored string
+		err = s.pg.QueryRowContext(ctx,
+			`SELECT value FROM sync_metadata WHERE key = $1`, key).Scan(&stored)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("reading cursor usage high-water id: %w", err)
+		}
+		if id, generation, ok := strings.Cut(stored, ":"); ok && generation == s.databaseGeneration {
+			if sinceID, err = strconv.ParseInt(id, 10, 64); err != nil {
+				return fmt.Errorf("parsing cursor usage high-water id %q: %w", stored, err)
+			}
+		}
+	}
+	if sinceID >= localMax {
+		return nil
+	}
+
+	events, err := s.local.GetCursorUsageEvents(ctx, sinceID)
 	if err != nil {
 		return fmt.Errorf("loading local cursor usage events: %w", err)
 	}
 	if len(events) == 0 {
 		return nil
+	}
+	maxID := sinceID
+	for _, ev := range events {
+		maxID = max(maxID, ev.ID)
 	}
 
 	tx, err := s.pg.BeginTx(ctx, nil)
@@ -4250,6 +4456,13 @@ func (s *Sync) syncCursorUsageEvents(ctx context.Context) error {
 
 	if err := bulkInsertCursorUsageEvents(ctx, tx, events); err != nil {
 		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO sync_metadata (key, value) VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+		key, strconv.FormatInt(maxID, 10)+":"+s.databaseGeneration,
+	); err != nil {
+		return fmt.Errorf("recording cursor usage high-water id: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing pg cursor usage sync: %w", err)

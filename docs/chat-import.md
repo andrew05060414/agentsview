@@ -48,9 +48,8 @@ as unsupported before any sessions are emitted.
 The web import dialog currently supports Claude.ai and ChatGPT. Import Gemini
 Apps exports with the [CLI](#importing-via-the-cli).
 
-Click the **Import conversations** button in the header
-(the upload icon in the top-right area) to open the import
-dialog.
+Open the **More actions** menu (the `…` button in the header) and choose
+**Import conversations** to open the import dialog.
 
 ![Import button in header](/docs/assets/generated/screenshots/import-button.png)
 
@@ -162,6 +161,28 @@ that changes text, message count, or title triggers another fetch. Title-only
 changes count as updates and refresh open session lists. Resync clears
 freshness, so the next Sync fetches each chat once. Search stays available
 during Sync.
+
+### Choose which organizations Sync imports
+
+A Claude.ai login can belong to more than one organization, such as a personal
+plan and a Team or Enterprise workspace. Sync imports every organization that
+has chats unless `config.toml` lists the ones to keep:
+
+```toml
+[agents.claude-ai]
+organizations = ["11111111-1111-4111-8111-111111111111"]
+```
+
+- Sync skips every organization whose UUID is not listed. Case and surrounding
+  spaces do not matter.
+- An empty list, or no `organizations` key, imports every organization.
+- A value that is not a list of non-empty strings, or any other key in
+  `[agents.claude-ai]`, stops Claude.ai Sync with an error that names
+  `config.toml`. A misspelled key never widens the import.
+- The server reads the setting when it starts. Restart AgentsView after editing
+  it.
+- The list only limits what Sync fetches from now on. Chats imported earlier
+  stay in the archive.
 
 Changed chats show Claude.ai's visible branch, even when it has fewer turns.
 Usage-only archives also update their message and user-turn counts to follow

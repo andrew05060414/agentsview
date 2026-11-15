@@ -11,6 +11,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
 )
 
@@ -61,8 +62,33 @@ func seedPGDailyFixture(t *testing.T, store *Store) {
 	require.NoError(t, err, "insert messages")
 }
 
+func TestPGActivityReportReadersAvoidPreparedStatements(t *testing.T) {
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
+	seedPGDailyFixture(t, store)
+	tx, err := store.DB().BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+	view := store.readView(tx)
+	q := pgDayQuery(t, "2026-06-16", "UTC")
+	q.Partial, q.EffectiveEnd = true, q.RangeEnd.Add(-time.Second)
+	_, err = view.BuildActivityReportArtifacts(t.Context(), db.AnalyticsFilter{Timezone: "UTC"}, q, nil)
+	require.NoError(t, err)
+	for _, reader := range []string{
+		"%AS web_search_requests%",
+		"%SELECT session_id, ordinal, role, timestamp, model%",
+		"%WITH terminal_events AS%",
+	} {
+		var prepared int
+		require.NoError(t, tx.QueryRowContext(t.Context(),
+			"SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE $1", reader).Scan(&prepared))
+		assert.Zero(t, prepared, "Activity reader must plan with its actual parameters: %s", reader)
+	}
+}
+
 func TestPGActivityReportSourceProbeUsesMirrorSchema(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_activity_probe_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	before, err := store.ActivityReportSourceProbe(ctx)
@@ -85,8 +111,31 @@ func TestPGActivityReportSourceProbeUsesMirrorSchema(t *testing.T) {
 		"identity-only mirror updates must change the Activity probe")
 }
 
+// The probe reports the newest pricing time across model prices and the
+// GenAI document, so a change to either refreshes open Activity reports. A
+// table without a time does not hide the other's.
+func TestPGActivityReportSourceProbeReportsNewestPricingTime(t *testing.T) {
+	_, store := prepareUsageSchema(t, "agentsview_activity_probe_pricing_test")
+	ctx := t.Context()
+	for _, step := range []struct{ sql, want string }{
+		{`SELECT 1`, ""},
+		{`INSERT INTO genai_pricing (singleton, version, source, data_json)
+		  VALUES (1, 'v1', 'embedded', '\x7b7d')`, ""},
+		{`INSERT INTO model_pricing (model_pattern, updated_at)
+		  VALUES ('probe-model', '2026-07-01T00:00:02Z')`, "2026-07-01 00:00:02+00"},
+		{`UPDATE genai_pricing SET updated_at = '2026-07-02T00:00:00Z'`, "2026-07-02 00:00:00+00"},
+	} {
+		_, err := store.DB().ExecContext(ctx, step.sql)
+		require.NoError(t, err, step.sql)
+		probe, err := store.ActivityReportSourceProbe(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, step.want, probe.MaxPricingUpdated, step.sql)
+	}
+}
+
 func TestPGGetActivityReport(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 	seedPGDailyFixture(t, store)
 
@@ -100,6 +149,42 @@ func TestPGGetActivityReport(t *testing.T) {
 	assert.GreaterOrEqual(t, len(r.ByModel), 2)
 }
 
+func TestPGActivityReportSecondRead(t *testing.T) {
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
+	seedPGDailyFixture(t, store)
+	ctx := t.Context()
+	q := pgDayQuery(t, "2026-06-16", "UTC")
+	f := db.AnalyticsFilter{Timezone: "UTC"}
+
+	release, ok := (activityReportBackend{Store: store}).ActivityReportSecondRead()
+	require.True(t, ok, "a pool-backed report can read usage while pairing")
+	release()
+	var poolProgress []activity.Progress
+	pooled, err := store.BuildActivityReportArtifacts(ctx, f, q, func(p activity.Progress) {
+		poolProgress = append(poolProgress, p)
+	})
+	require.NoError(t, err)
+	require.Len(t, pooled.Sessions, 2)
+	assert.Equal(t, 2, pooled.Report.Peak.Agents)
+
+	// Force the transaction view to build rather than reuse the pooled report.
+	store.runtimeState().activityKept.DeleteSlots(func(string) bool { return true })
+	tx, err := store.DB().BeginTx(ctx, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, tx.Rollback()) }()
+	view := store.readView(tx)
+	_, ok = (activityReportBackend{Store: view}).ActivityReportSecondRead()
+	require.False(t, ok, "a transaction view must read usage and candidates in order")
+	var viewProgress []activity.Progress
+	sequential, err := view.BuildActivityReportArtifacts(ctx, f, q, func(p activity.Progress) {
+		viewProgress = append(viewProgress, p)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, pooled, sequential)
+	assert.Equal(t, poolProgress, viewProgress)
+}
+
 // TestPGGetActivityReportOpenSessionWithInRangeMessageIncluded confirms a
 // still-open session (no ended_at) that started before the range but has a
 // message inside it is not dropped. The effective-end fallback uses the
@@ -107,7 +192,8 @@ func TestPGGetActivityReport(t *testing.T) {
 // DuckDB. Mirrors the SQLite
 // TestGetActivityReport_OpenSessionWithInRangeMessageIncluded.
 func TestPGGetActivityReportOpenSessionWithInRangeMessageIncluded(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_open_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	// Started the day before, never closed (ended_at NULL), active in-range.
@@ -149,14 +235,15 @@ func TestPGGetActivityReportOpenSessionWithInRangeMessageIncluded(t *testing.T) 
 // its input and output tokens and computed cost in the day totals, matching
 // the SQLite reference behavior.
 func TestPGGetActivityReportUsageCostAndTokens(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_usage_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
-		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, 'seed')`)
+		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, '2026-01-01T00:00:00Z')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -198,15 +285,16 @@ func TestPGGetActivityReportUsageCostAndTokens(t *testing.T) {
 }
 
 func TestPGGetActivityReportCopilotReportedCostReplacesSessionEstimates(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_activity_copilot_authoritative_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
 		) VALUES
-			('copilot-model-a', 10000000, 0, 0, 0, 'seed'),
-			('copilot-model-b', 20000000, 0, 0, 0, 'seed')`)
+			('copilot-model-a', 10000000, 0, 0, 0, '2026-01-01T00:00:00Z'),
+			('copilot-model-b', 20000000, 0, 0, 0, '2026-01-01T00:00:00Z')`)
 	require.NoError(t, err)
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -253,7 +341,8 @@ func TestPGGetActivityReportCopilotReportedCostReplacesSessionEstimates(t *testi
 // GetDailyUsage, which never filters by relationship_type). The fork's
 // replayed usage row dedups away, so it adds a session row but no cost.
 func TestPGGetActivityReportIncludesSubagentUsage(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_subagent_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	_, err := store.DB().ExecContext(ctx, `
@@ -261,8 +350,8 @@ func TestPGGetActivityReportIncludesSubagentUsage(t *testing.T) {
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
 		) VALUES
-			('root-model', 3000000, 15000000, 0, 0, 'seed'),
-			('sub-model', 3000000, 15000000, 0, 0, 'seed')`)
+			('root-model', 3000000, 15000000, 0, 0, '2026-01-01T00:00:00Z'),
+			('sub-model', 3000000, 15000000, 0, 0, '2026-01-01T00:00:00Z')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -330,7 +419,8 @@ func TestPGGetActivityReportIncludesSubagentUsage(t *testing.T) {
 }
 
 func TestPGGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_pricing_survivor_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	_, err := store.DB().ExecContext(ctx, `
@@ -338,8 +428,8 @@ func TestPGGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T)
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
 		) VALUES
-			('partial-model', 3000000, 15000000, 0, 0, 'seed'),
-			('complete-model', 3000000, 15000000, 0, 0, 'seed')`)
+			('partial-model', 3000000, 15000000, 0, 0, '2026-01-01T00:00:00Z'),
+			('complete-model', 3000000, 15000000, 0, 0, '2026-01-01T00:00:00Z')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -383,7 +473,8 @@ func TestPGGetActivityReportPricingModelsOnlyIncludeDedupSurvivors(t *testing.T)
 // window plus the usage ts-bounds keep a session whose only activity
 // falls outside the target day from contributing to that day.
 func TestPGGetActivityReportExcludesOtherDays(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_otherday_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	_, err := store.DB().ExecContext(ctx, `
@@ -438,7 +529,8 @@ func reportSessionIDsPG(sessions []activity.SessionRow) map[string]struct{} {
 // bounds: a session that began and ended on the prior day but lands
 // inside the pad must NOT appear in the target day's report.
 func TestPGGetActivityReportPriorDayWithinPadExcluded(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_pad_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	_, err := store.DB().ExecContext(ctx, `
@@ -480,14 +572,15 @@ func TestPGGetActivityReportPriorDayWithinPadExcluded(t *testing.T) {
 // synthetic-model message carrying real token_usage must not inflate
 // the day totals.
 func TestPGGetActivityReportExcludesIneligibleUsage(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_eligible_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
-		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, 'seed')`)
+		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, '2026-01-01T00:00:00Z')`)
 	require.NoError(t, err, "insert pricing")
 	_, err = store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -526,14 +619,15 @@ func TestPGGetActivityReportExcludesIneligibleUsage(t *testing.T) {
 // first-seen cross-session dedup uses timestamp order rather than database or
 // candidate-ID order.
 func TestPGGetActivityReportDedupUsesChronologicalOrder(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_chunk_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO model_pricing (
 			model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
 			cache_creation_microdollars_per_mtok, cache_read_microdollars_per_mtok, updated_at
-		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, 'seed')`)
+		) VALUES ('claude-sonnet-4-20250514', 3000000, 15000000, 0, 0, '2026-01-01T00:00:00Z')`)
 	require.NoError(t, err, "insert pricing")
 
 	// dup-a: earlier timestamp and 500 output tokens -> the correct global
@@ -552,12 +646,12 @@ func TestPGGetActivityReportDedupUsesChronologicalOrder(t *testing.T) {
 		INSERT INTO messages (
 			session_id, ordinal, role, content, timestamp,
 			content_length, model, token_usage,
-			claude_message_id, source_uuid
+			source_uuid
 		) VALUES (
 			'dup-a', 0, 'assistant', 'x',
 			'2026-06-16T10:00:00Z'::timestamptz, 1,
 			'claude-sonnet-4-20250514',
-			'{"input_tokens":250,"output_tokens":500}', 'M1', 'R1'
+			'{"input_tokens":250,"output_tokens":500}', 'R1'
 		)`)
 	require.NoError(t, err, "insert dup-a message")
 
@@ -578,12 +672,12 @@ func TestPGGetActivityReportDedupUsesChronologicalOrder(t *testing.T) {
 		INSERT INTO messages (
 			session_id, ordinal, role, content, timestamp,
 			content_length, model, token_usage,
-			claude_message_id, source_uuid
+			source_uuid
 		) VALUES (
 			'dup-b', 0, 'assistant', 'x',
 			'2026-06-16T10:05:00Z'::timestamptz, 1,
 			'claude-sonnet-4-20250514',
-			'{"input_tokens":450,"output_tokens":900}', 'M1', 'R1'
+			'{"input_tokens":450,"output_tokens":900}', 'R1'
 		)`)
 	require.NoError(t, err, "insert dup-b message")
 
@@ -592,7 +686,11 @@ func TestPGGetActivityReportDedupUsesChronologicalOrder(t *testing.T) {
 	q := pgDayQuery(t, "2026-06-16", "UTC")
 	lower := db.PaddedUTCBound(q.RangeStart.UTC().Format(time.RFC3339), -14)
 	upper := db.PaddedUTCBound(q.RangeEnd.UTC().Format(time.RFC3339), 14)
-	usage, _, err := store.activityReportUsage(ctx, ids, lower, upper, q)
+	pricing, err := store.loadPricingMap(ctx)
+	require.NoError(t, err)
+	digest, err := export.EffectivePricingDigest(pricing)
+	require.NoError(t, err)
+	usage, _, err := store.activityReportUsage(ctx, ids, lower, upper, q, nil, pricing, digest, nil)
 	require.NoError(t, err)
 
 	// The shared dedup identity leaves one survivor.
@@ -603,7 +701,7 @@ func TestPGGetActivityReportDedupUsesChronologicalOrder(t *testing.T) {
 		}
 	}
 	require.Len(t, shared, 1, "only one dedup-identity row survives")
-	require.NotEmpty(t, shared[0].ClaudeMessageID, "rows carry a message id")
+	require.Equal(t, "R1", shared[0].SourceUUID, "rows carry a source UUID")
 	assert.Equal(t, "dup-a", shared[0].SessionID,
 		"earlier-timestamp row sorts first")
 	assert.Equal(t, 500, shared[0].OutputTokens, "dup-a survives first-seen")
@@ -612,8 +710,8 @@ func TestPGGetActivityReportDedupUsesChronologicalOrder(t *testing.T) {
 func TestPGGetActivityReportFiltersAfterCrossSessionSnapshotSelection(
 	t *testing.T,
 ) {
-	_, store := prepareUsageSchema(
-		t, "agentsview_activity_filtered_snapshot_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -658,8 +756,8 @@ func TestPGGetActivityReportFiltersAfterCrossSessionSnapshotSelection(
 }
 
 func TestPGGetActivityReportDeduplicatesAfterProjectFilter(t *testing.T) {
-	_, store := prepareUsageSchema(
-		t, "agentsview_activity_filtered_dedup_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 	_, err := store.DB().ExecContext(ctx, `
 		INSERT INTO sessions (
@@ -698,7 +796,8 @@ func TestPGGetActivityReportDeduplicatesAfterProjectFilter(t *testing.T) {
 // split. Mirrors the SQLite
 // TestGetActivityReport_AutomationFilterAndSessionSplit.
 func TestPGGetActivityReportAutomationFilterAndSessionSplit(t *testing.T) {
-	_, store := prepareUsageSchema(t, "agentsview_daily_report_automation_test")
+	t.Parallel()
+	_, store := prepareUsageSchema(t, usageTestSchema)
 	ctx := t.Context()
 
 	_, err := store.DB().ExecContext(ctx, `

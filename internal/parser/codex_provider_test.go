@@ -122,7 +122,7 @@ func TestCodexProviderUnresolvedParentNeedsRetry(t *testing.T) {
 	require.Len(t, outcome.Results, 1)
 	result := outcome.Results[0]
 	assert.Equal(t, DataVersionNeedsRetry, result.DataVersion)
-	assert.Contains(t, result.RetryReason, "parent turns")
+	assert.Contains(t, result.RetryReason, "forked from")
 	require.Len(t, result.Result.Messages, 2)
 	assert.Equal(t, "child task", result.Result.Messages[0].Content)
 	assert.Equal(t, "child answer", result.Result.Messages[1].Content)
@@ -2297,8 +2297,14 @@ func TestCodexProviderIncrementalUserBoundaryDoesNotBackfillCommittedUsage(t *te
 		)
 		require.NoError(t, err)
 		assert.Equal(t, IncrementalApplied, status)
-		require.Len(t, outcome.Messages, 1)
+		require.Len(t, outcome.Messages, 2)
 		assert.Equal(t, RoleUser, outcome.Messages[0].Role)
+		hidden := outcome.Messages[1]
+		assert.Equal(t, RoleAssistant, hidden.Role)
+		assert.True(t, hidden.IsSystem, "the usage-only row stays out of the transcript")
+		assert.Empty(t, hidden.Content)
+		assert.Equal(t, 100_000, hidden.ContextTokens)
+		assert.Equal(t, 250, hidden.OutputTokens)
 		assert.Empty(t, outcome.MessageTokenUsageUpdates,
 			"usage after a real user boundary must not update the prior turn")
 	})

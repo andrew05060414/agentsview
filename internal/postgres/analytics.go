@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strings"
@@ -93,16 +94,57 @@ func analyticsUTCRange(
 }
 
 func pgAnalyticsMessageWindow(f db.AnalyticsFilter, col string, pb *paramBuilder) string {
-	from, to := analyticsUTCRange(f)
-	var preds []string
-	if f.From != "" {
-		preds = append(preds, col+" >= "+pb.add(from)+"::timestamptz")
+	// Bind only the bounds that are set: PostgreSQL rejects a bound
+	// parameter that the statement never uses.
+	from, to := pgAnalyticsWindowBounds(f)
+	if from != "" {
+		from = pb.add(from)
 	}
-	if f.To != "" {
-		if t, err := time.Parse(time.RFC3339, to); err == nil {
-			to = t.Add(time.Second).Format(time.RFC3339)
-		}
-		preds = append(preds, col+" < "+pb.add(to)+"::timestamptz")
+	if to != "" {
+		to = pb.add(to)
+	}
+	return pgAnalyticsWindowPred(col, from, to)
+}
+
+// pgAnalyticsMessageWindowLiteral is pgAnalyticsMessageWindow with the
+// bounds written into the SQL, so a cached generic plan cannot hide how
+// narrow the window is. The bounds are RFC 3339 timestamps that Go formats
+// from parsed dates, or fixed sentinels, so quoting them is safe.
+func pgAnalyticsMessageWindowLiteral(f db.AnalyticsFilter, col string) string {
+	from, to := pgAnalyticsWindowBounds(f)
+	if from != "" {
+		from = "'" + from + "'"
+	}
+	if to != "" {
+		to = "'" + to + "'"
+	}
+	return pgAnalyticsWindowPred(col, from, to)
+}
+
+// pgAnalyticsWindowBounds returns the padded message window as RFC 3339 UTC
+// timestamps, with an exclusive upper bound. An unset bound is empty.
+func pgAnalyticsWindowBounds(f db.AnalyticsFilter) (string, string) {
+	from, to := analyticsUTCRange(f)
+	if f.From == "" {
+		from = ""
+	}
+	if f.To == "" {
+		to = ""
+	} else if t, err := time.Parse(time.RFC3339, to); err == nil {
+		to = t.Add(time.Second).Format(time.RFC3339)
+	}
+	return from, to
+}
+
+// pgAnalyticsWindowPred keeps rows whose col is NULL or between the from and
+// to SQL expressions, skipping an empty one.
+func pgAnalyticsWindowPred(col, from, to string) string {
+	var preds []string
+	if from != "" {
+		preds = append(preds, col+" >= "+from+"::timestamptz")
+	}
+	if to != "" {
+		preds = append(preds, col+" < "+to+"::timestamptz")
 	}
 	if len(preds) == 0 {
 		return ""
@@ -542,7 +584,7 @@ func (s *Store) getAnalyticsModelsForSessionIDs(
 			SELECT DISTINCT model
 			FROM messages
 			WHERE session_id IN `+placeholders+`
-			AND COALESCE(model, '') <> ''
+			AND model <> ''
 			ORDER BY model`,
 			pb.args...,
 		)
@@ -607,7 +649,7 @@ func (s *Store) getAnalyticsModelsForSessionIDsFiltered(
 					'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
 			FROM messages
 			WHERE session_id IN `+placeholders+`
-			AND COALESCE(model, '') <> ''`,
+			AND model <> ''`,
 			pb.args...,
 		)
 		if err != nil {
@@ -1642,7 +1684,7 @@ func (s *Store) queryAutonomyChunk(
 	ph := pgInPlaceholders(chunk, pb)
 	q := `SELECT session_id,
 		SUM(CASE WHEN role='user' AND is_system=false
-			AND COALESCE(source_subtype, '') <> 'tool_result'
+			AND source_subtype <> 'tool_result'
 			THEN 1 ELSE 0 END),
 		SUM(CASE WHEN role='assistant'
 			AND has_tool_use=true THEN 1 ELSE 0 END)
@@ -1779,6 +1821,10 @@ func pgScanLocalDate(t *time.Time) string {
 // category, tool name, and local date; BuildToolsAnalytics forms the
 // weekly trend from those dates.
 func (s *Store) GetAnalyticsTools(ctx context.Context, f db.AnalyticsFilter) (db.ToolsAnalyticsResponse, error) {
+	return keptAnalytics(ctx, s, "tools", f, s.loadAnalyticsTools)
+}
+
+func (s *Store) loadAnalyticsTools(ctx context.Context, f db.AnalyticsFilter) (db.ToolsAnalyticsResponse, error) {
 	rows, err := s.analyticsToolRows(ctx, f)
 	return db.BuildToolsAnalytics(rows), err
 }
@@ -1790,12 +1836,18 @@ func (s *Store) analyticsToolRows(
 	predicates := db.ToolSelectionPredicates("tc", "s.quality_signal_version", f, func(value string) string { return pb.add(value) })
 	q := pgAnalyticsCallsSQL(s.sessionDialect(), f, pb, ", agent, project, quality_signal_version",
 		`, tc.category,
-			TRIM(COALESCE(tc.tool_name, '')) AS tool_name, s.agent, s.project, m.ordinal, s.quality_signal_version, tc.observed_outcome, tc.observed_repeat, tc.sequence_ending`, predicates...) + `
-	SELECT session_id, category, tool_name, agent,
-		local_at::date AS local_date, COUNT(*), project, MIN(ordinal)` + db.ToolEffectivenessSQL("analytics_calls", "quality_signal_version") + `
-	FROM analytics_calls
-	WHERE ` + pgAnalyticsCallLocalWhere(f, pb) + `
-	GROUP BY session_id, category, tool_name, agent, project, local_at::date`
+			TRIM(tc.tool_name) AS tool_name, m.ordinal, s.quality_signal_version, tc.observed_outcome, tc.observed_repeat, tc.sequence_ending`, predicates...) + `,
+	tool_totals (session_id, category, tool_name, local_date, call_count, ordinal,
+		analyzed, known_outcome, empty_calls, repeated, recovered, abandoned, open, unknown) AS (
+		SELECT session_id, category, tool_name, local_at::date, COUNT(*), MIN(ordinal)` + db.ToolEffectivenessSQL("analytics_calls", "quality_signal_version") + `
+		FROM analytics_calls
+		WHERE ` + pgAnalyticsCallLocalWhere(f, pb) + `
+		GROUP BY session_id, category, tool_name, local_at::date
+	)
+	SELECT t.session_id, t.category, t.tool_name, s.agent, t.local_date, t.call_count,
+		s.project, t.ordinal, t.analyzed, t.known_outcome, t.empty_calls, t.repeated,
+		t.recovered, t.abandoned, t.open, t.unknown
+	FROM tool_totals t JOIN analytics_sessions s ON s.id = t.session_id`
 
 	rows, err := s.pg.QueryContext(ctx, q, pb.args...)
 	if err != nil {
@@ -1847,7 +1899,7 @@ func (s *Store) GetAnalyticsSkills(
 	pb := &paramBuilder{}
 	q := pgAnalyticsCallsSQL(s.sessionDialect(), f, pb, ", agent, project",
 		`, TRIM(tc.skill_name) AS skill_name, s.agent, s.project`,
-		"TRIM(COALESCE(tc.skill_name, '')) != ''") + `
+		"TRIM(tc.skill_name) != ''") + `
 	SELECT session_id, skill_name, agent, project,
 		date_trunc(` + pb.add(pgSkillsTrendGranularity(granularity)) + `::text,
 			local_at)::date AS bucket,
@@ -1911,7 +1963,7 @@ func (s *Store) queryVelocityMsgs(
 		timestamp,
 		content_length
 		FROM messages
-		WHERE session_id IN ` + ph + `
+		WHERE ` + db.ExcludeClaudeHooksSQL("source_subtype") + ` AND session_id IN ` + ph + `
 		ORDER BY session_id, ordinal`
 
 	rows, err := s.pg.QueryContext(ctx, q, pb.args...)
@@ -2034,6 +2086,12 @@ func (a *velocityAccumulator) computeOverview() db.VelocityOverview {
 // GetAnalyticsVelocity computes turn cycle, first response,
 // and throughput metrics.
 func (s *Store) GetAnalyticsVelocity(
+	ctx context.Context, f db.AnalyticsFilter,
+) (db.VelocityResponse, error) {
+	return keptAnalytics(ctx, s, "velocity", f, s.loadAnalyticsVelocity)
+}
+
+func (s *Store) loadAnalyticsVelocity(
 	ctx context.Context, f db.AnalyticsFilter,
 ) (db.VelocityResponse, error) {
 	loc := analyticsLocation(f)
@@ -2403,15 +2461,16 @@ func (s *Store) GetAnalyticsTopSessions(
 				END), 0) / 60000.0
 			FROM (
 				SELECT CAST(
-					round(EXTRACT(EPOCH FROM (
+					EXTRACT(EPOCH FROM (
 						LEAD(m2.timestamp) OVER (ORDER BY m2.ordinal)
 						- m2.timestamp
-					)) * 1000)
+					)) * 1000
 				AS BIGINT) AS delta_ms
 				FROM messages m2
 				WHERE m2.session_id = sessions.id
+					AND %[2]s
 			) inner2
-		), 0)`, db.ActiveGapCapMs)
+		), 0)`, db.ActiveGapCapMs, db.ExcludeClaudeHooksSQL("m2.source_subtype"))
 
 	query := `SELECT id, ` + pgDateCol + `, project,
 		first_message,
@@ -2546,83 +2605,15 @@ func (s *Store) GetAnalyticsTopSessions(
 func (s *Store) GetAnalyticsSignals(
 	ctx context.Context, f db.AnalyticsFilter,
 ) (db.SignalsAnalyticsResponse, error) {
-	loc := analyticsLocation(f)
-	pb := &paramBuilder{}
-	where := buildAnalyticsWhere(f, pgDateCol, pb, s.sessionDialect())
-
-	var timeIDs map[string]bool
-	if f.HasTimeFilter() {
-		var err error
-		timeIDs, err = s.filteredSessionIDs(ctx, f)
-		if err != nil {
-			return db.SignalsAnalyticsResponse{}, err
-		}
-	}
-
-	query := `SELECT id, agent, project, first_message, is_automated,
-		` + pgDateCol + `,
-		health_score, health_grade, outcome,
-		outcome_confidence,
-		tool_failure_signal_count, tool_retry_count,
-		edit_churn_count, compaction_count,
-		mid_task_compaction_count,
-		context_pressure_max,
-		quality_signal_version,
-		short_prompt_count, unstructured_start,
-		missing_success_criteria_count,
-		missing_verification_count, duplicate_prompt_count,
-		no_code_context_count, runaway_tool_loop_count
-		FROM sessions WHERE ` + where
-
-	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
+	versionColumn, err := sessionVersionColumnPG(ctx, s.pg)
 	if err != nil {
-		return db.SignalsAnalyticsResponse{}, fmt.Errorf(
-			"querying analytics signals: %w", err,
-		)
+		return db.SignalsAnalyticsResponse{}, err
 	}
-	defer rows.Close()
-
-	var all []db.SignalRow
-	for rows.Next() {
-		var (
-			r  db.SignalRow
-			ts *time.Time
-		)
-		if err := rows.Scan(
-			&r.ID, &r.Agent, &r.Project,
-			&r.FirstMessage, &r.IsAutomated, &ts,
-			&r.HealthScore, &r.HealthGrade,
-			&r.Outcome, &r.OutcomeConfidence,
-			&r.ToolFailureSignalCount,
-			&r.ToolRetryCount, &r.EditChurnCount,
-			&r.CompactionCount, &r.MidTaskCompactionCount,
-			&r.ContextPressureMax,
-			&r.QualitySignalVersion,
-			&r.ShortPromptCount, &r.UnstructuredStart,
-			&r.MissingSuccessCriteriaCount,
-			&r.MissingVerificationCount,
-			&r.DuplicatePromptCount,
-			&r.NoCodeContextCount, &r.RunawayToolLoopCount,
-		); err != nil {
-			return db.SignalsAnalyticsResponse{}, fmt.Errorf(
-				"scanning signals row: %w", err,
-			)
-		}
-		r.Date = db.LocalDate(scanDateCol(ts), loc)
-		if !db.InDateRange(r.Date, f.From, f.To) {
-			continue
-		}
-		if timeIDs != nil && !timeIDs[r.ID] {
-			continue
-		}
-		all = append(all, r)
+	all, versions, err := s.signalRows(ctx, f, versionColumn)
+	if err != nil {
+		return db.SignalsAnalyticsResponse{}, err
 	}
-	if err := rows.Err(); err != nil {
-		return db.SignalsAnalyticsResponse{}, fmt.Errorf(
-			"iterating signals rows: %w", err,
-		)
-	}
-	if err := s.populateFrustrationMarkers(ctx, all); err != nil {
+	if err := s.populateFrustrationMarkers(ctx, all, versions, versionColumn); err != nil {
 		return db.SignalsAnalyticsResponse{}, err
 	}
 
@@ -2650,11 +2641,15 @@ func (s *Store) GetAnalyticsSignalSessions(
 	if limit <= 0 || limit > 20 {
 		limit = 10
 	}
-	rows, err := s.signalRows(ctx, f)
+	versionColumn, err := sessionVersionColumnPG(ctx, s.pg)
 	if err != nil {
 		return db.SignalSessionsResponse{}, err
 	}
-	if err := s.populateFrustrationMarkers(ctx, rows); err != nil {
+	rows, versions, err := s.signalRows(ctx, f, versionColumn)
+	if err != nil {
+		return db.SignalSessionsResponse{}, err
+	}
+	if err := s.populateFrustrationMarkers(ctx, rows, versions, versionColumn); err != nil {
 		return db.SignalSessionsResponse{}, err
 	}
 	candidates := db.SignalCandidates(rows, signal, limit)
@@ -2671,7 +2666,8 @@ func (s *Store) GetAnalyticsSignalSessions(
 func (s *Store) signalRows(
 	ctx context.Context,
 	f db.AnalyticsFilter,
-) ([]db.SignalRow, error) {
+	versionColumn string,
+) ([]db.SignalRow, map[string]string, error) {
 	loc := analyticsLocation(f)
 	pb := &paramBuilder{}
 	where := buildAnalyticsWhere(f, pgDateCol, pb, s.sessionDialect())
@@ -2680,7 +2676,7 @@ func (s *Store) signalRows(
 		var err error
 		timeIDs, err = s.filteredSessionIDs(ctx, f)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	query := `SELECT id, agent, project, first_message, is_automated,
@@ -2695,20 +2691,21 @@ func (s *Store) signalRows(
 		short_prompt_count, unstructured_start,
 		missing_success_criteria_count,
 		missing_verification_count, duplicate_prompt_count,
-		no_code_context_count, runaway_tool_loop_count
+		no_code_context_count, runaway_tool_loop_count, ` + frustrationSessionVersion(versionColumn) + `
 		FROM sessions WHERE ` + where
 	rows, err := s.pg.QueryContext(ctx, query, pb.args...)
 	if err != nil {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"querying analytics signal rows: %w", err,
 		)
 	}
 	defer rows.Close()
 	var all []db.SignalRow
+	versions := make(map[string]string)
 	for rows.Next() {
-		r, err := scanPGSignalRow(rows, loc)
+		r, version, err := scanPGSignalRow(rows, loc)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !db.InDateRange(r.Date, f.From, f.To) {
 			continue
@@ -2717,22 +2714,24 @@ func (s *Store) signalRows(
 			continue
 		}
 		all = append(all, r)
+		versions[r.ID] = version
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"iterating analytics signal rows: %w", err,
 		)
 	}
-	return all, nil
+	return all, versions, nil
 }
 
 func scanPGSignalRow(
 	rows interface{ Scan(dest ...any) error },
 	loc *time.Location,
-) (db.SignalRow, error) {
+) (db.SignalRow, string, error) {
 	var (
-		r  db.SignalRow
-		ts *time.Time
+		r       db.SignalRow
+		ts      *time.Time
+		version string
 	)
 	if err := rows.Scan(
 		&r.ID, &r.Agent, &r.Project,
@@ -2748,14 +2747,14 @@ func scanPGSignalRow(
 		&r.MissingSuccessCriteriaCount,
 		&r.MissingVerificationCount,
 		&r.DuplicatePromptCount,
-		&r.NoCodeContextCount, &r.RunawayToolLoopCount,
+		&r.NoCodeContextCount, &r.RunawayToolLoopCount, &version,
 	); err != nil {
-		return db.SignalRow{}, fmt.Errorf(
+		return db.SignalRow{}, "", fmt.Errorf(
 			"scanning signal row: %w", err,
 		)
 	}
 	r.Date = db.LocalDate(scanDateCol(ts), loc)
-	return r, nil
+	return r, version, nil
 }
 
 func (s *Store) signalMessages(
@@ -2802,7 +2801,7 @@ func (s *Store) signalMessages(
 		q := `SELECT session_id, ordinal, role, content,
 					COALESCE(to_char(timestamp AT TIME ZONE 'UTC',
 						'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), ''),
-					is_system, has_tool_use, COALESCE(source_subtype, '')
+					is_system, has_tool_use, source_subtype
 				FROM messages
 				WHERE session_id IN (` + strings.Join(placeholders, ",") + `)`
 		if len(filterModels) == 1 {
@@ -2852,60 +2851,89 @@ func (s *Store) signalMessages(
 func (s *Store) populateFrustrationMarkers(
 	ctx context.Context,
 	rows []db.SignalRow,
+	versions map[string]string,
+	versionColumn string,
 ) error {
-	if len(rows) == 0 {
+	if rows == nil {
 		return nil
 	}
+	memo := &s.runtimeState().frustrationMarkers
+	generation := memo.Generation()
 	idx := make(map[string]int, len(rows))
 	ids := make([]string, 0, len(rows))
 	for i := range rows {
+		if count, hit := memo.Lookup(generation, rows[i].ID, versions[rows[i].ID]); hit {
+			rows[i].FrustrationMarkerCount = count
+			continue
+		}
 		idx[rows[i].ID] = i
 		ids = append(ids, rows[i].ID)
 	}
-	return pgQueryChunked(ids, func(chunk []string) error {
-		pb := &paramBuilder{}
-		placeholders := make([]string, 0, len(chunk))
-		for _, id := range chunk {
-			placeholders = append(placeholders, pb.add(id))
-		}
-		q := `SELECT session_id, ordinal, content, is_system
-			FROM messages
-			WHERE role = 'user'
-			  AND COALESCE(source_subtype, '') <> 'tool_result'
-			  AND session_id IN (` + strings.Join(placeholders, ",") + `)`
-		msgRows, err := s.pg.QueryContext(ctx, q, pb.args...)
-		if err != nil {
-			return fmt.Errorf(
-				"querying frustration markers: %w", err,
-			)
-		}
-		defer msgRows.Close()
-		for msgRows.Next() {
-			var sessionID, content string
-			var ordinal int
-			var isSystem bool
-			if err := msgRows.Scan(
-				&sessionID, &ordinal, &content, &isSystem,
-			); err != nil {
-				return fmt.Errorf(
-					"scanning frustration marker: %w", err,
-				)
-			}
-			i, ok := idx[sessionID]
-			if !ok || isSystem {
-				continue
-			}
-			if signals.IsFrustrationMarker(content) {
-				rows[i].FrustrationMarkerCount++
-			}
-		}
-		if err := msgRows.Err(); err != nil {
-			return fmt.Errorf(
-				"iterating frustration markers: %w", err,
-			)
-		}
+	if len(ids) == 0 {
 		return nil
-	})
+	}
+	if s.DB() != nil && !s.hostedRelations {
+		counts, err := s.loadStoredFrustrationCounts(ctx, ids, versions, versionColumn)
+		if err != nil {
+			log.Printf("loading frustration counts: %v", err)
+		}
+		remaining := ids[:0]
+		for _, id := range ids {
+			if count, ok := counts[id]; ok {
+				rows[idx[id]].FrustrationMarkerCount = count
+				memo.Store(generation, id, versions[id], count)
+			} else {
+				remaining = append(remaining, id)
+			}
+		}
+		ids = remaining
+		if len(ids) == 0 {
+			return nil
+		}
+	}
+	var serverEncoding string
+	if err := s.pg.QueryRowContext(ctx, `SELECT current_setting('server_encoding')`).Scan(&serverEncoding); err != nil {
+		return fmt.Errorf("reading server encoding: %w", err)
+	}
+	scannedVersions := make(map[string]string, len(ids))
+	query, args := pgFrustrationQuery(serverEncoding, frustrationSessionVersion(versionColumn), ids)
+	msgRows, err := s.pg.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("querying frustration markers: %w", err)
+	}
+	defer msgRows.Close()
+	for msgRows.Next() {
+		var sessionID, content string
+		var version *string
+		var decided bool
+		if err := msgRows.Scan(&sessionID, &version, &decided, &content); err != nil {
+			return fmt.Errorf("scanning frustration marker: %w", err)
+		}
+		if version != nil {
+			scannedVersions[sessionID] = *version
+			continue
+		}
+		if decided || signals.IsFrustrationMarker(content) {
+			rows[idx[sessionID]].FrustrationMarkerCount++
+		}
+	}
+	if err := msgRows.Err(); err != nil {
+		return fmt.Errorf("iterating frustration markers: %w", err)
+	}
+	// Only complete scans are memoized, using versions read with the prompts.
+	for id, version := range scannedVersions {
+		memo.Store(generation, id, version, rows[idx[id]].FrustrationMarkerCount)
+	}
+	if s.DB() != nil && !s.hostedRelations {
+		counts := make(map[string]int, len(scannedVersions))
+		for id := range scannedVersions {
+			counts[id] = rows[idx[id]].FrustrationMarkerCount
+		}
+		if err := s.storeFrustrationCountsForRead(ctx, scannedVersions, counts, versionColumn); err != nil && !isUndefinedTable(err) && !IsReadOnlyError(err) {
+			log.Printf("storing frustration counts: %v", err)
+		}
+	}
+	return nil
 }
 
 // rankTopSessions sorts sessions by active duration (if

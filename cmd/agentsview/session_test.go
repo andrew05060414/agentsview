@@ -299,10 +299,10 @@ func seedSessionWithOpts(
 	})
 }
 
-func seedSessionsWithOpts(t *testing.T, dataDir string, seeds ...sessionSeed) {
+func seedSessionsWithOpts(t *testing.T, dataDir string, seeds ...sessionSeed) string {
 	t.Helper()
 	seedSessionArchiveRows(t, dataDir, seeds...)
-	registerSQLiteDaemonRuntime(t, dataDir)
+	return registerSQLiteDaemonRuntime(t, dataDir)
 }
 
 func seedSessionArchiveRows(t *testing.T, dataDir string, seeds ...sessionSeed) {
@@ -340,9 +340,9 @@ func seedSessionArchiveRows(t *testing.T, dataDir string, seeds ...sessionSeed) 
 	require.NoError(t, err)
 }
 
-func registerSQLiteDaemonRuntime(t *testing.T, dataDir string) {
+func registerSQLiteDaemonRuntime(t *testing.T, dataDir string) string {
 	t.Helper()
-	registerSQLiteDaemonRuntimeWithEngine(t, dataDir, false)
+	return registerSQLiteDaemonRuntimeWithEngine(t, dataDir, false)
 }
 
 func registerSQLiteWritableDaemonRuntime(t *testing.T, dataDir string) {
@@ -352,7 +352,7 @@ func registerSQLiteWritableDaemonRuntime(t *testing.T, dataDir string) {
 
 func registerSQLiteDaemonRuntimeWithEngine(
 	t *testing.T, dataDir string, writable bool,
-) {
+) string {
 	t.Helper()
 
 	cfg, err := config.LoadMinimal()
@@ -389,6 +389,7 @@ func registerSQLiteDaemonRuntimeWithEngine(
 		RemoveDaemonRuntime(dataDir)
 	})
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+	return ts.URL
 }
 
 func recordFixtureInstallation(t *testing.T, database *db.DB) {
@@ -1045,6 +1046,32 @@ func TestSessionExport_StreamsFromDisk(t *testing.T) {
 
 	out, err := executeCommand(newRootCommand(),
 		"session", "export", "s-1")
+	require.NoError(t, err)
+	assert.Equal(t, body, out)
+}
+
+func TestSessionExportMasksSecretsUnlessRevealed(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	src := filepath.Join(t.TempDir(), "session.jsonl")
+	// The second record's key follows a JSON-escaped newline, which hides
+	// it from a scan of the serialized line.
+	body := "{\"type\":\"user\",\"content\":\"use " + exportFakeAWSKey + " now\"}\n" +
+		"{\"type\":\"tool_result\",\"content\":\"creds:\\n" + exportFakeAWSKey + "\"}\n" +
+		"{\"type\":\"assistant\",\"content\":\"done\"}\n"
+	require.NoError(t, os.WriteFile(src, []byte(body), 0o600))
+	seedSessionWithOpts(t, dataDir, "s-secret", "proj",
+		func(s *db.Session) { s.FilePath = &src })
+
+	out, err := executeCommand(newRootCommand(), "session", "export", "s-secret")
+	require.NoError(t, err)
+	assert.Equal(t,
+		"{\"type\":\"user\",\"content\":\"use AKIA…PLJM now\"}\n"+
+			"{\"type\":\"tool_result\",\"content\":\"creds:\\nAKIA…PLJM\"}\n"+
+			"{\"type\":\"assistant\",\"content\":\"done\"}\n",
+		out)
+
+	out, err = executeCommand(newRootCommand(), "session", "export", "s-secret", "--reveal")
 	require.NoError(t, err)
 	assert.Equal(t, body, out)
 }
@@ -2491,13 +2518,19 @@ func TestSessionUsageResolvesMissingIDsBySyncStatus(t *testing.T) {
 		{
 			name: "startup ingestion pending", id: "absent",
 			statusBody: `{"archive_stale":false,"startup_pending":true,"stats":{}}`,
-			wantErr:    "not yet available", wantCode: tokenUseExitErr,
+			wantErr:    "session usage is not ready", wantCode: tokenUseExitErr,
+			detailLookups: 1, wantStatusChecks: 1,
+		},
+		{
+			name: "idle catch-up pending", id: "absent",
+			statusBody: `{"sync_pending":true,"archive_stale":false,"startup_pending":false,"stats":{}}`,
+			wantErr:    "session usage is not ready", wantCode: tokenUseExitErr,
 			detailLookups: 1, wantStatusChecks: 1,
 		},
 		{
 			name: "archive rebuild pending", id: "absent",
 			statusBody: `{"archive_stale":true,"startup_pending":false,"stats":{}}`,
-			wantErr:    "not yet available", wantCode: tokenUseExitErr,
+			wantErr:    "session usage is not ready", wantCode: tokenUseExitErr,
 			detailLookups: 1, wantStatusChecks: 1,
 		},
 		{
@@ -2622,6 +2655,6 @@ func TestSessionUsageIncompleteRefreshReturnsAvailableUsage(t *testing.T) {
 	assert.Equal(t, 42, out.TotalOutputTokens)
 	assert.True(t, out.RefreshIncomplete)
 	assert.Equal(t, tokenUseExitOK, code)
-	assert.Contains(t, stderr, "warning: usage refresh incomplete; showing usage currently stored in the archive")
+	assert.Contains(t, stderr, "warning: couldn't refresh usage; saved totals may be out of date")
 	assert.Contains(t, stderr, reason)
 }

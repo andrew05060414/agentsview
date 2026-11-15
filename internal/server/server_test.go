@@ -41,7 +41,6 @@ import (
 	"go.kenn.io/agentsview/internal/sessionwatch"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
-	"go.kenn.io/agentsview/internal/testutil"
 )
 
 // Timestamp constants for test data.
@@ -338,7 +337,10 @@ func (te *testEnv) writeSessionFile(
 }
 
 func waitForPort(port int, timeout time.Duration) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	return waitForAddress(net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), timeout)
+}
+
+func waitForAddress(addr string, timeout time.Duration) error {
 	dialer := &net.Dialer{Timeout: time.Second}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -511,6 +513,60 @@ func TestListenAndServeUsesAvailablePortOutsideFixedRange(t *testing.T) {
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, baseURL+"/api/v1/version", nil)
 	require.NoError(t, err)
 	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestListenAndServeAcceptsIPv6Loopback(t *testing.T) {
+	probe, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback is unavailable: %v", err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	require.NoError(t, probe.Close())
+
+	te := setup(t, func(cfg *config.Config) {
+		cfg.Host = "::1"
+		cfg.Port = port
+	})
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- te.srv.ListenAndServe()
+	}()
+
+	addr := net.JoinHostPort("::1", strconv.Itoa(port))
+	if err := waitForAddress(addr, 2*time.Second); err != nil {
+		select {
+		case serveErr := <-serveErrCh:
+			require.NoError(t, serveErr)
+		default:
+		}
+		require.NoError(t, err)
+	}
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(
+			context.WithoutCancel(t.Context()), 5*time.Second,
+		)
+		defer cancel()
+		require.NoError(t, te.srv.Shutdown(ctx))
+		select {
+		case serveErr := <-serveErrCh:
+			require.ErrorIs(t, serveErr, http.ErrServerClosed)
+		case <-time.After(5 * time.Second):
+			require.Fail(t, "timed out waiting for IPv6 server shutdown")
+		}
+	})
+
+	baseURL := "http://[::1]:" + strconv.Itoa(port)
+	req, err := http.NewRequestWithContext(
+		t.Context(), http.MethodGet, baseURL+"/api/v1/version", nil,
+	)
+	require.NoError(t, err)
+	transport := &http.Transport{Proxy: nil}
+	t.Cleanup(transport.CloseIdleConnections)
+	resp, err := (&http.Client{Transport: transport}).Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -1357,6 +1413,8 @@ type SSEEvent struct {
 func parseSSE(body string) []SSEEvent {
 	var events []SSEEvent
 	scanner := bufio.NewScanner(strings.NewReader(body))
+	// Change stream pages exceed the default 64 KiB line limit.
+	scanner.Buffer(nil, 16<<20)
 	var currentEvent SSEEvent
 	hasData := false
 	for scanner.Scan() {
@@ -3317,6 +3375,31 @@ func TestAuthRequiredProtectsPing(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 }
 
+func TestAuthRequiredMatchesWholeToken(t *testing.T) {
+	te := setup(t, withAuth("secret-token"))
+
+	tests := []struct {
+		name string
+		path string
+		opts []requestOpt
+		want int
+	}{
+		{"exact bearer", "/api/ping", []requestOpt{withBearer("secret-token")}, http.StatusOK},
+		{"wrong bearer", "/api/ping", []requestOpt{withBearer("wrong-token!")}, http.StatusUnauthorized},
+		{"bearer prefix", "/api/ping", []requestOpt{withBearer("secret")}, http.StatusUnauthorized},
+		{"bearer with suffix", "/api/ping", []requestOpt{withBearer("secret-token-extra")}, http.StatusUnauthorized},
+		{"empty bearer", "/api/ping", []requestOpt{withHeader("Authorization", "Bearer ")}, http.StatusUnauthorized},
+		{"query token off stream paths", "/api/ping?token=secret-token", nil, http.StatusUnauthorized},
+		{"query token prefix on stream path", "/api/v1/events?token=secret", nil, http.StatusUnauthorized},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := te.rawRequest(http.MethodGet, tt.path, tt.opts...)
+			assertStatus(t, w, tt.want)
+		})
+	}
+}
+
 // Serial: waits only one second for real synchronization.
 func TestPingReportsStalledSyncWithoutLosingDaemonIdentity(t *testing.T) {
 	dir := tempDirWithRetryCleanup(t)
@@ -3884,6 +3967,38 @@ func TestSettingsToolResultImagesRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "keep", persisted.ToolResultImages)
 	assert.Equal(t, config.ToolResultImagesKeep, loadedPolicy(t))
+}
+
+func TestSettingsRestartRequired(t *testing.T) {
+	te := setup(t)
+	check := func(want bool) {
+		t.Helper()
+		w := te.get(t, "/api/v1/settings")
+		assertStatus(t, w, http.StatusOK)
+		var body struct {
+			RestartRequired bool `json:"restart_required"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		assert.Equal(t, want, body.RestartRequired)
+	}
+	put := func(policy string) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/settings", strings.NewReader(`{"tool_result_images":"`+policy+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", "http://127.0.0.1:0")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		assertStatus(t, w, http.StatusOK)
+	}
+	check(false)
+	put("drop")
+	check(true)
+	te.db.SetToolResultImages(config.ToolResultImagesDrop)
+	check(false)
+	put("keep")
+	check(true)
+	te.db.SetToolResultImages(config.ToolResultImagesKeep)
+	check(false)
 }
 
 func TestSettingsInsightDefaultAgent(t *testing.T) {
@@ -5510,56 +5625,6 @@ func TestGetMemoryStatus(t *testing.T) {
 	assert.Equal(t, service.MemoryUnavailable, status.Semantic.Status)
 	assert.Equal(t, service.MemoryPartial, status.Status)
 	assert.Equal(t, service.MemoryUnknown, status.Sources.Status)
-}
-
-func TestFindAvailablePortSkipsOccupied(t *testing.T) {
-	// Bind a port on 127.0.0.1 so FindAvailablePort must skip it.
-	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		require.FailNowf(t, "test failed", "listen: %v", err)
-	}
-	defer ln.Close()
-
-	occupied := ln.Addr().(*net.TCPAddr).Port
-
-	got, err := server.FindAvailablePort(t.Context(), "127.0.0.1", occupied)
-	require.NoError(t, err)
-	if got == occupied {
-		assert.Failf(t, "test failed",
-			"FindAvailablePort returned occupied port %d", occupied,
-		)
-	}
-}
-
-func TestFindAvailablePortWildcardSkipsOccupiedPort(t *testing.T) {
-	// A dual-stack wildcard listen can succeed on IPv6 while an unrelated
-	// process still owns the port on IPv4 (observed on macOS), so wildcard
-	// availability must check the IPv4 wildcard address on its own.
-	testutil.RequireWildcardListen(t)
-	for _, tt := range []struct {
-		name    string
-		network string
-		address string
-	}{
-		{name: "IPv4", network: "tcp4", address: "0.0.0.0:0"},
-		{name: "IPv6", network: "tcp6", address: "[::]:0"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			ln, err := (&net.ListenConfig{}).Listen(t.Context(), tt.network, tt.address)
-			if err != nil && tt.network == "tcp6" {
-				t.Skipf("IPv6 unavailable: %v", err)
-			}
-			require.NoError(t, err, "bind %s wildcard", tt.name)
-			defer ln.Close()
-
-			occupied := ln.Addr().(*net.TCPAddr).Port
-
-			got, err := server.FindAvailablePort(t.Context(), "0.0.0.0", occupied)
-			require.NoError(t, err)
-			assert.NotEqual(t, occupied, got,
-				"wildcard port selection must skip an %s-occupied port", tt.name)
-		})
-	}
 }
 
 func TestFindAvailablePortZeroReturnsAssignedPort(t *testing.T) {

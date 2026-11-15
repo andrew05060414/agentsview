@@ -108,6 +108,106 @@ func TestActivityReportCandidateSourcePreservesRangeEdgePairs(t *testing.T) {
 		"left pruning and right successor lookup must preserve adjacency")
 }
 
+// TestActivityReportCandidateSourcePairsAndAttributesModels pins how the
+// candidate query picks each message's successor and prior model: rows
+// without a timestamp are skipped, an assistant model counts only when its
+// timestamp is strictly later than the previous timestamped row's, and
+// rows outside the range still act as neighbours.
+func TestActivityReportCandidateSourcePairsAndAttributesModels(t *testing.T) {
+	ctx := t.Context()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+
+	type row struct {
+		session string
+		ordinal int
+		role    string
+		ts      string // empty means NULL
+		model   string
+	}
+	rows := []row{
+		{"attr", 0, "user", "2026-06-13T23:00:00Z", ""},
+		// Before the range, but its model carries into the day.
+		{"attr", 1, "assistant", "2026-06-13T23:10:00Z", "model-early"},
+		{"attr", 2, "user", "", ""},
+		{"attr", 3, "user", "2026-06-14T10:00:00Z", ""},
+		{"attr", 4, "user", "", ""},
+		// Same timestamp as the previous timestamped row.
+		{"attr", 5, "assistant", "2026-06-14T10:00:00Z", "model-tied"},
+		// Earlier than the previous timestamped row.
+		{"attr", 6, "assistant", "2026-06-14T09:59:00Z", "model-backwards"},
+		{"attr", 7, "assistant", "2026-06-14T10:05:00Z", ""},
+		{"attr", 8, "user", "2026-06-14T10:06:00Z", "model-user"},
+		{"attr", 9, "assistant", "", "model-untimed"},
+		// Its previous timestamped row is ordinal 8, past the NULL at 9.
+		{"attr", 10, "assistant", "2026-06-14T10:07:00Z", "model-late"},
+		{"attr", 11, "tool", "2026-06-14T23:58:00Z", ""},
+		// After the range, but still closes ordinal 11.
+		{"attr", 12, "user", "2026-06-15T00:30:00Z", ""},
+		// The first timestamped row has no previous timestamp to beat.
+		{"first", 0, "assistant", "2026-06-14T12:00:00Z", "model-first"},
+		{"first", 1, "user", "2026-06-14T12:01:00Z", ""},
+		// Not requested.
+		{"other", 0, "user", "2026-06-14T11:00:00Z", ""},
+		{"other", 1, "assistant", "2026-06-14T11:01:00Z", "model-other"},
+	}
+	for i, r := range rows {
+		var ts any
+		if r.ts != "" {
+			ts = r.ts
+		}
+		_, err := conn.ExecContext(ctx, `
+			INSERT INTO messages (id, session_id, ordinal, role, content, timestamp, model)
+			VALUES (?, ?, ?, ?, '', CAST(? AS TIMESTAMP), ?)`,
+			i+1, r.session, r.ordinal, r.role, ts, r.model)
+		require.NoError(t, err)
+	}
+
+	at := func(value string) time.Time {
+		t.Helper()
+		parsed, err := time.Parse(time.RFC3339, value)
+		require.NoError(t, err)
+		return parsed
+	}
+	candidate := func(
+		session string, start, end int, startTS, endTS, role, model, prior string,
+	) activity.IntervalCandidate {
+		return activity.IntervalCandidate{
+			SessionID: session, StartOrdinal: start, EndOrdinal: end,
+			Start: at(startTS), End: at(endTS),
+			ClosingRole: role, ClosingModel: model, PriorModel: prior,
+		}
+	}
+	want := []activity.IntervalCandidate{
+		candidate("attr", 6, 7, "2026-06-14T09:59:00Z", "2026-06-14T10:05:00Z",
+			"assistant", "", "model-early"),
+		candidate("attr", 3, 5, "2026-06-14T10:00:00Z", "2026-06-14T10:00:00Z",
+			"assistant", "model-tied", "model-early"),
+		candidate("attr", 5, 6, "2026-06-14T10:00:00Z", "2026-06-14T09:59:00Z",
+			"assistant", "model-backwards", "model-early"),
+		candidate("attr", 7, 8, "2026-06-14T10:05:00Z", "2026-06-14T10:06:00Z",
+			"user", "model-user", "model-early"),
+		candidate("attr", 8, 10, "2026-06-14T10:06:00Z", "2026-06-14T10:07:00Z",
+			"assistant", "model-late", "model-early"),
+		candidate("attr", 10, 11, "2026-06-14T10:07:00Z", "2026-06-14T23:58:00Z",
+			"tool", "", "model-late"),
+		candidate("first", 0, 1, "2026-06-14T12:00:00Z", "2026-06-14T12:01:00Z",
+			"user", "", "unknown"),
+		candidate("attr", 11, 12, "2026-06-14T23:58:00Z", "2026-06-15T00:30:00Z",
+			"user", "", "model-late"),
+	}
+
+	var got []activity.IntervalCandidate
+	err := NewStoreFromDB(conn).ActivityReportCandidateSource(
+		[]string{"attr", "first"}, duckDayQuery(t, "2026-06-14", "UTC"),
+	)(ctx, func(c activity.IntervalCandidate) error {
+		got = append(got, c)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+}
+
 func TestDuckActivityReportIncludesToolCompletionEvents(t *testing.T) {
 	const sessionID = "tool-completion"
 	started := "2026-06-14T10:00:00Z"
@@ -1060,7 +1160,6 @@ func TestDuckActivityReportSourceUUIDFallbackOrdersTimeBeforeSessionID(t *testin
 	earlier.Agent = "claude"
 	earlierMsg := syncMessage("z-earlier", 0, "assistant", "x", "2026-06-14T10:30:00Z")
 	earlierMsg.Model = "claude-sonnet-4-20250514"
-	earlierMsg.ClaudeMessageID = "dup-m"
 	earlierMsg.SourceUUID = "dup-source"
 	earlierMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":500}`)
 	earlierMsg.OutputTokens = 500
@@ -1069,7 +1168,6 @@ func TestDuckActivityReportSourceUUIDFallbackOrdersTimeBeforeSessionID(t *testin
 	later.Agent = "claude"
 	laterMsg := syncMessage("a-later", 0, "assistant", "x", "2026-06-14T10:30:00.123Z")
 	laterMsg.Model = "claude-sonnet-4-20250514"
-	laterMsg.ClaudeMessageID = "dup-m"
 	laterMsg.SourceUUID = "dup-source"
 	laterMsg.TokenUsage = jsontext.Value(`{"input_tokens":1000,"output_tokens":9000}`)
 	laterMsg.OutputTokens = 9000
@@ -1120,6 +1218,28 @@ func TestDuckGetActivityReportZeroCostKeepsPrimaryModel(t *testing.T) {
 	require.Len(t, r.BySession, 1)
 	assert.Equal(t, "model-x", r.BySession[0].PrimaryModel,
 		"zero-cost usage must still report its known model as primary")
+}
+
+// Usage rows need a model, so a mirror whose messages carry none has no rate
+// to send and binds an empty rate schedule. The report must still build, with
+// the session's activity and no usage.
+func TestDuckGetActivityReportUsageWithoutModelNames(t *testing.T) {
+	ctx := t.Context()
+	sess := syncSession("n", "proj1", "first", "2026-06-14T10:30:00Z", 1)
+	msg := syncMessage("n", 0, "assistant", "x", "2026-06-14T10:30:00Z")
+	msg.Model = ""
+	writes := []db.SessionBatchWrite{{
+		Session: sess, Messages: []db.Message{msg},
+		DataVersion: 1, ReplaceMessages: true,
+	}}
+	store := activityReportStore(t, writes, nil)
+
+	r, err := store.GetActivityReport(
+		ctx, db.AnalyticsFilter{Timezone: "UTC"},
+		duckDayQuery(t, "2026-06-14", "UTC"))
+	require.NoError(t, err)
+	assert.Equal(t, 1, r.Totals.Sessions)
+	assert.Zero(t, r.Totals.OutputTokens)
 }
 
 // TestDuckGetActivityReportAutomationFilterAndSessionSplit confirms the shared
@@ -1217,5 +1337,29 @@ func TestDuckGetActivityReportAutomationFilterAndSessionSplit(t *testing.T) {
 				assert.Contains(t, ids, id)
 			}
 		})
+	}
+}
+
+// The probe reports the newest pricing time across model prices and the
+// GenAI document, so a change to either refreshes open Activity reports. A
+// table without a time does not hide the other's.
+func TestActivityReportSourceProbeReportsNewestPricingTime(t *testing.T) {
+	ctx := t.Context()
+	conn := openTestDuckDB(t)
+	require.NoError(t, EnsureSchema(ctx, conn))
+	store := NewStoreFromDB(conn)
+	for _, step := range []struct{ sql, want string }{
+		{`SELECT 1`, ""},
+		{`INSERT INTO genai_pricing (singleton, version, source, data_json)
+		  VALUES (1, 'v1', 'embedded', '{}')`, ""},
+		{`INSERT INTO model_pricing (model_pattern, updated_at)
+		  VALUES ('probe-model', '2026-07-01 00:00:02')`, "2026-07-01 00:00:02"},
+		{`UPDATE genai_pricing SET updated_at = '2026-07-02 00:00:00'`, "2026-07-02 00:00:00"},
+	} {
+		_, err := conn.ExecContext(ctx, step.sql)
+		require.NoError(t, err, step.sql)
+		probe, err := store.ActivityReportSourceProbe(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, step.want, probe.MaxPricingUpdated, step.sql)
 	}
 }

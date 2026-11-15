@@ -5,6 +5,7 @@ import type {
   BatchDeleteInputBody,
   DbSession,
   DbSessionActivityResponse,
+  DbSessionCommitList,
   DbSessionExternalParent,
   DbSessionLabels,
   DbSessionTiming,
@@ -15,7 +16,9 @@ import type {
   GetApiV1SessionIdsResolveParams,
   GetApiV1SessionsByIdActivityPathParameters,
   GetApiV1SessionsByIdChildrenPathParameters,
+  GetApiV1SessionsByIdCommitsPathParameters,
   GetApiV1SessionsByIdDirectoryPathParameters,
+  GetApiV1SessionsByIdExportParams,
   GetApiV1SessionsByIdExportPathParameters,
   GetApiV1SessionsByIdFileReferencesPathParameters,
   GetApiV1SessionsByIdMdParams,
@@ -335,6 +338,25 @@ export const getApiV1SessionsByIdChildren = async (
   });
 };
 
+export const getGetApiV1SessionsByIdCommitsUrl = ({
+  id,
+}: GetApiV1SessionsByIdCommitsPathParameters) => {
+  return `/api/v1/sessions/${encodeURIComponent(String(id))}/commits`;
+};
+
+/**
+ * @summary List session commits
+ */
+export const getApiV1SessionsByIdCommits = async (
+  { id }: GetApiV1SessionsByIdCommitsPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<DbSessionCommitList> => {
+  return orvalFetch<DbSessionCommitList>(getGetApiV1SessionsByIdCommitsUrl({ id }), {
+    ...options,
+    method: "GET",
+  });
+};
+
 export const getGetApiV1SessionsByIdDirectoryUrl = ({
   id,
 }: GetApiV1SessionsByIdDirectoryPathParameters) => {
@@ -354,10 +376,23 @@ export const getApiV1SessionsByIdDirectory = async (
   });
 };
 
-export const getGetApiV1SessionsByIdExportUrl = ({
-  id,
-}: GetApiV1SessionsByIdExportPathParameters) => {
-  return `/api/v1/sessions/${encodeURIComponent(String(id))}/export`;
+export const getGetApiV1SessionsByIdExportUrl = (
+  { id }: GetApiV1SessionsByIdExportPathParameters,
+  params?: GetApiV1SessionsByIdExportParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/api/v1/sessions/${encodeURIComponent(String(id))}/export?${stringifiedParams}`
+    : `/api/v1/sessions/${encodeURIComponent(String(id))}/export`;
 };
 
 /**
@@ -365,9 +400,10 @@ export const getGetApiV1SessionsByIdExportUrl = ({
  */
 export const getApiV1SessionsByIdExport = async (
   { id }: GetApiV1SessionsByIdExportPathParameters,
+  params?: GetApiV1SessionsByIdExportParams,
   options?: Parameters<typeof orvalRequest>[1],
 ): Promise<Response> => {
-  return orvalRequest<Response>(getGetApiV1SessionsByIdExportUrl({ id }), {
+  return orvalRequest<Response>(getGetApiV1SessionsByIdExportUrl({ id }, params), {
     ...options,
     method: "GET",
   });

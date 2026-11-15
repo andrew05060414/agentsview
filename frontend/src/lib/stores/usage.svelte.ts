@@ -1,6 +1,6 @@
 import { excludedModelGroups, groupedModelCsv, toggleGroupedModel } from "../utils/model-groups.js";
 import { m } from "../i18n/index.js";
-import { queryStepFrom, type QueryStep } from "../utils/refresh.js";
+import { queryStepFrom, refreshScopeKey, type QueryStep } from "../utils/refresh.js";
 import { LiveQuery } from "../utils/liveQuery.svelte.js";
 import type { UsagePairwiseDimension } from "../api/types/usage.js";
 import {
@@ -14,10 +14,19 @@ import { sessions } from "./sessions.svelte.js";
 import { perf, type PerfEntryStatus } from "./perf.svelte.js";
 import { rollingRange, today } from "../utils/dates.js";
 import { ALL_TOKEN_TYPES, canonicalTokenTypes, type UsageTokenType } from "./usageTokenTypes.js";
+import type { TreemapLabelScale } from "../components/usage/treemapLabelSize.js";
 import {
-  isTreemapLabelScale,
-  type TreemapLabelScale,
-} from "../components/usage/treemapLabelSize.js";
+  loadToggles,
+  loadUsageFilters,
+  saveToggles,
+  saveUsageFilters,
+  type AttributionView,
+  type GroupBy,
+  type TimeSeriesView,
+  type Toggles,
+} from "./usagePreferences.js";
+import { summaryForDateRange } from "./usageRangeSummary.js";
+import { DEFAULT_WINDOW_DAYS, joinCsvParts } from "./usageUrl.js";
 
 type UsageParams = NonNullable<Parameters<typeof UsageService.getApiV1UsageSummary>[0]>;
 type UsagePairwiseParams = Parameters<typeof UsageService.getApiV1UsagePairwiseComparison>[0];
@@ -63,144 +72,8 @@ export interface UsageProjectFilterItem {
   count?: number;
 }
 
-export type GroupBy = "project" | "model" | "agent";
-export type TimeSeriesView = "smooth" | "lines" | "bars";
-export type AttributionView = "treemap" | "list" | "bars";
-
-interface Toggles {
-  timeSeries: { groupBy: GroupBy; view: TimeSeriesView };
-  attribution: { groupBy: GroupBy; view: AttributionView; labelScale: TreemapLabelScale };
-}
-
-const TOGGLES_KEY = "usage-toggles";
-
-function defaultToggles(): Toggles {
-  return {
-    timeSeries: { groupBy: "project", view: "smooth" },
-    attribution: { groupBy: "project", view: "treemap", labelScale: "sqrt" },
-  };
-}
-
-function isGroupBy(value: unknown): value is GroupBy {
-  return value === "project" || value === "model" || value === "agent";
-}
-
-function isTimeSeriesView(value: unknown): value is TimeSeriesView {
-  return value === "smooth" || value === "lines" || value === "bars";
-}
-
 function isUnknownProjectKeyError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 400 && error.code === "unknown_project_key";
-}
-
-function loadToggles(): Toggles {
-  try {
-    const raw = localStorage.getItem(TOGGLES_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<Toggles>;
-      const defaults = defaultToggles();
-      // `Project | Model | Agent` selector is shared across usage
-      // panels. Migrate legacy split state by choosing one value
-      // and applying it to both widgets.
-      const sharedGroupBy = isGroupBy(parsed.timeSeries?.groupBy)
-        ? parsed.timeSeries.groupBy
-        : isGroupBy(parsed.attribution?.groupBy)
-          ? parsed.attribution.groupBy
-          : defaults.timeSeries.groupBy;
-      return {
-        timeSeries: {
-          groupBy: sharedGroupBy,
-          view: isTimeSeriesView(parsed.timeSeries?.view)
-            ? parsed.timeSeries.view
-            : defaults.timeSeries.view,
-        },
-        attribution: {
-          groupBy: sharedGroupBy,
-          view: parsed.attribution?.view ?? defaults.attribution.view,
-          labelScale: isTreemapLabelScale(parsed.attribution?.labelScale)
-            ? parsed.attribution.labelScale
-            : defaults.attribution.labelScale,
-        },
-      };
-    }
-  } catch {
-    // Corrupted localStorage — fall back to defaults.
-  }
-  return defaultToggles();
-}
-
-function saveToggles(t: Toggles): void {
-  try {
-    localStorage.setItem(TOGGLES_KEY, JSON.stringify(t));
-  } catch {
-    // localStorage full or unavailable — silently skip.
-  }
-}
-
-const DEFAULT_WINDOW_DAYS = 30;
-
-// 100 years is well beyond any realistic session history and stays
-// inside Date#setDate's safe range, so rollingRange(MAX_WINDOW_DAYS)
-// always produces valid YYYY-MM-DD strings.
-const MAX_WINDOW_DAYS = 36500;
-
-const USAGE_FILTERS_KEY = "usage-filters";
-
-export interface UsageFilterState {
-  excludedProjects: string;
-  excludedProjectKeys?: string;
-  excludedAgents: string;
-  excludedModels: string;
-}
-
-function loadUsageFilters(): UsageFilterState {
-  try {
-    const raw = localStorage.getItem(USAGE_FILTERS_KEY);
-    if (raw) {
-      const saved = JSON.parse(raw) as Partial<UsageFilterState>;
-      return {
-        excludedProjects: saved.excludedProjects ?? "",
-        excludedProjectKeys: "",
-        excludedAgents: saved.excludedAgents ?? "",
-        excludedModels: saved.excludedModels ?? "",
-      };
-    }
-  } catch {
-    // Corrupted localStorage — fall back to defaults.
-  }
-  return {
-    excludedProjects: "",
-    excludedProjectKeys: "",
-    excludedAgents: "",
-    excludedModels: "",
-  };
-}
-
-function saveUsageFilters(f: UsageFilterState): void {
-  try {
-    const data: UsageFilterState = {
-      excludedProjects: f.excludedProjects,
-      excludedAgents: f.excludedAgents,
-      excludedModels: f.excludedModels,
-    };
-    localStorage.setItem(USAGE_FILTERS_KEY, JSON.stringify(data));
-  } catch {
-    // localStorage full or unavailable — silently skip.
-  }
-}
-
-function joinCsvParts(...parts: string[]): string {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const part of parts) {
-    for (const value of part.split(",")) {
-      const trimmed = value.trim();
-      if (!trimmed || seen.has(trimmed)) continue;
-      seen.add(trimmed);
-      out.push(trimmed);
-    }
-  }
-  return out.join(",");
 }
 
 type Endpoint = "summary" | "pairwise" | "topSessions" | "zoom";
@@ -218,145 +91,6 @@ function selectionKey(params: UsageParams): string {
   return [params.project_key, params.model, params.agent].join("|");
 }
 
-// active_since follows the clock, so only whether it is set changes the scope.
-function refreshScopeKey(params: UsageParams): string {
-  return JSON.stringify({ ...params, active_since: params.active_since !== undefined });
-}
-
-function summaryForDateRange(
-  summary: UsageSummaryResponse,
-  from: string,
-  to: string,
-): UsageSummaryResponse {
-  const daily = summary.daily.filter((day) => day.date >= from && day.date <= to);
-  const projectTotals = new Map<string, UsageSummaryResponse["projectTotals"][number]>();
-  const modelTotals = new Map<string, UsageSummaryResponse["modelTotals"][number]>();
-  const agentTotals = new Map<string, UsageSummaryResponse["agentTotals"][number]>();
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheCreationTokens = 0;
-  let cacheReadTokens = 0;
-  let totalMicrodollars = 0;
-
-  for (const day of daily) {
-    inputTokens += day.inputTokens;
-    outputTokens += day.outputTokens;
-    cacheCreationTokens += day.cacheCreationTokens;
-    cacheReadTokens += day.cacheReadTokens;
-    totalMicrodollars += day.totalCost.microdollars;
-
-    for (const item of day.projectBreakdowns ?? []) {
-      const total = projectTotals.get(item.project_key) ?? {
-        project_key: item.project_key,
-        project: item.project,
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheCreationTokens: 0,
-        cacheReadTokens: 0,
-        cost: { microdollars: 0 },
-      };
-      total.inputTokens += item.inputTokens;
-      total.outputTokens += item.outputTokens;
-      total.cacheCreationTokens += item.cacheCreationTokens;
-      total.cacheReadTokens += item.cacheReadTokens;
-      total.cost.microdollars += item.cost.microdollars;
-      projectTotals.set(item.project_key, total);
-    }
-
-    for (const item of day.modelBreakdowns ?? []) {
-      const total = modelTotals.get(item.modelName) ?? {
-        model: item.modelName,
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheCreationTokens: 0,
-        cacheReadTokens: 0,
-        cost: { microdollars: 0 },
-      };
-      total.inputTokens += item.inputTokens;
-      total.outputTokens += item.outputTokens;
-      total.cacheCreationTokens += item.cacheCreationTokens;
-      total.cacheReadTokens += item.cacheReadTokens;
-      total.cost.microdollars += item.cost.microdollars;
-      modelTotals.set(item.modelName, total);
-    }
-
-    for (const item of day.agentBreakdowns ?? []) {
-      const total = agentTotals.get(item.agent) ?? {
-        agent: item.agent,
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheCreationTokens: 0,
-        cacheReadTokens: 0,
-        cost: { microdollars: 0 },
-      };
-      total.inputTokens += item.inputTokens;
-      total.outputTokens += item.outputTokens;
-      total.cacheCreationTokens += item.cacheCreationTokens;
-      total.cacheReadTokens += item.cacheReadTokens;
-      total.cost.microdollars += item.cost.microdollars;
-      agentTotals.set(item.agent, total);
-    }
-  }
-
-  // Plan-only sessions have no usage events, so daily entries cannot place
-  // them in the range; keep each model's count from the source summary so
-  // its row still reads "Plan usage" instead of zero until the range's own
-  // summary arrives.
-  for (const source of summary.modelTotals) {
-    if (!source.planOnlySessions) continue;
-    const total = modelTotals.get(source.model) ?? {
-      model: source.model,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheCreationTokens: 0,
-      cacheReadTokens: 0,
-      cost: { microdollars: 0 },
-    };
-    total.planOnlySessions = source.planOnlySessions;
-    modelTotals.set(source.model, total);
-  }
-
-  const byCost = <T extends { cost: { microdollars: number } }>(a: T, b: T) =>
-    b.cost.microdollars - a.cost.microdollars;
-  const cacheHitDenominator = cacheReadTokens + inputTokens;
-
-  return {
-    ...summary,
-    from,
-    to,
-    daily,
-    totals: {
-      inputTokens,
-      outputTokens,
-      cacheCreationTokens,
-      cacheReadTokens,
-      totalCost: { microdollars: totalMicrodollars },
-      // Daily entries carry no per-day savings, so a derived range cannot
-      // recompute them; the UI does not read this field for derived ranges.
-      cacheSavings: { microdollars: 0 },
-    },
-    projectTotals: [...projectTotals.values()].sort(
-      (a, b) => byCost(a, b) || a.project_key.localeCompare(b.project_key),
-    ),
-    modelTotals: [...modelTotals.values()].sort(
-      (a, b) => byCost(a, b) || a.model.localeCompare(b.model),
-    ),
-    agentTotals: [...agentTotals.values()].sort(
-      (a, b) => byCost(a, b) || a.agent.localeCompare(b.agent),
-    ),
-    cacheStats: {
-      cacheReadTokens,
-      cacheCreationTokens,
-      uncachedInputTokens: inputTokens,
-      outputTokens,
-      hitRate: cacheHitDenominator > 0 ? cacheReadTokens / cacheHitDenominator : 0,
-      savingsVsUncached: { microdollars: 0 },
-    },
-    unsupportedUsage: undefined,
-    comparison: undefined,
-  };
-}
-
 class UsageStore {
   from: string = $state(rollingRange(DEFAULT_WINDOW_DAYS).from);
   to: string = $state(today());
@@ -372,6 +106,7 @@ class UsageStore {
   excludedAgents: string = $state("");
   excludedModels: string = $state("");
   knownProjects: UsageProjectFilterItem[] = $state([]);
+  knownAgents: Array<{ name: string; count?: number }> = $state([]);
 
   constructor() {
     const saved = loadUsageFilters();
@@ -415,6 +150,8 @@ class UsageStore {
   private zoomRanking = "";
   topSessions = $state<DbTopSessionEntry[] | null>(null);
   lastUpdatedAt: number | null = $state(null);
+  // Monotonic milliseconds shared by query timings and automatic refreshes.
+  lastFetchStartedAt = $state(0);
   // Wall-clock ms of the most recent full refresh, request start to data
   // applied, shown next to the refresh label. null until the first load.
   lastQueryDurationMs: number | null = $state(null);
@@ -422,9 +159,8 @@ class UsageStore {
   lastQuerySteps: QueryStep[] = $state([]);
   // Latest successful timing per panel, collected while a full refresh runs
   // and snapshotted into lastQuerySteps when it completes. Offsets are
-  // relative to refreshStartedAt.
+  // relative to lastFetchStartedAt.
   private stepTimings = new Map<UsageStep, QueryStep>();
-  private refreshStartedAt = 0;
   // The full refresh running now, drawn live by the refresh control.
   readonly liveQuery = new LiveQuery();
   hasNewData: boolean = $state(false);
@@ -468,7 +204,6 @@ class UsageStore {
   }
 
   markNewData(): void {
-    if (this.lastUpdatedAt === null) return;
     this.hasNewData = true;
   }
 
@@ -996,10 +731,12 @@ class UsageStore {
   }
 
   private async fetchAllWithResult(options: FetchAllOptions = {}): Promise<FetchResult> {
+    // A failed read waits for another event or poll; events during this read mark pending again.
+    this.hasNewData = false;
     this.dropExcludedSelection();
     const startedAt = performance.now();
+    this.lastFetchStartedAt = startedAt;
     this.stepTimings.clear();
-    this.refreshStartedAt = startedAt;
     const live = this.liveQuery.begin(startedAt);
     try {
       return await this.fetchAllSteps(startedAt, options);
@@ -1035,6 +772,7 @@ class UsageStore {
       params,
       contextParams,
     });
+    const comparisonPromise = this.fetchComparison(this.versions.summary, params, summaryPromise);
     void this.fetchPairwise(
       params,
       refreshScopeKey(params) !== this.pairwiseScope || this.pairwiseComparison === null,
@@ -1066,6 +804,7 @@ class UsageStore {
       }
     }
     if (!loadedSummary) {
+      this.abortPanel("comparison");
       await Promise.all([topSessionsPromise, zoomPromise]);
       if (fetchVersion !== this.fetchAllVersion) return "aborted";
       if (rangeRestored) {
@@ -1092,10 +831,20 @@ class UsageStore {
           return this.fetchZoom(loadedSummary.params);
         })
       : zoomPromise;
+    const currentComparisonPromise = loadedSummary.projectScopeRecovered
+      ? comparisonPromise.then(() => {
+          if (fetchVersion !== this.fetchAllVersion) return "aborted";
+          return this.fetchComparison(
+            loadedSummary.version,
+            loadedSummary.params,
+            Promise.resolve(loadedSummary),
+          );
+        })
+      : comparisonPromise;
     const [topSessionsResult, loadedZoomResult, comparisonResult] = await Promise.all([
       currentTopSessionsPromise,
       currentZoomPromise,
-      this.fetchComparison(loadedSummary.version, loadedSummary.summary, loadedSummary.params),
+      currentComparisonPromise,
     ]);
     let pairwiseResult = await this.awaitPairwise();
     if (
@@ -1237,7 +986,7 @@ class UsageStore {
           projectScopeRecovered: false,
         };
         if (loadComparison) {
-          void this.fetchComparison(v, data, params);
+          void this.fetchComparison(v, params, Promise.resolve(loaded));
           void this.fetchPairwise(params, this.pairwiseSelectionUnavailable());
         }
         return loaded;
@@ -1339,8 +1088,8 @@ class UsageStore {
 
   private async fetchComparison(
     summaryVersion: number,
-    summary: UsageSummaryResponse,
     params: UsageParams,
+    summary: Promise<LoadedUsageSummary | null>,
   ): Promise<FetchResult> {
     if (this.versions.summary !== summaryVersion) return "aborted";
     const signal = this.nextAbortSignal("comparison");
@@ -1348,16 +1097,15 @@ class UsageStore {
     const liveStep = this.liveQuery.start("comparison", started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const comparison = await UsageService.getApiV1UsageComparison(
-        {
-          ...params,
-          current_microdollars: summary.totals.totalCost.microdollars,
-        },
-        { signal },
-      );
-      if (this.versions.summary === summaryVersion) {
-        this.summary = { ...summary, comparison };
-        this.noteStep("comparison", liveStep, started, comparison);
+      const [comparison, loaded] = await Promise.all([
+        // The card uses the summary total and priorTotalCost for its percentage, so this request needn't wait for Summary.
+        UsageService.getApiV1UsageComparison({ ...params, current_microdollars: 0 }, { signal }),
+        summary,
+      ]);
+      if (loaded && this.versions.summary === summaryVersion) {
+        const applyStartedAt = performance.now();
+        this.summary = { ...loaded.summary, comparison };
+        this.noteStep("comparison", liveStep, started, comparison, applyStartedAt);
         return "ok";
       }
       return "aborted";
@@ -1619,14 +1367,12 @@ class UsageStore {
     this.loading.pairwise = false;
     this.loading.topSessions = false;
     this.loading.zoom = false;
-    this.zoomRows = null;
   }
 
   private markRefreshComplete(startedAt: number): void {
     this.lastUpdatedAt = Date.now();
     this.lastQueryDurationMs = performance.now() - startedAt;
     this.lastQuerySteps = USAGE_STEP_ORDER.flatMap((name) => this.stepTimings.get(name) ?? []);
-    this.hasNewData = false;
   }
 
   private recordStep(
@@ -1657,7 +1403,7 @@ class UsageStore {
       responseTimingOf(data),
       startedAt,
       performance.now(),
-      this.refreshStartedAt,
+      this.lastFetchStartedAt,
       applyStartedAt,
     );
     this.stepTimings.set(step, timing);
@@ -1666,66 +1412,3 @@ class UsageStore {
 }
 
 export const usage = new UsageStore();
-
-export interface UsageUrlState {
-  from: string;
-  to: string;
-  isPinned: boolean;
-  windowDays: number;
-  excludedProjects: string;
-  excludedProjectKeys: string;
-  excludedAgents: string;
-  excludedModels: string;
-}
-
-export const USAGE_DEFAULT_WINDOW_DAYS = DEFAULT_WINDOW_DAYS;
-
-export function parseWindowDays(raw: string | undefined): number | null {
-  if (!raw) return null;
-  const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0 || n > MAX_WINDOW_DAYS || String(n) !== raw) {
-    return null;
-  }
-  return n;
-}
-
-export function buildUsageUrlParams(state: UsageUrlState): Record<string, string> {
-  const params: Record<string, string> = {};
-  if (state.isPinned) {
-    if (state.from) params["from"] = state.from;
-    if (state.to) params["to"] = state.to;
-  } else if (state.windowDays > 0 && state.windowDays !== DEFAULT_WINDOW_DAYS) {
-    params["window_days"] = String(state.windowDays);
-  }
-  if (state.excludedModels) {
-    params["exclude_model"] = state.excludedModels;
-  }
-  if (state.excludedProjects) {
-    params["exclude_project"] = state.excludedProjects;
-  }
-  // Shared-store project keys are scoped to the current aggregate archive
-  // set. Keep them in live request state only; URLs outlive that scope.
-  if (state.excludedAgents) {
-    params["exclude_agent"] = state.excludedAgents;
-  }
-  return params;
-}
-
-const CSV_MERGE_URL_KEYS = new Set(["exclude_project"]);
-const SESSION_DATE_URL_KEYS = new Set(["date", "date_from", "date_to"]);
-
-export function mergeUsageAndSessionUrlParams(
-  usageParams: Record<string, string>,
-  sessionParams: Record<string, string>,
-): Record<string, string> {
-  const params = { ...usageParams };
-  for (const [key, value] of Object.entries(sessionParams)) {
-    if (SESSION_DATE_URL_KEYS.has(key)) continue;
-    if (CSV_MERGE_URL_KEYS.has(key) && params[key]) {
-      params[key] = joinCsvParts(params[key], value);
-    } else {
-      params[key] = value;
-    }
-  }
-  return params;
-}

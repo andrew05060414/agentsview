@@ -46,9 +46,11 @@ func (c *Config) validateSections() error {
 		// The public URL joins the allowed origins, so one bad value is one warning.
 		{ScopeServer, "public_url/public_origins", c.resolvePublicConfig},
 		{ScopeServer, "daemon_idle_timeout", c.validateDaemonIdleTimeout},
+		{ScopeServer, "sync_idle_after", c.validateSyncIdleAfter},
 		{ScopeVector, "[vector]", c.Vector.Validate},
 		{ScopeRecall, "[recall.extract]", c.Recall.Extract.Validate},
 		{ScopeInsights, "[insights]", c.Insights.Validate},
+		{ScopeServer, "[image_text]", c.ImageText.Validate},
 		{ScopeServer, "[friction]", c.Friction.Validate},
 		{ScopeServer, "[kata]", c.Kata.Validate},
 		{ScopePG, "[pg]", func() error { return c.pgConfigErr }},
@@ -67,6 +69,25 @@ func (c *Config) validateDaemonIdleTimeout() error {
 		return fmt.Errorf("invalid daemon_idle_timeout: %s", c.DaemonIdleTimeout)
 	}
 	return nil
+}
+
+func (c *Config) validateSyncIdleAfter() error {
+	if c.SyncIdleAfter < 0 {
+		return fmt.Errorf("invalid sync_idle_after: %s", c.SyncIdleAfter)
+	}
+	return nil
+}
+
+// ResolvedPublicURL validates public_url as the server does and returns it
+// normalized. A command that loads only local settings, where an invalid
+// value is just a warning, calls it before putting the URL into content
+// that leaves the machine.
+func (c Config) ResolvedPublicURL() (string, error) {
+	value, err := resolvePublicURL(c.PublicURL, c.Proxy)
+	if err != nil {
+		return "", fmt.Errorf("invalid public url: %w", err)
+	}
+	return value, nil
 }
 
 func (c *Config) resolvePublicConfig() error {

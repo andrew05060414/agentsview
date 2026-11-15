@@ -16,7 +16,7 @@ func (s *Server) registerSearchRoutes() {
 	group := huma.NewGroup(s.api, "/api/v1/search")
 	configureRouteGroup(group, "Search")
 
-	s.get(group, "", "Search sessions", s.humaSearch)
+	s.getLong(group, "", "Search sessions", s.humaSearch)
 	s.getLong(group, "/content", "Search session content", s.humaSearchContent)
 }
 
@@ -40,7 +40,8 @@ type contentSearchInput struct {
 	Pattern            string             `query:"pattern" doc:"Pattern to search for; mutually exclusive with concepts"`
 	Concepts           []string           `query:"concepts,explode" doc:"Two to five semantic concepts that must all have evidence in one session; repeatable and mutually exclusive with pattern"`
 	Mode               contentSearchMode  `query:"mode" enum:"substring,regex,fts,terms,semantic,hybrid" doc:"Search mode"`
-	Scope              contentSearchScope `query:"scope" enum:"top,all,subordinate" doc:"Semantic/hybrid/terms result scope: top, all, or subordinate (default all)"`
+	KeywordFallback    bool               `query:"allow_keyword_fallback" doc:"Return hybrid keyword matches when semantic search is unavailable"`
+	Scope              contentSearchScope `query:"scope" enum:"top,all,subordinate" doc:"Result scope: top, all, or subordinate (blank lexical scope keeps sidebar child filtering)"`
 	SearchIntent       string             `header:"X-AgentsView-Search-Intent" doc:"Required for semantic/hybrid GET searches"`
 	In                 string             `query:"in" doc:"Comma-separated content sources"`
 	ExcludeSystem      bool               `query:"exclude_system" doc:"Exclude system messages"`
@@ -145,6 +146,7 @@ func (s *Server) humaSearchContent(
 		Pattern:            in.Pattern,
 		Concepts:           in.Concepts,
 		Mode:               string(in.Mode),
+		KeywordFallback:    in.KeywordFallback,
 		Sources:            sources,
 		ExcludeSystem:      in.ExcludeSystem,
 		Reveal:             in.Reveal,

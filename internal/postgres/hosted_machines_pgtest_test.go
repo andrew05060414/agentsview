@@ -30,6 +30,7 @@ func hostedMachineOutcome(content string) rawderive.ParsedManifest {
 }
 
 func TestHostedSourceMachinesLabelsWithoutSessions(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	f.accept(t, "device-a", "unprojected", "")
 	_, err := f.runtime.ExecContext(t.Context(), `UPDATE raw_devices SET display_name='Workstation A' WHERE device_id='device-a'`)
@@ -69,6 +70,7 @@ func newHostedBranchExclusionFixture(t *testing.T) *HostedStore {
 }
 
 func TestHostedSourceMachinesExcludedBranch(t *testing.T) {
+	t.Parallel()
 	h := newHostedBranchExclusionFixture(t)
 	machines, err := h.GetMachines(t.Context(), false, false)
 	require.NoError(t, err)
@@ -113,6 +115,7 @@ func newHostedCoalescedMachinesFixture(t *testing.T) (projectionFixture, *Hosted
 }
 
 func TestHostedSourceMachinesFilterCoalescedSessions(t *testing.T) {
+	t.Parallel()
 	_, h := newHostedCoalescedMachinesFixture(t)
 	resolved, err := db.ResolveMachineFilter(t.Context(), h, "Workstation A")
 	require.NoError(t, err)
@@ -172,14 +175,23 @@ func TestHostedSourceMachinesFilterCoalescedSessions(t *testing.T) {
 	assert.Equal(t, "codex:portable", httpPage.Sessions[0].ID)
 }
 
-func TestHostedSourceMachinesStats(t *testing.T) {
-	_, h := newHostedCoalescedMachinesFixture(t)
+func TestHostedStatsMachineAndSessionCounts(t *testing.T) {
+	t.Parallel()
+	f, h := newHostedCoalescedMachinesFixture(t)
+	_, err := f.runtime.ExecContext(t.Context(), `INSERT INTO sessions
+		(id, project, machine, agent, message_count, user_message_count, relationship_type, parent_session_id, started_at)
+		VALUES ('continuation', 'legacy', 'legacy-machine', 'claude', 4, 2, 'continuation', 'legacy-session', '2026-01-01T00:00:00Z')`)
+	require.NoError(t, err)
 	stats, err := h.GetStats(t.Context(), false, false)
 	require.NoError(t, err)
 	assert.Equal(t, 4, stats.MachineCount)
+	index, err := h.GetSidebarSessionIndex(t.Context(), db.SessionFilter{})
+	require.NoError(t, err)
+	assert.Equal(t, index.Total, stats.SessionCount)
 }
 
 func TestHostedSourceMachinesCatalogFlags(t *testing.T) {
+	t.Parallel()
 	f, h := newHostedCoalescedMachinesFixture(t)
 	// Catalog flags must retain automated one-shot sources when automation is
 	// included.
@@ -202,6 +214,7 @@ func TestHostedSourceMachinesCatalogFlags(t *testing.T) {
 }
 
 func TestHostedSourceMachinesContributorInvalidatesCursor(t *testing.T) {
+	t.Parallel()
 	f, h := newHostedCoalescedMachinesFixture(t)
 
 	page, err := h.ListSessions(t.Context(), db.SessionFilter{Limit: 1})
@@ -214,6 +227,7 @@ func TestHostedSourceMachinesContributorInvalidatesCursor(t *testing.T) {
 }
 
 func TestHostedSourceMachinesKeepDivergentVariantsSeparate(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	for _, device := range []string{"device-a", "device-b"} {
 		m, _ := f.accept(t, device, "capture-"+device, "")
@@ -240,6 +254,7 @@ func TestHostedSourceMachinesKeepDivergentVariantsSeparate(t *testing.T) {
 }
 
 func TestHostedSourceMachinesIncludePrefixCopies(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	a, _ := f.accept(t, "device-a", "short-a", "")
 	short := hostedMachineOutcome("shared prefix")
@@ -274,6 +289,7 @@ func TestHostedSourceMachinesIncludePrefixCopies(t *testing.T) {
 }
 
 func TestHostedSourceMachinesFollowRetainedProof(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	a, acceptedA := f.accept(t, "device-a", "capture-a", "")
 	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, a), a, hostedMachineOutcome("retained needle")))
@@ -313,6 +329,7 @@ func TestHostedSourceMachinesFollowRetainedProof(t *testing.T) {
 }
 
 func TestHostedSourceMachinesOpaqueDeviceSelector(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	m, _ := f.accept(t, "device,研发", "capture-opaque", "")
 	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, m), m, hostedMachineOutcome("opaque device needle")))

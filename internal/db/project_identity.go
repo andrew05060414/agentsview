@@ -412,25 +412,53 @@ func (db *DB) CopyArchiveIdentityFrom(ctx context.Context, sourcePath string) er
 }
 
 func (db *DB) GetDatabaseID(ctx context.Context) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	var id string
-	err := db.getReader().QueryRowContext(ctx,
-		`SELECT value FROM archive_metadata WHERE key = ?`,
-		archiveMetadataDatabaseIDKey,
-	).Scan(&id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", ErrDatabaseIDMissing
+	if db.usageSource != nil {
+		// Every capture refreshes this identity and every prepared window
+		// compares it with its capture, so a changed source is retried.
+		if id := db.usageSourceDatabaseID.Load(); id != nil {
+			return *id, nil
 		}
-		return "", fmt.Errorf("reading database id: %w", err)
+		probe, err := db.usageSource.CaptureUsage(ctx, UsageSourceRequest{IDs: &[]string{}})
+		if err == nil && probe.DatabaseID != "" {
+			if !db.usageSourceDatabaseID.CompareAndSwap(nil, &probe.DatabaseID) {
+				return *db.usageSourceDatabaseID.Load(), nil
+			}
+		}
+		return probe.DatabaseID, err
 	}
-	id = strings.TrimSpace(id)
+	id, _, err := db.databaseIDAndUsagePricingRevision(ctx)
+	if err != nil {
+		return "", err
+	}
 	if id == "" {
 		return "", ErrDatabaseIDMissing
 	}
 	return id, nil
+}
+
+func (db *DB) databaseIDAndUsagePricingRevision(ctx context.Context) (string, int64, error) {
+	return databaseIDAndUsagePricingRevisionFrom(ctx, db.getReader())
+}
+
+func databaseIDAndUsagePricingRevisionFrom(ctx context.Context, conn interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+},
+) (string, int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var id string
+	var pricingRevision int64
+	err := conn.QueryRowContext(ctx, `SELECT
+		COALESCE((SELECT value FROM archive_metadata WHERE key = ?), ''),
+		COALESCE((SELECT CAST(value AS INTEGER) FROM archive_metadata WHERE key = ?), 0)`,
+		archiveMetadataDatabaseIDKey, archiveMetadataUsagePricingRevisionKey,
+	).Scan(&id, &pricingRevision)
+	if err != nil {
+		return "", 0, fmt.Errorf("reading database id: %w", err)
+	}
+	id = strings.TrimSpace(id)
+	return id, pricingRevision, nil
 }
 
 func (db *DB) GetOrCreateDatabaseID(ctx context.Context) (string, error) {

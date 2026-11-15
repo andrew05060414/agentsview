@@ -192,31 +192,6 @@ func TestDuckDBStoreContract(t *testing.T) {
 	}
 }
 
-func TestDuckDBSystemPrefixSQLTerminalRemainder(t *testing.T) {
-	conn := openTestDuckDB(t)
-	rows, err := conn.QueryContext(t.Context(), `
-		WITH candidates(label, role, content) AS (VALUES
-			('reminder-only', 'user', '<system-reminder>a</system-reminder><system-reminder>b</system-reminder>'),
-			('reminder-task', 'user', '<system-reminder>a</system-reminder><task-notification>done</task-notification>'),
-			('reminder-ordinary', 'user', '<system-reminder>a</system-reminder>real prompt'),
-			('reminder-malformed', 'user', '<system-reminder>a')
-		)
-		SELECT label FROM candidates
-		WHERE `+db.DuckDBSystemPrefixSQL("content", "role")+`
-		ORDER BY label`)
-	require.NoError(t, err)
-	defer rows.Close()
-
-	var got []string
-	for rows.Next() {
-		var label string
-		require.NoError(t, rows.Scan(&label))
-		got = append(got, label)
-	}
-	require.NoError(t, rows.Err())
-	assert.Equal(t, []string{"reminder-malformed", "reminder-ordinary"}, got)
-}
-
 // TestDuckDBSearchContentSemanticModesUnavailable pins that "semantic" and
 // "hybrid" are rejected with db.ErrSemanticUnavailable before any query runs
 // -- a zero-value Store (no live *sql.DB) is enough to prove that.
@@ -297,52 +272,6 @@ func TestDuckDBFindSessionIDsByPartialLiteralCaseSensitive(t *testing.T) {
 	require.NoError(t, err, "case-sensitive lookup")
 	assert.ElementsMatch(t, []string{"abc_def", "abcXdef", "abc%def"}, got)
 	assert.NotContains(t, got, "ABCdef")
-}
-
-func TestDuckDBFindSessionIDsByRawSuffix(t *testing.T) {
-	ctx := t.Context()
-	local := newLocalDB(t)
-	for _, id := range []string{
-		"plain-id", "codex:uuid", "host~uuid", "host~uuid-fork",
-		"host~P-E", "host~wild_%_literal", "host~trashed",
-	} {
-		require.NoError(t, local.UpsertSession(ctx, db.Session{
-			ID: id, Project: "proj", Machine: "test",
-			Agent: "claude", MessageCount: 1,
-		}), "upsert %q", id)
-	}
-	require.NoError(t, local.SoftDeleteSession(ctx, "host~trashed"))
-
-	syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
-	require.NoError(t, createSchema(ctx, syncer.DB()))
-	_, err := syncer.pushEverything(ctx, nil)
-	require.NoError(t, err)
-	store := NewStoreFromDB(syncer.DB())
-
-	got, err := store.FindSessionIDsByRawSuffix(ctx, "uuid", 2)
-	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"codex:uuid", "host~uuid"}, got)
-	uuidIDs := append([]string(nil), got...)
-
-	got, err = store.FindSessionIDsByRawSuffix(ctx, "plain-id", 2)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"plain-id"}, got)
-	exactIDs := append([]string(nil), got...)
-
-	got, err = store.FindSessionIDsByRawSuffix(ctx, "wild_%_literal", 2)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"host~wild_%_literal"}, got)
-	wildcardIDs := append([]string(nil), got...)
-
-	got, err = store.FindSessionIDsByRawSuffix(ctx, "trashed", 2)
-	require.NoError(t, err)
-	assert.Empty(t, got)
-	trashedIDs := append([]string(nil), got...)
-
-	got, err = store.FindSessionIDsByRawSuffix(ctx, "E", 2)
-	require.NoError(t, err)
-	assert.Empty(t, got)
-	t.Logf("head: duckdb_uuid=%v exact=%v wildcard=%v trashed=%v entry=%v", uuidIDs, exactIDs, wildcardIDs, trashedIDs, got)
 }
 
 func duckContractSessionsCursorsAndMetadata(
@@ -1054,4 +983,71 @@ func requireReadOnlyDuck(t *testing.T, err error) {
 	t.Helper()
 	require.Error(t, err)
 	assert.ErrorIs(t, err, db.ErrReadOnly, "expected ErrReadOnly, got %v", err)
+}
+
+func TestDuckDBSidebarIndexPaging(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		sessions  []db.Session
+		starredID string
+		check     func(*testing.T, *Store)
+	}{
+		{
+			name: "cursor walk",
+			sessions: []db.Session{
+				{ID: "root-a", StartedAt: new("2026-01-01T00:00:00Z")},
+				{ID: "child-a", StartedAt: new("2026-01-04T00:00:00Z"), ParentSessionID: new("root-a"), RelationshipType: "subagent"},
+				{ID: "root-b", StartedAt: new("2026-01-03T00:00:00Z")},
+				{ID: "root-c", StartedAt: new("2026-01-02T00:00:00Z")},
+			},
+			check: func(t *testing.T, store *Store) {
+				t.Helper()
+				cursor := ""
+				for i, want := range [][]string{{"child-a", "root-a"}, {"root-b"}, {"root-c"}} {
+					page, err := store.GetSidebarSessionIndex(t.Context(), db.SessionFilter{Limit: 1, Cursor: cursor})
+					require.NoError(t, err)
+					assert.Equal(t, want, duckSidebarSessionIDs(page.Sessions))
+					assert.Equal(t, 3, page.Total)
+					assert.Equal(t, i < 2, page.NextCursor != "")
+					cursor = page.NextCursor
+				}
+			},
+		},
+		{
+			name: "starred descendant",
+			sessions: []db.Session{
+				{ID: "unstarred-newer", StartedAt: new("2026-01-20T00:00:00Z")},
+				{ID: "root", StartedAt: new("2026-01-01T00:00:00Z")},
+				{ID: "starred-child", StartedAt: new("2026-01-10T00:00:00Z"), ParentSessionID: new("root"), RelationshipType: "subagent"},
+			},
+			starredID: "starred-child",
+			check: func(t *testing.T, store *Store) {
+				t.Helper()
+				page, err := store.GetSidebarSessionIndex(t.Context(), db.SessionFilter{Starred: true, Limit: 1})
+				require.NoError(t, err)
+				assert.Equal(t, []string{"starred-child", "root"}, duckSidebarSessionIDs(page.Sessions))
+				assert.Equal(t, 1, page.Total)
+				assert.Empty(t, page.NextCursor)
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			local := newLocalDB(t)
+			for _, session := range tt.sessions {
+				session.Project, session.Machine, session.Agent = "sidebar", "local", "claude"
+				session.MessageCount, session.UserMessageCount = 1, 1
+				require.NoError(t, local.UpsertSession(ctx, session))
+			}
+			if tt.starredID != "" {
+				ok, err := local.StarSession(ctx, tt.starredID)
+				require.NoError(t, err)
+				require.True(t, ok)
+			}
+			syncer := newInMemoryTestSync(t, local, storage.MirrorPushOptions{})
+			pushDataReadMirror(t, ctx, syncer)
+			store := NewStoreFromDB(syncer.DB())
+			tt.check(t, store)
+		})
+	}
 }

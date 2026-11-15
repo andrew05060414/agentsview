@@ -17,6 +17,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 	"go.kenn.io/agentsview/internal/chromehost"
+	agentconfig "go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/importer"
 )
@@ -27,7 +28,7 @@ func (s *Server) registerImportRoutes() {
 	group.UseSimpleModifier(func(op *huma.Operation) {
 		if op.Method == http.MethodPost && op.Path == "/api/v1/import/claude-ai/sync" {
 			if response := op.Responses["409"]; response != nil {
-				response.Description = "Before streaming, code claude_ai_chrome_host_required reports a disconnected Chrome host; claude_ai_sync_running reports that Chrome Sync is already running."
+				response.Description = "Before streaming, code claude_ai_chrome_host_required reports a disconnected Chrome host; claude_ai_sync_running reports that Chrome Sync is already running; claude_ai_config_invalid reports an invalid [agents.claude-ai] table in config.toml."
 			}
 		}
 		if op.Method == http.MethodPost && op.Path == "/api/v1/import/chatgpt/sync" {
@@ -135,7 +136,10 @@ type claudeAISyncResult struct {
 
 func (s *Server) humaSyncClaudeAI(ctx context.Context, in *claudeAISyncInput, results *sync.Map) (*huma.StreamResponse, error) {
 	return s.syncBrowser(ctx, in.Browser == "chrome", browserSyncConfig{
-		platform: chromehost.ClaudeAI, sync: importer.SyncClaudeAI, authError: importer.ErrClaudeAIAuthRequired, label: "Claude.ai", desktopResults: results,
+		platform: chromehost.ClaudeAI, configErr: claudeAIConfigErr(s.cfg.ClaudeAI.Err), authError: importer.ErrClaudeAIAuthRequired, label: "Claude.ai", desktopResults: results,
+		sync: func(ctx context.Context, store importer.BrowserSyncStore, fetch func(context.Context, string) (importer.ClaudeAIResponse, error), cb *importer.ImportCallbacks, machine ...string) (importer.ImportStats, error) {
+			return importer.SyncClaudeAI(ctx, store, fetch, s.cfg.ClaudeAI.Organizations, cb, machine...)
+		},
 		hostRequired: "claude_ai_chrome_host_required", running: "claude_ai_sync_running",
 		authRequired: "claude_ai_auth_required", updateRequired: "claude_ai_chrome_host_update_required",
 	})
@@ -154,6 +158,7 @@ type browserSyncConfig struct {
 	platform                                            chromehost.Platform
 	sync                                                func(context.Context, importer.BrowserSyncStore, func(context.Context, string) (importer.ClaudeAIResponse, error), *importer.ImportCallbacks, ...string) (importer.ImportStats, error)
 	authError                                           error
+	configErr                                           error
 	label                                               string
 	hostRequired, running, authRequired, updateRequired string
 }
@@ -171,6 +176,9 @@ func (s *Server) syncBrowser(ctx context.Context, chrome bool, config browserSyn
 	store, ok := s.db.(*db.DB)
 	if !ok {
 		return nil, apiError(http.StatusNotImplemented, "sync requires a local archive")
+	}
+	if config.configErr != nil {
+		return nil, apiErrorWithCode(http.StatusConflict, "claude_ai_config_invalid", config.configErr.Error())
 	}
 	if chrome && !s.chrome.Connected() {
 		return nil, apiErrorWithCode(http.StatusConflict, config.hostRequired, "Run agentsview source chrome setup, restart AgentsView, and keep Chrome open, then Sync again")
@@ -495,4 +503,13 @@ func jsonStreamResponse(value any) *huma.StreamResponse {
 		hctx.SetHeader("Content-Type", "application/json")
 		_ = json.MarshalEncode(jsontext.NewEncoder(hctx.BodyWriter()), value)
 	}}
+}
+
+// claudeAIConfigErr turns the typed config error into a plain error so a nil
+// pointer does not become a non-nil interface value.
+func claudeAIConfigErr(err *agentconfig.ClaudeAIConfigError) error {
+	if err == nil {
+		return nil
+	}
+	return err
 }

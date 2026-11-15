@@ -323,9 +323,10 @@ func (b *directBackend) List(
 	}
 	hideStaleSecretCounts(page.Sessions, filter.SecretsRulesVersions)
 	return &SessionList{
-		Sessions:   page.Sessions,
-		NextCursor: page.NextCursor,
-		Total:      page.Total,
+		ExclusionCounts: page.ExclusionCounts,
+		Sessions:        page.Sessions,
+		NextCursor:      page.NextCursor,
+		Total:           page.Total,
 	}, nil
 }
 
@@ -334,6 +335,7 @@ func (b *directBackend) List(
 // transports produce identical SessionFilter values.
 func listFilterToDB(f ListFilter) db.SessionFilter {
 	filter := db.SessionFilter{
+		ExclusionCounts:      f.ExclusionCounts,
 		IDs:                  f.IDs,
 		Project:              f.Project,
 		ExcludeProject:       f.ExcludeProject,
@@ -353,6 +355,7 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		AutomatedFilterSet:   f.AutomatedFilterSet,
 		ExcludeAutomated:     !f.IncludeAutomated,
 		IncludeChildren:      f.IncludeChildren,
+		Flat:                 f.Flat,
 		IncludeSource:        f.IncludeSource,
 		Cursor:               f.Cursor,
 		Limit:                f.Limit,
@@ -407,7 +410,7 @@ const defaultAroundSpan = 5
 func (b *directBackend) Messages(
 	ctx context.Context, id string, f MessageFilter,
 ) (*MessageList, error) {
-	if f.Around != nil && (f.From != nil || f.Direction != "") {
+	if f.Around != nil && (f.From != nil || f.Direction != "" || f.CompactBoundaryOnly) {
 		return nil, ErrAroundMutuallyExclusive
 	}
 	if (f.Before != nil || f.After != nil) && f.Around == nil {
@@ -430,7 +433,7 @@ func (b *directBackend) Messages(
 		limit = db.MaxMessageLimit
 	}
 
-	w := db.MessageWindow{Limit: limit, Asc: asc, Roles: f.Roles}
+	w := db.MessageWindow{Limit: limit, Asc: asc, Roles: f.Roles, CompactBoundaryOnly: f.CompactBoundaryOnly}
 	if f.Around != nil {
 		w.Around = f.Around
 		w.Before = defaultAroundSpan
@@ -1037,6 +1040,7 @@ func (b *directBackend) SessionUsage(
 func (b *directBackend) UsagePairwiseComparison(
 	ctx context.Context, req UsagePairwiseComparisonRequest,
 ) (*UsagePairwiseComparisonResponse, error) {
+	ctx = db.WithUsageWindowMemo(ctx)
 	var err error
 	req.Machine, err = db.ResolveMachineFilter(ctx, b.db, req.Machine)
 	if err != nil {
@@ -1051,6 +1055,7 @@ func (b *directBackend) UsagePairwiseComparison(
 		return nil, err
 	}
 	useDefault := req.LeftDimension == "" && req.LeftValue == "" && req.RightDimension == "" && req.RightValue == ""
+	var sides *db.UsagePairwiseSides
 	if req.FallbackToDefault && !useDefault {
 		if err := validatePairwiseDimension(req.LeftDimension, req.LeftValue, "left"); err != nil {
 			return nil, err
@@ -1068,12 +1073,13 @@ func (b *directBackend) UsagePairwiseComparison(
 			right = b.modelGroups.Expand(right)
 		}
 		rankingFilter := base
-		rankingFilter.Breakdowns = true
+		rankingFilter.Breakdowns, rankingFilter.PairwiseSides = true, true
 		rankingFilter.SkipSessionCounts = true
 		rankingResult, err := b.db.GetDailyUsage(ctx, rankingFilter)
 		if err != nil {
 			return nil, err
 		}
+		sides = rankingResult.Pairwise
 		rankingPlanUsage, err := b.db.GetPlanUsageSessionCounts(ctx, rankingFilter)
 		if err != nil {
 			return nil, err
@@ -1126,18 +1132,28 @@ func (b *directBackend) UsagePairwiseComparison(
 
 	var leftResult db.DailyUsageResult
 	var rightResult db.DailyUsageResult
+	readSide := func(ctx context.Context, dimension string, filter db.UsageFilter) (db.DailyUsageResult, error) {
+		values := splitCSVTokens(filter.Model)
+		if dimension == "project" {
+			values = filter.ProjectFilterLabels()
+		}
+		if result, ok := sides.Side(dimension, values); ok {
+			return result, nil
+		}
+		return b.db.GetDailyUsage(ctx, filter)
+	}
 	group, groupCtx := errgroup.WithContext(ctx)
 	if !leftEmpty {
 		group.Go(func() error {
 			var readErr error
-			leftResult, readErr = b.db.GetDailyUsage(groupCtx, leftFilter)
+			leftResult, readErr = readSide(groupCtx, req.LeftDimension, leftFilter)
 			return readErr
 		})
 	}
 	if !rightEmpty {
 		group.Go(func() error {
 			var readErr error
-			rightResult, readErr = b.db.GetDailyUsage(groupCtx, rightFilter)
+			rightResult, readErr = readSide(groupCtx, req.RightDimension, rightFilter)
 			return readErr
 		})
 	}
@@ -1243,6 +1259,23 @@ func (b *directBackend) SearchContent(
 	} else {
 		page, err = b.db.SearchContent(ctx, filter)
 	}
+	var effectiveMode, note string
+	if err != nil && req.Mode == "hybrid" && req.KeywordFallback && errors.Is(err, db.ErrSemanticUnavailable) {
+		reason := "not set up"
+		if unavailable, ok := errors.AsType[*db.SemanticUnavailableError](err); ok {
+			reason = unavailable.Reason
+		}
+		filter.KeywordOnly, effectiveMode, note = true, "hybrid_keyword", "Search by meaning is unavailable: "+reason+". Returned hybrid keyword matches only."
+		// SQLite keyword matches already rank messages holding fewer of the
+		// words, so shorter retries find nothing new there.
+		if named, ok := b.db.(db.MemoryBackendNamer); !ok || named.MemoryBackendName() != "sqlite" {
+			note += " Query words must appear. If matches are empty or few, try short substring queries with key terms or synonyms."
+		}
+		if reason == "not set up" {
+			note += " To enable search by meaning, run `agentsview index embeddings build` or turn it on in Settings → Embeddings → Turn on."
+		}
+		page, err = b.db.SearchContent(ctx, filter)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1277,6 +1310,8 @@ func (b *directBackend) SearchContent(
 		NextCursor:          page.NextCursor,
 		RevisionBound:       revisionBound,
 		Coverage:            coverage,
+		EffectiveMode:       effectiveMode,
+		Note:                note,
 		CandidateTruncated:  candidateTruncated,
 	}, nil
 }
@@ -1311,7 +1346,7 @@ func readsOverlap(store db.Store) bool {
 // by the store -- they were never part of the search hit, so
 // ContentSearchFilter.RevealSecrets (which only governs snippet redaction)
 // never touches them. When reveal is false, every context message is
-// redacted here via redactMessageSecrets before being attached to the
+// redacted here via RedactMessageSecrets before being attached to the
 // match, so context_before/context_after never leak a secret from an
 // adjacent message regardless of transport (HTTP, CLI, MCP all share this
 // path). When reveal is true the raw messages are attached unchanged, same
@@ -1354,7 +1389,7 @@ func (b *directBackend) enrichContentContext(
 			stale[i] = revision != m.TranscriptRevision
 			for _, msg := range msgs {
 				if !reveal {
-					msg = redactMessageSecrets(msg)
+					msg = RedactMessageSecrets(msg)
 				}
 				switch {
 				case msg.Ordinal < anchor:
@@ -1372,16 +1407,18 @@ func (b *directBackend) enrichContentContext(
 	return !slices.Contains(stale, true), nil
 }
 
-// redactMessageSecrets returns a copy of m with every secret-shaped span
+// RedactMessageSecrets returns a copy of m with every secret-shaped span
 // masked in its user-visible text fields: message content, thinking text,
 // and each tool call's input/output payloads (InputJSON, ResultContent, and
 // every ResultEvent's Content). It mirrors the masking the search-snippet
 // path already applies via secrets.RedactWindow, but a context message has
 // no known match offset to window around, so the whole-string secrets.Redact
-// scan is used instead. m.ToolResults is not touched: it is a transient
+// scan is used instead. Tool payloads go through secrets.RedactJSON, which
+// scans decoded strings so JSON escapes cannot hide a secret. Session HTML
+// and Markdown exports use it too. m.ToolResults is not touched: it is a transient
 // parse-time field (json:"-") that GetMessagesWindow never populates, so it
 // never reaches a transport response.
-func redactMessageSecrets(m db.Message) db.Message {
+func RedactMessageSecrets(m db.Message) db.Message {
 	m.Content = secrets.Redact(m.Content)
 	m.ThinkingText = secrets.Redact(m.ThinkingText)
 	if len(m.ToolCalls) == 0 {
@@ -1389,12 +1426,12 @@ func redactMessageSecrets(m db.Message) db.Message {
 	}
 	toolCalls := make([]db.ToolCall, len(m.ToolCalls))
 	for i, tc := range m.ToolCalls {
-		tc.InputJSON = secrets.Redact(tc.InputJSON)
-		tc.ResultContent = secrets.Redact(tc.ResultContent)
+		tc.InputJSON = secrets.RedactJSON(tc.InputJSON)
+		tc.ResultContent = secrets.RedactJSON(tc.ResultContent)
 		if len(tc.ResultEvents) > 0 {
 			events := make([]db.ToolResultEvent, len(tc.ResultEvents))
 			for j, ev := range tc.ResultEvents {
-				ev.Content = secrets.Redact(ev.Content)
+				ev.Content = secrets.RedactJSON(ev.Content)
 				events[j] = ev
 			}
 			tc.ResultEvents = events
@@ -1415,15 +1452,27 @@ func (b *directBackend) ListRecallEntries(
 	if err := db.ValidateRecallQuery(query); err != nil {
 		return nil, err
 	}
+	query = db.NormalizeRecallQuery(query)
+	if err := ValidateRecallListQuery(query); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(f.Query) == "" {
-		entries, err := b.db.ListRecallEntries(ctx, query)
+		var cursor *RecallListCursor
+		if f.Cursor != "" {
+			decoded, err := DecodeRecallListCursor(f.Cursor)
+			if err != nil || decoded.FilterHash != RecallListFilterHash(query) {
+				return nil, db.ErrInvalidRecallQuery
+			}
+			cursor = &decoded
+		}
+		entries, next, err := ListRecentRecallEntriesPage(ctx, b.db, query, cursor)
 		if err != nil {
 			return nil, err
 		}
-		return &RecallList{
-			RecallEntries: recallResultsFromRecallEntries(entries),
-			TrustedOnly:   f.TrustedOnly,
-		}, nil
+		return &RecallList{RecallEntries: entries, TrustedOnly: f.TrustedOnly, NextCursor: next}, nil
+	}
+	if f.Cursor != "" {
+		return nil, db.ErrInvalidRecallQuery
 	}
 	page, err := b.db.QueryRecallEntries(ctx, query)
 	if err != nil {
@@ -1436,14 +1485,6 @@ func (b *directBackend) ListRecallEntries(
 		RecallEntries: page.RecallEntries,
 		TrustedOnly:   f.TrustedOnly,
 	}, nil
-}
-
-func recallResultsFromRecallEntries(entries []db.RecallEntry) []db.RecallResult {
-	out := make([]db.RecallResult, 0, len(entries))
-	for _, entry := range entries {
-		out = append(out, db.RecallResult{RecallEntry: entry})
-	}
-	return out
 }
 
 func (b *directBackend) GetRecallEntry(
@@ -1476,6 +1517,8 @@ func (b *directBackend) ImportRecallEntries(
 func recallFilterToDB(f RecallFilter) db.RecallQuery {
 	return db.RecallQuery{
 		Text:                f.Query,
+		UpdatedSince:        f.UpdatedSince,
+		CreatedSince:        f.CreatedSince,
 		Project:             f.Project,
 		CWD:                 f.CWD,
 		GitBranch:           f.GitBranch,
@@ -1594,12 +1637,16 @@ func (b *directBackend) Stats(
 		IncludeProjects:        f.IncludeProjects,
 		ExcludeProjects:        f.ExcludeProjects,
 		Timezone:               f.Timezone,
+		OutcomesOnly:           f.OutcomesOnly,
 		IncludeGitOutcomes:     f.IncludeGitOutcomes,
 		IncludeGitHubOutcomes:  f.IncludeGitHubOutcomes,
 		GHToken:                f.GHToken,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if f.OutcomesOnly {
+		return stats, nil
 	}
 	archiveOnly, err := b.local.IsArchiveOnly(ctx)
 	if err != nil {
@@ -1799,4 +1846,20 @@ func cursorAttributionSource(status, warning string) db.CodeAttributionSource {
 		out.Warnings = []string{warning}
 	}
 	return out
+}
+
+func (b *directBackend) SessionCommits(ctx context.Context, id string) (*db.SessionCommitList, error) {
+	reader, ok := b.db.(db.CommitLinkReader)
+	if !ok {
+		return nil, db.ErrCommitLinksUnavailable
+	}
+	return reader.SessionCommitLinks(ctx, id)
+}
+
+func (b *directBackend) CommitSessions(ctx context.Context, shas []string) (*db.CommitSessionList, error) {
+	reader, ok := b.db.(db.CommitLinkReader)
+	if !ok {
+		return nil, db.ErrCommitLinksUnavailable
+	}
+	return reader.CommitSessionLinks(ctx, shas)
 }

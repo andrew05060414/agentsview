@@ -31,6 +31,7 @@ const (
 	codexTypeEventMsg         = "event_msg"
 	codexTypeHistoryMutation  = "history_mutation"
 	codexTypeTokenUsageRecord = "token_usage_record"
+	codexTypeCompacted        = "compacted"
 	codexOriginatorExec       = "codex_exec"
 )
 
@@ -63,6 +64,12 @@ type codexSessionIndexEntry struct {
 // codexSessionBuilder accumulates state while scanning a Codex
 // JSONL session file line by line.
 type codexSessionBuilder struct {
+	sourceLine         int
+	sourceTurnID       string
+	sourceInTurn       bool
+	sourceTurnContexts []string
+	// sourceTimestamp is the envelope timestamp of the line being processed.
+	sourceTimestamp time.Time
 	codexCursorState
 	agent       AgentType
 	incremental bool
@@ -139,7 +146,7 @@ func (g *codexForkGate) retryReason() string {
 	if g.resolvedOnce {
 		return ""
 	}
-	return "codex parent turns unresolved for " + g.parentSessionID
+	return "could not read the Codex session it was forked from (" + g.parentSessionID + ")"
 }
 
 type codexParentTurnResolver func(string) (map[string]struct{}, bool)
@@ -224,6 +231,7 @@ type codexToolCallRef struct {
 }
 
 type codexPendingEvent struct {
+	origin    CodexMessageOrigin
 	agentID   string
 	source    string
 	status    string
@@ -375,8 +383,15 @@ func (b *codexSessionBuilder) refreshPendingCallPositions() {
 func (b *codexSessionBuilder) processLine(ctx context.Context,
 	line string,
 ) (skip bool, err error) {
+	b.sourceLine++
+	if gjson.Get(line, "type").Str == codexTypeTurnContext {
+		b.sourceTurnID = strings.Clone(gjson.Get(line, "payload.turn_id").Str)
+		b.sourceTurnContexts = append(b.sourceTurnContexts, b.sourceTurnID)
+		b.sourceInTurn = true
+	}
 	tsStr := gjson.Get(line, "timestamp").Str
 	ts := parseTimestamp(tsStr)
+	b.sourceTimestamp = ts
 	if ts.IsZero() {
 		if tsStr != "" {
 			logParseError(tsStr)
@@ -425,8 +440,37 @@ func (b *codexSessionBuilder) processLine(ctx context.Context,
 			return false, nil
 		}
 		b.handleTokenUsageRecord(payload)
+	case codexTypeCompacted:
+		if b.suppresses(codexTypeCompacted, payload) {
+			return false, nil
+		}
+		b.handleCompacted(payload, ts)
 	}
 	return false, nil
+}
+
+// handleCompacted records a compaction as a system boundary carrying the
+// summary Codex keeps in place of the earlier history. Remote compaction
+// writes no summary; its boundary stays empty, because the divider already
+// labels every compaction. The record's
+// replacement_history repeats messages already in the transcript and is not
+// replayed. The boundary is never a usage target: the compaction call's usage
+// belongs to the response that produced it.
+func (b *codexSessionBuilder) handleCompacted(payload gjson.Result, ts time.Time) {
+	// A copy keeps the stored row from holding the whole line, which carries
+	// replacement_history, in memory.
+	content := strings.Clone(strings.TrimSpace(payload.Get("message").Str))
+	b.sink.AppendMessage(ParsedMessage{
+		CodexOrigin:       CodexMessageOrigin{Line: b.sourceLine, TurnID: b.sourceTurnID, InTurn: b.sourceInTurn, TurnContext: len(b.sourceTurnContexts)},
+		Role:              RoleAssistant,
+		Content:           content,
+		Timestamp:         ts,
+		IsSystem:          true,
+		ContentLength:     len(content),
+		SourceType:        "system",
+		SourceSubtype:     "compact_boundary",
+		IsCompactBoundary: true,
+	})
 }
 
 // codexAcceptSessionMetaID keeps the first nonempty ID as the file's owner.
@@ -512,6 +556,9 @@ func (b *codexSessionBuilder) handleResponseItem(ctx context.Context,
 	case "image_generation_call":
 		b.handleImageGenerationCall(ctx, payload, ts)
 		return
+	case "reasoning":
+		b.handleReasoning(payload, ts)
+		return
 	}
 
 	role := payload.Get("role").Str
@@ -554,6 +601,7 @@ func (b *codexSessionBuilder) handleResponseItem(ctx context.Context,
 	}
 
 	msg := ParsedMessage{
+		CodexOrigin:   CodexMessageOrigin{Line: b.sourceLine, TurnID: b.sourceTurnID, InTurn: b.sourceInTurn, TurnContext: len(b.sourceTurnContexts)},
 		Role:          RoleType(role),
 		Content:       content,
 		DialogueText:  new(content),
@@ -587,6 +635,7 @@ func (b *codexSessionBuilder) handleAgentMessage(
 	b.committedUsageTarget = nil
 	b.committedUsageBlockedByUser = true
 	b.sink.AppendMessage(ParsedMessage{
+		CodexOrigin:   CodexMessageOrigin{Line: b.sourceLine, TurnID: b.sourceTurnID, InTurn: b.sourceInTurn, TurnContext: len(b.sourceTurnContexts)},
 		Role:          RoleUser,
 		Content:       content,
 		DialogueText:  new(content),
@@ -594,6 +643,48 @@ func (b *codexSessionBuilder) handleAgentMessage(
 		ContentLength: len(content),
 		Model:         b.model,
 	})
+}
+
+// handleReasoning keeps a reasoning item's readable text as a thinking row.
+// Codex writes the summary under summary[].text and, for models that expose
+// it, raw reasoning under content[].text; the summary wins, as in Codex Cloud.
+// Encrypted reasoning with no readable text adds no row.
+func (b *codexSessionBuilder) handleReasoning(payload gjson.Result, ts time.Time) {
+	thinking := codexReasoningText(payload.Get("summary"))
+	if thinking == "" {
+		thinking = codexReasoningText(payload.Get("content"))
+	}
+	if thinking == "" {
+		return
+	}
+	content := "[Thinking]\n" + thinking + "\n[/Thinking]"
+	b.sink.AppendMessage(ParsedMessage{
+		CodexOrigin:     CodexMessageOrigin{Line: b.sourceLine, TurnID: b.sourceTurnID, InTurn: b.sourceInTurn, TurnContext: len(b.sourceTurnContexts)},
+		Role:            RoleAssistant,
+		Content:         content,
+		DialogueText:    new(""),
+		ThinkingText:    thinking,
+		HasThinking:     true,
+		Timestamp:       ts,
+		ContentLength:   len(content),
+		Model:           b.model,
+		ReasoningEffort: b.reasoningEffort,
+		ProviderID:      b.serviceTierProviderID,
+	})
+}
+
+// codexReasoningText joins the nonblank text parts of a reasoning summary or
+// content array with blank lines, the thinking-block boundary used elsewhere.
+func codexReasoningText(parts gjson.Result) string {
+	var texts []string
+	for _, part := range parts.Array() {
+		if text := strings.TrimSpace(part.Get("text").Str); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	// Join returns a lone part as is; the copy keeps the row from holding
+	// the whole line, encrypted reasoning included, in memory.
+	return strings.Clone(strings.Join(texts, "\n\n"))
 }
 
 func (b *codexSessionBuilder) applyThreadSettings(payload gjson.Result) {
@@ -658,7 +749,7 @@ func (b *codexSessionBuilder) handleTokenUsageRecord(
 	}
 	for _, counter := range []string{"input_tokens", "cached_input_tokens", "output_tokens", "cache_write_input_tokens"} {
 		if usage.Get(counter).Type == gjson.Number {
-			b.applyTokenUsage(usage.Raw, payload.Get("response_id").Str)
+			b.applyTokenUsage(usage.Raw, usage.Raw, payload.Get("response_id").Str)
 			return
 		}
 	}
@@ -671,15 +762,21 @@ func (b *codexSessionBuilder) markFirstUserReplayPossible() {
 func (b *codexSessionBuilder) handleTokenCountEvent(
 	payload gjson.Result,
 ) {
-	raw := payload.Get("info.last_token_usage").Raw
+	info := payload.Get("info")
+	raw := info.Get("last_token_usage").Raw
 	if raw == "" {
 		return
 	}
-	b.applyTokenUsage(raw, "")
+	// A repeated token_count carries the same cumulative total_token_usage;
+	// a new call with equal per-call counts raises it. Keying on the whole
+	// info object therefore drops only true repeats.
+	b.applyTokenUsage(raw, info.Raw, "")
 }
 
-func (b *codexSessionBuilder) applyTokenUsage(raw, responseID string) {
-	if b.observeTokenUsage(raw, responseID) {
+// applyTokenUsage attaches one call's usage, raw, unless dedupKey and
+// responseID repeat the previous observation.
+func (b *codexSessionBuilder) applyTokenUsage(raw, dedupKey, responseID string) {
+	if b.observeTokenUsage(dedupKey, responseID) {
 		return
 	}
 
@@ -689,11 +786,17 @@ func (b *codexSessionBuilder) applyTokenUsage(raw, responseID string) {
 	if b.sink.ApplyTokenUsageToLastAssistant(raw) {
 		return
 	}
-	if b.committedUsageBlockedByUser {
-		return
-	}
 	if b.committedUsageTarget == nil {
-		b.unattachedTokenUsage = true
+		if b.incremental && !b.committedUsageBlockedByUser {
+			// The target may precede the resume offset; a full parse
+			// decides whether one exists.
+			b.unattachedTokenUsage = true
+			return
+		}
+		// No row in this turn can take the usage, for example after
+		// encrypted-only reasoning or a compaction request. Keep it as a
+		// hidden usage-only row instead of dropping it.
+		b.appendUsageOnlyMessage(raw)
 		return
 	}
 	msg := ParsedMessage{}
@@ -710,6 +813,22 @@ func (b *codexSessionBuilder) applyTokenUsage(raw, responseID string) {
 		},
 	)
 	b.committedUsageTarget = nil
+}
+
+// appendUsageOnlyMessage appends the hidden row that carries token usage no
+// assistant message in the current turn can take.
+func (b *codexSessionBuilder) appendUsageOnlyMessage(raw string) {
+	msg := ParsedMessage{
+		CodexOrigin:     CodexMessageOrigin{Line: b.sourceLine, TurnID: b.sourceTurnID, InTurn: b.sourceInTurn, TurnContext: len(b.sourceTurnContexts)},
+		Timestamp:       b.sourceTimestamp,
+		Model:           b.model,
+		ReasoningEffort: b.reasoningEffort,
+		ProviderID:      b.serviceTierProviderID,
+	}
+	applyCodexTokenUsage(&msg, raw)
+	if msg, ok := usageOnlyMessage(msg); ok {
+		b.sink.AppendMessage(msg)
+	}
 }
 
 func (b *codexSessionBuilder) handleCollabAgentSpawnEnd(
@@ -795,6 +914,7 @@ func (b *codexSessionBuilder) handleFunctionCall(
 	}
 
 	messageOrdinal := b.sink.AppendMessage(ParsedMessage{
+		CodexOrigin:     CodexMessageOrigin{Line: b.sourceLine, TurnID: b.sourceTurnID, InTurn: b.sourceInTurn, TurnContext: len(b.sourceTurnContexts)},
 		Role:            RoleAssistant,
 		Content:         content,
 		DialogueText:    new(""),
@@ -849,6 +969,7 @@ func (b *codexSessionBuilder) handleImageGenerationCall(ctx context.Context,
 	// The viewer hides tool markers, so the call shows once, as its block.
 	content := formatToolHeader("Tool", generatedImageCallName)
 	messageOrdinal := b.sink.AppendMessage(ParsedMessage{
+		CodexOrigin:     CodexMessageOrigin{Line: b.sourceLine, TurnID: b.sourceTurnID, InTurn: b.sourceInTurn, TurnContext: len(b.sourceTurnContexts)},
 		Role:            RoleAssistant,
 		Content:         content,
 		DialogueText:    new(""),
@@ -993,6 +1114,7 @@ func (b *codexSessionBuilder) handleSubagentNotification(ctx context.Context,
 
 	b.pendingAgentEvents[agentID] = append(
 		b.pendingAgentEvents[agentID], codexPendingEvent{
+			origin:    CodexMessageOrigin{Line: b.sourceLine, TurnID: b.sourceTurnID, InTurn: b.sourceInTurn, TurnContext: len(b.sourceTurnContexts)},
 			agentID:   agentID,
 			source:    "subagent_notification",
 			status:    statusName,
@@ -1067,6 +1189,7 @@ func (b *codexSessionBuilder) flushPendingAgentResultsContext(
 				}
 				key := agentID + "\x00" + ev.status + "\x00" + ev.text
 				b.sink.InsertOrphanMessage(key, ParsedMessage{
+					CodexOrigin:   ev.origin,
 					Ordinal:       ev.ordinal,
 					Role:          RoleUser,
 					Content:       ev.text,
@@ -2198,7 +2321,7 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 		FirstMessage:       b.firstMessage,
 		SessionName:        sessionName,
 		SessionNamePresent: sessionNamePresent,
-		MalformedLines:     malformedLines,
+		MalformedLines:     malformedLines + lr.SkippedLines(),
 		StartedAt:          b.startedAt,
 		EndedAt:            b.endedAt,
 		MessageCount:       len(msgs),
@@ -2214,6 +2337,9 @@ func (p *codexProvider) parseCodexSessionSnapshotStreaming(
 		},
 	}
 
+	if b.forkGate.lineagePositive {
+		sess.CodexFork = &CodexForkInfo{ParentID: b.forkGate.parentSessionID, Resolved: b.forkGate.resolvedOnce, ParentTurns: b.parentTurnIDs, TurnContexts: b.sourceTurnContexts}
+	}
 	if err := accumulateMessageTokenUsageContext(ctx, sess, msgs); err != nil {
 		return nil, nil, codexCursorState{}, false, nil, "", "", err
 	}
