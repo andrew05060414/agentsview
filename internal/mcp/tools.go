@@ -748,10 +748,15 @@ func (t *toolset) shapeAround(
 		mapped[i], kept[i], uncertain[i] = filterAndMapMessage(m, roles, maxChars, raw)
 	}
 
-	anchorIdx := -1
+	beforeEnd := len(res.Messages)
+	afterStart := len(res.Messages)
 	for i := range res.Messages {
-		if res.Messages[i].Ordinal == anchor {
-			anchorIdx = i
+		if res.Messages[i].Ordinal >= anchor {
+			beforeEnd = i
+			afterStart = i
+			if res.Messages[i].Ordinal == anchor {
+				afterStart++
+			}
 			break
 		}
 	}
@@ -759,33 +764,27 @@ func (t *toolset) shapeAround(
 	// before the anchor, or the start when fewer exist. Rows fetched past it
 	// were only scanned to find that message, so they are not part of the page
 	// and not counted in Filtered.
-	beforeFrom := 0
-	if anchorIdx >= 0 {
-		beforeFrom = anchorIdx
-		seen := 0
-		for i := anchorIdx - 1; before > 0 && i >= 0; i-- {
-			if kept[i] {
-				seen++
-			}
-			beforeFrom = i
-			if seen == before {
-				break
-			}
+	beforeFrom := beforeEnd
+	seen := 0
+	for i := beforeEnd - 1; before > 0 && i >= 0; i-- {
+		if kept[i] {
+			seen++
+		}
+		beforeFrom = i
+		if seen == before {
+			break
 		}
 	}
 	// afterTo is one past the last row of the page, found the same way.
-	afterTo := len(res.Messages)
-	if anchorIdx >= 0 {
-		afterTo = anchorIdx + 1
-		seen := 0
-		for i := anchorIdx + 1; after > 0 && i < len(res.Messages); i++ {
-			afterTo = i + 1
-			if kept[i] {
-				seen++
-			}
-			if seen == after {
-				break
-			}
+	afterTo := afterStart
+	seen = 0
+	for i := afterStart; after > 0 && i < len(res.Messages); i++ {
+		afterTo = i + 1
+		if kept[i] {
+			seen++
+		}
+		if seen == after {
+			break
 		}
 	}
 
