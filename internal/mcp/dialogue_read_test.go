@@ -384,6 +384,97 @@ func TestGetMessages_AroundCountsVisibleRows(t *testing.T) {
 	assert.Equal(t, 8, *out.NextFrom, "next_from anchors on the last scanned raw ordinal")
 }
 
+func TestGetMessages_AroundMissingAnchor(t *testing.T) {
+	for _, raw := range []bool{false, true} {
+		for _, tc := range []struct {
+			name                  string
+			anchor, before, after int
+			want                  []int
+			next                  *int
+		}{
+			{"existing zero window", 2, 0, 0, []int{2}, new(3)},
+			{"past end zero window", 99, 0, 0, []int{}, nil},
+			{"past end before one", 99, 1, 0, []int{3}, new(4)},
+			{"before start after one", -1, 0, 1, []int{0}, new(1)},
+		} {
+			t.Run(fmt.Sprintf("%s/raw=%t", tc.name, raw), func(t *testing.T) {
+				ts, d := newTestToolset(t)
+				dbtest.SeedSessionWithMessages(t, d, "window", "proj", []db.Message{
+					dialogueUserMsg("window", 0, "first"),
+					dialogueAsstMsg("window", 1, "second"),
+					dialogueUserMsg("window", 2, "third"),
+					dialogueAsstMsg("window", 3, "last"),
+				}, dbtest.WithMessageCounts(4, 2))
+				_, page, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+					SessionID: "window", Around: &tc.anchor, Before: &tc.before, After: &tc.after, Raw: raw,
+				})
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, ordinals(page))
+				assert.Equal(t, tc.next, page.NextFrom)
+				assert.Zero(t, page.Filtered)
+				assert.Zero(t, page.Uncertain)
+				if !raw || len(tc.want) > 0 {
+					assert.NotEmpty(t, page.TranscriptRevision)
+				}
+			})
+		}
+	}
+}
+
+func TestGetMessages_AroundSparseAnchor(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		anchor, before, after int
+		want                  []int
+		filtered, uncertain   int
+		next                  *int
+	}{
+		{"missing zero window", 4, 0, 0, []int{}, 0, 0, nil},
+		{"missing both sides", 4, 1, 1, []int{0, 8}, 2, 1, new(9)},
+		{"missing before only", 4, 1, 0, []int{0}, 1, 0, new(3)},
+		{"missing after only", 4, 0, 1, []int{8}, 1, 1, new(9)},
+		{"filtered anchor", 2, 0, 0, []int{}, 1, 0, new(3)},
+		{"uncertain anchor", 6, 0, 0, []int{}, 1, 1, new(7)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, d := newTestToolset(t)
+			dbtest.SeedSessionWithMessages(t, d, "sparse", "proj", []db.Message{
+				dialogueUserMsg("sparse", 0, "before\n"+strings.Repeat("x", 10)),
+				toolRow("sparse", 2, "[Bash]\n$ hidden", `{"command":"hidden"}`),
+				{SessionID: "sparse", Ordinal: 6, Role: "assistant", Content: "[Thinking] unclassified"},
+				dialogueAsstMsg("sparse", 8, "after\n"+strings.Repeat("y", 10)),
+				dialogueUserMsg("sparse", 10, "next"),
+			}, dbtest.WithMessageCounts(5, 2))
+			_, page, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+				SessionID: "sparse", Around: &tc.anchor, Before: &tc.before, After: &tc.after, MaxCharsPerMessage: 4,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, ordinals(page))
+			assert.Equal(t, tc.filtered, page.Filtered)
+			assert.Equal(t, tc.uncertain, page.Uncertain)
+			assert.NotEmpty(t, page.TranscriptRevision)
+			if len(tc.want) == 0 {
+				assert.Equal(t, tc.next, page.NextFrom)
+				return
+			}
+			assert.Nil(t, page.NextFrom, "finish truncated bodies before advancing the page")
+			for _, message := range page.Messages {
+				require.NotEmpty(t, message.BodyCursor)
+				_, rest, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+					SessionID: "sparse", BodyCursor: message.BodyCursor,
+				})
+				require.NoError(t, err)
+				require.Len(t, rest.Messages, 1)
+				assert.Equal(t, message.Ordinal, rest.Messages[0].Ordinal)
+				assert.Equal(t, page.TranscriptRevision, rest.TranscriptRevision)
+				assert.Equal(t, tc.next, rest.NextFrom)
+				assert.NotContains(t, message.Content+rest.Messages[0].Content, "[Bash]")
+				assert.NotContains(t, message.Content+rest.Messages[0].Content, "[Thinking]")
+			}
+		})
+	}
+}
+
 // TestGetMessages_AroundRawCountsStoredRows pins raw to the old window: it
 // counts stored rows, so the tool-only neighbour fills the requested context.
 func TestGetMessages_AroundRawCountsStoredRows(t *testing.T) {
