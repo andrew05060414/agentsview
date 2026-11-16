@@ -18,13 +18,16 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/ingest"
 	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/signals"
 	"go.kenn.io/agentsview/internal/storage"
+	"go.kenn.io/agentsview/internal/usagefacts"
 )
 
 func (s *Sync) syncModelPricing(ctx context.Context) error {
-	prices, err := s.local.ListModelPricing(ctx)
+	prices, localOpenRouter, err := s.local.ListModelPricingWithOpenRouter(ctx)
 	if err != nil {
 		return err
 	}
@@ -39,14 +42,19 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	prices, removePatterns, err := db.PlanModelPricingSync(existing, prices)
+	existingOpenRouter, err := s.duckPricingMeta(ctx, pricingpkg.OpenRouterModelsMetaKey)
+	if err != nil {
+		return err
+	}
+	plan, err := db.PlanModelPricingSync(existing, existingOpenRouter, prices, localOpenRouter)
 	if err != nil {
 		return fmt.Errorf("planning duckdb pricing sync: %w", err)
 	}
-	if len(prices) == 0 && len(removePatterns) == 0 {
+	prices = plan.Changed
+	if len(prices) == 0 && len(plan.Remove) == 0 && plan.OpenRouterModels == "" {
 		return s.syncGenAIPricing(ctx)
 	}
-	if err := s.removeDuckModelPricing(ctx, removePatterns); err != nil {
+	if err := s.removeDuckModelPricing(ctx, plan.Remove); err != nil {
 		return err
 	}
 
@@ -61,7 +69,10 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	for i := 0; i < len(prices); i += duckPricingUpsertBatch {
 		end := min(i+duckPricingUpsertBatch, len(prices))
 		batch := prices[i:end]
-		query, args := duckPricingUpsertStatement(batch)
+		query, args, err := duckPricingUpsertStatement(batch)
+		if err != nil {
+			return err
+		}
 		if err := s.execMutation(ctx, tx, query, args...); err != nil {
 			return fmt.Errorf(
 				"syncing duckdb pricing batch starting at %d: %w",
@@ -91,7 +102,10 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	}
 	for i := 0; i < len(bands); i += duckPricingUpsertBatch {
 		end := min(i+duckPricingUpsertBatch, len(bands))
-		query, args := duckPricingBandInsertStatement(bands[i:end])
+		query, args, err := duckPricingBandInsertStatement(bands[i:end])
+		if err != nil {
+			return err
+		}
 		if err := s.execMutation(ctx, tx, query, args...); err != nil {
 			return fmt.Errorf(
 				"inserting duckdb pricing bands batch starting at %d: %w",
@@ -99,10 +113,35 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 			)
 		}
 	}
+	if plan.OpenRouterModels != "" {
+		if err := s.execMutation(ctx, tx, `
+			INSERT INTO pricing_meta (key, value) VALUES (?, ?)
+			ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+			pricingpkg.OpenRouterModelsMetaKey, plan.OpenRouterModels,
+		); err != nil {
+			return fmt.Errorf("writing duckdb OpenRouter models: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing duckdb pricing sync: %w", err)
 	}
 	return s.syncGenAIPricing(ctx)
+}
+
+// duckPricingMeta reads a pricing_meta value from the mirror. Returns ""
+// if not found.
+func (s *Sync) duckPricingMeta(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.duck.QueryRowContext(ctx,
+		`SELECT value FROM pricing_meta WHERE key = ?`, key,
+	).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading duckdb pricing meta %q: %w", key, err)
+	}
+	return value, nil
 }
 
 type duckGenAIPricingQuerier interface {
@@ -113,21 +152,37 @@ type duckGenAIPricingRow interface {
 	Scan(...any) error
 }
 
-func loadDuckGenAIPricing(
+// loadDuckGenAIPricingState reads the mirror's GenAI pricing document
+// without its data, which a push compares by digest instead of reading.
+func loadDuckGenAIPricingState(
 	ctx context.Context, q duckGenAIPricingQuerier,
-) (*db.GenAIPricingDocument, error) {
-	return scanDuckGenAIPricing(q.QueryRowContext(ctx, `
-		SELECT version, source_ref, source, data_json, updated_at
-		FROM genai_pricing WHERE singleton = 1`))
+) (*db.GenAIPricingState, error) {
+	var state db.GenAIPricingState
+	var updatedAt sql.NullTime
+	err := q.QueryRowContext(ctx, `
+		SELECT version, source_ref, source, sha256(data_json), updated_at
+		FROM genai_pricing WHERE singleton = 1`).Scan(
+		&state.Version, &state.SourceRef, &state.Source,
+		&state.DataSHA256, &updatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading duckdb GenAI pricing state: %w", err)
+	}
+	state.UpdatedAt = db.FormatMirrorPricingTime(updatedAt)
+	return &state, nil
 }
 
 func scanDuckGenAIPricing(
 	row duckGenAIPricingRow,
 ) (*db.GenAIPricingDocument, error) {
 	var document db.GenAIPricingDocument
+	var updatedAt sql.NullTime
 	err := row.Scan(
 		&document.Version, &document.SourceRef, &document.Source,
-		&document.Data, &document.UpdatedAt,
+		&document.Data, &updatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -135,42 +190,52 @@ func scanDuckGenAIPricing(
 	if err != nil {
 		return nil, fmt.Errorf("reading duckdb GenAI pricing document: %w", err)
 	}
+	document.UpdatedAt = db.FormatMirrorPricingTime(updatedAt)
 	return &document, nil
 }
 
-func duckGenAIEffectivePricingRow(
-	document *db.GenAIPricingDocument,
+// loadDuckGenAIPricingRow returns the pricing row of the mirror's GenAI
+// Prices document. It reads the document's provenance and DuckDB's SHA-256 of
+// its JSON first, and reads the JSON, several hundred KB, only when this
+// process has not parsed a document with those bytes yet. Over Quack that
+// keeps the JSON off the network on most reads.
+func loadDuckGenAIPricingRow(
+	ctx context.Context,
+	queryRow func(context.Context, string, ...any) interface{ Scan(...any) error },
 ) (export.EffectivePricingRow, error) {
-	if document == nil {
-		embedded := pricingpkg.EmbeddedGenAIDocument()
-		return export.EffectivePricingRow{
-			GenAI: embedded.Prices, GenAIVersion: embedded.Version,
-			GenAISource: export.PricingRowSourceEmbedded,
-		}, nil
-	}
-	parsed, err := pricingpkg.ParseGenAIDocument(
-		document.Data, document.Version, document.SourceRef,
+	var digest db.GenAIPricingDigest
+	var sum string
+	var updatedAt sql.NullTime
+	err := queryRow(ctx, `
+		SELECT version, source_ref, source, updated_at, sha256(data_json)
+		FROM genai_pricing WHERE singleton = 1`).Scan(
+		&digest.Version, &digest.SourceRef, &digest.Source, &updatedAt, &sum,
 	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return db.GenAIEffectivePricingRow(nil)
+	}
 	if err != nil {
 		return export.EffectivePricingRow{}, fmt.Errorf(
-			"parsing duckdb GenAI pricing document: %w", err,
-		)
+			"reading duckdb GenAI pricing digest: %w", err)
 	}
-	var updatedAt *time.Time
-	if parsedTime, parseErr := time.Parse(
-		time.RFC3339Nano, document.UpdatedAt,
-	); parseErr == nil {
-		utc := parsedTime.UTC()
-		updatedAt = &utc
+	digest.UpdatedAt = db.FormatMirrorPricingTime(updatedAt)
+	if digest.Sum, err = db.ParseGenAIPricingSum([]byte(sum)); err != nil {
+		return export.EffectivePricingRow{}, err
 	}
-	source := export.PricingRowSourceFetched
-	if document.Source == db.GenAIPricingSourceEmbedded {
-		source = export.PricingRowSourceEmbedded
+	if row, ok := db.CachedGenAIEffectivePricingRow(digest); ok {
+		return row, nil
 	}
-	return export.EffectivePricingRow{
-		GenAI: parsed.Prices, GenAIVersion: parsed.Version,
-		GenAISource: source, GenAIUpdatedAt: updatedAt,
-	}, nil
+	document, err := scanDuckGenAIPricing(queryRow(ctx, `
+		SELECT version, source_ref, source, data_json, updated_at
+		FROM genai_pricing WHERE singleton = 1`))
+	if err != nil {
+		return export.EffectivePricingRow{}, err
+	}
+	row, err := db.GenAIEffectivePricingRow(document)
+	if err != nil {
+		return export.EffectivePricingRow{}, fmt.Errorf("duckdb: %w", err)
+	}
+	return row, nil
 }
 
 func (s *Sync) syncGenAIPricing(ctx context.Context) error {
@@ -187,12 +252,16 @@ func (s *Sync) syncGenAIPricing(ctx context.Context) error {
 		return fmt.Errorf("beginning duckdb GenAI pricing sync: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	existing, err := loadDuckGenAIPricing(ctx, tx)
+	existing, err := loadDuckGenAIPricingState(ctx, tx)
 	if err != nil {
 		return err
 	}
-	if db.GenAIPricingDocumentsEqual(existing, document) {
+	if existing.Matches(document) {
 		return nil
+	}
+	updatedAt, err := db.MirrorPricingTime(document.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("GenAI pricing document: %w", err)
 	}
 	if err := s.execMutation(ctx, tx, `
 		INSERT INTO genai_pricing
@@ -205,7 +274,7 @@ func (s *Sync) syncGenAIPricing(ctx context.Context) error {
 			data_json = excluded.data_json,
 			updated_at = excluded.updated_at`,
 		document.Version, document.SourceRef, document.Source,
-		document.Data, document.UpdatedAt,
+		document.Data, updatedAt,
 	); err != nil {
 		return fmt.Errorf("upserting duckdb GenAI pricing document: %w", err)
 	}
@@ -276,7 +345,7 @@ type duckModelPricingBand struct {
 	band         db.PricingBand
 }
 
-func duckPricingBandInsertStatement(bands []duckModelPricingBand) (string, []any) {
+func duckPricingBandInsertStatement(bands []duckModelPricingBand) (string, []any, error) {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing_bands (
 		model_pattern, above_input_tokens,
@@ -291,9 +360,13 @@ func duckPricingBandInsertStatement(bands []duckModelPricingBand) (string, []any
 			b.WriteString(", ")
 		}
 		b.WriteString("(?, ?, ?, ?, ?, ?, ?, ?)")
-		updatedAt := item.band.UpdatedAt
-		if updatedAt == "" {
-			updatedAt = item.updatedAt
+		stored := item.band.UpdatedAt
+		if stored == "" {
+			stored = item.updatedAt
+		}
+		updatedAt, err := db.MirrorPricingTime(stored)
+		if err != nil {
+			return "", nil, fmt.Errorf("pricing band for %q: %w", item.modelPattern, err)
 		}
 		args = append(args,
 			item.modelPattern,
@@ -306,12 +379,12 @@ func duckPricingBandInsertStatement(bands []duckModelPricingBand) (string, []any
 			updatedAt,
 		)
 	}
-	return b.String(), args
+	return b.String(), args, nil
 }
 
 const duckPricingUpsertBatch = 100
 
-func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
+func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any, error) {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO model_pricing (
 		model_pattern, input_microdollars_per_mtok, output_microdollars_per_mtok,
@@ -324,6 +397,10 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 			b.WriteString(", ")
 		}
 		b.WriteString("(?, ?, ?, ?, ?, ?, ?)")
+		updatedAt, err := db.MirrorPricingTime(p.UpdatedAt)
+		if err != nil {
+			return "", nil, fmt.Errorf("pricing for %q: %w", p.ModelPattern, err)
+		}
 		args = append(args,
 			p.ModelPattern,
 			p.InputPerMTok.Microdollars,
@@ -331,7 +408,7 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 			p.CacheCreationPerMTok.Microdollars,
 			p.CacheCreation1hPerMTok.Microdollars,
 			p.CacheReadPerMTok.Microdollars,
-			p.UpdatedAt,
+			updatedAt,
 		)
 	}
 	b.WriteString(`
@@ -342,7 +419,7 @@ func duckPricingUpsertStatement(prices []db.ModelPricing) (string, []any) {
 		cache_creation_1h_microdollars_per_mtok = excluded.cache_creation_1h_microdollars_per_mtok,
 		cache_read_microdollars_per_mtok = excluded.cache_read_microdollars_per_mtok,
 		updated_at = excluded.updated_at`)
-	return b.String(), args
+	return b.String(), args, nil
 }
 
 func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, error) {
@@ -372,7 +449,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 		var p db.ModelPricing
 		var threshold, input, output, cacheCreation, cacheCreation1h,
 			cacheRead sql.NullInt64
-		var bandUpdatedAt sql.NullString
+		var updatedAt, bandUpdatedAt sql.NullTime
 		if err := rows.Scan(
 			&p.ModelPattern,
 			&p.InputPerMTok,
@@ -380,7 +457,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 			&p.CacheCreationPerMTok,
 			&p.CacheCreation1hPerMTok,
 			&p.CacheReadPerMTok,
-			&p.UpdatedAt,
+			&updatedAt,
 			&threshold,
 			&input,
 			&output,
@@ -391,6 +468,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 		); err != nil {
 			return nil, fmt.Errorf("scanning duckdb pricing: %w", err)
 		}
+		p.UpdatedAt = db.FormatMirrorPricingTime(updatedAt)
 		i, exists := byPattern[p.ModelPattern]
 		if !exists {
 			i = len(out)
@@ -412,7 +490,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 				CacheCreationPerMTok:   money.Money{Microdollars: cacheCreation.Int64},
 				CacheCreation1hPerMTok: money.Money{Microdollars: cacheCreation1h.Int64},
 				CacheReadPerMTok:       money.Money{Microdollars: cacheRead.Int64},
-				UpdatedAt:              bandUpdatedAt.String,
+				UpdatedAt:              db.FormatMirrorPricingTime(bandUpdatedAt),
 			})
 		}
 	}
@@ -422,7 +500,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 	return out, nil
 }
 
-// syncCursorUsageEvents appends the cursor admin usage rows the mirror has
+// syncCursorUsageEvents appends the imported account usage rows the mirror has
 // not consumed yet, tracked by a high-water id in mirror sync_metadata
 // (cursorUsageMaxIDMetadataKey). The local table is append-only with a
 // monotonic id, so each push's work is bounded by the appended batch, not
@@ -432,7 +510,7 @@ func (s *Sync) listDuckModelPricing(ctx context.Context) ([]db.ModelPricing, err
 // commit and the high-water record, the overlap is re-read and deduped by
 // the mirror's unique dedup_key index (ON CONFLICT DO NOTHING).
 func (s *Sync) syncCursorUsageEvents(ctx context.Context) error {
-	// Cursor admin rows are global and unattributed, so project-filtered pushes
+	// Account rows are global and unattributed, so project-filtered pushes
 	// cannot sync them honestly.
 	if s.isFiltered() {
 		return nil
@@ -996,68 +1074,12 @@ func (s *Sync) refreshCurationIfChanged(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// pushSession fully replaces one mirror session row and all of its
-// dependent rows (messages, tool calls/results, usage events, plan usage,
-// secret findings, pins) with the current local content, then writes the
-// fingerprint used to detect future changes. buildMirror and
-// incrementalPush share this single write path: on a freshly created
-// rebuild file the pre-delete below is simply a no-op.
-func (s *Sync) pushSession(
-	ctx context.Context, exec duckMutationExecutor, sess db.Session, fingerprint string,
-) (int, error) {
-	if err := s.upsertSession(ctx, exec, sess, fingerprint); err != nil {
-		return 0, err
-	}
-	msgs, err := s.local.GetAllMessages(ctx, sess.ID)
-	if err != nil {
-		return 0, fmt.Errorf("reading local messages for %s: %w", sess.ID, err)
-	}
-
-	if err := s.replaceSessionDependents(ctx, exec, sess.ID); err != nil {
-		return 0, err
-	}
-	if err := s.replaceUsageEvents(ctx, exec, sess.ID); err != nil {
-		return 0, err
-	}
-	if err := s.replacePlanUsage(ctx, exec, sess.ID); err != nil {
-		return 0, err
-	}
-	if err := insertMessages(ctx, exec, msgs); err != nil {
-		return 0, err
-	}
-	if err := s.replaceToolRows(ctx, exec, sess.ID, msgs); err != nil {
-		return 0, err
-	}
-	if err := s.replaceSecretFindings(ctx, exec, sess.ID); err != nil {
-		return 0, err
-	}
-	if err := s.replacePinnedMessages(ctx, exec, sess.ID); err != nil {
-		return 0, err
-	}
-	return len(msgs), nil
-}
-
-func (s *Sync) replaceSessionDependents(
-	ctx context.Context, exec duckMutationExecutor, sessionID string,
-) error {
-	// usage_events is deliberately absent here: replaceUsageEvents owns that
-	// delete+reinsert so the row is cleared exactly once per push.
-	for _, stmt := range []string{
-		`DELETE FROM pinned_messages WHERE session_id = ?`,
-		`DELETE FROM secret_findings WHERE session_id = ?`,
-		`DELETE FROM messages WHERE session_id = ?`,
-	} {
-		if err := s.execMutation(ctx, exec, stmt, sessionID); err != nil {
-			return fmt.Errorf("clearing duckdb session dependents: %w", err)
-		}
-	}
-	return nil
-}
-
+// Keep commit_links project evidence until replaceRetainedCommitLinks refreshes it.
 func (s *Sync) deleteMirrorSession(
 	ctx context.Context, tx *sql.Tx, sessionID string,
 ) error {
 	for _, stmt := range []string{
+		`DELETE FROM image_text WHERE session_id = ?`,
 		`DELETE FROM pinned_messages WHERE session_id = ?`,
 		`DELETE FROM starred_sessions WHERE session_id = ?`,
 		`DELETE FROM secret_findings WHERE session_id = ?`,
@@ -1065,6 +1087,7 @@ func (s *Sync) deleteMirrorSession(
 		`DELETE FROM tool_calls WHERE session_id = ?`,
 		`DELETE FROM usage_events WHERE session_id = ?`,
 		`DELETE FROM session_plan_usage WHERE session_id = ?`,
+		`DELETE FROM session_usage_totals WHERE session_id = ?`,
 		`DELETE FROM messages WHERE session_id = ?`,
 		`DELETE FROM sessions WHERE id = ?`,
 	} {
@@ -1086,196 +1109,19 @@ type duckMutationExecutor interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
-const (
-	duckInsertBatchRows  = 100
-	duckInsertBatchBytes = 1 << 20
-)
+// frustrationMarkersVersion is independent of db.CurrentQualitySignalVersion.
+// Bump it when CountFrustrationMarkers, IsFrustrationMarker, or
+// ExtractHeuristicMessages changes its rules or message eligibility.
+const frustrationMarkersVersion = 1
 
-type duckInsertBatch struct {
-	exec   duckMutationExecutor
-	prefix string
-	rowSQL string
-	args   []any
-	rows   int
-	bytes  int
-}
-
-func newDuckInsertBatch(
-	exec duckMutationExecutor, prefix string, columns int,
-) *duckInsertBatch {
-	return &duckInsertBatch{
-		exec:   exec,
-		prefix: prefix,
-		rowSQL: "(" + strings.TrimSuffix(strings.Repeat("?,", columns), ",") + ")",
-	}
-}
-
-func (b *duckInsertBatch) add(ctx context.Context, values ...any) error {
-	payloadBytes := 0
-	for _, value := range values {
-		switch value := value.(type) {
-		case string:
-			payloadBytes += len(value)
-		case []byte:
-			payloadBytes += len(value)
-		case *string:
-			if value != nil {
-				payloadBytes += len(*value)
-			}
-		}
-	}
-	if b.rows > 0 && (b.rows == duckInsertBatchRows || b.bytes+payloadBytes > duckInsertBatchBytes) {
-		if err := b.flush(ctx); err != nil {
-			return err
-		}
-	}
-	b.args = append(b.args, values...)
-	b.rows++
-	b.bytes += payloadBytes
-	if b.bytes >= duckInsertBatchBytes {
-		return b.flush(ctx)
-	}
-	return nil
-}
-
-func (b *duckInsertBatch) flush(ctx context.Context) error {
-	if b.rows == 0 {
-		return nil
-	}
-	query := b.prefix + strings.TrimSuffix(strings.Repeat(b.rowSQL+",", b.rows), ",")
-	if _, err := b.exec.ExecContext(ctx, query, b.args...); err != nil {
-		return err
-	}
-	clear(b.args)
-	b.args = b.args[:0]
-	b.rows, b.bytes = 0, 0
-	return nil
-}
-
-func (s *Sync) upsertSession(
-	ctx context.Context, exec duckMutationExecutor, sess db.Session, fingerprint string,
-) error {
-	query := `
-		INSERT INTO sessions (
-			id, project, project_assigned, machine, agent,
-			agent_label, entrypoint, session_kind,
-			first_message, display_name, session_name, started_at, ended_at,
-			message_count, user_message_count,
-			file_path, file_size, file_mtime, file_inode, file_device,
-			file_hash, local_modified_at, transcript_revision,
-			parent_session_id,
-			relationship_type, total_output_tokens, peak_context_tokens,
-			has_total_output_tokens, has_peak_context_tokens, is_automated,
-			tool_failure_signal_count, tool_retry_count, edit_churn_count,
-			consecutive_failure_max, outcome, outcome_confidence,
-			ended_with_role, final_failure_streak, signals_pending_since,
-			compaction_count, mid_task_compaction_count,
-			context_pressure_max, health_score, health_grade,
-			has_tool_calls, has_context_data,
-			quality_signal_version, short_prompt_count, unstructured_start,
-			missing_success_criteria_count, missing_verification_count,
-			duplicate_prompt_count, no_code_context_count,
-			runaway_tool_loop_count, data_version,
-			cwd, git_branch, source_session_id, source_version, group_key, transcript_fidelity,
-			parser_malformed_lines, is_truncated, deleted_at, deletion_cause, created_at,
-			termination_status, secret_leak_count, secrets_rules_version,
-			pr_links, labels,
-			agentsview_push_fingerprint, source_archive_id
-		) VALUES (?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-		)`
-	query += `
-		ON CONFLICT(id) DO UPDATE SET
-			project = excluded.project,
-			project_assigned = excluded.project_assigned,
-			machine = excluded.machine,
-			agent = excluded.agent,
-			agent_label = excluded.agent_label,
-			entrypoint = excluded.entrypoint,
-			session_kind = excluded.session_kind,
-			first_message = excluded.first_message,
-			display_name = excluded.display_name,
-			session_name = excluded.session_name,
-			started_at = excluded.started_at,
-			ended_at = excluded.ended_at,
-			message_count = excluded.message_count,
-			user_message_count = excluded.user_message_count,
-			file_path = excluded.file_path,
-			file_size = excluded.file_size,
-			file_mtime = excluded.file_mtime,
-			file_inode = excluded.file_inode,
-			file_device = excluded.file_device,
-			file_hash = excluded.file_hash,
-			local_modified_at = excluded.local_modified_at,
-			transcript_revision = excluded.transcript_revision,
-			parent_session_id = excluded.parent_session_id,
-			relationship_type = excluded.relationship_type,
-			total_output_tokens = excluded.total_output_tokens,
-			peak_context_tokens = excluded.peak_context_tokens,
-			has_total_output_tokens = excluded.has_total_output_tokens,
-			has_peak_context_tokens = excluded.has_peak_context_tokens,
-			is_automated = excluded.is_automated,
-			tool_failure_signal_count = excluded.tool_failure_signal_count,
-			tool_retry_count = excluded.tool_retry_count,
-			edit_churn_count = excluded.edit_churn_count,
-			consecutive_failure_max = excluded.consecutive_failure_max,
-			outcome = excluded.outcome,
-			outcome_confidence = excluded.outcome_confidence,
-			ended_with_role = excluded.ended_with_role,
-			final_failure_streak = excluded.final_failure_streak,
-			signals_pending_since = excluded.signals_pending_since,
-			compaction_count = excluded.compaction_count,
-			mid_task_compaction_count = excluded.mid_task_compaction_count,
-			context_pressure_max = excluded.context_pressure_max,
-			health_score = excluded.health_score,
-			health_grade = excluded.health_grade,
-			has_tool_calls = excluded.has_tool_calls,
-			has_context_data = excluded.has_context_data,
-			quality_signal_version = excluded.quality_signal_version,
-			short_prompt_count = excluded.short_prompt_count,
-			unstructured_start = excluded.unstructured_start,
-			missing_success_criteria_count = excluded.missing_success_criteria_count,
-			missing_verification_count = excluded.missing_verification_count,
-			duplicate_prompt_count = excluded.duplicate_prompt_count,
-			no_code_context_count = excluded.no_code_context_count,
-			runaway_tool_loop_count = excluded.runaway_tool_loop_count,
-			data_version = excluded.data_version,
-			cwd = excluded.cwd,
-			git_branch = excluded.git_branch,
-			source_session_id = excluded.source_session_id,
-			source_version = excluded.source_version,
-			group_key = excluded.group_key,
-			transcript_fidelity = excluded.transcript_fidelity,
-			parser_malformed_lines = excluded.parser_malformed_lines,
-			is_truncated = excluded.is_truncated,
-			deleted_at = excluded.deleted_at,
-			deletion_cause = excluded.deletion_cause,
-			created_at = excluded.created_at,
-			termination_status = excluded.termination_status,
-			secret_leak_count = excluded.secret_leak_count,
-			secrets_rules_version = excluded.secrets_rules_version,
-			pr_links = excluded.pr_links,
-			labels = excluded.labels,
-			agentsview_push_fingerprint = excluded.agentsview_push_fingerprint,
-			source_archive_id = excluded.source_archive_id`
-
-	args := sessionInsertArgs(
-		sess, s.machine, s.archiveID, fingerprint,
-	)
-	if err := s.execMutation(ctx, exec, query, args...); err != nil {
-		return fmt.Errorf("writing duckdb session %s: %w", sess.ID, err)
-	}
-	return nil
-}
+const duckInsertBatchBytes = 1 << 20
 
 func sessionInsertArgs(
 	sess db.Session,
 	fallbackMachine string,
 	archiveID string,
 	fingerprint string,
+	frustrationCount int,
 ) []any {
 	return []any{
 		sess.ID, sess.Project, sess.ProjectAssigned,
@@ -1312,27 +1158,22 @@ func sessionInsertArgs(
 		timeValue(sess.CreatedAt), nilString(sess.TerminationStatus),
 		sess.SecretLeakCount, sess.SecretsRulesVersion,
 		db.EncodePRLinks(sess.PRLinks), db.LabelsArg(sess.Labels),
-		nilEmpty(fingerprint), archiveID,
+		nilEmpty(fingerprint), archiveID, frustrationCount,
 	}
 }
 
 func insertMessages(
-	ctx context.Context, exec duckMutationExecutor, msgs []db.Message,
+	ctx context.Context, batch *duckAppendBatch, msgs []db.Message,
 ) error {
-	batch := newDuckInsertBatch(exec, `
-		INSERT INTO messages (
-			id, session_id, ordinal, role, content, thinking_text, dialogue_text,
-			timestamp, has_thinking, has_tool_use, content_length,
-			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
-			provider_id,
-			has_context_tokens, has_output_tokens, claude_message_id,
-			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
-			source_parent_uuid, is_sidechain, is_compact_boundary
-		) VALUES `, 29)
 	for _, m := range msgs {
-		if err := batch.add(ctx,
+		dialogue, _ := db.StoredDialogue(m.Content, m.ThinkingText, m.DialogueText)
+		// Usage reads take these counters from typed columns, parsed here
+		// by the same function SQLite reads with, so no read parses
+		// token_usage.
+		usage := usagefacts.ParseTokenUsage(string(m.TokenUsage))
+		if err := batch.add(ctx, "messages",
 			m.ID, m.SessionID, m.Ordinal, m.Role, m.Content,
-			m.ThinkingText, m.DialogueText, timeValue(m.Timestamp),
+			m.ThinkingText, dialogue, timeValue(m.Timestamp),
 			m.HasThinking, m.HasToolUse, m.ContentLength,
 			m.IsSystem, m.Model, m.ReasoningEffort, string(m.TokenUsage),
 			m.ContextTokens, m.OutputTokens, m.ProviderID,
@@ -1340,53 +1181,24 @@ func insertMessages(
 			m.ClaudeMessageID, m.ClaudeRequestID,
 			m.SourceType, m.SourceSubtype, m.PromptSource, m.SourceUUID,
 			m.SourceParentUUID, m.IsSidechain, m.IsCompactBoundary,
+			usage.InputTokens, usage.OutputTokens, usage.CacheCreationTokens,
+			usage.CacheCreation1hTokens, usage.CacheReadTokens,
+			usage.ReasoningTokens, usage.WebSearchRequests,
+			db.IsDuckDBSystemPrefixed(m.Content, m.Role),
 		); err != nil {
 			return fmt.Errorf("inserting duckdb messages: %w", err)
 		}
-	}
-	if err := batch.flush(ctx); err != nil {
-		return fmt.Errorf("inserting duckdb messages: %w", err)
-	}
-	return nil
-}
-
-func (s *Sync) replaceToolRows(
-	ctx context.Context, exec duckMutationExecutor, sessionID string, msgs []db.Message,
-) error {
-	if err := s.execMutation(ctx, exec,
-		`DELETE FROM tool_result_events WHERE session_id = ?`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf("clearing duckdb tool_result_events for %s: %w", sessionID, err)
-	}
-	if err := s.execMutation(ctx, exec,
-		`DELETE FROM tool_calls WHERE session_id = ?`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf("clearing duckdb tool_calls for %s: %w", sessionID, err)
-	}
-	if err := insertToolCalls(ctx, exec, msgs); err != nil {
-		return err
-	}
-	if err := insertToolResultEvents(ctx, exec, msgs); err != nil {
-		return err
 	}
 	return nil
 }
 
 func insertToolCalls(
-	ctx context.Context, exec duckMutationExecutor, msgs []db.Message,
+	ctx context.Context, batch *duckAppendBatch, msgs []db.Message,
 ) error {
-	batch := newDuckInsertBatch(exec, `
-		INSERT INTO tool_calls (
-			message_id, session_id, tool_name, category,
-			call_index, tool_use_id, input_json, skill_name,
-			result_content_length, result_content,
-			subagent_session_id, file_path, observed_outcome, observed_repeat, sequence_ending
-		) VALUES `, 15)
 	for _, m := range msgs {
 		for i, tc := range m.ToolCalls {
-			if err := batch.add(ctx,
+			if err := batch.add(ctx, "tool_calls",
+				tc.ObservedOutcome, tc.ObservedRepeat, tc.SequenceEnding,
 				m.ID, m.SessionID, tc.ToolName, tc.Category,
 				i, tc.ToolUseID, nilEmpty(tc.InputJSON),
 				nilEmpty(tc.SkillName), nilZero(tc.ResultContentLength),
@@ -1394,32 +1206,22 @@ func insertToolCalls(
 					tc.ResultContent, tc.ResultEvents,
 				)),
 				nilEmpty(tc.SubagentSessionID),
-				nilEmpty(tc.FilePath), tc.ObservedOutcome, tc.ObservedRepeat, tc.SequenceEnding,
+				nilEmpty(tc.FilePath),
 			); err != nil {
 				return fmt.Errorf("inserting duckdb tool calls: %w", err)
 			}
 		}
 	}
-	if err := batch.flush(ctx); err != nil {
-		return fmt.Errorf("inserting duckdb tool calls: %w", err)
-	}
 	return nil
 }
 
 func insertToolResultEvents(
-	ctx context.Context, exec duckMutationExecutor, msgs []db.Message,
+	ctx context.Context, batch *duckAppendBatch, msgs []db.Message,
 ) error {
-	batch := newDuckInsertBatch(exec, `
-		INSERT INTO tool_result_events (
-			session_id, tool_call_message_ordinal, call_index,
-			tool_use_id, agent_id, subagent_session_id,
-			source, status, content, content_length,
-			timestamp, event_index
-		) VALUES `, 12)
 	for _, m := range msgs {
 		for i, tc := range m.ToolCalls {
 			for _, ev := range tc.ResultEvents {
-				if err := batch.add(ctx,
+				if err := batch.add(ctx, "tool_result_events",
 					m.SessionID, m.Ordinal, i,
 					nilEmpty(ev.ToolUseID), nilEmpty(ev.AgentID),
 					nilEmpty(ev.SubagentSessionID), ev.Source, ev.Status,
@@ -1431,28 +1233,6 @@ func insertToolResultEvents(
 			}
 		}
 	}
-	if err := batch.flush(ctx); err != nil {
-		return fmt.Errorf("inserting duckdb tool result events: %w", err)
-	}
-	return nil
-}
-
-func (s *Sync) replaceUsageEvents(
-	ctx context.Context, exec duckMutationExecutor, sessionID string,
-) error {
-	events, err := s.local.GetUsageEvents(ctx, sessionID)
-	if err != nil {
-		return err
-	}
-	if err := s.execMutation(ctx, exec,
-		`DELETE FROM usage_events WHERE session_id = ?`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf("clearing duckdb usage_events for %s: %w", sessionID, err)
-	}
-	if err := insertUsageEvents(ctx, exec, events); err != nil {
-		return fmt.Errorf("inserting duckdb usage events for %s: %w", sessionID, err)
-	}
 	return nil
 }
 
@@ -1462,12 +1242,6 @@ func (s *Sync) replacePlanUsage(
 	p, err := s.local.GetSessionPlanUsage(ctx, sessionID)
 	if err != nil {
 		return fmt.Errorf("reading local plan usage for %s: %w", sessionID, err)
-	}
-	if err := s.execMutation(ctx, exec,
-		`DELETE FROM session_plan_usage WHERE session_id = ?`,
-		sessionID,
-	); err != nil {
-		return fmt.Errorf("clearing duckdb plan usage for %s: %w", sessionID, err)
 	}
 	if p == nil {
 		return nil
@@ -1486,20 +1260,38 @@ func (s *Sync) replacePlanUsage(
 	return nil
 }
 
-func insertUsageEvents(
-	ctx context.Context, exec duckMutationExecutor, events []db.UsageEvent,
+// replaceSessionUsageTotal copies the session's recorded total. The batch
+// already deleted the mirror's row, so a session without one stays empty.
+func (s *Sync) replaceSessionUsageTotal(
+	ctx context.Context, exec duckMutationExecutor, sessionID string,
 ) error {
-	batch := newDuckInsertBatch(exec, `
-		INSERT INTO usage_events (
-			id, session_id, message_ordinal, source, model,
-			provider_id, input_tokens, output_tokens,
-			cache_creation_input_tokens, cache_read_input_tokens,
-			reasoning_tokens, cost_microdollars, cost_status, cost_source,
-			occurred_at, dedup_key
-		) VALUES `, 16)
+	t, err := s.local.GetSessionUsageTotal(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("reading local session total for %s: %w", sessionID, err)
+	}
+	if t == nil {
+		return nil
+	}
+	values, err := db.SessionUsageTotalValues(t)
+	if err != nil {
+		return fmt.Errorf("writing duckdb session total for %s: %w", sessionID, err)
+	}
+	if _, err := exec.ExecContext(ctx, `
+		INSERT INTO session_usage_totals (session_id, `+db.SessionUsageTotalColumns+`)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		append([]any{sessionID}, values...)...,
+	); err != nil {
+		return fmt.Errorf("writing duckdb session total for %s: %w", sessionID, err)
+	}
+	return nil
+}
+
+func insertUsageEvents(
+	ctx context.Context, batch *duckAppendBatch, events []db.UsageEvent,
+) error {
 	for _, ev := range events {
 		ordinal, cost, occurredAt := usageEventNullableValues(ev)
-		if err := batch.add(ctx,
+		if err := batch.add(ctx, "usage_events",
 			ev.ID, ev.SessionID, ordinal, ev.Source, ev.Model,
 			ev.ProviderID, ev.InputTokens, ev.OutputTokens,
 			ev.CacheCreationInputTokens, ev.CacheReadInputTokens,
@@ -1509,7 +1301,7 @@ func insertUsageEvents(
 			return err
 		}
 	}
-	return batch.flush(ctx)
+	return nil
 }
 
 func (s *Sync) bulkInsertCursorUsageEvents(
@@ -1525,23 +1317,28 @@ func (s *Sync) bulkInsertCursorUsageEvents(
 
 		var b strings.Builder
 		b.WriteString(`INSERT INTO cursor_usage_events (
-			occurred_at, model, kind,
+			agent, occurred_at, model, kind,
 			input_tokens, output_tokens,
 			cache_write_tokens, cache_read_tokens,
 			charged_microdollars, cursor_token_fee_microdollars,
 			user_id, user_email, is_headless, dedup_key
 		) VALUES `)
-		args := make([]any, 0, len(batch)*13)
+		args := make([]any, 0, len(batch)*14)
 		for j, ev := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			b.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+			b.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 			occurredAt, ok := parseTimestamp(ev.OccurredAt)
 			if !ok {
 				return fmt.Errorf("parsing cursor usage occurred_at %q", ev.OccurredAt)
 			}
+			agent := ev.Agent
+			if agent == "" {
+				agent = "cursor"
+			}
 			args = append(args,
+				db.SanitizeUTF8(agent),
 				occurredAt,
 				db.SanitizeUTF8(ev.Model),
 				db.SanitizeUTF8(ev.Kind),
@@ -1693,3 +1490,49 @@ func parseTimestamp(value string) (time.Time, bool) {
 	}
 	return time.Time{}, false
 }
+
+var duckAppendColumns = func() map[string][]columnSpec {
+	columns := make(map[string][]columnSpec)
+	for _, table := range mirrorTables {
+		switch table.name {
+		case "sessions", "messages", "tool_calls", "tool_result_events", "usage_events":
+			for _, column := range table.columns {
+				if column.name == "id" && (table.name == "tool_calls" || table.name == "tool_result_events") {
+					continue
+				}
+				columns[table.name] = append(columns[table.name], column)
+			}
+		}
+	}
+	return columns
+}()
+
+func (s *Sync) appendSession(ctx context.Context, batch *duckAppendBatch, sess db.Session, fingerprint string) (int, error) {
+	msgs, err := s.local.GetAllMessages(ctx, sess.ID)
+	if err != nil {
+		return 0, err
+	}
+	if err := batch.add(ctx, "sessions", sessionInsertArgs(sess, s.machine, s.archiveID, fingerprint, signals.CountFrustrationMarkers(ingest.ExtractHeuristicMessages(msgs)))...); err != nil {
+		return 0, err
+	}
+	if err := insertMessages(ctx, batch, msgs); err != nil {
+		return 0, err
+	}
+	if err := insertToolCalls(ctx, batch, msgs); err != nil {
+		return 0, err
+	}
+	if err := insertToolResultEvents(ctx, batch, msgs); err != nil {
+		return 0, err
+	}
+	events, err := s.local.GetUsageEvents(ctx, sess.ID)
+	if err != nil {
+		return 0, err
+	}
+	if err := insertUsageEvents(ctx, batch, events); err != nil {
+		return 0, err
+	}
+	return len(msgs), nil
+}
+
+// duckAppendHook runs before a row or after a successful explicit flush.
+var duckAppendHook func(table string, flushed bool) error

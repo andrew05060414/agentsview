@@ -35,6 +35,7 @@ import (
 	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/kit/atomicfile"
 	"go.kenn.io/kit/embedconfig"
+	"go.kenn.io/kit/embedlocal"
 )
 
 // TerminalConfig holds terminal launch preferences.
@@ -294,7 +295,8 @@ type VectorEmbeddingsServerConfig struct {
 	// APIKeyEnv names the environment variable holding the API key.
 	// Empty means anonymous access.
 	APIKeyEnv string `toml:"api_key_env" json:"api_key_env,omitempty"`
-	// BatchSize is the number of inputs sent per HTTP call. Default 32.
+	// BatchSize is the number of inputs sent per HTTP call. Default 32, or 8
+	// for a built-in server (no endpoint).
 	BatchSize int `toml:"batch_size" json:"batch_size"`
 	// MaxBatchTokens is the provider's maximum total input tokens per HTTP
 	// call. When set with ModelContextTokens, builds reduce BatchSize so the
@@ -304,9 +306,10 @@ type VectorEmbeddingsServerConfig struct {
 	// build against this server. Sequential requests leave a build
 	// round-trip-bound against remote endpoints, so the default is 4;
 	// servers that process one request at a time simply queue the extras.
+	// A built-in server runs on the CPU, so its default is 1.
 	Concurrency int `toml:"concurrency" json:"concurrency"`
 	// Timeout is a parseable duration string applied to each HTTP
-	// call. Default "30s".
+	// call. Default "30s", or "5m" for a built-in server (no endpoint).
 	Timeout string `toml:"timeout" json:"timeout"`
 	// MaxRetries is the maximum total attempts on retryable errors other than
 	// document-build 429 rate limits, which retry until success or
@@ -368,25 +371,53 @@ func (c VectorEmbeddingsConfig) Server(name string) (string, VectorEmbeddingsSer
 	return name, s, nil
 }
 
+// Transport defaults for a server with an endpoint, which is usually a
+// remote API or a GPU-backed local server.
+const (
+	defaultEmbeddingsBatchSize   = 32
+	defaultEmbeddingsConcurrency = 4
+	defaultEmbeddingsTimeout     = "30s"
+)
+
+// Transport defaults for a built-in server (no endpoint: automatic discovery
+// or local = true). Kit's shared local server runs the model on the CPU,
+// where one full-context input can take seconds, so a request carries fewer
+// inputs, builds send one request at a time, and each request may run longer.
+const (
+	defaultBuiltinEmbeddingsBatchSize   = embedlocal.BatchItems
+	defaultBuiltinEmbeddingsConcurrency = 1
+	defaultBuiltinEmbeddingsTimeout     = embedlocal.RequestTimeout
+)
+
 // normalizedEmbeddingsServers fills each named server's unset transport
-// fields with their defaults (batch_size 32, concurrency 4, timeout "30s",
-// max_retries 3). meta.IsDefined distinguishes "unset" (apply the default)
-// from an explicit zero — an explicit max_retries = 0 disables retries, and
-// an explicit zero batch_size/concurrency stays zero so validation rejects
-// it instead of silently substituting the default.
+// fields with their defaults: batch_size 32, concurrency 4, and timeout
+// "30s" for a server with an endpoint; batch_size 8, concurrency 1, and
+// timeout "5m" for a built-in server; max_retries 3 for both.
+// meta.IsDefined distinguishes "unset" (apply the default) from an explicit
+// zero — an explicit max_retries = 0 disables retries, and an explicit zero
+// batch_size/concurrency stays zero so validation rejects it instead of
+// silently substituting the default.
 func normalizedEmbeddingsServers(
 	servers map[string]VectorEmbeddingsServerConfig, meta toml.MetaData,
 ) map[string]VectorEmbeddingsServerConfig {
 	out := make(map[string]VectorEmbeddingsServerConfig, len(servers))
 	for name, s := range servers {
+		batchSize := defaultEmbeddingsBatchSize
+		concurrency := defaultEmbeddingsConcurrency
+		timeout := defaultEmbeddingsTimeout
+		if s.Endpoint == "" {
+			batchSize = defaultBuiltinEmbeddingsBatchSize
+			concurrency = defaultBuiltinEmbeddingsConcurrency
+			timeout = defaultBuiltinEmbeddingsTimeout.String()
+		}
 		if !meta.IsDefined("vector", "embeddings", "servers", name, "batch_size") {
-			s.BatchSize = 32
+			s.BatchSize = batchSize
 		}
 		if !meta.IsDefined("vector", "embeddings", "servers", name, "concurrency") {
-			s.Concurrency = 4
+			s.Concurrency = concurrency
 		}
 		if s.Timeout == "" {
-			s.Timeout = "30s"
+			s.Timeout = timeout
 		}
 		if !meta.IsDefined("vector", "embeddings", "servers", name, "max_retries") {
 			s.MaxRetries = 3
@@ -614,18 +645,13 @@ func (c VectorEmbeddingsServerConfig) validate(name string, modelContextTokens i
 	if c.Endpoint == "" && !c.Local {
 		return fmt.Errorf("%s endpoint is required", section)
 	}
-	if c.OllamaCPUFallback {
-		u, err := url.Parse(c.Endpoint)
-		if err != nil || u.Scheme == "" || u.Host == "" ||
-			(u.Scheme != "http" && u.Scheme != "https") {
-			return fmt.Errorf(
-				"%s ollama_cpu_fallback requires an absolute HTTP(S) endpoint", section)
-		}
-		endpointPath := strings.TrimSuffix(u.Path, "/")
-		if !strings.HasSuffix(endpointPath, "/v1") {
-			return fmt.Errorf(
-				"%s ollama_cpu_fallback requires an endpoint ending in /v1", section)
-		}
+	endpoint, err := c.EmbedDeployment().Canonical()
+	if err != nil && !c.Local {
+		return fmt.Errorf("%s %w", section, err)
+	}
+	if c.OllamaCPUFallback && !strings.HasSuffix(endpoint, "/v1") {
+		return fmt.Errorf(
+			"%s ollama_cpu_fallback requires an endpoint ending in /v1", section)
 	}
 	if c.BatchSize <= 0 {
 		return fmt.Errorf("%s batch_size must be greater than 0, got %d", section, c.BatchSize)
@@ -692,6 +718,46 @@ type FrictionConfig struct {
 	BackfillDays int `json:"backfill_days" toml:"backfill_days"`
 	// SeatPatterns are globs over session file paths with one {seat} capture.
 	SeatPatterns []string `json:"seat_patterns,omitempty" toml:"seat_patterns"`
+	// Kata is the hub's automatic filing policy.
+	Kata FrictionKataConfig `json:"kata,omitzero" toml:"kata"`
+}
+
+// FrictionKataConfig controls automatic filing of Friction Log patterns to
+// Kata. Only the filing hub with [kata] enabled acts on it.
+type FrictionKataConfig struct {
+	// AutoFile files recent unlinked patterns every hour.
+	AutoFile bool `json:"auto_file,omitempty" toml:"auto_file"`
+	// Kinds limits automatic filing to these kinds; empty means every kind
+	// that can be filed.
+	Kinds []string `json:"kinds,omitempty" toml:"kinds"`
+	// MinSessions is how many sessions a pattern must appear in before it
+	// is filed automatically; 0 means DefaultFrictionAutoFileMinSessions.
+	MinSessions int `json:"min_sessions,omitempty" toml:"min_sessions"`
+}
+
+// DefaultFrictionAutoFileMinSessions files only patterns that recur across
+// sessions. Correction, pattern and deferral fingerprints include the
+// session, so at this default they are filed only by hand.
+const DefaultFrictionAutoFileMinSessions = 2
+
+// FileMinSessions returns the session count automatic filing requires.
+func (c FrictionKataConfig) FileMinSessions() int {
+	if c.MinSessions == 0 {
+		return DefaultFrictionAutoFileMinSessions
+	}
+	return c.MinSessions
+}
+
+// FileKinds returns the kinds automatic filing considers.
+func (c FrictionKataConfig) FileKinds() []friction.Kind {
+	if len(c.Kinds) == 0 {
+		return friction.FileableKinds
+	}
+	out := make([]friction.Kind, 0, len(c.Kinds))
+	for _, k := range c.Kinds {
+		out = append(out, friction.Kind(k))
+	}
+	return out
 }
 
 // Validate checks the zone name, backfill bound, and seat patterns.
@@ -714,6 +780,19 @@ func (c FrictionConfig) Validate() error {
 	}
 	if _, err := friction.CompileSeatPatterns(c.SeatPatterns); err != nil {
 		return fmt.Errorf("[friction] seat_patterns: %w", err)
+	}
+	seen := make(map[string]bool, len(c.Kata.Kinds))
+	for _, k := range c.Kata.Kinds {
+		if !friction.Fileable(friction.Kind(k)) {
+			return fmt.Errorf("[friction.kata] kinds entry %q cannot be filed; use correction, error, workaround, deferral or pattern", k)
+		}
+		if seen[k] {
+			return fmt.Errorf("[friction.kata] kinds entry %q repeats", k)
+		}
+		seen[k] = true
+	}
+	if c.Kata.MinSessions < 0 {
+		return fmt.Errorf("[friction.kata] min_sessions must be at least 1, got %d", c.Kata.MinSessions)
 	}
 	return nil
 }
@@ -818,6 +897,29 @@ type CustomModelRate struct {
 	// cache_creation_microdollars_per_mtok.
 	CacheCreation1hMicrodollarsPerMTok int64 `json:"cache_creation_1h_microdollars_per_mtok,omitempty" toml:"cache_creation_1h_microdollars_per_mtok"`
 	CacheReadMicrodollarsPerMTok       int64 `json:"cache_read_microdollars_per_mtok,omitempty" toml:"cache_read_microdollars_per_mtok"`
+	// PriceAs prices the model exactly like this catalog model, including
+	// its long-context tiers and later catalog updates. It excludes the
+	// rate fields.
+	PriceAs string `json:"price_as,omitempty" toml:"price_as,omitempty"`
+}
+
+var customModelRateFields = []string{
+	"input_microdollars_per_mtok", "output_microdollars_per_mtok",
+	"cache_creation_microdollars_per_mtok",
+	"cache_creation_1h_microdollars_per_mtok",
+	"cache_read_microdollars_per_mtok",
+}
+
+// PricingAliases returns the price_as mappings in custom, keyed by the
+// reported model name.
+func PricingAliases(custom map[string]CustomModelRate) map[string]string {
+	out := make(map[string]string)
+	for model, rate := range custom {
+		if rate.PriceAs != "" {
+			out[model] = rate.PriceAs
+		}
+	}
+	return out
 }
 
 func decodeCustomModelPricing(data string) (map[string]CustomModelRate, error) {
@@ -833,18 +935,32 @@ func decodeCustomModelPricing(data string) (map[string]CustomModelRate, error) {
 			continue
 		}
 		return nil, fmt.Errorf(
-			"%s: unsupported pricing field; use input_microdollars_per_mtok, output_microdollars_per_mtok, cache_creation_microdollars_per_mtok, cache_creation_1h_microdollars_per_mtok, or cache_read_microdollars_per_mtok",
+			"%s: unsupported pricing field; use price_as, input_microdollars_per_mtok, output_microdollars_per_mtok, cache_creation_microdollars_per_mtok, cache_creation_1h_microdollars_per_mtok, or cache_read_microdollars_per_mtok",
 			key.String(),
 		)
 	}
 	for model, rate := range decoded.CustomModelPricing {
-		if rate.InputMicrodollarsPerMTok < 0 ||
-			rate.OutputMicrodollarsPerMTok < 0 ||
-			rate.CacheCreationMicrodollarsPerMTok < 0 ||
-			rate.CacheCreation1hMicrodollarsPerMTok < 0 ||
-			rate.CacheReadMicrodollarsPerMTok < 0 {
+		hasRates := slices.ContainsFunc(customModelRateFields, func(field string) bool {
+			return metadata.IsDefined("custom_model_pricing", model, field)
+		})
+		if !metadata.IsDefined("custom_model_pricing", model, "price_as") {
+			if rate.InputMicrodollarsPerMTok < 0 ||
+				rate.OutputMicrodollarsPerMTok < 0 ||
+				rate.CacheCreationMicrodollarsPerMTok < 0 ||
+				rate.CacheCreation1hMicrodollarsPerMTok < 0 ||
+				rate.CacheReadMicrodollarsPerMTok < 0 {
+				return nil, fmt.Errorf(
+					"custom_model_pricing.%s: rates must not be negative", model)
+			}
+			continue
+		}
+		target := rate.PriceAs
+		switch {
+		case hasRates:
 			return nil, fmt.Errorf(
-				"custom_model_pricing.%s: rates must not be negative", model)
+				"custom_model_pricing.%q: price_as cannot be combined with rate fields", model)
+		case target == "":
+			return nil, fmt.Errorf("custom_model_pricing.%q: price_as must not be empty", model)
 		}
 	}
 	return decoded.CustomModelPricing, nil
@@ -983,7 +1099,10 @@ type sessionSourceConfig struct {
 type Config struct {
 	// CodexCloud is the [agents.codex-cloud] table, read from config.toml
 	// only.
-	CodexCloud           CodexCloudConfig            `json:"-" toml:"-"`
+	CodexCloud CodexCloudConfig `json:"-" toml:"-"`
+	// ClaudeAI is the organizations setting of [agents.claude-ai], read
+	// from config.toml only.
+	ClaudeAI             ClaudeAIConfig              `json:"-" toml:"-"`
 	Host                 string                      `json:"host" toml:"host"`
 	Port                 int                         `json:"port" toml:"port"`
 	ChartPalette         ChartPalette                `json:"chart_palette" toml:"chart_palette"`
@@ -1005,6 +1124,7 @@ type Config struct {
 	RequireAuth          bool                        `json:"require_auth" toml:"require_auth"`
 	NoBrowser            bool                        `json:"no_browser" toml:"no_browser"`
 	DisableUpdateCheck   bool                        `json:"disable_update_check" toml:"disable_update_check"`
+	PersistentDaemon     bool                        `json:"-" toml:"-"`
 	NoSync               bool                        `json:"-" toml:"-"`
 	SkipInitialSync      bool                        `json:"-" toml:"-"`
 	ArchiveContent       ArchiveContent              `json:"archive_content" toml:"archive_content"`
@@ -1017,6 +1137,7 @@ type Config struct {
 	DuckDB               DuckDBConfig                `json:"duckdb,omitempty" toml:"duckdb"`
 	Vector               VectorConfig                `json:"vector,omitempty" toml:"vector"`
 	Recall               RecallConfig                `json:"recall,omitempty" toml:"recall"`
+	ImageText            ImageTextConfig             `json:"image_text,omitempty" toml:"image_text"`
 	Integrations         IntegrationsConfig          `json:"integrations,omitempty" toml:"integrations"`
 	Insights             InsightsConfig              `json:"insights,omitempty" toml:"insights"`
 	Kata                 KataConfig                  `json:"-" toml:"kata"`
@@ -1084,7 +1205,12 @@ type Config struct {
 	// work during bursts of sync activity. Zero disables coalescing.
 	EventsCoalesceInterval time.Duration `json:"events_coalesce_interval,omitzero" toml:"events_coalesce_interval"`
 
+	// SyncIdleAfter pauses local ingestion after client inactivity. Restart to apply changes.
+	SyncIdleAfter     time.Duration `json:"sync_idle_after,omitzero" toml:"sync_idle_after"`
 	DaemonIdleTimeout time.Duration `json:"daemon_idle_timeout,omitzero" toml:"daemon_idle_timeout"`
+
+	// SyncInterval is the minimum time between starts of watcher-triggered syncs.
+	SyncInterval time.Duration `json:"sync_interval,omitzero" toml:"sync_interval"`
 
 	ModelAliases       map[string]string          `json:"model_aliases,omitempty" toml:"model_aliases"`
 	CustomModelPricing map[string]CustomModelRate `json:"custom_model_pricing,omitempty" toml:"custom_model_pricing"`
@@ -1103,6 +1229,8 @@ type Config struct {
 	HostExplicit bool `json:"-" toml:"-"`
 	// PortExplicit is true when the user passed --port on the CLI.
 	PortExplicit bool `json:"-" toml:"-"`
+	// AuthSettingsSaved records that Settings owns authentication for this lifetime.
+	AuthSettingsSaved bool `json:"-" toml:"-"`
 
 	// DeploymentEmbeddings is the embedding transport from deployment env,
 	// set only without a [vector] section.
@@ -1402,6 +1530,8 @@ func Default() (Config, error) {
 		ResultContentBlockedCategories: []string{"Read", "Glob"},
 		EventsCoalesceInterval:         10 * time.Second,
 		DaemonIdleTimeout:              20 * time.Minute,
+		SyncIdleAfter:                  10 * time.Minute,
+		SyncInterval:                   5 * time.Second,
 		Agent:                          map[string]AgentConfig{},
 		CodexCloud:                     defaultCodexCloudConfig(),
 		Vector: VectorConfig{
@@ -1488,6 +1618,22 @@ func Load(fs *flag.FlagSet) (Config, error) {
 // LoadPFlags builds a Config from a parsed Cobra/pflag FlagSet.
 func LoadPFlags(fs *pflag.FlagSet) (Config, error) {
 	return LoadPFlagsFor(fs, 0)
+}
+
+// LoadSettingsRestartConfig keeps a successful Settings auth save authoritative
+// across Settings restarts while reading later edits to the saved config.
+func LoadSettingsRestartConfig(current Config, fs *pflag.FlagSet) (Config, error) {
+	cfg, err := LoadPFlags(fs)
+	if err != nil || !current.AuthSettingsSaved {
+		return cfg, err
+	}
+	saved, err := loadReadOnlyFor(ScopeLocal, current.DataDir)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.RequireAuth = saved.RequireAuth
+	cfg.AuthSettingsSaved = true
+	return cfg, nil
 }
 
 // LoadPFlagsFor loads a command's config, warning about invalid unused sections.
@@ -1851,6 +1997,7 @@ func (c *Config) applyConfigTOML(data string) error {
 		DuckDB                         DuckDBConfig           `toml:"duckdb"`
 		Vector                         VectorConfig           `toml:"vector"`
 		Recall                         RecallConfig           `toml:"recall"`
+		ImageText                      ImageTextConfig        `toml:"image_text"`
 		Integrations                   IntegrationsConfig     `toml:"integrations"`
 		Insights                       InsightsConfig         `toml:"insights"`
 		Kata                           KataConfig             `toml:"kata"`
@@ -1859,6 +2006,8 @@ func (c *Config) applyConfigTOML(data string) error {
 		Agent                          map[string]AgentConfig `toml:"agent"`
 		EventsCoalesceInterval         time.Duration          `toml:"events_coalesce_interval"`
 		DaemonIdleTimeout              time.Duration          `toml:"daemon_idle_timeout"`
+		SyncIdleAfter                  time.Duration          `toml:"sync_idle_after"`
+		SyncInterval                   time.Duration          `toml:"sync_interval"`
 		RemoteHosts                    []RemoteHost           `toml:"remote_hosts"`
 		ArchiveSources                 []ArchiveSource        `toml:"archive_sources"`
 		SessionSources                 []sessionSourceConfig  `toml:"session_sources"`
@@ -2173,6 +2322,9 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.Vector.Embed.BackstopInterval = file.Vector.Embed.BackstopInterval
 	}
 	c.mergeRecallExtractTOML(file.Recall, meta)
+	if meta.IsDefined("image_text") {
+		c.ImageText = file.ImageText
+	}
 	if meta.IsDefined("integrations") {
 		c.Integrations = file.Integrations
 	}
@@ -2197,6 +2349,18 @@ func (c *Config) applyConfigTOML(data string) error {
 	if meta.IsDefined("friction", "backfill_days") {
 		c.Friction.BackfillDays = file.Friction.BackfillDays
 	}
+	if meta.IsDefined("friction", "kata", "auto_file") {
+		c.Friction.Kata.AutoFile = file.Friction.Kata.AutoFile
+	}
+	if meta.IsDefined("friction", "kata", "min_sessions") {
+		c.Friction.Kata.MinSessions = file.Friction.Kata.MinSessions
+	}
+	if meta.IsDefined("friction", "kata", "kinds") {
+		c.Friction.Kata.Kinds = make([]string, 0, len(file.Friction.Kata.Kinds))
+		for _, k := range file.Friction.Kata.Kinds {
+			c.Friction.Kata.Kinds = append(c.Friction.Kata.Kinds, strings.TrimSpace(k))
+		}
+	}
 	if meta.IsDefined("friction", "seat_patterns") {
 		c.Friction.SeatPatterns = make([]string, 0, len(file.Friction.SeatPatterns))
 		for _, p := range file.Friction.SeatPatterns {
@@ -2211,8 +2375,14 @@ func (c *Config) applyConfigTOML(data string) error {
 	if meta.IsDefined("events_coalesce_interval") {
 		c.EventsCoalesceInterval = file.EventsCoalesceInterval
 	}
+	if meta.IsDefined("sync_idle_after") {
+		c.SyncIdleAfter = file.SyncIdleAfter
+	}
 	if meta.IsDefined("daemon_idle_timeout") {
 		c.DaemonIdleTimeout = file.DaemonIdleTimeout
+	}
+	if meta.IsDefined("sync_interval") {
+		c.SyncInterval = file.SyncInterval
 	}
 	if file.Automated.Prefixes != nil {
 		c.Automated.Prefixes = file.Automated.Prefixes
@@ -2261,6 +2431,7 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 
 	c.CodexCloud = parseCodexCloudTable(c.configPath(), raw["agents"])
+	c.ClaudeAI = parseClaudeAITable(c.configPath(), raw["agents"])
 	if err := c.applyAgentDirectories(raw["agents"]); err != nil {
 		return err
 	}
@@ -2599,7 +2770,7 @@ func RegisterServeFlags(fs *flag.FlagSet) {
 	)
 	fs.Duration(
 		"write-timeout", 30*time.Second,
-		"Max time to write an API response before a 503 request-timed-out; raise for slow aggregates over large datasets (0 disables)",
+		"Max API response time before a 503 (0 disables); some long-running routes are exempt",
 	)
 }
 
@@ -2667,7 +2838,7 @@ func RegisterServePFlags(fs *pflag.FlagSet) {
 	)
 	fs.Duration(
 		"write-timeout", 30*time.Second,
-		"Max time to write an API response before a 503 request-timed-out; raise for slow aggregates over large datasets (0 disables)",
+		"Max API response time before a 503 (0 disables); some long-running routes are exempt",
 	)
 }
 
@@ -3960,6 +4131,7 @@ func (c *Config) SaveSettings(patch map[string]any) error {
 		if v, ok := patch["require_auth"]; ok {
 			if b, ok := v.(bool); ok {
 				c.RequireAuth = b
+				c.AuthSettingsSaved = true
 			}
 		}
 		if v, ok := patch["chart_palette"]; ok {
@@ -4067,4 +4239,146 @@ func (c *Config) SaveGithubToken(token string) error {
 		c.GithubToken = token
 		return nil
 	})
+}
+
+// ErrInvalidVectorSetup marks settings a vector setup would reject, as
+// opposed to failures reading or locking the config file.
+var ErrInvalidVectorSetup = errors.New("invalid vector setup")
+
+type invalidVectorSetupError struct{ error }
+
+func (e invalidVectorSetupError) Unwrap() error { return e.error }
+
+func (invalidVectorSetupError) Is(target error) bool { return target == ErrInvalidVectorSetup }
+
+// VectorSetupEmbeddings returns the validated embeddings recipe SaveVectorSetup
+// would save now, so status and activation select the same provider.
+func (c *Config) VectorSetupEmbeddings() (VectorEmbeddingsConfig, error) {
+	var embeddings VectorEmbeddingsConfig
+	err := c.withConfigLock(func() error {
+		_, candidate, err := c.vectorSetupCandidate()
+		if err == nil {
+			embeddings = candidate.Vector.Embeddings
+		}
+		return err
+	})
+	return embeddings, err
+}
+
+// VectorExplicitlyDisabled reports a saved opt-out.
+func (c *Config) VectorExplicitlyDisabled() (bool, error) {
+	existing, err := c.readConfigMap()
+	if err != nil {
+		return false, err
+	}
+	section, _ := existing["vector"].(map[string]any)
+	enabled, ok := section["enabled"].(bool)
+	return ok && !enabled, nil
+}
+
+// SharedVectorSetup returns an in-memory setup when the current settings permit it.
+func (c *Config) SharedVectorSetup() (Config, bool, error) {
+	var candidate Config
+	eligible := false
+	err := c.withConfigLock(func() error {
+		existing, err := c.readConfigMap()
+		if err != nil {
+			return err
+		}
+		if c.Vector.Embeddings.Servers != nil || c.Vector.Embeddings.DefaultServer != "" || (c.Vector.Embeddings.Model != "" && c.Vector.Embeddings.Model != defaultNomicModel) {
+			return nil
+		}
+		section, _ := existing["vector"].(map[string]any)
+		if enabled, ok := section["enabled"].(bool); ok && !enabled {
+			return nil
+		}
+		embeddings, _ := section["embeddings"].(map[string]any)
+		if model, _ := embeddings["model"].(string); model != "" && model != defaultNomicModel {
+			return nil
+		}
+		if _, ok := embeddings["servers"]; ok {
+			return nil
+		}
+		if _, ok := embeddings["default_server"]; ok {
+			return nil
+		}
+		pg, err := c.ResolvePGTargets()
+		if err != nil {
+			return err
+		}
+		for _, target := range pg {
+			if target.Config.URL != "" && target.Config.PushVectorsEnabled() {
+				return nil
+			}
+		}
+		ch, err := c.ResolveClickHouseTargets()
+		if err != nil {
+			return err
+		}
+		for _, target := range ch {
+			if target.Config.URL != "" && target.Config.PushVectorsEnabled() {
+				return nil
+			}
+		}
+		_, candidate, err = c.vectorSetupCandidate()
+		if err != nil {
+			return err
+		}
+		candidate.Vector.DBPath = c.Vector.DBPath
+		name, server, err := candidate.Vector.Embeddings.Server("")
+		if err != nil {
+			return err
+		}
+		server.Local = true
+		candidate.Vector.Embeddings.Servers = map[string]VectorEmbeddingsServerConfig{name: server}
+		eligible = true
+		return nil
+	})
+	return candidate, eligible, err
+}
+
+// SaveVectorSetup records the selected action while keeping omitted defaults omitted.
+func (c *Config) SaveVectorSetup() error {
+	return c.withConfigLock(func() error {
+		existing, _, err := c.vectorSetupCandidate()
+		if err != nil {
+			return err
+		}
+		return c.writeConfigMap(existing)
+	})
+}
+
+func (c *Config) vectorSetupCandidate() (map[string]any, Config, error) {
+	existing, err := c.readConfigMap()
+	if err != nil {
+		if _, ok := errors.AsType[toml.ParseError](err); ok {
+			err = invalidVectorSetupError{err}
+		}
+		return nil, Config{}, err
+	}
+	section, ok := existing["vector"].(map[string]any)
+	if !ok && existing["vector"] != nil {
+		return nil, Config{}, invalidVectorSetupError{errors.New("vector must be a table")}
+	}
+	if section == nil {
+		section = make(map[string]any)
+	}
+	section["enabled"] = true
+	existing["vector"] = section
+	encoded, err := toml.Marshal(existing)
+	if err != nil {
+		return nil, Config{}, err
+	}
+	candidate, err := Default()
+	if err != nil {
+		return nil, Config{}, err
+	}
+	candidate.DataDir = c.DataDir
+	if err := candidate.applyConfigTOML(string(encoded)); err != nil {
+		return nil, Config{}, invalidVectorSetupError{err}
+	}
+	if err := candidate.Vector.Validate(); err != nil {
+		return nil, Config{}, invalidVectorSetupError{err}
+	}
+	return existing, candidate, nil
 }

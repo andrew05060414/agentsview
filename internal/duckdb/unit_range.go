@@ -30,13 +30,10 @@ const duckUnitSessionChunk = readbase.MaxSQLVars / 2
 const duckUnitExtentChunk = readbase.MaxSQLVars / 6
 
 // duckEmbeddableUserSQL is the DuckDB predicate matching an embeddable user
-// row under the given alias: user role, is_system = FALSE, and the DuckDB
-// dialect SystemPrefixSQL check — the DuckDB form of internal/db's
-// embeddableUserSQL. (The assistant-side member predicate skips the prefix
-// check: SystemPrefixSQL constrains user rows only.)
+// row under the given alias: user role, is_system = FALSE, and the stored
+// system-prefix verdict. Assistant rows do not need the prefix check.
 func duckEmbeddableUserSQL(alias string) string {
-	return fmt.Sprintf("%[1]s.role = 'user' AND %[1]s.is_system = FALSE AND %[2]s",
-		alias, db.DuckDBSystemPrefixSQL(alias+".content", alias+".role"))
+	return fmt.Sprintf("%[1]s.role = 'user' AND %[1]s.is_system = FALSE AND %[1]s.is_system_prefixed = FALSE", alias)
 }
 
 // NearestUserBoundaries returns, per probe, the nearest embeddable user
@@ -106,6 +103,11 @@ func (s *Store) RunExtents(
 // the stop-narrowed interval. The member predicate is role + is_system only:
 // SystemPrefixSQL constrains user rows exclusively, so it is identically
 // TRUE for assistant rows and deliberately omitted there.
+//
+// The stop subqueries repeat the probe sessions as an IN filter. It is
+// implied by the correlation, but DuckDB decorrelates these subqueries into
+// joins and would otherwise evaluate the system-prefix check over every
+// message in the mirror before joining to the few probe sessions.
 func duckRunExtentSelectSQL() string {
 	stop := "((f.role = 'assistant' AND f.is_system = FALSE AND f.is_sidechain <> p.sc)" +
 		" OR (" + duckEmbeddableUserSQL("f") + "))"
@@ -115,6 +117,7 @@ func duckRunExtentSelectSQL() string {
 	   WHERE m.session_id = p.session_id AND m.ordinal <= p.o
 	     AND m.ordinal > COALESCE((SELECT f.ordinal FROM messages f
 	       WHERE f.session_id = p.session_id
+	         AND f.session_id IN (SELECT session_id FROM probes)
 	         AND f.ordinal > p.lo AND f.ordinal < p.o
 	         AND %[1]s
 	       ORDER BY f.ordinal DESC LIMIT 1), p.lo)
@@ -125,6 +128,7 @@ func duckRunExtentSelectSQL() string {
 	   WHERE m.session_id = p.session_id AND m.ordinal >= p.o
 	     AND m.ordinal < COALESCE((SELECT f.ordinal FROM messages f
 	       WHERE f.session_id = p.session_id
+	         AND f.session_id IN (SELECT session_id FROM probes)
 	         AND f.ordinal > p.o AND f.ordinal < p.hi
 	         AND %[1]s
 	       ORDER BY f.ordinal ASC LIMIT 1), p.hi)
@@ -283,10 +287,9 @@ func (s *Store) lookupAnchorMetaChunkDuck(
 	query := "WITH refs(session_id, ordinal) AS (VALUES " +
 		strings.Join(values, ", ") + ") " +
 		"SELECT r.session_id, r.ordinal, " +
-		"COALESCE(s.relationship_type, ''), COALESCE(s.parent_session_id, ''), s.machine, COALESCE(s.display_name, s.session_name), " +
+		"s.relationship_type, COALESCE(s.parent_session_id, ''), s.machine, COALESCE(s.display_name, s.session_name), " +
 		"m.role, m.is_sidechain, " +
-		"CASE WHEN m.is_system = FALSE AND " +
-		db.DuckDBSystemPrefixSQL("m.content", "m.role") +
+		"CASE WHEN m.is_system = FALSE AND m.is_system_prefixed = FALSE" +
 		" THEN TRUE ELSE FALSE END " +
 		"FROM refs r " +
 		"JOIN sessions s ON s.id = r.session_id " +

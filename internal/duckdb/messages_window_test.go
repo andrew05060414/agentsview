@@ -3,12 +3,15 @@
 package duckdb
 
 import (
+	"database/sql"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/readbase"
+	"go.kenn.io/agentsview/internal/readbase/readbasetest"
 	"go.kenn.io/agentsview/internal/storage"
 )
 
@@ -223,4 +226,62 @@ func TestDuckGetMessagesWindow_ReportsRevisionWithRows(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, msgs)
 	assert.Empty(t, revision, "no rows means no revision to describe them")
+}
+
+func TestDuckGetMessagesWindowReadsOnlyWindowToolRows(t *testing.T) {
+	ctx := t.Context()
+	store := newDuckWindowStore(t, func(local *db.DB) {
+		seedDuckWindowMessages(t, local, "tools")
+		msgs, err := local.GetAllMessages(ctx, "tools")
+		require.NoError(t, err)
+		for i := range msgs {
+			if msgs[i].Role == "assistant" {
+				msgs[i].ToolCalls = []db.ToolCall{{
+					ToolName: "Read", Category: "Read", ResultContent: "result", ResultContentLength: 6,
+					ResultEvents: []db.ToolResultEvent{{Source: "tool", Status: "complete", Content: "result", ContentLength: 6}},
+				}}
+			}
+		}
+		sess, err := local.GetSessionFull(ctx, "tools")
+		require.NoError(t, err)
+		_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{Session: *sess, Messages: msgs, ReplaceMessages: true, DataVersion: 1}})
+		require.NoError(t, err)
+	})
+	all, err := store.GetAllMessages(ctx, "tools")
+	require.NoError(t, err)
+	require.Len(t, all, 12)
+	require.Len(t, all[6].ToolCalls, 1)
+	assert.Equal(t, "result", all[6].ToolCalls[0].ResultContent)
+	require.Len(t, all[6].ToolCalls[0].ResultEvents, 1)
+	from := 5
+	recorder := &readbasetest.RecordingSessions{SessionsBackend: sessionsSQL{store}, T: t}
+	reader := readbase.NewSessions(recorder)
+	for _, roles := range [][]string{nil, {"assistant"}} {
+		recorder.ToolOrdinals = nil
+		window, err := reader.GetMessagesWindow(ctx, "tools", db.MessageWindow{From: &from, Limit: 4, Asc: true, Roles: roles})
+		require.NoError(t, err)
+		if roles == nil {
+			assert.Equal(t, []int{5, 6, 7, 8}, duckOrdinalsOf(window))
+			assert.Equal(t, [][]int{{6, 8}, {6, 8}}, recorder.ToolOrdinals)
+		} else {
+			assert.Equal(t, []int{6, 8, 11}, duckOrdinalsOf(window))
+			assert.Equal(t, [][]int{{6, 8, 11}, {6, 8, 11}}, recorder.ToolOrdinals)
+		}
+		for _, msg := range window {
+			assert.Equal(t, all[msg.Ordinal].ToolCalls, msg.ToolCalls)
+		}
+	}
+}
+
+func TestDuckGetMessagesWindow_CompactBoundary(t *testing.T) {
+	store := newDuckWindowStore(t, func(local *db.DB) {
+		seedDuckWindowMessages(t, local, "boundary")
+		require.NoError(t, local.Update(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(), "UPDATE messages SET is_compact_boundary = 1, is_system = 1 WHERE session_id = ? AND ordinal IN (3, 8)", "boundary")
+			return err
+		}))
+	})
+	msgs, err := store.GetMessagesWindow(t.Context(), "boundary", db.MessageWindow{Limit: 100, Asc: true, CompactBoundaryOnly: true})
+	require.NoError(t, err)
+	assert.Equal(t, []int{3, 8}, duckOrdinalsOf(msgs))
 }

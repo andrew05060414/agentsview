@@ -39,6 +39,7 @@ func syncEventDescription(op *huma.Operation) {
 }
 
 type syncStatusResponse struct {
+	SyncPending    bool               `json:"sync_pending" doc:"Local ingestion is catching up after an idle period"`
 	ArchiveStale   bool               `json:"archive_stale" doc:"Results may reflect the archive before a required parser rebuild"`
 	StartupPending bool               `json:"startup_pending" doc:"Startup ingestion has not completed successfully"`
 	LastSync       string             `json:"last_sync"`
@@ -187,7 +188,7 @@ func (s *Server) humaSyncStatus(
 ) (*jsonOutput[syncStatusResponse], error) {
 	engine := s.syncStatusEngine()
 	if engine == nil {
-		return &jsonOutput[syncStatusResponse]{Body: syncStatusResponse{ArchiveStale: s.archiveStale()}}, nil
+		return &jsonOutput[syncStatusResponse]{Body: syncStatusResponse{ArchiveStale: s.archiveStale(), SyncPending: s.syncPending()}}, nil
 	}
 	startupPending := s.engine != nil && !s.engine.StartupReconciled()
 	lastSync := engine.LastSync()
@@ -203,6 +204,7 @@ func (s *Server) humaSyncStatus(
 	return &jsonOutput[syncStatusResponse]{
 		Body: syncStatusResponse{
 			ArchiveStale:   s.archiveStale(),
+			SyncPending:    s.syncPending(),
 			StartupPending: startupPending,
 			LastSync:       lastSyncStr,
 			Stats:          &stats,
@@ -365,6 +367,10 @@ func (s *Server) runSyncWhenReady(
 // the CLI can retry through /api/v1/resync instead of surfacing a raw HTTP
 // error. The body remains the human-readable explanation.
 const ResyncRequiredHeader = "X-Agentsview-Resync-Required"
+
+func (s *Server) syncPending() bool {
+	return s.ingestionFreshness != nil && s.ingestionFreshness.Pending()
+}
 
 func (s *Server) archiveStale() bool {
 	local, ok := s.db.(*db.DB)
@@ -570,24 +576,37 @@ func (s *Server) humaSyncRemotes(
 	}
 	req := in.Body
 	req.Hosts = hosts
+	// A remote import is shared daemon work that can take many minutes. A
+	// requester that disconnects, such as a CLI killed by its caller's
+	// timeout, must not cancel it: a canceled import keeps the host at its
+	// old data version, so every retry repeats the whole download and
+	// reparse. The server's base context still bounds the run at shutdown.
+	runCtx := s.baseCtx
+	if runCtx == nil {
+		runCtx = context.WithoutCancel(ctx)
+	}
 
 	return &huma.StreamResponse{Body: func(hctx huma.Context) {
 		if strings.Contains(hctx.Header("Accept"), "text/event-stream") {
 			stream, ok := newHumaSSEStream(hctx)
 			if ok {
 				response := s.runRemoteSyncRequest(
-					ctx, local, engine, req,
+					runCtx, local, engine, req,
 					func(progress syncpkg.Progress) {
-						stream.SendJSON("progress", progress)
+						if ctx.Err() == nil {
+							stream.SendJSON("progress", progress)
+						}
 					},
 				)
-				stream.SendJSON("done", response)
+				if ctx.Err() == nil {
+					stream.SendJSON("done", response)
+				}
 				return
 			}
 		}
 		writeHumaJSON(
 			hctx, http.StatusOK,
-			s.runRemoteSyncRequest(ctx, local, engine, req, nil),
+			s.runRemoteSyncRequest(runCtx, local, engine, req, nil),
 		)
 	}}, nil
 }

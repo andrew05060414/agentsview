@@ -717,6 +717,18 @@ components:
         - homes
         - state
       type: object
+    CommitSessionsInputBody:
+      additionalProperties: false
+      properties:
+        shas:
+          items:
+            type: string
+          maxItems: 200
+          minItems: 1
+          type: array
+      required:
+        - shas
+      type: object
     Comparison:
       additionalProperties: false
       properties:
@@ -1153,6 +1165,89 @@ components:
         - scope
         - status
       type: object
+    DbCommitLink:
+      additionalProperties: false
+      properties:
+        ambiguous:
+          type: boolean
+        branch:
+          type: string
+        call_index:
+          format: int64
+          type: integer
+        committed_at:
+          type: string
+        message_ordinal:
+          format: int64
+          type: integer
+        missing:
+          type: boolean
+        repository:
+          type: string
+        session_id:
+          type: string
+        sha:
+          type: string
+        source:
+          type: string
+        subject:
+          type: string
+        tool_use_id:
+          type: string
+        turn:
+          $ref: "#/components/schemas/DbCommitTurn"
+      required:
+        - session_id
+        - sha
+        - branch
+        - subject
+        - repository
+        - message_ordinal
+        - call_index
+        - tool_use_id
+        - committed_at
+        - source
+        - missing
+        - ambiguous
+      type: object
+    DbCommitSessionList:
+      additionalProperties: false
+      properties:
+        commits:
+          items:
+            $ref: "#/components/schemas/DbCommitSessionMatch"
+          type: array
+      required:
+        - commits
+      type: object
+    DbCommitSessionMatch:
+      additionalProperties: false
+      properties:
+        links:
+          items:
+            $ref: "#/components/schemas/DbCommitLink"
+          type: array
+        sha:
+          type: string
+      required:
+        - sha
+        - links
+      type: object
+    DbCommitTurn:
+      additionalProperties: false
+      properties:
+        heuristic:
+          type: boolean
+        ordinal:
+          format: int64
+          type: integer
+        text:
+          type: string
+      required:
+        - heuristic
+        - ordinal
+        - text
+      type: object
     DbCompactEstimate:
       additionalProperties: false
       properties:
@@ -1280,6 +1375,10 @@ components:
           type: string
         machine:
           type: string
+        matched_words:
+          description: Number of retained query words the match holds in ranked word search; unquoted stop words are dropped. Zero for other searches.
+          format: int64
+          type: integer
         ordinal:
           format: int64
           type: integer
@@ -1331,6 +1430,7 @@ components:
         - ordinal
         - timestamp
         - snippet
+        - matched_words
         - ordinal_range
       type: object
     DbCursorAttributionMetrics:
@@ -1456,6 +1556,28 @@ components:
         - projectBreakdowns
         - agentBreakdowns
         - machineBreakdowns
+      type: object
+    DbDiagnosticEvent:
+      additionalProperties: false
+      properties:
+        accepted_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        message:
+          type: string
+        occurred_at:
+          format: date-time
+          type: string
+        source:
+          type: string
+      required:
+        - id
+        - source
+        - message
+        - occurred_at
+        - accepted_at
       type: object
     DbDistributionBucket:
       additionalProperties: false
@@ -2827,6 +2949,36 @@ components:
         - interval_seconds
         - total_messages
       type: object
+    DbSessionCommitList:
+      additionalProperties: false
+      properties:
+        commits:
+          items:
+            $ref: "#/components/schemas/DbCommitLink"
+          type: array
+      required:
+        - commits
+      type: object
+    DbSessionExclusionCounts:
+      additionalProperties: false
+      properties:
+        automated:
+          format: int64
+          type: integer
+        children:
+          format: int64
+          type: integer
+        children_lower_bound:
+          type: boolean
+        one_shot:
+          format: int64
+          type: integer
+      required:
+        - one_shot
+        - automated
+        - children
+        - children_lower_bound
+      type: object
     DbSessionExternalParent:
       additionalProperties: false
       properties:
@@ -2872,6 +3024,8 @@ components:
     DbSessionPage:
       additionalProperties: false
       properties:
+        exclusion_counts:
+          $ref: "#/components/schemas/DbSessionExclusionCounts"
         next_cursor:
           type: string
         sessions:
@@ -2938,6 +3092,32 @@ components:
         - original_project
         - created_at
         - updated_at
+      type: object
+    DbSessionRecordedCost:
+      additionalProperties: false
+      properties:
+        computed:
+          $ref: "#/components/schemas/MoneyMoney"
+        difference:
+          $ref: "#/components/schemas/MoneyMoney"
+        fallback_rows:
+          format: int64
+          type: integer
+        recorded:
+          $ref: "#/components/schemas/MoneyMoney"
+        rows:
+          format: int64
+          type: integer
+        unpriced_rows:
+          format: int64
+          type: integer
+      required:
+        - recorded
+        - computed
+        - difference
+        - rows
+        - fallback_rows
+        - unpriced_rows
       type: object
     DbSessionShapeResponse:
       additionalProperties: false
@@ -3068,6 +3248,57 @@ components:
         - running
         - activity
         - activity_totals
+      type: object
+    DbSessionUsageTotal:
+      additionalProperties: false
+      properties:
+        cost:
+          $ref: "#/components/schemas/MoneyMoney"
+        incomplete:
+          type: boolean
+        models:
+          items:
+            $ref: "#/components/schemas/DbSessionUsageTotalModel"
+          type: array
+        source:
+          type: string
+        subagent_scope:
+          type: string
+      required:
+        - source
+        - models
+      type: object
+    DbSessionUsageTotalModel:
+      additionalProperties: false
+      properties:
+        cache_creation_input_tokens:
+          format: int64
+          type: integer
+        cache_read_input_tokens:
+          format: int64
+          type: integer
+        cost:
+          $ref: "#/components/schemas/MoneyMoney"
+        input_tokens:
+          format: int64
+          type: integer
+        model:
+          type: string
+        output_tokens:
+          format: int64
+          type: integer
+        reasoning_tokens:
+          format: int64
+          type: integer
+        web_search_requests:
+          format: int64
+          type: integer
+      required:
+        - model
+        - input_tokens
+        - output_tokens
+        - cache_creation_input_tokens
+        - cache_read_input_tokens
       type: object
     DbSidebarSessionIndex:
       additionalProperties: false
@@ -3590,6 +3821,8 @@ components:
     DbStats:
       additionalProperties: false
       properties:
+        earliest_account_usage:
+          type: string
         earliest_session:
           type:
             - string
@@ -4767,6 +5000,28 @@ components:
         - next_project
         - cwd
       type: object
+    DiagnosticAppendInputBody:
+      additionalProperties: false
+      properties:
+        id:
+          format: uuid
+          type: string
+        message:
+          maxLength: 500
+          minLength: 1
+          type: string
+        occurred_at:
+          format: date-time
+          type: string
+        source:
+          maxLength: 64
+          minLength: 1
+          type: string
+      required:
+        - id
+        - source
+        - message
+      type: object
     EmbeddingsBuildRequest:
       additionalProperties: false
       properties:
@@ -4806,6 +5061,15 @@ components:
           type: array
       required:
         - generations
+      type: object
+    EmbeddingsSetupInputBody:
+      additionalProperties: false
+      properties:
+        approved_bytes:
+          description: Download size the user saw; a larger download is declined
+          format: int64
+          minimum: 0
+          type: integer
       type: object
     EmptyTrashResponse:
       additionalProperties: false
@@ -5027,6 +5291,21 @@ components:
         - Skipped
         - Stale
       type: object
+    FrictionDiagnosticGroup:
+      additionalProperties: false
+      properties:
+        count:
+          format: int64
+          type: integer
+        message:
+          type: string
+        source:
+          type: string
+      required:
+        - source
+        - message
+        - count
+      type: object
     FrictionDigestItem:
       additionalProperties: false
       properties:
@@ -5061,6 +5340,10 @@ components:
           type: string
         date:
           type: string
+        diagnostics:
+          items:
+            $ref: "#/components/schemas/FrictionDiagnosticGroup"
+          type: array
         markdown_sha256:
           type: string
         p0_alerts:
@@ -5105,6 +5388,7 @@ components:
         - summary
         - signals
         - p0_alerts
+        - diagnostics
         - patterns
         - sessions
       type: object
@@ -5117,6 +5401,47 @@ components:
           type: array
       required:
         - digests
+      type: object
+    FrictionFileInputBody:
+      additionalProperties: false
+      properties:
+        dry_run:
+          description: Return the issue that would be filed without contacting Kata
+          type: boolean
+      type: object
+    FrictionFileResponse:
+      additionalProperties: false
+      properties:
+        created:
+          type: boolean
+        issue:
+          $ref: "#/components/schemas/FrictionIssueItem"
+        preview:
+          $ref: "#/components/schemas/FrictionIssuePreview"
+      required:
+        - created
+      type: object
+    FrictionFilingItem:
+      additionalProperties: false
+      properties:
+        attempts:
+          format: int64
+          type: integer
+        last_error:
+          type: string
+        next_attempt_at:
+          format: date-time
+          type: string
+        state:
+          description: "retry: waiting for the next attempt; needs_person: file or link it by hand; paused: a person removed its link"
+          enum:
+            - retry
+            - needs_person
+            - paused
+          type: string
+      required:
+        - state
+        - attempts
       type: object
     FrictionFindingItem:
       additionalProperties: false
@@ -5188,6 +5513,71 @@ components:
         - findings
         - next_cursor
       type: object
+    FrictionIssueItem:
+      additionalProperties: false
+      properties:
+        issue_uid:
+          type: string
+        linked_at:
+          format: date-time
+          type: string
+        qualified_id:
+          description: Kata issue reference, such as agentsview#f001
+          type: string
+        source:
+          description: created, found (Kata already held it) or manual
+          type: string
+        web_url:
+          description: Kata issue page, when Kata reports one
+          type: string
+      required:
+        - qualified_id
+        - issue_uid
+        - source
+        - linked_at
+      type: object
+    FrictionIssuePreview:
+      additionalProperties: false
+      properties:
+        body:
+          type: string
+        labels:
+          items:
+            type: string
+          type: array
+        metadata:
+          additionalProperties: {}
+          type: object
+        priority:
+          format: int64
+          type: integer
+        title:
+          type: string
+      required:
+        - title
+        - body
+        - priority
+        - labels
+        - metadata
+      type: object
+    FrictionLinkInputBody:
+      additionalProperties: false
+      properties:
+        issue:
+          description: "Kata issue: qualified ID (agentsview#f001), short ID (f001) or UID"
+          minLength: 1
+          type: string
+      required:
+        - issue
+      type: object
+    FrictionLinkResponse:
+      additionalProperties: false
+      properties:
+        issue:
+          $ref: "#/components/schemas/FrictionIssueItem"
+      required:
+        - issue
+      type: object
     FrictionP0Alert:
       additionalProperties: false
       properties:
@@ -5204,10 +5594,14 @@ components:
     FrictionPatternItem:
       additionalProperties: false
       properties:
+        filing:
+          $ref: "#/components/schemas/FrictionFilingItem"
         fingerprint:
           type: string
         first_seen_date:
           type: string
+        issue:
+          $ref: "#/components/schemas/FrictionIssueItem"
         kind:
           type: string
         last_ordinal:
@@ -5383,6 +5777,9 @@ components:
         date:
           type: string
         deferrals:
+          format: int64
+          type: integer
+        diagnostics:
           format: int64
           type: integer
         errors:
@@ -5718,11 +6115,16 @@ components:
       properties:
         healthy:
           type: boolean
+        instance_id:
+          format: uuid
+          type: string
         ok:
           type: boolean
         pid:
           format: int64
           type: integer
+        project_identity_backfill_error:
+          type: string
         service:
           type: string
         sync:
@@ -5730,6 +6132,7 @@ components:
         version:
           type: string
       required:
+        - instance_id
         - ok
         - healthy
       type: object
@@ -6756,6 +7159,8 @@ components:
           type: boolean
         coverage:
           $ref: "#/components/schemas/ServiceMemoryCoverage"
+        effective_mode:
+          type: string
         matches:
           items:
             $ref: "#/components/schemas/DbContentMatch"
@@ -6763,6 +7168,8 @@ components:
         next_cursor:
           format: int64
           type: integer
+        note:
+          type: string
         revision_bound:
           type: boolean
       required:
@@ -7471,6 +7878,8 @@ components:
     ServiceSessionList:
       additionalProperties: false
       properties:
+        exclusion_counts:
+          $ref: "#/components/schemas/DbSessionExclusionCounts"
         next_cursor:
           type: string
         sessions:
@@ -7906,6 +8315,10 @@ components:
         output_tokens:
           format: int64
           type: integer
+        recorded_cost:
+          $ref: "#/components/schemas/MoneyMoney"
+        recorded_cost_priced:
+          type: boolean
         source:
           type: string
         subagent_session_id:
@@ -7969,6 +8382,8 @@ components:
           $ref: "#/components/schemas/DbPlanUsageView"
         project:
           type: string
+        recorded_cost:
+          $ref: "#/components/schemas/DbSessionRecordedCost"
         rollup_cost:
           $ref: "#/components/schemas/MoneyMoney"
         rollup_cost_source:
@@ -7980,6 +8395,8 @@ components:
           type: boolean
         session_id:
           type: string
+        session_total:
+          $ref: "#/components/schemas/DbSessionUsageTotal"
         subagent_count:
           format: int64
           type: integer
@@ -8064,6 +8481,10 @@ components:
           type: boolean
         require_auth:
           type: boolean
+        restart_required:
+          type: boolean
+        restart_supported:
+          type: boolean
         session_providers:
           items:
             $ref: "#/components/schemas/SessionProviderResponse"
@@ -8105,6 +8526,8 @@ components:
         - insight_default_agent
         - require_auth
         - read_only
+        - restart_supported
+        - restart_required
       type: object
     SettingsUpdateRequest:
       additionalProperties: false
@@ -8320,7 +8743,11 @@ components:
           type: boolean
         stats:
           $ref: "#/components/schemas/SyncSyncStats"
+        sync_pending:
+          description: Local ingestion is catching up after an idle period
+          type: boolean
       required:
+        - sync_pending
         - archive_stale
         - startup_pending
         - last_sync
@@ -8642,6 +9069,8 @@ components:
           type: number
         running:
           type: boolean
+        setup:
+          $ref: "#/components/schemas/VectorSetupStatus"
         started_at:
           type: string
         total:
@@ -8732,6 +9161,40 @@ components:
         - remaining
         - remaining_known
       type: object
+    VectorSetupStatus:
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+        busy:
+          type: boolean
+        downloaded_bytes:
+          format: int64
+          type: integer
+        enabled:
+          type: boolean
+        error:
+          type: string
+        installing:
+          type: boolean
+        missing_bytes:
+          format: int64
+          type: integer
+        provider:
+          type: string
+        total_bytes:
+          format: int64
+          type: integer
+      required:
+        - enabled
+        - provider
+        - action
+        - missing_bytes
+        - installing
+        - busy
+        - downloaded_bytes
+        - total_bytes
+      type: object
     VersionInfo:
       additionalProperties: false
       properties:
@@ -8748,6 +9211,8 @@ components:
           format: int64
           type: integer
         docbank_enabled:
+          type: boolean
+        friction_auto_file:
           type: boolean
         friction_available:
           type: boolean
@@ -8869,7 +9334,7 @@ components:
         - project
       type: object
 info:
-  description: "HTTP API for browsing, searching, syncing, and managing local agent sessions. Responses carry X-Agentsview-Archive-Stale: true while a required archive rebuild is pending; GET /api/v1/sync/status reports its state."
+  description: "HTTP API for browsing, searching, syncing, and managing local agent sessions. Responses carry X-Agentsview-Archive-Stale: true while a required archive rebuild or idle catch-up is incomplete; GET /api/v1/sync/status reports its state."
   title: AgentsView API
   version: dev
 openapi: 3.1.0
@@ -12252,6 +12717,94 @@ paths:
       summary: List branches
       tags:
         - Metadata
+  /api/v1/changes/stream:
+    get:
+      description: Streams content-free session and message changes. ready names the archive, its newest cursor, and this installation's machine identity; each session and message carries the identity of the machine it originated on. changes carries every change from `from` to `to`; each event's `from` equals the previous event's `to`, and reset is true when the stream restarted from the beginning of the archive. heartbeat keeps the connection open. error reports a failed read before the stream closes; reconnect with the last `to` received.
+      operationId: get-api-v1-changes-stream
+      parameters:
+        - description: Cursor from the last changes event's to field. Empty, foreign, or invalid cursors restart from the beginning of the archive.
+          explode: false
+          in: query
+          name: after
+          schema:
+            description: Cursor from the last changes event's to field. Empty, foreign, or invalid cursors restart from the beginning of the archive.
+            type: string
+      responses:
+        "200":
+          content:
+            text/event-stream:
+              schema:
+                type: string
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Follow archive changes
+      tags:
+        - Changes
   /api/v1/codex-cloud/status:
     get:
       operationId: get-api-v1-codex-cloud-status
@@ -12327,6 +12880,91 @@ paths:
       summary: Read codex-cloud import status
       tags:
         - CodexCloud
+  /api/v1/commits/sessions:
+    post:
+      operationId: post-api-v1-commits-sessions
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommitSessionsInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DbCommitSessionList"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Find sessions by commit
+      tags:
+        - Commits
   /api/v1/config/github:
     get:
       operationId: get-api-v1-config-github
@@ -12641,6 +13279,156 @@ paths:
       summary: Set terminal config
       tags:
         - Config
+  /api/v1/daemon/persist:
+    post:
+      operationId: post-api-v1-daemon-persist
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                additionalProperties:
+                  type: boolean
+                type: object
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Keep the daemon running until stopped
+      tags:
+        - Daemon
+  /api/v1/daemon/restart:
+    post:
+      operationId: post-api-v1-daemon-restart
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                additionalProperties:
+                  type: boolean
+                type: object
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Restart the daemon with saved settings
+      tags:
+        - Daemon
   /api/v1/data/compact:
     post:
       operationId: post-api-v1-data-compact
@@ -13337,6 +14125,91 @@ paths:
       summary: Preview inline tool-result image removal
       tags:
         - Data
+  /api/v1/diagnostics:
+    post:
+      operationId: post-api-v1-diagnostics
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiagnosticAppendInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DbDiagnosticEvent"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Append a diagnostic
+      tags:
+        - Friction
   /api/v1/embeddings/build:
     post:
       operationId: post-api-v1-embeddings-build
@@ -13695,6 +14568,91 @@ paths:
                 $ref: "#/components/schemas/ApiErrorResponse"
           description: Gateway Timeout
       summary: Retire an embedding generation
+      tags:
+        - Embeddings
+  /api/v1/embeddings/setup:
+    post:
+      operationId: post-api-v1-embeddings-setup
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmbeddingsSetupInputBody"
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmbeddingsBuildResponse"
+          description: Accepted
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Set up search by meaning
       tags:
         - Embeddings
   /api/v1/embeddings/status:
@@ -14443,6 +15401,273 @@ paths:
       summary: List friction patterns
       tags:
         - Friction
+  /api/v1/friction/patterns/{fingerprint}/issue:
+    delete:
+      operationId: delete-api-v1-friction-patterns-fingerprint-issue
+      parameters:
+        - description: Pattern fingerprint (fl1:<sha256>)
+          in: path
+          name: fingerprint
+          required: true
+          schema:
+            description: Pattern fingerprint (fl1:<sha256>)
+            type: string
+      responses:
+        "204":
+          description: No Content
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Remove a friction pattern's Kata issue link
+      tags:
+        - Friction
+    post:
+      operationId: post-api-v1-friction-patterns-fingerprint-issue
+      parameters:
+        - description: Pattern fingerprint (fl1:<sha256>)
+          in: path
+          name: fingerprint
+          required: true
+          schema:
+            description: Pattern fingerprint (fl1:<sha256>)
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FrictionFileInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FrictionFileResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: File a friction pattern to Kata
+      tags:
+        - Friction
+    put:
+      operationId: put-api-v1-friction-patterns-fingerprint-issue
+      parameters:
+        - description: Pattern fingerprint (fl1:<sha256>)
+          in: path
+          name: fingerprint
+          required: true
+          schema:
+            description: Pattern fingerprint (fl1:<sha256>)
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FrictionLinkInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FrictionLinkResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Link a friction pattern to a Kata issue
+      tags:
+        - Friction
   /api/v1/friction/run:
     post:
       operationId: post-api-v1-friction-run
@@ -14951,7 +16176,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiErrorResponse"
-          description: Before streaming, code claude_ai_chrome_host_required reports a disconnected Chrome host; claude_ai_sync_running reports that Chrome Sync is already running.
+          description: Before streaming, code claude_ai_chrome_host_required reports a disconnected Chrome host; claude_ai_sync_running reports that Chrome Sync is already running; claude_ai_config_invalid reports an invalid [agents.claude-ai] table in config.toml.
         "422":
           content:
             application/json:
@@ -17348,6 +18573,14 @@ paths:
           schema:
             type: string
         - in: query
+          name: updated_since
+          schema:
+            type: string
+        - in: query
+          name: created_since
+          schema:
+            type: string
+        - in: query
           name: limit
           schema:
             type: integer
@@ -18664,12 +19897,19 @@ paths:
               - semantic
               - hybrid
             type: string
-        - description: "Semantic/hybrid/terms result scope: top, all, or subordinate (default all)"
+        - description: Return hybrid keyword matches when semantic search is unavailable
+          explode: false
+          in: query
+          name: allow_keyword_fallback
+          schema:
+            description: Return hybrid keyword matches when semantic search is unavailable
+            type: boolean
+        - description: "Result scope: top, all, or subordinate (blank lexical scope keeps sidebar child filtering)"
           explode: false
           in: query
           name: scope
           schema:
-            description: "Semantic/hybrid/terms result scope: top, all, or subordinate (default all)"
+            description: "Result scope: top, all, or subordinate (blank lexical scope keeps sidebar child filtering)"
             enum:
               - top
               - all
@@ -19365,6 +20605,13 @@ paths:
           schema:
             description: IANA timezone name
             type: string
+        - description: Compute only outcome_stats; other sections are zero-valued
+          explode: false
+          in: query
+          name: outcomes_only
+          schema:
+            description: Compute only outcome_stats; other sections are zero-valued
+            type: boolean
         - description: Include git-derived outcome stats
           explode: false
           in: query
@@ -19459,6 +20706,20 @@ paths:
     get:
       operationId: get-api-v1-sessions
       parameters:
+        - description: Match child sessions individually when include_children is true
+          explode: false
+          in: query
+          name: flat
+          schema:
+            description: Match child sessions individually when include_children is true
+            type: boolean
+        - description: Include default-exclusion counts; true also samples hidden children, false counts only one-shot and automated sessions. First page only.
+          explode: false
+          in: query
+          name: exclusion_counts
+          schema:
+            description: Include default-exclusion counts; true also samples hidden children, false counts only one-shot and automated sessions. First page only.
+            type: boolean
         - description: Filter by project
           explode: false
           in: query
@@ -20692,6 +21953,93 @@ paths:
       summary: List child sessions
       tags:
         - Sessions
+  /api/v1/sessions/{id}/commits:
+    get:
+      operationId: get-api-v1-sessions-id-commits
+      parameters:
+        - description: Session ID
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Session ID
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DbSessionCommitList"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: List session commits
+      tags:
+        - Sessions
   /api/v1/sessions/{id}/directory:
     get:
       operationId: get-api-v1-sessions-id-directory
@@ -20790,6 +22138,13 @@ paths:
           schema:
             description: Session ID
             type: string
+        - description: Export unredacted secret values; localhost callers only
+          explode: false
+          in: query
+          name: reveal
+          schema:
+            description: Export unredacted secret values; localhost callers only
+            type: boolean
       responses:
         "200":
           content:
@@ -21082,6 +22437,13 @@ paths:
               - "1"
               - all
             type: string
+        - description: Export unredacted secret values; localhost callers only
+          explode: false
+          in: query
+          name: reveal
+          schema:
+            description: Export unredacted secret values; localhost callers only
+            type: boolean
       responses:
         "200":
           content:
@@ -21177,6 +22539,13 @@ paths:
     get:
       operationId: get-api-v1-sessions-id-messages
       parameters:
+        - description: Only compact boundary messages
+          explode: false
+          in: query
+          name: compact_boundary
+          schema:
+            description: Only compact boundary messages
+            type: boolean
         - description: Session ID
           in: path
           name: id
@@ -21986,6 +23355,13 @@ paths:
           name: secret
           schema:
             description: Create a secret gist instead of a public one
+            type: boolean
+        - description: Publish unredacted secret values; localhost callers only
+          explode: false
+          in: query
+          name: reveal
+          schema:
+            description: Publish unredacted secret values; localhost callers only
             type: boolean
       responses:
         "200":

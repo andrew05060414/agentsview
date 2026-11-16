@@ -48,13 +48,18 @@ async function installMessages(
     const session = await response.json();
     await route.fulfill({ response, json: { ...session, message_count: all.length } });
   });
+  let initialTailFailure = true;
   await page.route(`**/api/v1/sessions/${SESSION_ID}/messages*`, async (route) => {
     const url = new URL(route.request().url());
     const descending = url.searchParams.get("direction") === "desc";
     const from = Number(url.searchParams.get("from") ?? (descending ? all.length - 1 : 0));
     const limit = Number(url.searchParams.get("limit") ?? 1000);
     if (!descending && from >= 1000 && control.failTail) {
-      await route.fulfill({ status: 503, json: { error: "injected history failure" } });
+      // Keep startup recovery out of this manual-retry scenario. Search's
+      // own history load still gets a transient server failure.
+      const status = initialTailFailure ? 400 : 503;
+      initialTailFailure = false;
+      await route.fulfill({ status, json: { error: "injected history failure" } });
       return;
     }
     const messages = descending
@@ -77,15 +82,13 @@ async function find(page: Page) {
 }
 
 async function toggleBlockFilter(page: Page, label: string) {
-  const toggle = page.getByRole("button", { name: "Filter block types" });
-  await toggle.click();
-  await expect(page.locator(".block-filter-dropdown")).toHaveCount(1);
-  await page
-    .locator(".block-filter-item")
-    .filter({ has: page.locator(".block-filter-label", { hasText: label }) })
-    .click();
-  if (await page.locator(".block-filter-dropdown").count()) await toggle.click();
-  await expect(page.locator(".block-filter-dropdown")).toHaveCount(0);
+  const view = page.locator(".view-trigger");
+  await view.click();
+  const menu = page.getByRole("menu", { name: "Transcript view" });
+  await expect(menu).toBeVisible();
+  await menu.getByRole("menuitemcheckbox", { name: label, exact: true }).click();
+  await view.click();
+  await expect(menu).toHaveCount(0);
 }
 
 test.describe("session find audit regressions", () => {

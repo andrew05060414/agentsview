@@ -1840,6 +1840,23 @@ func TestLoadFile_EventsCoalesceInterval(t *testing.T) {
 	}
 }
 
+func TestLoadFile_SyncIdleAfter(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data map[string]any
+		want time.Duration
+	}{
+		{"default", map[string]any{}, 10 * time.Minute},
+		{"configured", map[string]any{"sync_idle_after": "4m"}, 4 * time.Minute},
+		{"disabled", map[string]any{"sync_idle_after": "0"}, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := loadMinimalWithConfig(t, tt.data)
+			assert.Equal(t, tt.want, cfg.SyncIdleAfter)
+		})
+	}
+}
+
 func TestLoadFile_DaemonIdleTimeout(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1854,6 +1871,23 @@ func TestLoadFile_DaemonIdleTimeout(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := loadMinimalWithConfig(t, tt.data)
 			assert.Equal(t, tt.want, cfg.DaemonIdleTimeout)
+		})
+	}
+}
+
+func TestLoadFile_SyncInterval(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data map[string]any
+		want time.Duration
+	}{
+		{name: "absent uses default", data: map[string]any{}, want: 5 * time.Second},
+		{name: "configured", data: map[string]any{"sync_interval": "60s"}, want: time.Minute},
+		{name: "explicit zero is kept", data: map[string]any{"sync_interval": "0s"}, want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := loadMinimalWithConfig(t, tt.data)
+			assert.Equal(t, tt.want, cfg.SyncInterval)
 		})
 	}
 }
@@ -2594,6 +2628,54 @@ output = 15.0
 	assert.Contains(t, err.Error(), "input_microdollars_per_mtok")
 }
 
+func TestLoadFile_CustomModelPricingPriceAs(t *testing.T) {
+	f := newConfigFixture(t)
+	f.WriteConfigText(t, `[custom_model_pricing.empty]
+
+[custom_model_pricing.fetched-alias]
+price_as = "new-catalog-model"
+
+[custom_model_pricing.qualified-deployment]
+price_as = "provider/gpt-6-sol"
+[custom_model_pricing."gpt-6-sol"]
+price_as = "gpt-5.6-luna"
+
+[custom_model_pricing.self]
+price_as = "self"
+`)
+
+	cfg := f.LoadMinimal(t)
+	assert.Equal(t, map[string]string{
+		"fetched-alias":        "new-catalog-model",
+		"qualified-deployment": "provider/gpt-6-sol",
+		"gpt-6-sol":            "gpt-5.6-luna",
+		"self":                 "self",
+	}, PricingAliases(cfg.CustomModelPricing))
+}
+
+func TestLoadFileRejectsInvalidCustomModelPricingPriceAs(t *testing.T) {
+	tests := []struct {
+		name, config, want string
+	}{
+		{"both", `[custom_model_pricing.alias]
+price_as = "gpt-6-sol"
+input_microdollars_per_mtok = 0
+`, `custom_model_pricing."alias": price_as cannot be combined with rate fields`},
+		{"empty target", `[custom_model_pricing.alias]
+price_as = ""
+`, `price_as must not be empty`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newConfigFixture(t)
+			f.WriteConfigText(t, tt.config)
+			err := f.LoadMinimalErr(t)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
 func TestLoadFile_RemoteHosts(t *testing.T) {
 	f := newConfigFixture(t)
 	f.WriteConfigText(t, `[[remote_hosts]]
@@ -3158,4 +3240,72 @@ func TestLoadFile_ModelAliases(t *testing.T) {
 			assert.Equal(t, tt.want, cfg.ModelAliases)
 		})
 	}
+}
+
+func TestSaveVectorSetupPreservesSettings(t *testing.T) {
+	for _, raw := range []string{
+		"port = 12345\n[vector]\nenabled = false\ninclude_automated = true\n",
+		"[vector]\nenabled = false\n[vector.embeddings]\nmodel = 'test-model'\ndimension = 3\nmodel_context_tokens = 0\nquery_prefix = ''\ndocument_prefix = ''\ninput_suffix = '!'\nrequest_dimensions = false\n[vector.embeddings.servers.local]\nendpoint = 'https://example.com/v1'\nmax_retries = 0\n",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			dir := setupTestEnv(t)
+			path := filepath.Join(dir, configFileName)
+			cfg, err := LoadReadOnly()
+			require.NoError(t, err)
+			// Setup reads edits made after the daemon loaded its config.
+			require.NoError(t, os.WriteFile(path, []byte(raw), 0o600))
+			var expected map[string]any
+			_, err = toml.Decode(raw, &expected)
+			require.NoError(t, err)
+			expected["vector"].(map[string]any)["enabled"] = true
+			require.NoError(t, cfg.SaveVectorSetup())
+			var saved map[string]any
+			_, err = toml.DecodeFile(path, &saved)
+			require.NoError(t, err)
+			assert.Equal(t, expected, saved)
+		})
+	}
+}
+
+func TestSaveVectorSetupRejectsInvalidCurrentSettings(t *testing.T) {
+	for _, tc := range []struct{ name, raw, wantError string }{
+		{name: "invalid token budget", raw: "[vector]\nenabled = false\n[vector.embeddings]\nmodel = 'test-model'\ndimension = 3\nmodel_context_tokens = 512\n[vector.embeddings.servers.local]\nendpoint = 'https://example.com/v1'\nmax_batch_tokens = 256\n"},
+		{name: "array of vector tables", raw: "[[vector]]\nenabled = false\n[vector.embeddings]\nmodel = 'test-model'\ndimension = 3\n[vector.embeddings.servers.local]\nendpoint = 'https://example.com/v1'\n", wantError: "vector must be a table"},
+		{name: "scalar vector", raw: "vector = 'preserve this value'\n", wantError: "vector must be a table"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := setupTestEnv(t)
+			cfg, err := LoadReadOnly()
+			require.NoError(t, err)
+			path := filepath.Join(dir, configFileName)
+			require.NoError(t, os.WriteFile(path, []byte(tc.raw), 0o600))
+			_, setupErr := cfg.VectorSetupEmbeddings()
+			saveErr := cfg.SaveVectorSetup()
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+			assert.Equal(t, tc.raw, string(data))
+			require.ErrorIs(t, setupErr, ErrInvalidVectorSetup)
+			require.ErrorIs(t, saveErr, ErrInvalidVectorSetup)
+			if tc.wantError != "" {
+				require.ErrorContains(t, setupErr, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestAuthFlagRetiredOnlyBySuccessfulAuthSave(t *testing.T) {
+	cfg, err := loadConfigFromPFlags(t, "--require-auth=false")
+	require.NoError(t, err)
+	require.False(t, cfg.AuthSettingsSaved)
+	require.NoError(t, cfg.SaveSettings(map[string]any{"tool_result_images": ToolResultImages("drop")}))
+	assert.False(t, cfg.AuthSettingsSaved)
+	configPath := cfg.configPath()
+	saved, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(configPath, []byte("[invalid"), 0o600))
+	require.Error(t, cfg.SaveSettings(map[string]any{"require_auth": false}))
+	assert.False(t, cfg.AuthSettingsSaved)
+	require.NoError(t, os.WriteFile(configPath, saved, 0o600))
+	require.NoError(t, cfg.SaveSettings(map[string]any{"require_auth": false}))
+	assert.True(t, cfg.AuthSettingsSaved)
 }

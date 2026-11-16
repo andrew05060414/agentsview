@@ -3,6 +3,7 @@ import {
   KNOWN_AGENTS,
   agentColor,
   agentForeground,
+  agentInk,
   agentLabel,
   entrypointBadge,
 } from "./agents.js";
@@ -17,6 +18,7 @@ describe("KNOWN_AGENTS", () => {
       "codex-cloud",
       "traex",
       "augure-code",
+      "open-interpreter",
       "augure-desktop",
       "copilot",
       "devin",
@@ -38,6 +40,7 @@ describe("KNOWN_AGENTS", () => {
       "visualstudio-copilot",
       "pi",
       "stepcode",
+      "direct-api",
       "fx",
       "tau",
       "prime-agent",
@@ -110,6 +113,19 @@ describe("agentForeground", () => {
   });
 });
 
+describe("agentInk", () => {
+  it("writes agent names in their accent's ink, falling back to the accent", () => {
+    expect(agentInk("vibe")).toBe("var(--accent-orange-ink, var(--accent-orange))");
+    expect(agentInk("copilot")).toBe("var(--accent-amber-ink, var(--accent-amber))");
+    expect(agentInk("cursor")).toBe("var(--accent-black-ink, var(--accent-black))");
+  });
+
+  it("uses the blue ink for unknown agents", () => {
+    expect(agentInk("unknown")).toBe("var(--accent-blue-ink, var(--accent-blue))");
+    expect(agentInk("")).toBe("var(--accent-blue-ink, var(--accent-blue))");
+  });
+});
+
 describe("entrypointBadge", () => {
   it("shows non-default entrypoints and hides the default cli value", () => {
     expect(entrypointBadge("sdk-cli")).toBe("sdk-cli");
@@ -156,11 +172,13 @@ describe("agentLabel", () => {
     expect(agentLabel("deepseek-harness")).toBe("DeepSeek Harness");
     expect(agentLabel("prime-agent")).toBe("Prime Agent");
     expect(agentLabel("stepcode")).toBe("StepCode");
+    expect(agentLabel("direct-api")).toBe("Direct API");
     expect(agentLabel("qoder")).toBe("Qoder");
     expect(agentLabel("roocode")).toBe("RooCode");
     expect(agentLabel("omnigent")).toBe("Omnigent");
     expect(agentLabel("traex")).toBe("TraeX");
     expect(agentLabel("augure-code")).toBe("Augure Code");
+    expect(agentLabel("open-interpreter")).toBe("Open Interpreter");
     expect(agentLabel("augure-desktop")).toBe("Augure Desktop");
     expect(agentLabel("opencodereview")).toBe("Open Code Review");
     expect(agentLabel("crush")).toBe("Charm Crush");

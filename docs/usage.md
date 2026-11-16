@@ -9,9 +9,13 @@ interface.
 
 ## Dashboard
 
-When you open AgentsView with no session selected, you see the analytics
+If your archive is empty, AgentsView shows **No sessions yet** and lists the
+folders it reads for sessions. **Choose folders** opens **Settings > Session
+Providers**, where you can configure those sources.
+
+With sessions in your archive and no session selected, you see the analytics
 dashboard. It provides a high-level overview of your agent activity across all
-projects.
+projects, including when filters hide every session in the sidebar.
 
 ![Analytics dashboard](/docs/assets/generated/screenshots/dashboard.png)
 
@@ -32,10 +36,14 @@ last sync time, and the build version.
 
 On the normal local `agentsview serve` runtime, the session lists in the sidebar
 update automatically from a global SSE event stream (debounced during busy
-syncs). The dashboard, Usage page, and Activity page do not refetch their charts
+syncs). The dashboard and Activity page do not refetch their charts
 on every sync event — each pairs a manual refresh button with a relative
 "Updated…" timestamp, and the Analytics dashboard also refreshes periodically on
-its own. Click refresh, or change the date range, to pull the latest numbers.
+its own. Use refresh or change the date range for an immediate update.
+
+Usage refreshes after session data changes and on its five-minute timer,
+at most once a minute while visible.
+It pauses while hidden and catches up when you return.
 
 For range-based concurrency and agent-minutes reporting, use the top-level
 [Activity](/docs/activity/) page.
@@ -423,16 +431,12 @@ Each session item shows:
   from other machines show a machine name tag. Only visible in shared multi-host
   deployments.
 - **Project name** — abbreviated, right-aligned
-- **Relative time** — "2h ago", "Mon", "Dec 1"
+- **Session time** — relative time such as "2h ago", or the date and time with the year when **Always show year** is on
 - **User prompt count** — number of user messages in the session
 
 Antigravity sessions show the conversation title Antigravity saves in
 `conversation_summaries.db`. Renames appear shortly after that file changes,
-or on the next `agentsview source sync`. Names set in AgentsView still win. The
-same file also gives each session its workspace folder, which sets the project,
-and its parent conversation when it has one. AgentsView records these once: a
-workspace or parent already recorded is kept even if Antigravity later changes
-or drops it.
+or on the next `agentsview source sync`. Names set in AgentsView still win.
 
 Qoder's database title lookup applies to `~/.qoder/projects` and
 `~/.qoder-cn/projects`. The Qoder app stores titles in `main.sqlite` under
@@ -660,9 +664,10 @@ when that value is the most common effort for the displayed model. Effort is a
 model setting, not a measured token count. Upgrading resyncs existing sessions
 to populate it when the source files remain available.
 
-If a parser skipped malformed source lines while still recovering the session,
-the header shows a malformed-lines badge with the persisted count (for example
-"3 malformed lines"). For Antigravity IDE and CLI sessions decoded from an
+If a parser skipped malformed source lines, records larger than 64 MiB, or
+database rows it could not decode while still recovering the session, the
+header shows a malformed-lines badge with the persisted count (for example "3
+malformed lines"). For Antigravity IDE and CLI sessions decoded from an
 unrecognized SQLite schema fingerprint, the header also shows **Unverified
 schema**. That badge means the session was decoded heuristically from a newer
 schema and may be incomplete.
@@ -698,9 +703,10 @@ agents still collapses to its prompts and final answers.
 
 ![Focused transcript mode](/docs/assets/generated/screenshots/focused-transcript.png)
 
-Toggle between Normal and Focused mode using the transcript mode button in the
-session header. The header adjusts responsively to fit the available space. The
-mode preference is saved in localStorage.
+Switch between Normal and Focused mode in the **Transcript view** menu in the
+session header: under **Content**, choose **All messages and tool calls** or
+**Only your prompts and final answers**. The mode preference is saved in
+localStorage.
 
 ### Message Display
 
@@ -820,7 +826,7 @@ so matches can be highlighted.
 ### Block-Type Filtering
 
 Click the filter icon in the message viewer header to open a dropdown that
-toggles visibility of six content categories:
+toggles visibility of seven content categories:
 
 | Category  | What It Controls          |
 | --------- | ------------------------- |
@@ -830,6 +836,7 @@ toggles visibility of six content categories:
 | Tool      | Tool call blocks          |
 | Code      | Code blocks               |
 | System    | System boundary cards     |
+| Hooks     | Hook output cards         |
 
 Turning off **Code** collapses each fenced block into an inline placeholder
 showing its language and an **Expand** button. Expand or collapse individual
@@ -1068,6 +1075,9 @@ Search in one of three modes:
 The palette remembers the last mode you selected across openings and browser
 sessions. Results update after a 300ms typing pause.
 
+The palette automatically retries a transient Full text search failure once. If
+the search still fails, select **Retry** to try again.
+
 !!! tip
 
     For deeper searches across full transcripts — including thinking, tool inputs, tool result
@@ -1177,7 +1187,7 @@ can copy the session directory and open it in detected editors or file browsers.
 Pi sessions use `pi --session` with the transcript path when available, or the
 native session ID. For Pi, **Copy command** includes the working directory so
 you can paste the complete command into a shell. Augure Code sessions use
-`augure resume`. Copying a session's directory path also works when that
+`augure resume`, and Open Interpreter sessions use `interpreter resume`. Copying a session's directory path also works when that
 directory has been deleted.
 
 Local Codex sessions add **Open in Codex Desktop**, which deep-links to the
@@ -1263,13 +1273,33 @@ Then attach `session-context.md` to another agent run or paste its contents into
 a prompt so the next agent can inspect the full session tree without opening the
 AgentsView UI.
 
+### Secrets in exports
+
+The HTML and Markdown exports mask detected secrets, such as API keys, tokens
+and private keys. They use the same detector and masked form as search results,
+for example `AKIA…PLJM` for an AWS access key. Message text, thinking text, and
+tool input and output are all masked. Detection is best-effort; see
+[SECURITY.md](https://github.com/kenn-io/agentsview/blob/main/SECURITY.md#secrets-subsystem)
+for its limits.
+
+To export the stored text unchanged, add `reveal=true`:
+
+```bash
+curl "http://127.0.0.1:8080/api/v1/sessions/<session-id>/md?depth=all&reveal=true" \
+  -o session-context.md
+```
+
+Only a request made directly from localhost may use `reveal`. A remote or
+proxied request that asks for it gets HTTP 403, the same rule as revealing
+secrets in search and the secrets list.
+
 ______________________________________________________________________
 
 ## Publish to Gist
 
-Press `p` or click the publish button to share a session via GitHub Gist. As of
-0.33.0, the publish button is a dropdown with two entries: **Publish public
-Gist** and **Publish secret Gist**. The `p` shortcut publishes publicly.
+Press `p` or open the **More actions** menu in the header to share a session via
+GitHub Gist. The menu has two entries: **Publish public Gist** and **Publish
+secret Gist**. The `p` shortcut publishes publicly.
 
 ![Publish modal](/docs/assets/generated/screenshots/publish-modal.png)
 
@@ -1298,6 +1328,11 @@ After publishing, the modal shows two URLs:
 - **Gist URL** — direct GitHub link
 
 Both have copy buttons and an "Open in Browser" action.
+
+The published gist masks detected secrets in the transcript and in the gist
+description, the same way as [session export](#secrets-in-exports). The publish
+endpoint, `POST /api/v1/sessions/{id}/publish`, accepts the same
+localhost-only `reveal=true` parameter; the UI does not use it.
 
 ______________________________________________________________________
 
@@ -1359,11 +1394,10 @@ organized into sections:
 | Section            | What You Can Configure                                                                                   |
 | ------------------ | -------------------------------------------------------------------------------------------------------- |
 | Language           | Interface language (Azerbaijani, English, French, Japanese, Korean, Spanish, Simplified Chinese, or Traditional Chinese)       |
-| Appearance         | Theme (light/dark), high-contrast mode, chart colors, message colors, message layout, zoom, block visibility |
+| Appearance         | Theme (light/dark), high-contrast mode, chart colors, message colors, message layout, zoom, always show year, block visibility |
 | Date ranges        | Browser-local checkbox for linking date selections across Sessions, Usage, Activity, Trends, and Quality |
 | Session Providers  | Enable session providers, inspect their session directories, and add alternate agent homes               |
-| Archive content    | Choose whether future imports keep, drop, or offload tool-result images                                  |
-| Tool-result images | Preview and remove images from stored tool results                                                       |
+| Tool-result images | Choose whether future imports keep, drop, or offload tool-result images; preview and remove images already stored |
 | Terminal           | Default terminal emulator for session resume                                                             |
 | Embeddings         | Current semantic-index build phase, progress, throughput, ETA, last result, and local generations        |
 | GitHub             | Personal access token for Gist publishing                                                                |

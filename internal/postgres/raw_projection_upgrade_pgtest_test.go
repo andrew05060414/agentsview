@@ -10,6 +10,7 @@ import (
 )
 
 func TestHostedReprovisionRestoresMigratedColumnsAndIndexes(t *testing.T) {
+	t.Parallel()
 	f := newHostedFixture(t, "tenant-upgrade")
 	_, err := f.runtime.ExecContext(t.Context(), `INSERT INTO sessions(id,project,machine,agent) VALUES('preserved','project','device','codex')`)
 	require.NoError(t, err)
@@ -34,4 +35,18 @@ func TestHostedReprovisionRestoresMigratedColumnsAndIndexes(t *testing.T) {
 	_, constructorErr = NewRawProjectionStore(t.Context(), f.runtime, RawProjectionOptions{Tenant: f.tenant})
 	require.NoError(t, constructorErr)
 	require.NoError(t, CheckHostedTenant(t.Context(), f.runtime, f.schema, f.tenant))
+}
+
+func TestHostedRuntimeRequiresDialogueContentMarker(t *testing.T) {
+	t.Parallel()
+	f := newHostedFixture(t, "tenant-dialogue-marker")
+	// Model a hosted schema provisioned before raw_message_dialogue.is_content.
+	_, err := f.admin.ExecContext(t.Context(), `ALTER TABLE raw_message_dialogue DROP COLUMN is_content`)
+	require.NoError(t, err)
+	_, constructorErr := NewRawProjectionStore(t.Context(), f.runtime, RawProjectionOptions{Tenant: f.tenant})
+	require.Error(t, constructorErr)
+	assert.Contains(t, constructorErr.Error(), "owner provisioning")
+	require.NoError(t, EnsureHostedTenant(t.Context(), f.admin, f.schema, f.tenant))
+	_, constructorErr = NewRawProjectionStore(t.Context(), f.runtime, RawProjectionOptions{Tenant: f.tenant})
+	require.NoError(t, constructorErr)
 }

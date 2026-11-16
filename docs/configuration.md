@@ -19,6 +19,7 @@ AgentsView stores all persistent data under a single directory, defaulting to
 ├── assets/          # Images stored outside SQLite
 ├── vectors.db       # Semantic-search vector index (when [vector] is enabled)
 ├── usage-cache-v6-<id>.db # Disposable usage-aggregate cache
+├── usage-postgres/  # Disposable PostgreSQL usage caches
 ├── telemetry-install-id # Application installation ID
 ├── telemetry-daemon-active.lock  # Serializes daily daemon reports
 ├── telemetry-setup-finished.lock # Serializes the one-time setup report
@@ -43,12 +44,16 @@ has stopped before rotating. Debug log writes share `debug.log.rotate.lock`
 and wait while rotation holds it exclusively. If the lock is busy or the
 backup fails, AgentsView keeps the active log intact.
 
-`usage-cache-v6-<id>.db` is a derived cache of usage aggregates, not user data.
-It is safe to delete when no AgentsView process is running; the next usage query
-rebuilds it automatically. Back up `sessions.db` for session history, `assets/`
+`usage-cache-v6-<id>.db` and `usage-postgres/` contain derived usage aggregates.
+They are safe to delete when no AgentsView process is running; the next usage
+query rebuilds them automatically. Back up `sessions.db` for session history, `assets/`
 for images stored outside SQLite, `config.toml` for settings, and
 `telemetry-install-id` for installation identity. Keep the database and assets
 together when restoring or moving the archive.
+
+Trends keeps per-session counts under `$CACHE_DIRECTORY/sqlite-trends`, or
+`agentsview/sqlite-trends` in the user cache directory, up to 256 MiB per
+archive. They are safe to delete; the next Trends visit counts messages again.
 
 SQLite needs a writable temp directory for session writes and large sorts.
 AgentsView uses the system temp directory: `TMP` or `TEMP` on Windows, and
@@ -59,8 +64,10 @@ choice. To use a different directory, point those variables at a writable
 directory before you start AgentsView.
 
 The desktop app and CLI share a detached local daemon for fresh reads and
-writes. A running daemon owns local SQLite writes for this data directory and
-self-exits after an idle period. Ordinary session commands require the daemon.
+writes. A running daemon owns local SQLite writes for this data directory.
+Automatically started daemons self-exit after an idle period; `daemon start`
+and `daemon restart` stay running until stopped. Ordinary session commands
+require the daemon.
 Dedicated diagnostics, including `db adopt-machine --list` and `doctor sync`,
 can inspect the archive without starting it. Set `AGENTSVIEW_NO_DAEMON=1` when a
 script must never auto-start a daemon; commands that require one will refuse.
@@ -115,9 +122,10 @@ Limits of the narrower policies:
     be present in the archive, use `"usage"`, which stores no transcript text.
 - `"transcripts"` keeps session search, transcript viewing, and tool analytics
     working, but signals and secret findings that read tool inputs or results
-    (tool failure detection, repeated identical calls, secrets inside tool
-    output) see empty payloads. `result_content_blocked_categories` has no
-    additional effect under this policy. Archived RooCode, Kilo Legacy, gptme,
+    see empty payloads. Content-based tool failure detection and secrets inside
+    tool output find nothing, and no calls count as repeated identical calls.
+    `result_content_blocked_categories` has no additional effect under this
+    policy. Archived RooCode, Kilo Legacy, gptme,
     OpenHands, Aider, Codex, TraeX, and Zencoder sessions parsed before data
     version 105 and whose source files are gone cannot be re-parsed, so a
     rebuild drops every row shape those parsers once used for tool output. This
@@ -152,8 +160,8 @@ writes keep inline content, and archives that omit tool content write no assets.
 See [image storage](/docs/data/#ingest-time-image-offload) for retries, backups,
 and remote-backend limits.
 
-You can also select **Offload** under **Settings > Archive content**. The
-restart notice appears after you save a changed policy.
+You can also select **Offload** under **Settings > Tool-result images**. After
+you save a changed policy, select **Restart now** in the notice to apply it.
 
 ![Tool-result image policy in Settings](/docs/assets/generated/screenshots/settings-archive-content.png)
 
@@ -250,9 +258,27 @@ cursor_secret = "base64-encoded-secret"
 require_auth = true
 cursor_admin_api_key = "key_xxxxx"
 daemon_idle_timeout = "20m"
+sync_idle_after = "10m"
+sync_interval = "5s"
 chart_palette = "agentsview"
 zoom_level = 120
 ```
+
+`sync_idle_after` defaults to `"10m"`. After this long without a client request
+or an open event stream, local serve stops watching session files and pauses its
+local sync timers, remote-source sync, S3 imports, and attachment imports.
+Remote-host polling, Codex Cloud capture, replica push, and raw uploads keep their
+own schedules.
+The next archive request starts catch-up for files changed or added since
+collection paused. Requests share a two-second wait budget from the start of
+catch-up. After that, reads return immediately with a stale-results warning
+while catch-up continues in the
+background.
+The warning clears when catch-up finishes or fails, and failures are logged.
+Every client request except `/api/ping` counts as activity. Version and sync-status
+probes report readiness without starting catch-up.
+Desktop health probes keep the daemon alive without restarting sync.
+Set it to `"0"` to keep syncing while idle. Restart the server after changing it.
 
 | Field                               | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -263,14 +289,16 @@ zoom_level = 120
 | `cursor_admin_user_id`              | Optional default Cursor Admin usage filter by member user ID                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `github_token`                      | Optional saved GitHub token for Gist publishing                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `result_content_blocked_categories` | Tool categories whose result content is not stored (default: `["Read", "Glob"]`). Changes apply to new ingestion and full rebuilds; see [storage maintenance](/docs/data/#storage-maintenance) for existing source-backed sessions.                                                                                                                                                                                                                                              |
-| `tool_result_images`                | Retain supported inline tool-result image blocks with `"keep"` (default), or store readable `agentsview_image` placeholders with `"drop"`, or move supported images to the local asset store with `"offload"`. The setting affects future ingestion and full resyncs; use `db migrate --images` to move existing images or `db strip --images` to remove them from stored results; also configurable under **Settings > Archive content**, and changes require a daemon restart. |
+| `tool_result_images`                | Retain supported inline tool-result image blocks with `"keep"` (default), or store readable `agentsview_image` placeholders with `"drop"`, or move supported images to the local asset store with `"offload"`. The setting affects future ingestion and full resyncs; use `db migrate --images` to move existing images or `db strip --images` to remove them from stored results; also configurable under **Settings > Tool-result images**, and changes require a daemon restart. |
 | `archive_content`                   | How much of each session the archive stores: `"full"` (default), `"transcripts"`, or `"usage"`; changes require a daemon restart — see [Archive content](#archive-content)                                                                                                                                                                                                                                                                                                       |
 | `host`                              | Interface the server binds to (default `127.0.0.1`); non-loopback values require `require_auth = true`                                                                                                                                                                                                                                                                                                                                                                           |
 | `require_auth`                      | Require bearer-token authentication for API access                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `auth_token`                        | Auto-generated 256-bit bearer token for remote access; overridden by `AGENTSVIEW_AUTH_TOKEN`, or by `AGENTSVIEW_AUTH_TOKEN_FILE` under a [container deployment](#container-deployment)                                                                                                                                                                                                                                                                                           |
 | `public_url`                        | Browser URL, trusted origin, and managed Caddy site address                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `public_origins`                    | Additional trusted origins for request Host/Origin checks                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `daemon_idle_timeout`               | Idle timeout for detached writable daemons; set to `"0s"` to keep them alive                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `daemon_idle_timeout`               | Idle timeout for automatically started and `serve --background` writable daemons; set to `"0s"` to keep them alive                                                                                                                                                                                                                                                                                                                                                               |
+| `sync_idle_after`                   | Pause local collection after this long without client activity; defaults to `"10m"`, with `"0"` disabling the pause                                                                                                                                                                                                                                                                                                                                                              |
+| `sync_interval`                     | Minimum time between watcher-triggered session sync starts in `serve` and archive push commands. Default `"5s"`; use `"60s"` for less frequent syncs. Zero or negative durations disable the minimum interval. While a [change stream](/docs/conversation-export/#follow-changes-live) is open, `serve` uses at most `"1s"`. Applies on restart or when provider changes rebuild watchers. Raw sync, live-activity polling, and periodic catch-up keep their own timers.         |
 | `chart_palette`                     | Server-wide categorical chart colors: `"agentsview"` (default), `"matplotlib"`, or `"colorblind"`; also configurable under **Settings > Appearance**                                                                                                                                                                                                                                                                                                                             |
 | `zoom_level`                        | Default interface zoom for clients without a local preference: `67`, `75`, `80`, `90`, `100`, `110`, `120`, `125`, `130`, `150`, `175`, or `200`. Defaults to `100` when omitted. Restart the daemon after manual edits                                                                                                                                                                                                                                                          |
 | `disabled_agents`                   | Session providers to exclude from local filesystem scanning — see [Disabling Session Providers](#disabling-session-providers)                                                                                                                                                                                                                                                                                                                                                    |
@@ -287,6 +315,7 @@ zoom_level = 120
 | `[friction]`                        | Opt-in Friction Log review; set `enabled = true` to review changed sessions in the background after each sync — see [Friction Log](#friction-log)                                                                                                                                                                                                                                                                                                                                |
 | `[kata]`                            | Optional Kata issue-tracker connection; off by default; HTTPS needs `token_env` — see [Kata](/docs/kata/)                                         |
 | `[[remote_hosts]]`                  | Remote machines synced by a bare `agentsview source sync` — see [CLI Reference](/docs/commands/#agentsview-sync)                                                                                                                                                                                                                                                                                                                                                                 |
+| `[agents.claude-ai]`                | Organizations Claude.ai Sync imports — see [Choose which organizations Sync imports](/docs/chat-import/#choose-which-organizations-sync-imports) |
 | `[[session_sources]]`               | Additional filesystem session roots with per-root machine keys — see [Filesystem Session Sync](/docs/filesystem-sync/)                                                                                                                                                                                                                                                                                                                                                           |
 | `[automated]`                       | Custom automated-session patterns — see [Automated Session Detection](#automated-session-detection)                                                                                                                                                                                                                                                                                                                                                                              |
 | `[custom_model_pricing]`            | Per-model price overrides for usage reports — see [Custom Model Pricing](/docs/token-usage/#custom-model-pricing)                                                                                                                                                                                                                                                                                                                                                                |
@@ -495,10 +524,10 @@ For a one-off flag override, `agentsview serve --background --host 0.0.0.0`
 remains available, including without auth. Prefer authenticated persistent
 configuration for an always-available remote node.
 
-Detached writable daemons started by `agentsview daemon start`, automatic CLI
-startup, or `agentsview serve --background` exit after `daemon_idle_timeout`
-when idle. Set it to zero on machines that should stay available for HTTP remote
-sync:
+Explicit `agentsview daemon start` and `daemon restart` stay running until
+stopped. Automatic CLI startup and `agentsview serve --background` exit after
+`daemon_idle_timeout` when idle. Set it to zero on machines that should stay
+available for HTTP remote sync:
 
 ```toml
 daemon_idle_timeout = "0s"
@@ -599,6 +628,7 @@ keeps its default directories.
 | OpenClaw              | `~/.openclaw/agents/` and `~/.kimi_openclaw/agents/`                                                                                                             | JSONL per session or SQLite per agent (`agent/openclaw-agent.sqlite`)                                                                                        |
 | OpenCode              | `~/.local/share/opencode/`                                                                                                                                       | SQLite DB or `storage/` JSON files                                                                                                                            |
 | Open Code Review      | `~/.opencodereview/sessions/`                                                                                                                                    | One JSONL file per review under an encoded project directory                                                                                                  |
+| Open Interpreter      | `~/.openinterpreter/sessions/`, `archived_sessions/`                                                                                                             | Codex-format JSONL per session                                                                                                                                |
 | OpenHands CLI         | `~/.openhands/conversations/`                                                                                                                                    | Per-conversation `base_state.json` + `events/*.json`                                                                                                          |
 | Omnigent              | `~/.omnigent/`                                                                                                                                                   | SQLite `chat.db`, one session per conversation                                                                                                                |
 | Pi                    | `~/.pi/agent/sessions/`                                                                                                                                          | JSONL per session                                                                                                                                             |
@@ -606,6 +636,7 @@ keeps its default directories.
 | Tau                   | `~/.tau/sessions/`                                                                                                                                               | JSONL transcripts under `<project>/`, with metadata `index.jsonl` excluded                                                                                    |
 | Prime Agent           | `~/.prime/agent/sessions/`                                                                                                                                       | Flat Pi-family JSONL sessions                                                                                                                                 |
 | StepCode              | `~/.stepcode/agent/sessions/`                                                                                                                                    | JSONL per session                                                                                                                                             |
+| Direct API            | `~/.agentsview/direct-api/`                                                                                                                                      | Body-free JSONL usage files                                                                                                                                   |
 | Poolside              | `~/Library/Application Support/poolside/trajectories/` (macOS), `~/.local/state/poolside/trajectories/` (Linux), `%APPDATA%\\poolside\\trajectories\\` (Windows) | NDJSON trajectory files                                                                                                                                       |
 | Piebald               | `~/.local/share/piebald/`                                                                                                                                        | SQLite database (`app.db`)                                                                                                                                    |
 | Posit Assistant       | `~/.posit/assistant/workspaces/`                                                                                                                                 | Per-conversation `conversation.json` tree plus `lm-messages.jsonl` transcript                                                                                 |
@@ -643,6 +674,15 @@ reads it without writing or migrating the database.
 under the separate `augure-code` agent ID. Set `AUGURE_CODE_SESSIONS_DIR` or
 `agents.augure-code.dirs` for another sessions root. Resume these sessions with
 `augure resume`, not `codex resume`.
+
+**Open Interpreter** reads Codex-format JSONL from
+`~/.openinterpreter/sessions/` and `~/.openinterpreter/archived_sessions/` and
+appears under the separate `open-interpreter` agent ID. Set `INTERPRETER_HOME`
+to move both defaults, as Open Interpreter itself does, or set
+`OPEN_INTERPRETER_SESSIONS_DIR` or `agents.open-interpreter.dirs` for other
+sessions roots. `CODEX_HOME` does not affect these paths. Resume these sessions
+with `interpreter resume`. Sessions are titled by their first prompt; names
+set with Open Interpreter's rename command are not read.
 
 **Augure Desktop 3 beta** reads `state.db` and its `sessions/` sibling from
 `~/.augure-desktop/` on macOS and Linux, or `~/AppData/Local/augure-desktop/` on
@@ -741,8 +781,10 @@ one or more explicit roots.
 Grok sessions are read from `summary.json` (title, timestamps, project),
 optional `signals.json` (token counters), and `chat_history.jsonl` when present
 for the full transcript (user turns, assistant replies, thinking, and tool
-calls). If `chat_history.jsonl` is missing, AgentsView falls back to
-summary-only mode. Set `GROK_DIR` or `agents.grok.dirs` to override the default
+calls). Grok trims `chat_history.jsonl` each time it compacts a session, so
+AgentsView rebuilds the turns before each compaction from `updates.jsonl` and
+marks each compaction in the transcript. If `chat_history.jsonl` is missing,
+AgentsView falls back to summary-only mode. Set `GROK_DIR` or `agents.grok.dirs` to override the default
 directory.
 
 **Goose default directories** are:
@@ -1154,6 +1196,7 @@ export VIBE_SESSIONS_DIR=~/custom/vibe/logs/session
 export OMP_DIR=~/custom/omp
 export OPENCLAW_DIR=~/custom/openclaw
 export OPENCODE_DIR=~/custom/opencode
+export OPEN_INTERPRETER_SESSIONS_DIR=~/custom/openinterpreter/sessions
 export OPENCODEREVIEW_DIR=~/custom/opencodereview/sessions
 export OPENHANDS_CONVERSATIONS_DIR=~/custom/openhands
 export PI_DIR=~/custom/pi
@@ -1368,10 +1411,10 @@ listening in on, that it is listening in on none right now, that live tokens are
 off and why, or that live tokens stopped after a reply AgentsView could not
 read.
 
-A detached daemon normally exits once it has been idle for `daemon_idle_timeout`.
-While AgentsView is listening in on a running chat, the daemon stays up past that
-timeout, for at most 6 hours per chat. A daemon that is shutting down does not
-start listening in on new chats.
+An automatically started daemon normally exits once it has been idle for
+`daemon_idle_timeout`. While AgentsView is listening in on a running chat, the
+daemon stays up past that timeout, for at most 6 hours per chat. A daemon that
+is shutting down does not start listening in on new chats.
 
 Each token update carries the chat's running total, so an update also covers
 every turn that finished before it, back to the last time OpenAI restarted that
@@ -1727,6 +1770,12 @@ with the existing per-agent parser, records the original `s3://` URI as
 `file_path`, and removes the temporary file. No persistent local mirror is
 created.
 
+Codex forks and subagents also need their parent's rollouts to filter replayed
+turns. A sync downloads each parent once and shares it with every child it
+processes. If a parent's object changes during the sync, later children get
+the new version. The sync keeps about 512 MiB of recent parent rollouts in a
+temporary directory and removes that directory when the sync ends.
+
 Credentials and endpoint configuration use standard AWS-style environment
 variables:
 
@@ -1955,11 +2004,10 @@ backing off to daily; a restart also retries.
 
 ## History from a saved archive
 
-This feature is unreleased. It lets an ordinary AgentsView installation browse
-and search a retired machine's history alongside current local sessions. The
-original Claude and Codex files stay in their Docbank storage; you can attach a
-backup snapshot or an existing archive directory. Neither requires a permanent
-extracted transcript directory.
+Browse and search a retired machine's history alongside your current local
+sessions. The original Claude and Codex files stay in their Docbank storage; you
+can attach a backup snapshot or an existing archive directory. Neither requires
+a permanent extracted transcript directory.
 
 Copy an AgentsView archive backup repository to a local disk or mounted share.
 Add its path and the exact snapshot ID from the backup report to `config.toml`:
@@ -2097,7 +2145,8 @@ mechanisms:
 
 1. **File watcher** — uses FSEvents on macOS and fsnotify elsewhere to detect
     file changes. An isolated edit is batched for 500ms; watcher-driven sync
-    start times remain at least five seconds apart. Common dependency and build
+    start times remain at least five seconds apart by default (see
+    [`sync_interval`](#config-file)). Common dependency and build
     folders (`node_modules`, `__pycache__`, `.git`, `vendor`, `dist`, etc.) are
     automatically skipped to reduce noise and overhead. On macOS, FSEvents
     reports a file that its producer keeps open only when the file is created
@@ -2135,6 +2184,15 @@ file:
 Change detection uses file size, mtime, inode, and device tracking to validate
 incremental parses more reliably. A pool of 8 workers processes files in
 parallel during sync.
+
+On `main` (not yet released), shared JSONL discovery can isolate an inaccessible
+file or subtree when the provider supports scoped traversal. A dangling symlink
+remains incomplete, but retries inspect only the unfinished scope. Archived
+sessions beneath that scope remain available, and unrelated session changes
+continue importing. Restoring access lets the retained retry complete without a
+daemon restart. Actual source removal still follows the normal source-missing
+policy. Opaque failures and passes with more than 256 reported failure scopes
+retain the original conservative retry scope.
 
 Codex history hints are available when the producing frontend writes
 `history.jsonl`. In Codex configuration, `[history] persistence = "none"`
@@ -2191,7 +2249,8 @@ progress detail, and log path while the daemon holds the start lock.
 The Friction Log records moments a session went wrong: corrections, failed
 commands, workarounds, deferrals, repeated patterns, frustration, and
 interruptions. Review is off by default because it reads every changed
-transcript a second time.
+transcript a second time. To learn how to read a digest, see
+[Friction Log](/docs/quality/#friction-log).
 
 ```toml
 [friction]
@@ -2199,6 +2258,11 @@ enabled = true
 backfill_days = 7
 timezone = "" # Local time on SQLite, UTC on PostgreSQL; or an IANA zone.
 seat_patterns = [] # Optional path globs with one whole-segment {seat} capture.
+
+[friction.kata]
+auto_file = false # The hub files recent patterns to Kata every hour and reopens recurring ones.
+kinds = [] # Kinds to file automatically; empty means all that can be filed.
+min_sessions = 2 # File only patterns seen in at least this many sessions.
 ```
 
 Restart the daemon after changing this setting. When enabled:
@@ -2221,6 +2285,8 @@ An hourly job builds one stored digest per completed local day, catching up
 within `backfill_days` (1–3650, default 7). It never builds today. Set
 `AGENTSVIEW_FRICTION_TZ` to override the configured timezone. Seat patterns label
 digest findings from session paths without changing the stored detections.
+`[friction.kata]` needs `[kata]` enabled on the hub; see
+[File patterns automatically](/docs/kata/#file-patterns-automatically).
 
 Digests keep Markdown, schema 1 summary JSON, frozen findings and usage,
 session membership, and pattern recurrence. SQLite keeps this state through a
@@ -2235,13 +2301,21 @@ with [`agentsview friction`](/docs/commands/#agentsview-friction), the
 builds missing days on demand. Findings are heuristics: check the session
 before acting on one.
 
+Use `agentsview diagnostics append` or `POST /api/v1/diagnostics` to record a
+failure outside an agent session. Friction review must be enabled on the
+archive building the digest for the events to appear. The digest groups matching sources and
+messages in a Diagnostics section. These events do not create P0 alerts or
+recurring patterns. A delayed event rebuilds its completed day, including dates
+older than the session backfill window.
+
 On the Friction Log page, **Generate summary** asks the configured `[insights]`
 endpoint or agent CLI for an optional model-written overview of one digest.
 Nothing generates summaries on a schedule. The model receives the digest counts,
-P0 alerts, and up to 20 pattern titles ranked by occurrences. Pattern titles can
+P0 alerts, up to 20 pattern titles ranked by occurrences, and up to 20 grouped
+diagnostic sources and messages. Pattern titles can
 contain up to 80 characters of the text that triggered a correction, workaround,
 or deferral; frustration titles are withheld because they quote the user. The
-model does not receive finding text, evidence, or transcripts. The summary is
+model does not receive session finding text, evidence, or transcripts. The summary is
 labeled as model-written and cannot change findings, digests, or recurrence.
 Repeating a request returns the saved summary until the digest changes, and
 saved summaries also appear under **Recall → Generated insights** as **Friction
@@ -2383,12 +2457,23 @@ A regular file replacing the directory or an ancestor releases polling.
 A directory symlink keeps polling. Removing a root from the watch plan releases
 its polling obligations. Budget or native watch resource exhaustion keeps
 root-level polling. Event-buffer overflow puts every recursive root on polling.
+On macOS, when FSEvents reports dropped or must-rescan events for one session
+folder, AgentsView rescans only that folder and keeps watching it natively.
+Other folders are not affected and nothing moves to polling. If the drop hid
+the folder's own removal or replacement, only that folder is polled until it
+can be watched again.
 
 Roots that fall back to polling are picked up by:
 
 - the existing 15-minute periodic full sync, plus
-- a new 2-minute fallback sync loop that runs whenever any roots are unwatched
+- a 2-minute fallback sync loop that runs whenever any roots are unwatched
     (it reconciles the affected scopes)
+
+After a fallback pass finishes, the loop waits 2 minutes or as long as that pass
+took, whichever is longer, so polling uses at most about half of wall-clock
+time. A pass reconciles one provider at a time, and watcher syncs that are
+waiting run between providers, so live sessions keep updating during a long
+pass.
 
 The startup polling summary counts roots handed to fallback polling. It excludes
 folders already covered by separate polling obligations. Runtime
@@ -2409,14 +2494,16 @@ sudo sysctl fs.inotify.max_user_watches=524288
 
 ## Memory Behavior
 
-The serve daemon bounds its own memory, so no tuning is required. It installs a
-256 MiB Go soft memory limit, and on Linux it also limits glibc to two malloc
-arenas and pins the heap trim threshold at 1 MiB. Pinning the threshold turns
-off glibc's dynamic adjustment, which otherwise lets a long-running process stop
-trimming until as much as 64 MiB is free, so memory freed by the SQLite driver
-goes back to the operating system instead of accumulating as fragmentation.
-Setting `GOMEMLIMIT`, `MALLOC_ARENA_MAX`, or `MALLOC_TRIM_THRESHOLD_` in the
-daemon's environment overrides the corresponding default.
+The serve daemon installs a 4 GiB Go soft memory limit as a backstop so large
+requests run with normal GC pacing. Setting `GOMEMLIMIT` lower trades GC time
+for a smaller heap. On Linux, every agentsview process limits glibc to two
+malloc arenas and pins the heap trim threshold at 1 MiB. Pinning the threshold
+turns off glibc's dynamic adjustment, which otherwise lets a long-running
+process stop trimming until as much as 64 MiB is free, so memory freed by the
+SQLite driver goes back to the operating system instead of accumulating as
+fragmentation. Setting `GOMEMLIMIT`, `MALLOC_ARENA_MAX`, or
+`MALLOC_TRIM_THRESHOLD_` in the process's environment overrides the
+corresponding default.
 
 ## Manual Sync
 
@@ -2441,8 +2528,8 @@ Check sync status:
 curl http://127.0.0.1:8080/api/v1/sync/status
 ```
 
-The JSON response includes `startup_pending` and `archive_stale` alongside
-sync progress.
+The JSON response includes `startup_pending`, `archive_stale`, and, starting
+with daemon API 15, `sync_pending` alongside sync progress.
 
 ## Privacy and Telemetry
 
@@ -2466,13 +2553,18 @@ Optional features that send data externally when you enable them:
     `model`, or to the selected agent CLI when neither is set.
 - [Publish to Gist](/docs/usage/#publish-to-gist) uploads a session to GitHub.
 
-The automatic outbound requests are update checks and anonymous telemetry:
+The automatic outbound requests are update checks, pricing refreshes, and
+anonymous telemetry:
 
-- **CLI and web UI** — on startup, the server contacts the GitHub API to check
-    for new releases. No identifying information is sent beyond what a standard
-    GitHub API request includes (IP address, user-agent).
+- **CLI and web UI** — when the web UI loads, the server requests
+    `github.com/kenn-io/agentsview/releases/latest` to find the newest release
+    and caches the answer for an hour. No identifying information is sent
+    beyond what a standard HTTPS request includes (IP address, user-agent).
 - **Desktop app** — uses Tauri's native updater, which checks the GitHub release
     feed independently.
+- **Pricing** — the server downloads public model-pricing catalogs from GitHub
+    and OpenRouter at startup and daily; see
+    [Pricing Source](/docs/token-usage/#pricing-source).
 - **Anonymous daemon telemetry** — see below.
 
 ### Anonymous Daemon Telemetry
@@ -2606,6 +2698,7 @@ Every event contains only:
 - operating system and CPU architecture
 - the application-owned installation ID stored in
   `~/.agentsview/telemetry-install-id`
+- whole hours since that ID was created
 - for the five UI actions, the one listed value above
 - for feature outcomes, the listed kind or reason
 - for screen views, the listed screen name and `surface: web`
@@ -2666,11 +2759,27 @@ commands that connect to a daemon use the daemon's integration configuration.
 MCP offers `get_session_file_references` when its backend enables Docbank
 lookup. Connections through a signed reader listener omit this tool.
 
-| Setting                            | Purpose                                           |
-| ---------------------------------- | ------------------------------------------------- |
-| `integrations.docbank.url`         | Docbank API base URL. HTTPS, or HTTP on loopback. |
-| `integrations.docbank.web_url`     | Optional browser base URL for version links.      |
-| `integrations.docbank.api_key_env` | Environment variable containing the API key.      |
+| Setting                            | Purpose                                                              |
+| ---------------------------------- | -------------------------------------------------------------------- |
+| `integrations.docbank.url`         | Docbank API base URL. HTTPS, or HTTP under the policy below.         |
+| `integrations.docbank.web_url`     | Optional browser base URL for version links.                         |
+| `integrations.docbank.api_key_env` | Environment variable containing the API key.                         |
+| `integrations.docbank.allow_http`  | Allow plaintext HTTP to any host. Default: `false`.                  |
+
+HTTPS and loopback HTTP work by default. For a trusted private container
+network, opt in explicitly:
+
+```toml
+[integrations.docbank]
+url = "http://docbank:8485"
+api_key_env = "DOCBANK_API_KEY"
+allow_http = true
+```
+
+`allow_http` applies to both `url` and the optional `web_url`, matching the
+Insights transport policy. HTTP exposes the API key and requested digests in
+plaintext, so enable it only on a network you trust. API keys stay in request
+headers and redirects are refused.
 
 Lookup covers retained tool-result images, including offloaded assets, inline
 OpenCode `file.uri` payloads such as PDF and text files, and Markdown `asset://`
@@ -2695,3 +2804,21 @@ Images dropped by the image policy have no bytes to hash, so they report
 Results refresh when the session reopens and when its transcript changes, at
 most every 15 seconds while matches are already shown. Successful Docbank
 answers are reused for one minute. No migration or resync is required.
+
+### Image text
+
+Enable image text extraction when a local GLM-OCR service is available:
+
+```toml
+[image_text]
+enabled = true
+# endpoint = "http://127.0.0.1:30004/glmocr/parse"
+```
+
+Restart the daemon after changing this setting. Images removed by the `drop`
+storage policy cannot be indexed. Disabling image text clears extracted text;
+enabling it again extracts images anew. The endpoint must use a loopback
+address. Image text requires an `archive_content` setting that keeps tool
+results; otherwise it stays off and a warning is logged. See
+[search text in images](commands.md#search-text-in-images) for supported images
+and search modes.

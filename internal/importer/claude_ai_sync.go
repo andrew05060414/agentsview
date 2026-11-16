@@ -84,7 +84,9 @@ type ClaudeAIResponse struct {
 }
 
 // SyncClaudeAI imports changed conversations through the existing export importer.
-func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(context.Context, string) (ClaudeAIResponse, error), cb *ImportCallbacks, machine ...string,
+// A non-empty orgs lists the lowercase organization UUIDs to import.
+func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(context.Context, string) (ClaudeAIResponse, error), orgs []string,
+	cb *ImportCallbacks, machine ...string,
 ) (stats ImportStats, retErr error) {
 	raw, err := fetchClaudeAI(ctx, fetch, claudeAIRequest(claudeAIOrganizationsRequest, "", "", 0))
 	if err != nil {
@@ -106,7 +108,7 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 		tooLarge: ErrClaudeAIResponseTooLarge, stop: func(err error) bool { return errors.Is(err, ErrClaudeAIAuthRequired) },
 	}
 	for _, org := range organizations {
-		if !slices.Contains(org.Capabilities, "chat") {
+		if !slices.Contains(org.Capabilities, "chat") || (len(orgs) > 0 && !slices.Contains(orgs, strings.ToLower(org.UUID))) {
 			continue
 		}
 		for offset := 0; ; {

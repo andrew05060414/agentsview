@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,8 +16,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/servicehttp"
 )
@@ -696,6 +699,17 @@ func TestSearchContent_SubstringMatch(t *testing.T) {
 	assert.Equal(t, "s1", out.Matches[0].SessionID)
 }
 
+func TestSearchContent_ReportsMatchedWords(t *testing.T) {
+	fake := &fakeContentSearchService{result: &service.ContentSearchResult{
+		Matches: []db.ContentMatch{{MatchedWords: 2}},
+	}}
+	ts := &toolset{svc: fake}
+	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{Pattern: "invoice rounding decision", IncludeActive: true})
+	require.NoError(t, err)
+	require.Len(t, out.Matches, 1)
+	assert.Equal(t, 2, out.Matches[0].MatchedWords)
+}
+
 // TestSearchContent_ContextRedactsSecretByDefault verifies that a secret in
 // a message adjacent to a search match comes back redacted in
 // context_before through the real service (not a fake), proving the MCP
@@ -1280,8 +1294,8 @@ func TestServer_EndToEnd(t *testing.T) {
 		names = append(names, tl.Name)
 	}
 	assert.ElementsMatch(t, []string{
-		ToolSearchSessions, ToolQueryRecall, ToolListSessions, ToolGetSessionOverview,
-		ToolGetMessages, ToolGetMemoryStatus, ToolSearchContent, ToolGetUsageSummary, ToolGetSessionUsage,
+		ToolSearchSessions, ToolQueryRecall, ToolListRecall, ToolListSessions, ToolGetSessionOverview,
+		ToolGetMessages, ToolGetCompactionSummaries, ToolGetMemoryStatus, ToolSearchContent, ToolGetUsageSummary, ToolGetSessionUsage,
 		ToolGetToolCalls, ToolGetRecentEdits, ToolGetChildSessions, ToolCompareUsage,
 		ToolGetActivityReport, ToolGetToolUsage, ToolGetQualitySignals, ToolSearchDocs,
 		ToolGetFrictionDigest, ToolListFrictionPatterns,
@@ -1346,10 +1360,13 @@ func TestServer_SearchContentIncludeOneShot(t *testing.T) {
 	assert.Equal(t, "one-shot", included.Matches[0].SessionID)
 	assert.Contains(t, included.Matches[0].Snippet, "wire one-shot marker")
 
+	callerRequests := []string{requests[0]}
+
 	for _, args := range []map[string]any{
 		{"pattern": "wire one-shot marker", "mode": "substring", "agent": "pi", "include_active": true},
 		{"pattern": "wire one-shot marker", "mode": "substring", "agent": "pi", "include_active": true, "include_one_shot": false},
 	} {
+		before := len(requests)
 		result, err := ct.CallTool(ctx, callParams(ToolSearchContent, args))
 		require.NoError(t, err)
 		require.False(t, result.IsError)
@@ -1358,6 +1375,7 @@ func TestServer_SearchContentIncludeOneShot(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, json.Unmarshal(raw, &excluded))
 		assert.Empty(t, excluded.Matches)
+		callerRequests = append(callerRequests, requests[before])
 	}
 
 	tools, err := ct.ListTools(ctx, nil)
@@ -1405,16 +1423,16 @@ func TestServer_SearchContentIncludeOneShot(t *testing.T) {
 	assert.Contains(t, searchTool.Description, "One-shot and automated sessions are excluded by default")
 	assert.Contains(t, searchTool.Description, "include_one_shot")
 	assert.Contains(t, searchTool.Description, "include_automated")
-	assert.Len(t, requests, 3)
-	assert.Contains(t, requests[0], "mode=substring")
-	assert.Contains(t, requests[0], "agent=pi")
-	assert.Contains(t, requests[0], "include_one_shot=true")
-	for _, request := range requests {
+	assert.Len(t, callerRequests, 3)
+	assert.Contains(t, callerRequests[0], "mode=substring")
+	assert.Contains(t, callerRequests[0], "agent=pi")
+	assert.Contains(t, callerRequests[0], "include_one_shot=true")
+	for _, request := range callerRequests {
 		assert.NotContains(t, request, "include_automated=")
 	}
 }
 
-// fakeContentSearchService captures the ContentSearchRequest a tool builds
+// fakeContentSearchService captures the first ContentSearchRequest a tool builds
 // and returns a canned result or error, so semantic-mode passthrough and
 // context-mapping can be asserted without a full backend. Unused methods
 // fall through to the embedded nil interface (never called by searchContent
@@ -1429,7 +1447,9 @@ type fakeContentSearchService struct {
 func (f *fakeContentSearchService) SearchContent(
 	_ context.Context, req service.ContentSearchRequest,
 ) (*service.ContentSearchResult, error) {
-	f.lastReq = req
+	if f.lastReq.Pattern == "" && len(f.lastReq.Concepts) == 0 {
+		f.lastReq = req
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -1453,33 +1473,21 @@ func TestSearchContent_SemanticUnavailableMapsToRemediationError(t *testing.T) {
 	assert.Equal(t, "semantic", fake.lastReq.Mode)
 }
 
-// search_content must reject scope outside semantic/hybrid/terms with the same
-// message the HTTP transport uses (the db layer silently ignores Scope for
-// lexical modes, so the guard lives in the transport), and must not reach
-// the service at all on rejection.
-func TestSearchContent_ScopeRejectedOnUnsupportedLexicalModes(t *testing.T) {
+func TestSearchContent_ScopeRejectedForFTS(t *testing.T) {
 	fake := &fakeContentSearchService{result: &service.ContentSearchResult{}}
 	ts := &toolset{svc: fake, now: func() time.Time { return fixedNow }}
 
-	for _, mode := range []string{"", "substring", "regex", "fts"} {
-		t.Run("mode="+mode, func(t *testing.T) {
-			_, _, err := ts.searchContent(t.Context(), nil, searchContentIn{
-				Pattern: "needle", Mode: mode, Scope: "top", IncludeActive: true,
-			})
-			require.Error(t, err)
-			assert.EqualError(t, err,
-				"scope is only supported for semantic, hybrid, and terms search modes")
-		})
-	}
+	_, _, err := ts.searchContent(t.Context(), nil, searchContentIn{
+		Pattern: "needle", Mode: "fts", Scope: "top", IncludeActive: true,
+	})
+	require.EqualError(t, err, db.ContentSearchScopeUnsupportedMsg)
 	assert.Empty(t, fake.lastReq.Pattern,
 		"a rejected request must not reach the service")
 }
 
-// search_content must pass Scope through to the service untouched for
-// semantic, hybrid, and terms modes; the db layer owns scope-value validation from
-// there.
+// Scoped modes forward the requested scope; the store validates its value.
 func TestSearchContent_ScopeForwardedForScopedModes(t *testing.T) {
-	for _, mode := range []string{"semantic", "hybrid", "terms"} {
+	for _, mode := range []string{"semantic", "hybrid", "terms", "", "substring", "regex"} {
 		t.Run(mode, func(t *testing.T) {
 			fake := &fakeContentSearchService{result: &service.ContentSearchResult{}}
 			ts := &toolset{svc: fake, now: func() time.Time { return fixedNow }}
@@ -1503,13 +1511,33 @@ func TestSearchContent_ScopeForwardedForScopedModes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "all", out.EffectiveScope)
 
+	fake.lastReq = service.ContentSearchRequest{}
 	_, out, err = ts.searchContent(t.Context(), nil, searchContentIn{
 		Pattern: "retries", IncludeActive: true,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "substring", out.EffectiveMode)
-	assert.Empty(t, out.EffectiveScope,
-		"substring results are not conversation units, so no scope applies")
+	assert.Equal(t, "all", out.EffectiveScope)
+	assert.Equal(t, "all", fake.lastReq.Scope)
+	assert.False(t, out.Exclusions.Children)
+	for _, tc := range []struct {
+		mode, scope, sessionID, effectiveScope string
+		children                               bool
+	}{
+		{mode: "regex", effectiveScope: "all"},
+		{mode: "substring", scope: "top", effectiveScope: "top", children: true},
+		{mode: "fts", children: true},
+		{mode: "fts", sessionID: "child"},
+	} {
+		fake.lastReq = service.ContentSearchRequest{}
+		_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{
+			Pattern: "retries", Mode: tc.mode, Scope: tc.scope, SessionID: tc.sessionID, IncludeActive: true,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, tc.effectiveScope, fake.lastReq.Scope)
+		assert.Equal(t, tc.effectiveScope, out.EffectiveScope)
+		assert.Equal(t, tc.children, out.Exclusions.Children)
+	}
 }
 
 func TestSearchContent_RecallContractMapping(t *testing.T) {
@@ -1695,12 +1723,12 @@ func TestGetMessages_AroundValidation(t *testing.T) {
 		{
 			name:    "around with direction rejected",
 			in:      getMessagesIn{SessionID: "s1", Around: &anchor, Direction: "desc"},
-			wantErr: "around is mutually exclusive with from/direction",
+			wantErr: "around is mutually exclusive with from/direction/compact_boundary",
 		},
 		{
 			name:    "around with from rejected",
 			in:      getMessagesIn{SessionID: "s1", Around: &anchor, From: &from},
-			wantErr: "around is mutually exclusive with from/direction",
+			wantErr: "around is mutually exclusive with from/direction/compact_boundary",
 		},
 		{
 			name:    "before without around rejected",
@@ -2080,4 +2108,98 @@ func TestFileReferencesTool(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &out))
 	assert.Equal(t, "enabled", out.Integration)
 	assert.Empty(t, out.Occurrences)
+}
+
+func TestSearchContent_LexicalChildScope(t *testing.T) {
+	_, d := newTestToolset(t)
+	dbtest.SeedLexicalScope(t, d)
+	httpServer := httptest.NewUnstartedServer(nil)
+	srv := server.New(config.Config{
+		Host: "127.0.0.1", Port: httpServer.Listener.Addr().(*net.TCPAddr).Port,
+		DataDir: t.TempDir(), WriteTimeout: 30 * time.Second,
+	}, d, nil)
+	httpServer.Config.Handler = srv.Handler()
+	httpServer.Start()
+	t.Cleanup(httpServer.Close)
+	svc := servicehttp.NewHTTPBackend(httpServer.URL, "", false, "")
+	st, ct := newInMemoryPair(t, newServer(ServeOptions{Service: svc}))
+	defer func() { require.NoError(t, ct.Close()); require.NoError(t, st.Wait()) }()
+	// Quotes keep the default search to the exact text instead of every
+	// message holding its words.
+	for _, tc := range []struct{ mode, pattern string }{{"", `"a-child first prompt"`}, {"regex", "a-child first prompt"}} {
+		result, err := ct.CallTool(t.Context(), callParams(ToolSearchContent, map[string]any{
+			"pattern": tc.pattern, "mode": tc.mode, "include_active": true,
+		}))
+		require.NoError(t, err)
+		require.False(t, result.IsError)
+		out := decodeStructured[searchContentOut](t, result)
+		require.Len(t, out.Matches, 1)
+		assert.Equal(t, "a-child", out.Matches[0].SessionID)
+	}
+}
+
+func TestSearchContent_HybridKeywordFallbackMetadata(t *testing.T) {
+	const note = "Search by meaning is unavailable: index is building: 40% complete. Returned hybrid keyword matches only. Query words must appear. If matches are empty or few, try short substring queries with key terms or synonyms."
+	fake := &fakeContentSearchService{result: &service.ContentSearchResult{EffectiveMode: "hybrid_keyword", Note: note}}
+	ts := &toolset{svc: fake}
+	_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{Pattern: "needle", Mode: "hybrid", IncludeActive: true})
+	require.NoError(t, err)
+	assert.True(t, fake.lastReq.KeywordFallback)
+	assert.Equal(t, "hybrid_keyword", out.EffectiveMode)
+	assert.Equal(t, note, out.Note)
+}
+
+func TestListRecallPagesWithEvidenceAndSourceSessionFilter(t *testing.T) {
+	d := dbtest.OpenTestDB(t)
+	dbtest.SeedSession(t, d, "s1", "project")
+	dbtest.SeedSession(t, d, "s2", "project")
+	for _, id := range []string{"a", "b"} {
+		_, err := d.InsertRecallEntry(t.Context(), db.RecallEntry{
+			ID: id, Type: "fact", Scope: "project", Status: "archived", Title: id, Body: id,
+			SourceSessionID: "s1", SourceRunID: "generation", Evidence: []db.RecallEvidence{{SessionID: "s1", MessageStartOrdinal: 1, MessageEndOrdinal: 2, Snippet: "evidence"}},
+		})
+		require.NoError(t, err)
+	}
+	srv := newServer(ServeOptions{Service: service.NewDirectBackend(d, nil)})
+	st, ct := newInMemoryPair(t, srv)
+	t.Cleanup(func() { require.NoError(t, ct.Close()); require.NoError(t, st.Wait()) })
+	res, err := ct.CallTool(t.Context(), callParams("list_recall", map[string]any{"limit": 1, "updated_since": "2020-01-01T00:00:00Z"}))
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	var out listRecallOut
+	raw, err := json.Marshal(res.StructuredContent)
+	require.NoError(t, err)
+	assert.NotRegexp(t, `"score(_breakdown)?"\s*:`, string(raw))
+	require.NoError(t, json.Unmarshal(raw, &out))
+	require.Len(t, out.Entries, 1)
+	assert.Equal(t, "archived", out.Entries[0].Status)
+	assert.NotEmpty(t, out.Entries[0].ReviewState)
+	assert.Equal(t, "generation", out.Entries[0].SourceRunID)
+	require.Len(t, out.Entries[0].Evidence, 1)
+	require.NotEmpty(t, out.NextCursor)
+	res, err = ct.CallTool(t.Context(), callParams("list_recall", map[string]any{"limit": 1, "updated_since": "2020-01-01T00:00:00Z", "cursor": out.NextCursor}))
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	var next listRecallOut
+	raw, err = json.Marshal(res.StructuredContent)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(raw, &next))
+	require.Len(t, next.Entries, 1)
+	assert.NotEqual(t, out.Entries[0].ID, next.Entries[0].ID)
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
+		ID: "c", Type: "fact", Scope: "project", Status: "accepted",
+		Title: "c", Body: "c", SourceSessionID: "s2",
+	})
+	require.NoError(t, err)
+	_, err = d.InsertRecallEntry(t.Context(), db.RecallEntry{
+		ID: "d", Type: "fact", Scope: "project", Status: "accepted",
+		Title: "d", Body: "d", SourceSessionID: "s1",
+	})
+	require.NoError(t, err)
+	res, err = ct.CallTool(t.Context(), callParams("list_recall", map[string]any{"source_session_id": "s2"}))
+	require.NoError(t, err)
+	require.False(t, res.IsError)
+	filtered := decodeStructured[listRecallOut](t, res)
+	require.Len(t, filtered.Entries, 1)
+	assert.Equal(t, "s2", filtered.Entries[0].SourceSessionID)
 }

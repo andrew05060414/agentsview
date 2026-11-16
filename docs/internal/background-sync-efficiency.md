@@ -4,13 +4,14 @@ This document records the runtime and cost-model contracts that keep active
 session writers from turning into unbounded background work. The implementation
 lives primarily in `internal/sync/watcher.go`,
 `internal/parser/codex_cursor.go`, and the provider incremental path in
-`internal/sync/engine.go`.
+`internal/sync/engine_incremental.go`.
 
 ## Watcher runtime contract
 
 - Production watcher events use a 500 ms first-event batching window. Later
   events join the pending set without postponing its deadline.
-- Watcher callback start times are at least five seconds apart. One worker runs
+- Watcher callback start times are at least five seconds apart by default (see
+  [`sync_interval`](../configuration.md#config-file)). One worker runs
   callbacks serially while the fsnotify loop continues draining events and
   errors, so a long sync cannot block event intake or overlap another sync.
 - An idle watcher has no running timer or ticker. The first relevant event

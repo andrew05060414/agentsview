@@ -191,9 +191,9 @@ func TestSessionDiagnosisEvidenceAndPrivacy(t *testing.T) {
 	// The usage block above this point belongs to session usage. Everything
 	// the diagnosis adds must vary with the session; fixed coverage notices
 	// stay in the JSON coverage object.
-	_, evidence, found := strings.Cut(human.String(), "Observed usage rows:")
+	_, evidence, found := strings.Cut(human.String(), "Recorded token totals:")
 	require.True(t, found)
-	assert.Equal(t, " uncached input 45; cache read 60; cache write 20; output 12 (coverage may be incomplete)\n"+
+	assert.Equal(t, " uncached input 45; cache read 60; cache write 20; output 12. Some usage data may be missing.\n"+
 		"Context observations: 1; compactions: [7]\n"+
 		"  Context #3: 120 tokens (model-a)\n"+
 		"Largest tool results (length is not billed tokens):\n"+
@@ -207,9 +207,9 @@ func TestSessionDiagnosisEvidenceAndPrivacy(t *testing.T) {
 
 func TestSessionDiagnosisMissingEvidence(t *testing.T) {
 	messages := []db.Message{
-		{Ordinal: 0, ToolCalls: []db.ToolCall{{ToolName: "read"}}},
-		{Ordinal: 1, ToolCalls: []db.ToolCall{{ToolName: "read"}}},
-		{Ordinal: 2, ToolCalls: []db.ToolCall{{ToolName: "read"}}},
+		{Ordinal: 0, ToolCalls: []db.ToolCall{{ToolName: "read", InputJSON: `{"path":"a.go"}`}}},
+		{Ordinal: 1, ToolCalls: []db.ToolCall{{ToolName: "read", InputJSON: `{"path":"a.go"}`}}},
+		{Ordinal: 2, ToolCalls: []db.ToolCall{{ToolName: "read", InputJSON: `{"path":"a.go"}`}}},
 	}
 	got := testSessionDiagnosis(t, "root", &service.SessionUsageReport{}, messages)
 	assert.Equal(t, []diagnosisRetry{{Tool: "read", Count: 3, FirstOrdinal: 0, LastOrdinal: 2}}, got.RetryRuns)

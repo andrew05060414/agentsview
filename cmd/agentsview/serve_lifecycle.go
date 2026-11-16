@@ -265,8 +265,19 @@ func codexCloudStatusLines(ctx context.Context, baseURL, authToken string) []str
 func serveStatusLines(rt *DaemonRuntime) []string {
 	lines := []string{
 		"agentsview running at " + urlFromDaemonRuntime(rt),
-		fmt.Sprintf("  pid:     %d", rt.Record.PID),
 	}
+	if !rt.ReadOnly && rt.IdleTimeout != nil {
+		lifetime := "Stays running until agentsview daemon stop"
+		if *rt.IdleTimeout > 0 {
+			duration := rt.IdleTimeout.String()
+			if *rt.IdleTimeout%time.Minute == 0 {
+				duration = fmt.Sprintf("%dm", *rt.IdleTimeout/time.Minute)
+			}
+			lifetime = fmt.Sprintf("Exits after %s idle", duration)
+		}
+		lines = append(lines, "  "+lifetime)
+	}
+	lines = append(lines, fmt.Sprintf("  pid:     %d", rt.Record.PID))
 	if rt.Record.Version != "" {
 		lines = append(lines, "  version: "+rt.Record.Version)
 	}
@@ -403,7 +414,7 @@ func stopDaemonRuntimeForUpgradeImpl(ctx context.Context,
 		}
 		// A wider bind may also overlap an unrelated listener on the same port.
 		if !reusesEndpoint {
-			if _, err := prepareServeRuntimeConfig(ctx, cfg, serveRuntimeOptions{}); err != nil {
+			if _, err := prepareServeRuntimeConfig(ctx, cfg, serveRuntimeOptions{RequestedPort: cfg.Port}); err != nil {
 				return err
 			}
 		}
@@ -439,6 +450,7 @@ func stopWritableDaemonsForUpdate(ctx context.Context,
 			result.RequireAuth = rt.RequireAuth
 			result.RequireAuthKnown = rt.RequireAuthKnown
 			result.NoSync = rt.NoSync
+			result.Persistent = rt.Persistent
 		}
 		if err := stopDaemonRuntimeForUpgrade(ctx, cfg, rt); err != nil {
 			return result, err
@@ -478,7 +490,7 @@ func probeDaemonRecord(
 			Timeout:         500 * time.Millisecond,
 		},
 	)
-	return info, err == nil && info.PID == rec.PID
+	return info.PingInfo, err == nil && info.PID == rec.PID
 }
 
 // processIdentityConfirmed reports whether the process now holding rec.PID is

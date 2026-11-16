@@ -356,6 +356,12 @@ func writeReplicaPushSummary(
 	if result.SkippedResumed > 0 {
 		fmt.Fprintf(w, "Skipped %d session(s) already pushed by the unfinished full push\n", result.SkippedResumed)
 	}
+	if result.SessionRowsOnly > 0 {
+		fmt.Fprintf(w, "Rewrote only the session row of %d pushed session(s) whose messages were unchanged\n", result.SessionRowsOnly)
+	}
+	if result.CommitLinksOnly > 0 {
+		fmt.Fprintf(w, "Rewrote only the commit links of %d session(s)\n", result.CommitLinksOnly)
+	}
 	if result.DeletedStale > 0 {
 		fmt.Fprintf(w, "Removed %d stale session(s)\n", result.DeletedStale)
 	}
@@ -592,7 +598,7 @@ var prepareReplicaServe = prepareReplicaServeImpl
 
 func prepareReplicaServeImpl(
 	ctx context.Context, backend storage.Replica, appCfg config.Config, basePath string,
-	watch *ReplicaPushConfig,
+	watch *ReplicaPushConfig, pprof bool,
 ) (replicaServeStartup, error) {
 	name := backend.Name()
 	if err := validateServeConfig(appCfg); err != nil {
@@ -615,7 +621,7 @@ func prepareReplicaServeImpl(
 			return replicaServeStartup{}, err
 		}
 		if pg.RawTenant != "" {
-			return prepareHostedPGServe(ctx, appCfg, pg, basePath)
+			return prepareHostedPGServe(ctx, appCfg, pg, basePath, pprof)
 		}
 	}
 
@@ -680,6 +686,7 @@ func prepareReplicaServeImpl(
 		}),
 		server.WithDataDir(appCfg.DataDir),
 		server.WithBaseContext(ctx),
+		server.WithPprof(pprof),
 	}
 	if extras, ok := backend.(replicaServeExtras); ok {
 		extraOpts, closeFn, err := extras.serveOptions(ctx, appCfg, target.Target, store)
@@ -713,7 +720,7 @@ func supportsInsightGeneration(store storage.ReplicaStore) bool {
 	return ok && capable.InsightGenerationAvailable()
 }
 
-func runReplicaServe(ctx context.Context, backend storage.Replica, appCfg config.Config, basePath string, watch *ReplicaPushConfig) {
+func runReplicaServe(ctx context.Context, backend storage.Replica, appCfg config.Config, basePath string, watch *ReplicaPushConfig, pprof bool) {
 	name := backend.Name()
 	setupLogFile(appCfg.DataDir)
 	if appCfg.RequireAuth {
@@ -722,7 +729,7 @@ func runReplicaServe(ctx context.Context, backend storage.Replica, appCfg config
 		}
 	}
 
-	startup, err := prepareReplicaServe(ctx, backend, appCfg, basePath, watch)
+	startup, err := prepareReplicaServe(ctx, backend, appCfg, basePath, watch, pprof)
 	if err != nil {
 		fatal("%v", err)
 	}

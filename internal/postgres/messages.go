@@ -91,7 +91,7 @@ func (s *Store) GetMessagesWindow(
 	if w.From != nil {
 		from = *w.From
 	}
-	if w.ObservedRevision == nil && len(w.Roles) == 0 {
+	if w.ObservedRevision == nil && len(w.Roles) == 0 && !w.CompactBoundaryOnly {
 		return s.GetMessages(ctx, sessionID, from, w.Limit, w.Asc)
 	}
 	return s.getMessagesLinear(ctx, sessionID, from, w)
@@ -109,6 +109,9 @@ func (s *Store) getMessagesLinear(
 		dir, op = "DESC", "<="
 	}
 	roleClause, roleArgs := pgRoleFilterClause(w.Roles, 3)
+	if w.CompactBoundaryOnly {
+		roleClause += " AND is_compact_boundary = TRUE"
+	}
 	query := fmt.Sprintf(`
 		SELECT %s, %s
 		FROM messages
@@ -348,6 +351,7 @@ func (s *Store) Search(
 	if f.Sort == "recency" {
 		outerOrderBy = "session_ended_at DESC NULLS LAST, session_id ASC"
 	}
+	pageOrderBy := strings.NewReplacer("match_priority", "p.match_priority", "match_pos", "p.match_pos", "session_ended_at", "p.session_ended_at", "session_id", "p.session_id").Replace(outerOrderBy)
 
 	// $1 = escaped ILIKE pattern for the name branch (full plain term)
 	// $2 = raw first term (for POSITION — case folded in expression)
@@ -357,14 +361,20 @@ func (s *Store) Search(
 	// Message branch matches every term (AND). Each term gets its own escaped
 	// ILIKE placeholder so a multi-word query requires all terms to be present
 	// without demanding they be contiguous, exactly like SQLite FTS5.
-	termClauses := make([]string, len(terms))
+	termParams := make([]int, len(terms))
 	for i, t := range terms {
-		termClauses[i] = fmt.Sprintf(
-			"m.content ILIKE '%%' || $%d || '%%' ESCAPE E'\\\\'", argIdx)
+		termParams[i] = argIdx
 		args = append(args, escapeLike(t))
 		argIdx++
 	}
-	msgTermPredicate := strings.Join(termClauses, "\n\t\t\t\t\tAND ")
+	termPredicate := func(column string) string {
+		clauses := make([]string, len(termParams))
+		for i, p := range termParams {
+			clauses[i] = fmt.Sprintf(
+				"%s ILIKE '%%' || $%d || '%%' ESCAPE E'\\\\'", column, p)
+		}
+		return strings.Join(clauses, "\n\t\t\t\t\tAND ")
+	}
 
 	msgProjectClause := ""
 	nameProjectClause := ""
@@ -391,23 +401,12 @@ func (s *Store) Search(
 		WITH msg_matches AS (
 			SELECT DISTINCT ON (m.session_id)
 				m.session_id,
-				s.project,
-				s.agent,
- s.machine,
-				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
 				m.ordinal,
 				POSITION(LOWER($2) IN LOWER(m.content)) AS match_pos,
-				CASE
-					WHEN POSITION(LOWER($2) IN LOWER(m.content)) > 100
-						THEN '...' || SUBSTRING(m.content
-							FROM GREATEST(1, POSITION(
-								LOWER($2) IN LOWER(m.content)
-							) - 50) FOR 200) || '...'
-					ELSE SUBSTRING(m.content FROM 1 FOR 200)
-						|| CASE WHEN LENGTH(m.content) > 200
-							THEN '...' ELSE '' END
-				END AS snippet
+				'message' AS kind,
+				NULL::text AS source_kind, NULL::integer AS call_index,
+				NULL::integer AS event_index, NULL::integer AS image_index, NULL::text AS processor
 			FROM messages m
 			JOIN sessions s ON m.session_id = s.id
 			WHERE %s
@@ -419,23 +418,39 @@ func (s *Store) Search(
 				POSITION(LOWER($2) IN LOWER(m.content)) ASC,
 				m.ordinal ASC
 		),
+		-- Image text matches sessions without a message match. It ranks with
+		-- name-only rows and anchors at the tool call's message, which must
+		-- pass the message branch's visibility checks.
+		image_matches AS (
+			SELECT DISTINCT ON (s.id)
+				s.id AS session_id,
+				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
+				im.ordinal,
+				0 AS match_pos,
+				'image' AS kind, it.source_kind, it.call_index, it.event_index,
+				it.image_index, it.processor
+			FROM image_text it
+			JOIN sessions s ON s.id = it.session_id
+			JOIN messages im ON im.session_id = it.session_id
+				AND im.ordinal = it.message_ordinal
+			WHERE %s
+				AND s.deleted_at IS NULL
+				AND im.is_system = FALSE
+				AND `+db.PostgresSystemPrefixSQL("im.content", "im.role")+`
+				AND s.id NOT IN (SELECT session_id FROM msg_matches)
+				%s
+			ORDER BY s.id, it.message_ordinal, it.call_index,
+				it.source_kind, it.event_index, it.image_index, it.processor
+		),
 		name_matches AS (
 			SELECT
 				s.id AS session_id,
-				s.project,
-				s.agent,
- s.machine,
-				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
 				-1 AS ordinal,
 				0 AS match_pos,
-				CASE
-					WHEN COALESCE(s.display_name, s.session_name) ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
-						THEN COALESCE(s.display_name, s.session_name, '')
-					WHEN s.first_message ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
-						THEN COALESCE(s.first_message, '')
-					ELSE COALESCE(s.display_name, s.session_name, s.first_message, '')
-				END AS snippet
+				'name' AS kind,
+				NULL::text AS source_kind, NULL::integer AS call_index,
+				NULL::integer AS event_index, NULL::integer AS image_index, NULL::text AS processor
 			FROM sessions s
 			WHERE (COALESCE(s.display_name, s.session_name) ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
 				OR s.first_message ILIKE '%%' || $1 || '%%' ESCAPE E'\\')
@@ -447,26 +462,51 @@ func (s *Store) Search(
 					  AND `+db.PostgresSystemPrefixSQL("mx.content", "mx.role")+`
 				)
 				AND s.id NOT IN (SELECT session_id FROM msg_matches)
+				AND s.id NOT IN (SELECT session_id FROM image_matches)
 				%s
-		)
-		-- rank is a constant 1.0 because PostgreSQL ILIKE has no
-	-- relevance scoring engine (unlike SQLite FTS5). Ordering
-	-- uses match_pos and session_ended_at instead.
-	SELECT session_id, project, agent, machine, name,
-			session_ended_at, ordinal,
-			snippet, 1.0 AS rank, match_pos
-		FROM (
+		),
+		page AS MATERIALIZED (
+		SELECT * FROM (
 			SELECT *, 1 AS match_priority FROM msg_matches
+			UNION ALL
+			SELECT *, 2 AS match_priority FROM image_matches
 			UNION ALL
 			SELECT *, 2 AS match_priority FROM name_matches
 		) combined
 		ORDER BY %s
-		LIMIT $%d OFFSET $%d`,
-		msgTermPredicate,
+		LIMIT $%d OFFSET $%d
+		)
+		SELECT p.session_id, s.project, s.agent, s.machine,
+			COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
+			p.session_ended_at, p.ordinal,
+			CASE WHEN p.kind = 'name' THEN
+				CASE WHEN COALESCE(s.display_name, s.session_name) ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
+					THEN COALESCE(s.display_name, s.session_name, '')
+					WHEN s.first_message ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
+					THEN COALESCE(s.first_message, '')
+					ELSE COALESCE(s.display_name, s.session_name, s.first_message, '') END
+			ELSE CASE WHEN POSITION(LOWER($2) IN LOWER(COALESCE(m.content, it.text))) > 100
+				THEN '...' || SUBSTRING(COALESCE(m.content, it.text)
+					FROM GREATEST(1, POSITION(LOWER($2) IN LOWER(COALESCE(m.content, it.text))) - 50) FOR 200) || '...'
+				ELSE SUBSTRING(COALESCE(m.content, it.text) FROM 1 FOR 200)
+					|| CASE WHEN LENGTH(COALESCE(m.content, it.text)) > 200 THEN '...' ELSE '' END
+			END END AS snippet, 1.0 AS rank, p.match_pos
+		FROM page p
+		JOIN sessions s ON s.id = p.session_id
+		LEFT JOIN messages m ON p.kind = 'message' AND m.session_id = p.session_id AND m.ordinal = p.ordinal
+		LEFT JOIN image_text it ON p.kind = 'image' AND it.session_id = p.session_id
+			AND it.message_ordinal = p.ordinal AND it.source_kind = p.source_kind
+			AND it.call_index = p.call_index AND it.event_index = p.event_index
+			AND it.image_index = p.image_index AND it.processor = p.processor
+		ORDER BY %s`,
+		termPredicate("m.content"),
 		msgProjectClause,
+		termPredicate("it.text"),
+		nameProjectClause,
 		nameProjectClause,
 		outerOrderBy,
 		argIdx, argIdx+1,
+		pageOrderBy,
 	)
 	args = append(args, f.Limit+1, f.Cursor)
 
@@ -567,14 +607,14 @@ func (s *Store) attachToolCallsBatch(
 	query := fmt.Sprintf(`
 		SELECT message_ordinal, session_id, tool_name,
 			category,
-			COALESCE(tool_use_id, ''),
+			tool_use_id,
 			COALESCE(input_json, ''),
 			COALESCE(skill_name, ''),
 			COALESCE(result_content_length, 0),
 			COALESCE(result_content, ''),
 			COALESCE(subagent_session_id, ''),
 			COALESCE(file_path, ''),
-			COALESCE(call_index, 0), observed_outcome, observed_repeat, sequence_ending
+			call_index, observed_outcome, observed_repeat, sequence_ending
 		FROM tool_calls
 		WHERE session_id = $1
 			AND message_ordinal IN (%s)

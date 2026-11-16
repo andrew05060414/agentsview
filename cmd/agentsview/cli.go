@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/clickhouse"
 	"go.kenn.io/agentsview/internal/config"
@@ -110,6 +111,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newServeCommand())
 	root.AddCommand(newDaemonCommand())
 	root.AddCommand(newSyncCommand())
+	root.AddCommand(newWhyCommand())
 	root.AddCommand(newSyncWorkerCommand())
 	root.AddCommand(newPruneCommand())
 	root.AddCommand(newDBCommand())
@@ -136,11 +138,13 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newInsightCommand())
 	root.AddCommand(newKataCommand())
 	root.AddCommand(newFrictionCommand())
+	root.AddCommand(newDiagnosticsCommand())
 	root.AddCommand(newStatsCommand())
 	root.AddCommand(newParseDiffCommand())
 	root.AddCommand(newClassifierCommand())
 	root.AddCommand(newSecretsCommand())
 	root.AddCommand(newSkillsCommand())
+	root.AddCommand(newAgentCommand())
 	root.AddCommand(newMemoryCommand())
 	root.AddCommand(newSigningCommand())
 	root.AddCommand(newDoctorCommand())
@@ -148,7 +152,9 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newAgentsCommand())
 	root.AddCommand(newOpenAPICommand())
 	root.AddCommand(newRemoteSyncCommand())
+	root.AddCommand(newGitHookCommand())
 	groupCommands(root)
+	root.AddCommand(newCLISearchCommand(root))
 
 	defaultHelp := root.HelpFunc()
 	root.SetHelpFunc(func(cmd *cobra.Command, args []string) {
@@ -205,17 +211,17 @@ func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 				)
 				return nil
 			}
-			runServe(cmd.Context(), mustLoadConfig(cmd), serveOptions{
+			return runServeLoop(cmd.Context(), mustLoadConfig(cmd), serveOptions{
 				ReplaceDaemon:   replace,
 				NoSyncExplicit:  cmd.Flags().Changed("no-sync"),
 				SkipInitialSync: skipInitialSync,
 				BasePath:        basePath,
 				Pprof:           pprofEnabled,
+				RestartArgs:     serveRestartArgs(cmd.Flags()),
 				ReloadConfig: func() (config.Config, error) {
 					return config.LoadPFlags(cmd.Flags())
 				},
-			}, restartPort)
-			return nil
+			}, restartPort, runServe)
 		},
 	}
 	cmd.Flags().BoolVar(
@@ -250,13 +256,7 @@ func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 		"Start serving before the initial sync",
 	)
 	_ = cmd.Flags().MarkHidden("skip-initial-sync")
-	cmd.Flags().BoolVar(
-		&pprofEnabled,
-		"pprof",
-		false,
-		"Serve net/http/pprof under /debug/pprof (developer use)",
-	)
-	_ = cmd.Flags().MarkHidden("pprof")
+	addPprofFlag(cmd, &pprofEnabled)
 	cmd.Flags().IntVar(
 		&restartPort,
 		"restart-port",
@@ -269,6 +269,24 @@ func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 	cmd.AddCommand(newServeStopCommand())
 	cmd.AddCommand(newServeRestartCommand(deps))
 	return cmd
+}
+
+func serveRestartArgs(flags *pflag.FlagSet) []string {
+	var args []string
+	flags.Visit(func(flag *pflag.Flag) {
+		switch flag.Name {
+		case "background", "replace", "check-data-version", "port", "restart-port":
+			return
+		}
+		args = append(args, "--"+flag.Name+"="+flag.Value.String())
+	})
+	return args
+}
+
+func serveReplacementArgs(args []string, current config.Config) []string {
+	return slices.DeleteFunc(slices.Clone(args), func(arg string) bool {
+		return current.AuthSettingsSaved && strings.HasPrefix(arg, "--require-auth=")
+	})
 }
 
 func applyServeRestartPort(cfg config.Config, port int) (config.Config, int) {
@@ -483,7 +501,7 @@ func newPruneCommandWithRunner(run func(context.Context, PruneConfig)) *cobra.Co
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&agent, "agent", "", "Exact agent name; includes matching trash and parents unless needed by surviving descendants")
+	cmd.Flags().StringVar(&agent, "agent", "", "Exact agent name; includes matching trash")
 	cmd.Flags().StringVar(&project, "project", "", "Sessions whose project contains this substring")
 	cmd.Flags().IntVar(&maxMessages, "max-messages", -1, "Sessions with at most N user messages")
 	cmd.Flags().StringVar(&before, "before", "", "Sessions that ended before this date (YYYY-MM-DD)")
@@ -623,6 +641,7 @@ func newUsageCommand() *cobra.Command {
 	cmd.AddCommand(newUsageDailyCommand())
 	cmd.AddCommand(newUsageStatuslineCommand())
 	cmd.AddCommand(newUsageCursorCommand())
+	cmd.AddCommand(newUsageGrokCommand())
 	return cmd
 }
 
@@ -820,7 +839,20 @@ func newDuckDBStatusCommand() *cobra.Command {
 	}
 }
 
+// addPprofFlag registers the hidden --pprof flag shared by every command
+// that serves the web UI and API.
+func addPprofFlag(cmd *cobra.Command, enabled *bool) {
+	cmd.Flags().BoolVar(
+		enabled,
+		"pprof",
+		false,
+		"Serve net/http/pprof under /debug/pprof (developer use)",
+	)
+	_ = cmd.Flags().MarkHidden("pprof")
+}
+
 func newDuckDBServeCommand() *cobra.Command {
+	var pprofEnabled bool
 	cmd := &cobra.Command{
 		Use:          "serve",
 		Short:        "Serve from DuckDB (read-only)",
@@ -831,7 +863,7 @@ func newDuckDBServeCommand() *cobra.Command {
 			if err != nil {
 				fatal("%v", err)
 			}
-			runDuckDBServe(cmd.Context(), appCfg, basePath)
+			runDuckDBServe(cmd.Context(), appCfg, basePath, pprofEnabled)
 			return nil
 		},
 	}
@@ -840,6 +872,7 @@ func newDuckDBServeCommand() *cobra.Command {
 		"",
 		"URL prefix for reverse-proxy subpath (e.g. /agentsview)",
 	)
+	addPprofFlag(cmd, &pprofEnabled)
 	config.RegisterServePFlags(cmd.Flags())
 	return cmd
 }
@@ -931,6 +964,7 @@ func printVersion(w io.Writer) {
 }
 
 func writeRootHelp(w io.Writer, root *cobra.Command) {
+	fmt.Fprintln(w, `Agents: find the right command with: agentsview cli search "<what you want to do>"`)
 	fmt.Fprintf(w, "agentsview %s - local web viewer for AI agent sessions\n\n", version)
 	fmt.Fprintln(w, "Syncs session data from supported AI coding agents into SQLite,")
 	fmt.Fprintln(w, "serves analytics, and exposes a session browser via local web UI.")
@@ -960,6 +994,7 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  QWENPAW_DIR             QwenPaw workspaces directory")
 	fmt.Fprintln(w, "  OMO_DIR                 OMO sessions directory")
 	fmt.Fprintln(w, "  STEPCODE_DIR            StepCode sessions directory")
+	fmt.Fprintln(w, "  DIRECT_API_DIR          Direct API sessions directory")
 	fmt.Fprintln(w, "  OMP_DIR                 OhMyPi sessions directory")
 	fmt.Fprintln(w, "  MUSE_SESSIONS_DIR       Muse Code sessions directory")
 	fmt.Fprintln(w, "  DEEPSEEK_TUI_SESSIONS_DIR")
@@ -1025,7 +1060,9 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  destination = \"user@devbox.example.com\" # optional; defaults to host")
 	fmt.Fprintln(w, "  Each host must be unique.")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "  Top-level daemon_idle_timeout = \"0s\" keeps serve --background nodes alive.")
+	fmt.Fprintln(w, "  Top-level daemon_idle_timeout applies to automatically started and serve --background daemons;")
+	fmt.Fprintln(w, "  \"0s\" keeps them alive. daemon start and daemon restart stay running until stopped.")
+	fmt.Fprintln(w, "  Top-level sync_idle_after = \"10m\" pauses local collection while idle; \"0\" disables the pause.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Data stored in ~/.agentsview/ by default.")
 }

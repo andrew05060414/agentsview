@@ -132,12 +132,12 @@ targets link back to the corresponding inventory row.
 
 ## Repair worktree project names
 
-In source builds after 0.46.1, SQLite imports use the repository URL recorded by
-the agent when a checkout cannot be identified on disk. This keeps temporary
-worktree folders from becoming separate projects. AgentsView reuses an existing
-project with the repository's name, or a single established Git checkout name.
-Otherwise it uses the repository name. Conflicting checkout names are left for
-an explicit rule. The chosen name is saved so later imports keep using it.
+In 0.47.0 and later, SQLite imports use the repository URL recorded by the agent
+when a checkout cannot be identified on disk. This keeps temporary worktree
+folders from becoming separate projects. AgentsView reuses an existing project
+with the repository's name, or a single established Git checkout name. Otherwise
+it uses the repository name. Conflicting checkout names are left for an explicit
+rule. The chosen name is saved so later imports keep using it.
 
 Session assignments and enabled folder rules take priority. The original parser
 label and repository evidence remain in the archive. Sessions with a previously
@@ -184,14 +184,14 @@ shrinking the SQLite file are separate operations.
 | Keep image descriptions without image access | Set `tool_result_images = "drop"` for future imports. Run `db strip --images` for stored results. Neither deletes asset files.                    |
 | Omit results from selected tool categories   | Set `result_content_blocked_categories`, then run `sync --full`. This needs the source files.                                                     |
 | Keep transcripts or reporting metadata only  | Set `archive_content`, restart the daemon, then run `sync --full`. The rebuild also applies the policy to copied sessions whose sources are gone. |
-| Reclaim SQLite free space after cleanup      | Run `db compact`. It preserves stored rows and does not change retention settings.                                                                |
+| Reclaim SQLite free space after cleanup      | Run `db compact`. It preserves stored sessions and messages and does not change retention settings.                                               |
 
-Change these settings in `config.toml`. **Settings > Archive content** also lets
-you choose the image policy. Restart the daemon to apply a changed policy to new
-imports. Existing rows stay as they are until you resync or run the matching
-maintenance command. See [Archive content](/docs/configuration/#archive-content)
-for what each policy retains and which source files are needed to recover
-removed content.
+Change these settings in `config.toml`. **Settings > Tool-result images** also
+lets you choose the image policy. Restart the daemon to apply a changed policy
+to new imports. Existing rows stay as they are until you resync or run the
+matching maintenance command. See
+[Archive content](/docs/configuration/#archive-content) for what each policy
+retains and which source files are needed to recover removed content.
 
 ### Remove archived images
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 
@@ -18,6 +19,7 @@ type Issue struct {
 	UID, ShortID, QualifiedID, Title, Status, ClosedReason, WebURL string
 	Labels                                                         []string
 	Metadata                                                       map[string]any
+	ClosedAt                                                       *time.Time
 	Priority                                                       *int
 }
 
@@ -58,7 +60,7 @@ func intPtr(p *int64) *int {
 
 func (c *Client) routeRef(ref string) (string, error) {
 	if ref == "" || strings.TrimSpace(ref) != ref {
-		return "", errors.New("kata: invalid issue ref")
+		return "", ErrInvalidIssueRef
 	}
 	if shortID, ok := strings.CutPrefix(ref, c.project+"#"); ok && c.project != "" && validShortID(shortID) {
 		// A qualified ref is already scoped to this project. Sending the short ID
@@ -66,7 +68,7 @@ func (c *Client) routeRef(ref string) (string, error) {
 		return shortID, nil
 	}
 	if strings.ContainsAny(ref, "/?#") {
-		return "", errors.New("kata: invalid issue ref")
+		return "", ErrInvalidIssueRef
 	}
 	return ref, nil
 }
@@ -141,7 +143,7 @@ func (c *Client) validateIssueProject(id int64, uid *string) error {
 	projectID, projectUID := c.projectID, c.projectUID
 	c.mu.RUnlock()
 	if projectID == 0 || id != projectID || (uid != nil && *uid != projectUID) {
-		return fmt.Errorf("%w: issue belongs to a different project", ErrInvalidResponse)
+		return fmt.Errorf("%w: %w", ErrInvalidResponse, ErrIssueInOtherProject)
 	}
 	return nil
 }
@@ -167,7 +169,7 @@ func (c *Client) issueFromShow(s kg.ShowIssueResponseBody) (Issue, error) {
 	}
 	return Issue{
 		UID: o.UID, ShortID: o.ShortID, QualifiedID: qualifiedID, Title: o.Title, Status: o.Status,
-		ClosedReason: deref(o.ClosedReason), WebURL: deref(s.WebURL), Labels: labels, Metadata: o.Metadata, Priority: intPtr(o.Priority),
+		ClosedAt: o.ClosedAt, ClosedReason: deref(o.ClosedReason), WebURL: deref(s.WebURL), Labels: labels, Metadata: o.Metadata, Priority: intPtr(o.Priority),
 	}, nil
 }
 
