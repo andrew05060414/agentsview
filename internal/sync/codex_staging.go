@@ -17,6 +17,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/mask"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/signals"
@@ -577,6 +578,16 @@ func (s *codexStagingSink) AppendToolResultEvent(ctx context.Context,
 		// deduplication and result_content_length parity without storing bytes.
 		ev.Content = ""
 	}
+	// The scratch rows that are later published into tool_result_events, and
+	// every summary and finding derived from them, carry the masked text.
+	if blanked == 0 {
+		if masked := db.MaskText(ev.Content); masked != ev.Content {
+			if contentLength == len(ev.Content) {
+				contentLength = len(masked)
+			}
+			ev.Content = masked
+		}
+	}
 	if _, err := s.scratch.ExecContext(ctx,
 		`INSERT INTO stage_events (
 		     seq, call_key, tool_use_id, agent_id, subagent_session_id,
@@ -794,7 +805,7 @@ func (s *codexStagingSink) addEventFindings(
 			MatchStart:    match.Start,
 			MatchEnd:      match.End,
 			MatchIndex:    match.Index,
-			RedactedMatch: match.Redacted,
+			RedactedMatch: mask.Placeholder(content[match.Start:match.End]),
 			RulesVersion:  secrets.DefiniteRulesVersion(),
 		})
 		s.findingPos = append(s.findingPos, stagedFindingPos{

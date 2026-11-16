@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 
+	"go.kenn.io/agentsview/internal/mask"
 	"go.kenn.io/agentsview/internal/secrets"
 )
 
@@ -56,7 +57,7 @@ func scanStoredSecretFindingsTx(
 			finding.MatchStart = match.Start
 			finding.MatchEnd = match.End
 			finding.MatchIndex = match.Index
-			finding.RedactedMatch = match.Redacted
+			finding.RedactedMatch = mask.Placeholder(content[match.Start:match.End])
 			finding.RulesVersion = secrets.RulesVersion()
 			findings = append(findings, finding)
 			if match.Confidence == secrets.ConfidenceDefinite {

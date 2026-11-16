@@ -2945,8 +2945,13 @@ schemas keep their existing ordering behavior.
   stores a UTC instant with zero seconds and nanoseconds. The source has
   minute precision, so the encoded `:00` does not provide second precision.
 - **Session bounds:** Agentsview uses the earliest and latest usable tagged user
-  turns. A transcript with no usable tag retains the file modification time
-  for both bounds. The latest user turn gives a lower bound for assistant
+  turns. A transcript with no usable tag starts at the file's creation time
+  and ends at its modification time. Windows and macOS record creation time;
+  other platforms, and files whose creation time is later than their
+  modification time (such as copies), keep the modification time for both
+  bounds. A Windows install checked 2026-10-21 wrote JSONL transcripts with no
+  `<timestamp>` tags in most files, and appends kept each file's creation time
+  at the session's first turn. The latest user turn gives a lower bound for assistant
   completion because the Cursor format supplies no assistant completion time.
 - **Evidence:** `documentation`.
 - **Upstream:** Cursor's first-party
