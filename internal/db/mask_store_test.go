@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 
@@ -157,10 +158,18 @@ func TestStorageProjectionMasksDialogueText(t *testing.T) {
 	msg.DialogueText = &text
 	require.NoError(t, d.ReplaceSessionMessages(ctx, "dlg", []Message{msg}))
 
-	var content, dialogue string
+	// Upstream stores NULL dialogue_text when it equals content
+	// (dialogue_is_content = 1), so fall back to content in that case.
+	var content string
+	var dialogueCol sql.NullString
+	var isContent bool
 	require.NoError(t, d.getReader().QueryRowContext(ctx,
-		`SELECT content, dialogue_text FROM messages WHERE session_id = 'dlg'`,
-	).Scan(&content, &dialogue))
+		`SELECT content, dialogue_text, dialogue_is_content FROM messages WHERE session_id = 'dlg'`,
+	).Scan(&content, &dialogueCol, &isContent))
+	dialogue := dialogueCol.String
+	if isContent {
+		dialogue = content
+	}
 	ph := mask.Placeholder(fakeAnthropicKey())
 	assert.Contains(t, content, ph)
 	assert.Contains(t, dialogue, ph)
