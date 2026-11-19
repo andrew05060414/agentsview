@@ -217,6 +217,16 @@ func selectedClaudeAIPath(conv claudeAIConversation) ([]claudeAIMessage, error) 
 		seen[id] = true
 		var parent string
 		if m.Parent.Kind() != jsontext.KindString || json.Unmarshal(m.Parent, &parent) != nil {
+			// Claude.ai sometimes sends a null or absent parent, not only for a
+			// lone prompt but also partway up a longer chat. Treat it like the
+			// root sentinel: the selected path starts here. Rejecting it dropped
+			// the whole conversation on every sync (claude-ai:639bf810…,
+			// 2026-11). Messages above it that the leaf no longer reaches are
+			// left out, the same as abandoned branches.
+			if k := m.Parent.Kind(); k == jsontext.KindNull || len(m.Parent) == 0 {
+				path = append(path, m)
+				break
+			}
 			return nil, fmt.Errorf("message %s's parent must be a string", m.UUID)
 		}
 		path = append(path, m)
