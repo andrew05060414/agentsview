@@ -27,9 +27,6 @@ type nativeTitleSource struct {
 	sessionRoot         func(string) (string, bool)
 	blankClears         bool
 	outsideWatchedRoots bool
-	// applyMetadata, when set, copies non-title metadata from the same store
-	// after the title pass.
-	applyMetadata func(e *Engine, ctx context.Context, source nativeTitleSource, root, store string) (int, error)
 }
 
 var nativeTitleSources = []nativeTitleSource{
@@ -42,7 +39,6 @@ var nativeTitleSources = []nativeTitleSource{
 		sessionRoot:         parser.AntigravitySessionRoot,
 		blankClears:         true,
 		outsideWatchedRoots: false,
-		applyMetadata:       (*Engine).applyAntigravityStoreSummaries,
 	},
 	{
 		agent:               parser.AgentQoder,
@@ -88,11 +84,6 @@ func (e *Engine) reconcileNativeTitlesLocked(ctx context.Context, stats *SyncSta
 			if err == nil {
 				var n int
 				n, err = e.applyNativeStoreTitles(ctx, source, root, titles)
-				stats.TitlesUpdated += n
-			}
-			if err == nil && source.applyMetadata != nil {
-				var n int
-				n, err = source.applyMetadata(e, ctx, source, root, store)
 				stats.TitlesUpdated += n
 			}
 			if err != nil {
