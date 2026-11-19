@@ -25,10 +25,17 @@ import (
 type Store struct {
 	readbase.ReadOnlyStubs
 	hostedRelations bool
+	cockroach       bool
+	serverEncoding  string
 	pg              storeExecutor
 	ownedDB         *sql.DB
 	readTx          *sql.Tx
 	pricingSnapshot *pricingSnapshot
+	usageCache      *db.UsageCacheReader
+	activityDisk    kept.Disk
+	trendsDisk      kept.Disk
+	trendsIdentity  string
+	trendsVersion   string
 	runtimeOnce     sync.Once
 	runtime         *storeRuntime
 }
@@ -36,6 +43,7 @@ type Store struct {
 // storeRuntime is shared by the owning store and its borrowed read views.
 // Views never copy locks or start detached work with their transaction.
 type storeRuntime struct {
+	searchKept         kept.Memo[pgSearchEntry]
 	activityKept       kept.Memo[pgActivityKept]
 	activityInputs     kept.Memo[pgActivityInputs]
 	frustrationMarkers db.FrustrationMarkerMemo
@@ -43,9 +51,10 @@ type storeRuntime struct {
 	cursorMu     sync.RWMutex
 	cursorSecret []byte
 
-	insightCapabilityMu        sync.RWMutex
-	insightGenerationAvailable bool
-	frictionAvailable          atomic.Bool
+	insightCapabilityMu          sync.RWMutex
+	insightGenerationAvailable   bool
+	frictionAvailable            atomic.Bool
+	frictionDiagnosticsAvailable atomic.Bool
 	// frictionIssueLinksPresent is set once a pattern read finds
 	// friction_issue_links; see frictionIssueSelect.
 	frictionIssueLinksPresent atomic.Bool
@@ -55,14 +64,21 @@ type storeRuntime struct {
 	// frictionFilingStatePresent is the same for friction_filing_state.
 	frictionFilingStatePresent atomic.Bool
 
-	pricingMu         sync.Mutex
-	pricingLoadMu     sync.Mutex
-	pricingLoad       *pricingLoad
-	customPricing     map[string]config.CustomModelRate
-	pricingGeneration uint64
-	dailyUsage        kept.Reads[db.DailyUsageResult]
-	planUsage         kept.Reads[*db.PlanUsageCountSummary]
-	topUsage          kept.Reads[[]db.TopSessionEntry]
+	pricingMu           sync.Mutex
+	pricingLoadMu       sync.Mutex
+	pricingLoad         *pricingLoad
+	customPricing       map[string]config.CustomModelRate
+	pricingGeneration   uint64
+	usageIdentityDenied atomic.Bool
+	dailyUsage          kept.Reads[db.DailyUsageResult]
+	analytics           kept.Reads[[]byte]
+	search              kept.Reads[db.SearchPage]
+	planUsage           kept.Reads[*db.PlanUsageCountSummary]
+	topUsage            kept.Reads[[]db.TopSessionEntry]
+	standbySearch       kept.Flights[snapshotResult[db.SearchPage]]
+	standbyDaily        kept.Flights[snapshotResult[db.DailyUsageResult]]
+	standbyPlan         kept.Flights[snapshotResult[*db.PlanUsageCountSummary]]
+	standbyTop          kept.Flights[snapshotResult[[]db.TopSessionEntry]]
 
 	// vectorMu guards the semantic-search seam. vectorSearcher is the PG
 	// vector searcher wired at pg serve startup when a generation matches
@@ -854,10 +870,15 @@ func (s *Store) GetSession(
 	return &sess, nil
 }
 
+// pgSessionIDTailExpr computes db.SessionIDTail(id).
+// idx_sessions_id_tail indexes this exact expression.
+const pgSessionIDTailExpr = `substring(id, '[^:~]*$')`
+
 // FindSessionIDsByRawSuffix returns up to limit session IDs whose
 // stored id is either the exact raw input or the raw input preceded
 // by an agent or host prefix. The suffix comparison is literal and results
-// match SQLite ordering: exact match first, then most recent session.
+// match SQLite ordering: exact match first, then most recent session. The
+// tail predicate lets PostgreSQL seek idx_sessions_id_tail.
 func (s *Store) FindSessionIDsByRawSuffix(
 	ctx context.Context, raw string, limit int,
 ) ([]string, error) {
@@ -869,13 +890,14 @@ func (s *Store) FindSessionIDsByRawSuffix(
 	}
 	rows, err := s.pg.QueryContext(ctx,
 		`SELECT id FROM sessions
-		 WHERE (id = $1
+		 WHERE `+pgSessionIDTailExpr+` = $3
+		   AND (id = $1
 		        OR RIGHT(id, LENGTH($1) + 1) IN (':' || $1, '~' || $1))
 		   AND deleted_at IS NULL
 		 ORDER BY (id = $1) DESC,
 		          COALESCE(ended_at, started_at, created_at) DESC
 		 LIMIT $2`,
-		raw, limit,
+		raw, limit, db.SessionIDTail(raw),
 	)
 	if err != nil {
 		return nil, fmt.Errorf(

@@ -250,6 +250,8 @@ describe("CostTimeSeriesChart", () => {
     await tick();
     const tooltip = document.querySelector(".tooltip")!;
     expect(tooltip.querySelector(".tooltip-date")?.textContent).toContain("Jun 5, 2026");
+    expect(tooltip.querySelector(".tooltip-row")).toBeNull();
+    expect(tooltip.querySelector(".tooltip-empty")?.textContent).toBe("No usage");
 
     unmount(component);
   });
@@ -347,6 +349,20 @@ describe("CostTimeSeriesChart", () => {
     expect(document.querySelector(".chart-svg")).toBeNull();
 
     unmount(component);
+  });
+
+  it("leaves the empty state to a loaded summary when the summary read failed", async () => {
+    usage.summary = null;
+    usage.errors.summary = "summary failed";
+    try {
+      const component = mountChart();
+      await tick();
+
+      expect(document.body.textContent).not.toContain("No data for this period");
+      unmount(component);
+    } finally {
+      usage.errors.summary = null;
+    }
   });
 
   it("marks a selected range and exposes a clear-selection action", async () => {
@@ -744,8 +760,8 @@ describe("CostTimeSeriesChart", () => {
     const dots = Array.from(document.querySelectorAll<HTMLElement>(".legend-dot"));
     expect(marks).toHaveLength(11);
     expect(dots).toHaveLength(11);
-    expect(marks.at(-1)!.getAttribute("fill")).toBe("var(--text-muted)");
-    expect(dots.at(-1)!.style.background).toBe("var(--text-muted)");
+    expect(marks.at(-1)!.getAttribute("fill")).toBe("var(--usage-series-other)");
+    expect(dots.at(-1)!.style.background).toBe("var(--usage-series-other)");
     unmount(component);
   });
 
@@ -808,6 +824,34 @@ describe("CostTimeSeriesChart", () => {
     expect(
       Array.from(document.querySelectorAll(".tooltip-name"), (row) => row.textContent),
     ).toEqual(names("model", 0, 10));
+
+    unmount(component);
+  });
+
+  it("leaves series with nothing on the hovered day out of the tooltip", async () => {
+    usage.toggles.timeSeries.groupBy = "model";
+    usage.summary = usageSummary([
+      modelDailyEntry(0, [
+        { modelName: "busy", cost: testMoney(5) },
+        { modelName: "idle", cost: testMoney(0) },
+      ]),
+      modelDailyEntry(1, [
+        { modelName: "busy", cost: testMoney(1) },
+        { modelName: "idle", cost: testMoney(2) },
+      ]),
+    ]);
+
+    const component = mountChart();
+    await tick();
+    document
+      .querySelector(".slot-hit")!
+      .dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
+    await tick();
+
+    const rows = Array.from(document.querySelectorAll(".tooltip .tooltip-row"));
+    expect(rows.map((row) => row.querySelector(".tooltip-name")?.textContent)).toEqual(["busy"]);
+    expect(document.querySelector(".tooltip .tooltip-empty")).toBeNull();
+
     unmount(component);
   });
 
@@ -896,8 +940,8 @@ describe("CostTimeSeriesChart", () => {
     const dots = Array.from(document.querySelectorAll<HTMLElement>(".legend-dot")).map(
       (dot) => dot.style.background,
     );
-    expect(paths).toEqual(["#1f77b4", "#ff7f0e"]);
-    expect(dots).toEqual(["rgb(31, 119, 180)", "rgb(255, 127, 14)"]);
+    expect(paths).toEqual(["#3977a7", "#ef8a46"]);
+    expect(dots).toEqual(["rgb(57, 119, 167)", "rgb(239, 138, 70)"]);
     unmount(component);
   });
 });

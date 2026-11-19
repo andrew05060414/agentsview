@@ -430,7 +430,7 @@ type Session struct {
 	// Claude full parser fell back to linear processing for this file
 	// (nil = unknown/legacy or non-Claude). Linearity is monotonic
 	// across appends, so the incremental parser skips fork detection
-	// for linear-bound transcripts. Not mirrored to PG/DuckDB.
+	// for linear-bound transcripts. Not pushed to replicas.
 	ClaudeLinearParse *bool `json:"-"`
 	// LastWriteIncremental is SQLite-only sync bookkeeping (like
 	// NextOrdinal): true when the last write to this row went through
@@ -438,7 +438,7 @@ type Session struct {
 	// of a full re-normalization (upsertSessionArgs, which always resets
 	// it to false). It is consumed only by parse-diff to classify benign
 	// incremental-vs-full skew and is json:"-" so it never leaks through
-	// the HTTP session API. Deliberately not mirrored to PG/DuckDB: their
+	// the HTTP session API. Deliberately not pushed to replicas: their
 	// push column lists omit the whole sync-bookkeeping cluster.
 	LastWriteIncremental bool    `json:"-"`
 	FileInode            *int64  `json:"file_inode,omitempty"`
@@ -619,6 +619,7 @@ type SessionFilter struct {
 	ExcludeAutomated   bool     // exclude sessions where is_automated = 1
 	AutomatedScope     string   // "", "human", "all", or "automated"
 	IncludeChildren    bool     // include subagent sessions (for sidebar grouping)
+	Flat               bool     // match child sessions individually
 	IncludeEmpty       bool     // include zero-message sessions for project mapping
 	IncludeOrphans     bool     // promote orphan child rows to sidebar roots
 	IncludeSource      bool     // include the session source file path in list rows
@@ -1255,7 +1256,7 @@ func (db *DB) GetSessionFull(
 		return s, err
 	}
 	// Expose the visible name (user rename, else agent session name)
-	// like the PG and DuckDB GetSessionFull and the sqlite base reads.
+	// like the replica GetSessionFull and the sqlite base reads.
 	// The coalesce happens post-scan because sessionFullCols is shared
 	// with ListSessionsModifiedBetween, whose push consumers must see
 	// display_name and session_name unmerged.
@@ -2098,7 +2099,7 @@ func (db *DB) LinkSubagentSessionsContext(ctx context.Context) (int, error) {
 	}
 
 	// local_modified_at is bumped so the sync_marker trigger fires and
-	// push targets (PostgreSQL and the DuckDB mirror) re-select the linked
+	// push targets (PostgreSQL and ClickHouse) re-select the linked
 	// session: parent_session_id and relationship_type are mirrored
 	// columns, but neither is a sync_marker signal, so linking an older
 	// session after a mirror's cutoff would otherwise never re-push it
@@ -2900,6 +2901,39 @@ func (db *DB) FindSessionIDsByPartial(
 	return ids, rows.Err()
 }
 
+// SessionIDTail returns the part of a session ID after its last ':' or '~'
+// delimiter, or the whole ID when it has neither. Every ID that
+// FindSessionIDsByRawSuffix matches for raw has the same tail as raw, so
+// backends index the tail and seek on it before checking the exact
+// suffix forms.
+func SessionIDTail(id string) string {
+	return id[strings.LastIndexAny(id, ":~")+1:]
+}
+
+// sqliteSessionIDTailExpr computes SessionIDTail(id) with SQLite core
+// functions, which have no reverse search. It maps '~' to ':', trims every
+// character after the last ':' to find the prefix ending at that delimiter,
+// and removes that prefix. The prefix ends in ':' and the tail has none, so
+// the replace removes only the leading copy. replace() returns its input
+// unchanged for an empty pattern, so an ID with no delimiter is its own
+// tail. idx_sessions_id_tail indexes this exact expression.
+const sqliteSessionIDTailExpr = `replace(replace(id, '~', ':'),
+	rtrim(replace(id, '~', ':'), replace(replace(id, '~', ''), ':', '')), '')`
+
+// rawSuffixLookupSQL binds ?1 raw, ?2 limit, and ?3 SessionIDTail(raw).
+const rawSuffixLookupSQL = `SELECT id FROM sessions
+	WHERE ` + sqliteSessionIDTailExpr + ` = ?3
+	  AND (id = ?1
+	       OR SUBSTR(id, -(LENGTH(?1) + 1)) IN (':' || ?1, '~' || ?1))
+	  AND deleted_at IS NULL
+	ORDER BY (id = ?1) DESC,
+	         COALESCE(
+	             NULLIF(ended_at, ''),
+	             NULLIF(started_at, ''),
+	             created_at
+	         ) DESC
+	LIMIT ?2`
+
 // FindSessionIDsByRawSuffix returns up to limit session IDs whose
 // stored id is either the exact raw input or the raw input
 // preceded by an agent or host prefix (e.g. "codex:<uuid>" or
@@ -2907,7 +2941,8 @@ func (db *DB) FindSessionIDsByPartial(
 // comparison uses SUBSTR rather than LIKE so that SQL wildcard
 // characters ('_' and '%') present in session IDs (which permit
 // underscores) are compared literally instead of matching any
-// character. Results are sorted by most recently active first.
+// character. The tail predicate lets SQLite seek idx_sessions_id_tail.
+// Results are sorted by most recently active first.
 // Excludes soft-deleted sessions.
 func (db *DB) FindSessionIDsByRawSuffix(
 	ctx context.Context, raw string, limit int,
@@ -2919,18 +2954,7 @@ func (db *DB) FindSessionIDsByRawSuffix(
 		limit = 5
 	}
 	rows, err := db.getReader().QueryContext(ctx,
-		`SELECT id FROM sessions
-		 WHERE (id = ?1
-		        OR SUBSTR(id, -(LENGTH(?1) + 1)) IN (':' || ?1, '~' || ?1))
-		   AND deleted_at IS NULL
-		 ORDER BY (id = ?1) DESC,
-		          COALESCE(
-		              NULLIF(ended_at, ''),
-		              NULLIF(started_at, ''),
-		              created_at
-		          ) DESC
-		 LIMIT ?2`,
-		raw, limit,
+		rawSuffixLookupSQL, raw, limit, SessionIDTail(raw),
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -3150,7 +3174,7 @@ func (db *DB) GetSessionVersion(ctx context.Context,
 		"SELECT message_count, COALESCE(file_mtime, 0),"+
 			" COALESCE(file_hash, ''), COALESCE(local_modified_at, ''), COALESCE(sync_marker, '')"+
 			", (SELECT json_group_array(label) FROM (SELECT label FROM session_labels WHERE session_id = sessions.id ORDER BY label)),"+
-			" COALESCE(parent_session_id, ''), COALESCE(relationship_type, ''),"+
+			" COALESCE(parent_session_id, ''), relationship_type,"+
 			" COALESCE((SELECT ep.parent_session_id FROM session_external_parents ep WHERE ep.session_id = sessions.id), '') FROM sessions WHERE id = ?",
 		id,
 	).Scan(&count, &fileMtime, &fileHash, &localModifiedAt, &syncMarker, &labels, &parent, &relationship, &launcherParent)
@@ -3201,7 +3225,11 @@ type IncrementalInfo struct {
 	// PendingUsageOrdinal identifies the last committed assistant message in
 	// the current turn whose token usage has not yet been persisted. Codex
 	// incremental tails use it to apply the token_count that follows a late
-	// tool result without reparsing the committed prefix.
+	// tool result without reparsing the committed prefix. System rows are
+	// never targets. Codex reasoning rows (thinking without tool use) are a
+	// target only while newest, a state an appended row can end, so any
+	// reasoning row after a candidate leaves this nil and an unattached tail
+	// falls back to a full parse, which applies the parser's rule.
 	PendingUsageOrdinal *int
 }
 
@@ -3318,7 +3346,18 @@ func (db *DB) GetSessionForIncremental(ctx context.Context,
 			 FROM messages m
 			 WHERE m.session_id = s.id
 			   AND m.role = 'assistant'
+			   AND m.is_system = 0
+			   AND NOT (m.has_thinking = 1 AND m.has_tool_use = 0)
 			   AND (m.token_usage IS NULL OR length(m.token_usage) = 0)
+			   AND NOT EXISTS (
+			       SELECT 1
+			       FROM messages r
+			       WHERE r.session_id = s.id
+			         AND r.role = 'assistant'
+			         AND r.is_system = 0
+			         AND r.has_thinking = 1 AND r.has_tool_use = 0
+			         AND r.ordinal > m.ordinal
+			   )
 			   AND m.ordinal > COALESCE((
 			       SELECT MAX(u.ordinal)
 			       FROM messages u
@@ -3500,7 +3539,7 @@ func messageRangeTotalsTx(ctx context.Context,
 	err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*),
 			COALESCE(SUM(role = 'user' AND is_system = 0
-				AND COALESCE(source_subtype, '') <> 'tool_result'), 0),
+				AND source_subtype <> 'tool_result'), 0),
 			COALESCE(SUM(CASE WHEN has_output_tokens != 0
 				THEN output_tokens ELSE 0 END), 0),
 			COALESCE(MAX(has_output_tokens != 0), 0),
@@ -4510,7 +4549,7 @@ func (db *DB) ListSessionWriteIdentitiesByID(
 				args[i] = id
 			}
 			rows, err := db.getReader().QueryContext(ctx, `
-			SELECT id, machine, agent, COALESCE(cwd, ''),
+			SELECT id, machine, agent, cwd,
 			       COALESCE(file_path, ''), COALESCE(file_hash, ''),
 			       session_name, COALESCE(parent_session_id, '')
 			FROM sessions
@@ -5435,10 +5474,7 @@ func (db *DB) MarkSessionSourceMissing(
 	defer db.mu.Unlock()
 	result, err := db.getWriter().ExecContext(ctx, `
 		UPDATE sessions
-		SET source_missing_at = COALESCE(
-		        source_missing_at,
-		        strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		    ),
+		SET source_missing_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
 		    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		WHERE machine = ? AND agent = ? AND id = ? AND file_path = ?
 		  AND source_missing_at IS NULL
@@ -6277,11 +6313,9 @@ func (db *DB) FindPruneCandidates(ctx context.Context,
 		args = append(args, escapeLike(f.FirstMessage)+"%")
 	}
 
-	prefix := ""
-	if f.Agent != "" {
-		// Kept sessions protect every ancestor, including through matching rows
-		// and legacy whole-thread trash anchors.
-		prefix = `WITH RECURSIVE matched(id) AS (
+	// Kept sessions protect every ancestor, including through matching rows
+	// and legacy whole-thread trash anchors.
+	prefix := `WITH RECURSIVE matched(id) AS (
 			SELECT id FROM sessions WHERE ` + where + `
 		), protected(id) AS (
 			SELECT id FROM sessions
@@ -6298,12 +6332,7 @@ func (db *DB) FindPruneCandidates(ctx context.Context,
 			  AND a.deleted_at IS NOT NULL
 			  AND a.trash_includes_codex_pages = 1
 		) `
-		where = "id IN (SELECT id FROM matched) AND id NOT IN (SELECT id FROM protected)"
-	} else {
-		where += ` AND NOT EXISTS (
-			SELECT 1 FROM sessions AS child
-			WHERE child.parent_session_id = sessions.id)`
-	}
+	where = "id IN (SELECT id FROM matched) AND id NOT IN (SELECT id FROM protected)"
 
 	query := prefix + "SELECT " + sessionPruneCols +
 		" FROM sessions WHERE " + where + `
@@ -7082,6 +7111,7 @@ type SessionMirrorSnapshot struct {
 	Findings            []SecretFinding
 	Pins                []PinnedMessage
 	PlanUsage           *SessionPlanUsage // nil when the session has none
+	ImageText           []ImageTextRow
 	UsageFingerprint    string
 	ToolCallFingerprint string
 }
@@ -7129,6 +7159,9 @@ func (db *DB) loadSessionMirrorSnapshot(ctx context.Context, id string, afterSes
 		return nil, err
 	}
 	if result.PlanUsage, err = sessionPlanUsageWithQuerier(ctx, tx, id); err != nil {
+		return nil, err
+	}
+	if result.ImageText, err = sessionImageTextRows(ctx, tx, []string{id}); err != nil {
 		return nil, err
 	}
 	usage := make(map[string]string, 1)

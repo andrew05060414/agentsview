@@ -8,9 +8,7 @@ import (
 
 // Byte caps of the memos whose entries can be large.
 const (
-	activityUsageRangeBytes = 256 << 20
-	activityUsageRowsBytes  = 128 << 20
-	dailyUsageRowsBytes     = 128 << 20
+	dailyUsageRowsBytes = 128 << 20
 )
 
 // The estimates below count a value's own bytes and the bytes of the
@@ -35,16 +33,16 @@ func optionalStringBytes(values ...*string) int64 {
 	return n
 }
 
-func aggregateRowBytes(r chUsageAggregateRow) int64 {
-	return int64(unsafe.Sizeof(r)) + stringBytes(r.date, r.ts, r.pricingTS, r.sessionID, r.project,
-		r.agent, r.machine, r.model, r.providerID, r.priceModel, r.source, r.displayName, r.startedAt, r.groupKey, r.sessionName)
+func aggregateRowBytes(r CHUsageAggregateRow) int64 {
+	return int64(unsafe.Sizeof(r)) + stringBytes(r.Date, r.TS, r.PricingTS, r.SessionID, r.Project,
+		r.Agent, r.Machine, r.Model, r.ProviderID, r.PriceModel, r.Source, r.DisplayName, r.StartedAt, r.GroupKey, r.SessionName)
 }
 
 func dailyUsageRowBytes(r chDailyUsageGroupRow) int64 {
-	return aggregateRowBytes(r.chUsageAggregateRow) + int64(unsafe.Sizeof(r)-unsafe.Sizeof(r.chUsageAggregateRow)) +
-		stringBytes(r.kind, r.contextID, r.priceError) +
-		int64(len(r.inexactModels)+len(r.inexactProjects))*int64(unsafe.Sizeof("")) +
-		stringBytes(r.inexactModels...) + stringBytes(r.inexactProjects...)
+	return aggregateRowBytes(r.CHUsageAggregateRow) + int64(unsafe.Sizeof(r)-unsafe.Sizeof(r.CHUsageAggregateRow)) +
+		stringBytes(r.Kind, r.ContextID, r.PriceError) +
+		int64(len(r.InexactModels)+len(r.InexactProjects))*int64(unsafe.Sizeof("")) +
+		stringBytes(r.InexactModels...) + stringBytes(r.InexactProjects...)
 }
 
 func usageSessionRowBytes(r chUsageSessionRow) int64 {
@@ -69,25 +67,6 @@ func sessionListingBytes(l activitySessionListing) int64 {
 	}
 	for id := range l.versions {
 		n += int64(len(id)) + 24
-	}
-	return n
-}
-
-func keptUsageBytes(k *activityUsageKept) int64 {
-	if k == nil {
-		return 0
-	}
-	n := int64(unsafe.Sizeof(*k)) + int64(len(k.arena)) + int64(len(k.data)) + 8*int64(len(k.sessions))
-	for _, v := range k.dict {
-		n += int64(unsafe.Sizeof(v)) + int64(len(v))
-	}
-	return n
-}
-
-func usageRangeBytes(r activityUsageRange) int64 {
-	n := keptUsageBytes(r.rows)
-	for session, revision := range r.revisions {
-		n += int64(len(session)+len(revision)) + 32
 	}
 	return n
 }

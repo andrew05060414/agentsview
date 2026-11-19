@@ -486,7 +486,10 @@ describe("MessageList follow cancellation", () => {
     await flushScrollUpdates();
     flushFrames();
 
-    expect(element.scrollTop).toBe(800);
+    // The new top row renders at the fixture's 100px instead of the 120px
+    // estimate, and TanStack keeps the view steady by scrolling up 20px.
+    // A jump still reconciling would land on ordinal 11 at 900.
+    expect(element.scrollTop).toBe(780);
   });
 
   it.each(["search closes", "match disappears", "ordinal target is hidden"])(
@@ -577,6 +580,36 @@ describe("MessageList follow cancellation", () => {
     await sessions.refreshActiveSession();
     await tick();
     expect(reportErrorShown).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows a failed transcript load with Retry instead of an empty transcript", async () => {
+    vi.spyOn(SessionsService, "getApiV1SessionsById").mockResolvedValue({
+      id: "s1",
+      message_count: 1,
+    } as Awaited<ReturnType<typeof SessionsService.getApiV1SessionsById>>);
+    const page = vi
+      .spyOn(SessionsService, "getApiV1SessionsByIdMessages")
+      .mockRejectedValueOnce(new Error("database is locked"));
+    messages.messages = [];
+
+    component = mount(MessageList, { target: document.body });
+    await messages.loadSession("s1");
+    const alert = await vi.waitFor(() => {
+      const el = document.querySelector('[role="alert"]');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+
+    expect(alert.textContent).toContain("Failed to load");
+    expect(alert.textContent).toContain("database is locked");
+    expect(reportErrorShown).toHaveBeenCalledWith("session");
+
+    page.mockResolvedValueOnce({ messages: [makeMessage(0)], count: 1 } as Awaited<
+      ReturnType<typeof SessionsService.getApiV1SessionsByIdMessages>
+    >);
+    alert.querySelector<HTMLButtonElement>("button")!.click();
+    await vi.waitFor(() => expect(document.querySelector('[role="alert"]')).toBeNull());
+    expect(messages.messages.map((message) => message.content)).toEqual(["msg 0"]);
   });
 
   it("renders empty and loading states in Simplified Chinese", async () => {

@@ -14,6 +14,7 @@ import (
 )
 
 func TestCodexPageUpgradePreservesPostgresPins(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ name, prefix, agent string }{
 		{"full_push", "codex:", "codex"},
 		{"head_first", "host~traex:", "traex"},
@@ -35,11 +36,12 @@ func TestCodexPageUpgradePreservesPostgresPins(t *testing.T) {
 			const threadUUID = "11111111-1111-4111-8111-111111111111"
 			thread := tc.prefix + threadUUID
 			page := thread + "_22222222-2222-4222-8222-222222222222"
-			const schema = "agentsview_codex_page_pin_test"
+			const schema = pgPushTestSchema
 			ctx := t.Context()
-			pgURL := testPGURL(t)
-			cleanNamedPGSchema(t, pgURL, schema)
-			t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+			pgURL := testPGSchemaURL(t, schema)
+			if !takeFreshSchemaCopy(t, pgURL, schema) {
+				cleanNamedPGSchema(t, pgURL, schema)
+			}
 			source := testDB(t)
 			sourcePath := source.Path()
 			pagePath := filepath.Join(t.TempDir(), "rollout-2026-09-25T12-00-00-"+threadUUID+"_22222222-2222-4222-8222-222222222222.jsonl")
@@ -65,6 +67,10 @@ func TestCodexPageUpgradePreservesPostgresPins(t *testing.T) {
 			before, err := store.ListPinnedMessages(ctx, thread, "")
 			require.NoError(t, err)
 			require.Len(t, before, 1)
+			if tc.name == "page_only" || tc.name == "other_owner" {
+				_, err = syncer.pg.ExecContext(ctx, `INSERT INTO commit_links (session_id,sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at,turn_ordinal,turn_text,project,retained) VALUES ($1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','','','',0,0,'','',0,'prompt','',false),($1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','','','',0,0,'','',NULL,'','',true)`, thread)
+				require.NoError(t, err)
+			}
 			if tc.name == "missing_unpinned_page" || tc.name == "filtered_unpinned_page" {
 				require.NoError(t, store.UnpinMessage(ctx, thread, before[0].MessageID))
 			}
@@ -180,6 +186,13 @@ func TestCodexPageUpgradePreservesPostgresPins(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.Zero(t, result.Errors)
+			if tc.name == "page_only" || tc.name == "other_owner" {
+				var live, retained int
+				require.NoError(t, syncer.pg.QueryRowContext(ctx, `SELECT count(*) FILTER (WHERE NOT retained), count(*) FILTER (WHERE retained) FROM commit_links WHERE session_id=$1`, thread).Scan(&live, &retained))
+				assert.Equal(t, map[string]int{"page_only": 0, "other_owner": 1}[tc.name], live)
+				assert.Equal(t, 1, retained)
+
+			}
 			if tc.name == "filtered_head" || tc.name == "excluded_head" {
 				head, err := store.GetSessionFull(ctx, thread)
 				require.NoError(t, err)

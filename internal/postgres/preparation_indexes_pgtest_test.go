@@ -14,6 +14,7 @@ import (
 )
 
 func TestPGPreparationIndexesUpgradeAndBoundEmptyChecks(t *testing.T) {
+	t.Parallel()
 	const schema = "agentsview_preparation_index_test"
 	t.Run("bounded empty checks", func(t *testing.T) {
 		_, store := prepareUsageSchema(t, schema)
@@ -50,13 +51,13 @@ func TestPGPreparationIndexesUpgradeAndBoundEmptyChecks(t *testing.T) {
 		pg := store.DB()
 
 		// Each missing index must independently trigger the ordinary push upgrade.
-		for _, index := range []string{"idx_sessions_data_version", "idx_sessions_parentless_workers", "idx_sessions_source_missing"} {
-			t.Run(index, func(t *testing.T) {
-				_, err := pg.ExecContext(t.Context(), `DROP INDEX `+index)
+		for _, index := range preparationIndexesPG {
+			t.Run(index.name, func(t *testing.T) {
+				_, err := pg.ExecContext(t.Context(), `DROP INDEX `+index.name)
 				require.NoError(t, err)
 				require.True(t, pushSchemaCurrent(t.Context(), pg), "missing performance indexes preserve schema compatibility")
 				require.NoError(t, (&Sync{pg: pg, schema: schema}).EnsureSchema(t.Context()))
-				require.True(t, pgHasIndex(t.Context(), pg, index), "owner preparation installs the missing index")
+				require.True(t, pgHasIndex(t.Context(), pg, index.name), "owner preparation installs the missing index")
 			})
 		}
 
@@ -72,13 +73,14 @@ func TestPGPreparationIndexesUpgradeAndBoundEmptyChecks(t *testing.T) {
 }
 
 func TestPGPreparationIndexesConcurrentInstallersBothSucceed(t *testing.T) {
+	t.Parallel()
 	const schema = "agentsview_preparation_concurrent_test"
 	pgURL, store := prepareUsageSchema(t, schema)
 	pg := store.DB()
 	_, err := pg.ExecContext(t.Context(), `INSERT INTO sessions(id,machine,project,agent) VALUES('existing','machine','project','codex')`)
 	require.NoError(t, err)
-	for _, index := range []string{"idx_sessions_data_version", "idx_sessions_parentless_workers", "idx_sessions_source_missing"} {
-		_, err := pg.ExecContext(t.Context(), `DROP INDEX `+index)
+	for _, index := range preparationIndexesPG {
+		_, err := pg.ExecContext(t.Context(), `DROP INDEX `+index.name)
 		require.NoError(t, err)
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -113,7 +115,7 @@ func TestPGPreparationIndexesConcurrentInstallersBothSucceed(t *testing.T) {
 	require.NoError(t, blocker.Commit())
 	require.NoError(t, <-results, "first publisher upgrades the shared archive")
 	require.NoError(t, <-results, "second publisher upgrades the shared archive")
-	for _, index := range []string{"idx_sessions_data_version", "idx_sessions_parentless_workers", "idx_sessions_source_missing"} {
-		assert.True(t, pgHasIndex(t.Context(), pg, index), index)
+	for _, index := range preparationIndexesPG {
+		assert.True(t, pgHasIndex(t.Context(), pg, index.name), index.name)
 	}
 }

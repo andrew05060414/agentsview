@@ -224,6 +224,27 @@ func OpenForAdmin(ctx context.Context, t Target) (*sql.DB, error) {
 	return openDatabase(ctx, t.URL, "default", 0)
 }
 
+// compactionReadTimeout is how long one OPTIMIZE may run before the push stops
+// waiting for it. The server sends nothing while it merges, so the driver's
+// default five-minute read timeout would end the wait for a large table on a
+// slow server while the merge keeps running.
+const compactionReadTimeout = time.Hour
+
+// openCompaction opens the one-connection pool a push compacts through; see
+// compactionReadTimeout.
+func openCompaction(ctx context.Context, t Target) (*sql.DB, error) {
+	database, err := t.DatabaseName()
+	if err != nil {
+		return nil, err
+	}
+	opt, err := connectOptions(t.URL, database, 1)
+	if err != nil {
+		return nil, err
+	}
+	opt.ReadTimeout = max(opt.ReadTimeout, compactionReadTimeout)
+	return openWithOptions(ctx, t.URL, opt)
+}
+
 // openDatabase opens a pool of poolSize connections, or of the URL's
 // max_open_conns (default defaultMaxOpenConns) when poolSize is 0.
 func openDatabase(ctx context.Context, dsn, database string, poolSize int) (*sql.DB, error) {
@@ -231,6 +252,10 @@ func openDatabase(ctx context.Context, dsn, database string, poolSize int) (*sql
 	if err != nil {
 		return nil, err
 	}
+	return openWithOptions(ctx, dsn, opt)
+}
+
+func openWithOptions(ctx context.Context, dsn string, opt *clickhouse.Options) (*sql.DB, error) {
 	conn := clickhouse.OpenDB(opt)
 	conn.SetMaxOpenConns(opt.MaxOpenConns)
 	conn.SetMaxIdleConns(opt.MaxIdleConns)
@@ -241,6 +266,33 @@ func openDatabase(ctx context.Context, dsn, database string, poolSize int) (*sql
 	if err := conn.PingContext(pingCtx); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("connecting to clickhouse at %s: %w", RedactDSN(dsn), err)
+	}
+	return conn, nil
+}
+
+// openBulk opens a native-protocol pool, with the settings Open applies, for
+// reads that return rows by the million. database/sql hands Scan every value
+// boxed in an interface, with reflection for nullable columns and a text
+// round trip into int fields; the native API scans into typed destinations
+// at a fraction of that cost.
+func openBulk(ctx context.Context, t Target) (clickhouse.Conn, error) {
+	database, err := t.DatabaseName()
+	if err != nil {
+		return nil, err
+	}
+	opt, err := connectOptions(t.URL, database, 0)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := clickhouse.Open(opt)
+	if err != nil {
+		return nil, fmt.Errorf("opening clickhouse native connection at %s: %w", RedactDSN(t.URL), err)
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+	defer cancel()
+	if err := conn.Ping(pingCtx); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("connecting to clickhouse at %s: %w", RedactDSN(t.URL), err), conn.Close())
 	}
 	return conn, nil
 }

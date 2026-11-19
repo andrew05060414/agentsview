@@ -47,19 +47,28 @@ func requireHostedSandbox(t *testing.T) {
 		t.Skip("kernel isolation unavailable")
 	}
 }
-func startParityRuntime(t *testing.T, policy config.ArchiveContent) (*replicaServeStartup, *postgres.HostedStore, *sql.DB) {
+func startParityRuntime(t *testing.T, policy config.ArchiveContent, configure ...func(*config.Config, *sql.DB)) (*replicaServeStartup, *postgres.HostedStore, *sql.DB) {
+	return startParityRuntimeConfigured(t, policy, true, configure...)
+}
+
+func startParityRuntimeConfigured(t *testing.T, policy config.ArchiveContent, checkSandbox bool, configure ...func(*config.Config, *sql.DB)) (*replicaServeStartup, *postgres.HostedStore, *sql.DB) {
 	t.Helper()
-	requireHostedSandbox(t)
 	cfg, admin := hostedRuntimeConfig(t)
 	cfg.PG.RawDerivation = true
 	cfg.PG.RawPollSeconds = 1
 	cfg.PG.RawMaxAttempts = 2
 	cfg.ArchiveContent = policy
+	for _, fn := range configure {
+		fn(&cfg, admin)
+	}
+	if cfg.PG.RawDerivation && checkSandbox {
+		requireHostedSandbox(t)
+	}
 	// An occupied archive path makes an accidental hosted archive open fail.
 	cfg.DBPath = filepath.Join(cfg.DataDir, "sessions.db")
 	require.NoError(t, os.Mkdir(cfg.DBPath, 0700))
 	require.NoError(t, os.WriteFile(filepath.Join(cfg.DBPath, "sentinel"), []byte("not an archive"), 0600))
-	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil)
+	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil, false)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(startup.ctx)
 	startup.ctx = ctx

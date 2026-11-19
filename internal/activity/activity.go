@@ -1,7 +1,7 @@
 // Package activity aggregates a resolved time range of agent activity into a
 // concurrency- and usage-oriented report. It operates on in-memory input
 // streams supplied by a storage backend, so the same aggregation runs
-// identically across SQLite, PostgreSQL, and DuckDB. Export contract types are
+// identically across SQLite, PostgreSQL, and ClickHouse. Export contract types are
 // referenced only for optional report metadata.
 package activity
 
@@ -78,14 +78,17 @@ type UsageRow struct {
 	Cost              money.Money
 	CostSource        export.CostSource
 	SessionCost       *money.Money
-	CostAllocated     bool // an authoritative session total was apportioned
-	Priced            bool
-	Contributes       bool
-	Agent             string
-	ClaudeMessageID   string
-	ClaudeRequestID   string
-	SourceUUID        string
-	UsageDedupKey     string
+	// RecordedCost is the cost the agent recorded for this row, when it
+	// recorded one; see UsagePrice.RecordedCost.
+	RecordedCost    *money.Money
+	CostAllocated   bool // an authoritative session total was apportioned
+	Priced          bool
+	Contributes     bool
+	Agent           string
+	ClaudeMessageID string
+	ClaudeRequestID string
+	SourceUUID      string
+	UsageDedupKey   string
 }
 
 // SessionTokenCoverage records the canonical token categories represented for
@@ -374,7 +377,10 @@ type interval struct {
 	sessionID string
 	start     time.Time
 	end       time.Time
-	model     string // model attributed to this interval
+	// tail is the start of the interval's last piece, for an interval that
+	// joins touching pieces; bucket membership depends on it.
+	tail  time.Time
+	model string // model attributed to this interval
 }
 
 // parseTS parses an RFC3339(/Nano) timestamp; ok=false on empty/invalid.
@@ -401,6 +407,16 @@ func rangeWindows(p Params) []BucketWindow {
 		return []BucketWindow{{Start: p.RangeStart, End: p.RangeEnd}}
 	}
 	return windows
+}
+
+// QueryWindows returns the bucket windows a report over q sums usage into.
+func QueryWindows(q Query) []BucketWindow {
+	return rangeWindows(Params{RangeStart: q.RangeStart, RangeEnd: q.RangeEnd, Bucket: q.Bucket, Loc: q.Loc})
+}
+
+// WindowIndex returns the index of the window that holds t, or -1.
+func WindowIndex(windows []BucketWindow, t time.Time) int {
+	return windowIndex(windows, t)
 }
 
 // Aggregate builds the range's report from the three input streams.
@@ -550,9 +566,10 @@ type usageAgg struct {
 	models       map[string]money.Money // model -> cost (for primary/mixed)
 }
 
+// sessionIntervalAgg sums durations, which add exactly, so a session's
+// minutes do not depend on how its activity was split into intervals.
 type sessionIntervalAgg struct {
-	minutes       float64
-	modelMins     map[string]float64
+	duration      time.Duration
 	modelDuration map[string]time.Duration
 	first, last   time.Time
 	hasIv         bool
@@ -573,6 +590,9 @@ func AddUsageDedupToken(seen map[UsageDedupToken]struct{}, token UsageDedupToken
 	return true
 }
 
+// claudeUsageSnapshotToken identifies one Claude response. The message ID is
+// required; the request ID is empty when the transcript omits requestId, which
+// Claude Agent SDK transcripts do.
 type claudeUsageSnapshotToken struct {
 	messageID string
 	requestID string
@@ -598,11 +618,11 @@ func (row UsageRow) UsageIdentity() UsageIdentity {
 	}
 }
 
-// usageDedupTokenWithoutSourceGate picks the Claude pair, source UUID, or stored usage key,
+// usageDedupTokenWithoutSourceGate picks the Claude response identity, source UUID, or stored usage key,
 // accepting source UUIDs regardless of UsageSource. SessionUsageDedupTokenForRow
 // restricts source UUIDs to message rows.
 func usageDedupTokenWithoutSourceGate(row UsageIdentity) (UsageDedupToken, bool) {
-	if row.ClaudeMessageID != "" && row.ClaudeRequestID != "" {
+	if row.ClaudeMessageID != "" {
 		return UsageDedupToken{
 			Kind: "claude", Value: row.ClaudeMessageID + ":" + row.ClaudeRequestID,
 		}, true
@@ -631,6 +651,27 @@ func KeepSessionUsageRow(seen map[UsageDedupToken]struct{}, row UsageIdentity) b
 	return !ok || AddUsageDedupToken(seen, key)
 }
 
+// UsageSelectionRow contains the fields needed to select usage survivors.
+type UsageSelectionRow struct {
+	UsageIdentity
+	SessionID         string
+	MessageOrdinal    int64
+	Timestamp         time.Time
+	TimestampValid    bool
+	RawTimestamp      string
+	OutputTokens      int
+	WebSearchRequests int
+}
+
+func usageSelectionRows(rows []UsageRow) []UsageSelectionRow {
+	out := make([]UsageSelectionRow, len(rows))
+	for i, row := range rows {
+		ts, valid := parseTS(row.Timestamp)
+		out[i] = UsageSelectionRow{UsageIdentity: row.UsageIdentity(), SessionID: row.SessionID, MessageOrdinal: row.MessageOrdinal, Timestamp: ts, TimestampValid: valid, RawTimestamp: row.Timestamp, OutputTokens: row.OutputTokens, WebSearchRequests: row.WebSearchRequests}
+	}
+	return out
+}
+
 // ClaudeSnapshotSurvivorSelection also returns the earliest session and the
 // maximum billed web-search count for each surviving snapshot. Callers use the
 // former for attribution and the latter when pricing the selected token row.
@@ -649,12 +690,12 @@ func ClaudeSnapshotSurvivorSelection(
 func ClaudeSnapshotSurvivorSelectionContext(
 	ctx context.Context, usage []UsageRow,
 ) (mask []bool, attribution []string, webSearchRequests []int, err error) {
-	mask, attribution, webSearchRequests, _, err = claudeSnapshotSelectionContext(ctx, usage, nil)
+	mask, attribution, webSearchRequests, _, err = claudeSnapshotSelectionContext(ctx, usageSelectionRows(usage), nil)
 	return mask, attribution, webSearchRequests, err
 }
 
 func claudeSnapshotSelectionContext(
-	ctx context.Context, usage []UsageRow, eligible []bool,
+	ctx context.Context, usage []UsageSelectionRow, eligible []bool,
 ) (
 	mask []bool,
 	attribution []string,
@@ -686,7 +727,7 @@ func claudeSnapshotSelectionContext(
 		if eligible != nil && !eligible[i] {
 			continue
 		}
-		if u.ClaudeMessageID == "" || u.ClaudeRequestID == "" {
+		if u.ClaudeMessageID == "" {
 			mask[i] = true
 			attribution[i] = u.SessionID
 			webSearchRequests[i] = u.WebSearchRequests
@@ -730,7 +771,7 @@ func claudeSnapshotSelectionContext(
 		if eligible != nil && !eligible[i] {
 			continue
 		}
-		if u.ClaudeMessageID == "" || u.ClaudeRequestID == "" {
+		if u.ClaudeMessageID == "" {
 			continue
 		}
 		canonical[i] = groups[rowGroup[i]].best
@@ -743,7 +784,7 @@ func claudeSnapshotSelectionContext(
 func CanonicalSessionTokenCoverageContext(
 	ctx context.Context, usage []UsageRow,
 ) (map[string]SessionTokenCoverage, error) {
-	_, _, _, snapshotCanonical, err := claudeSnapshotSelectionContext(ctx, usage, nil)
+	_, _, _, snapshotCanonical, err := claudeSnapshotSelectionContext(ctx, usageSelectionRows(usage), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -794,14 +835,12 @@ func CanonicalSessionTokenCoverageContext(
 	return coverage, nil
 }
 
-func earlierClaudeSnapshotAttribution(candidate, current UsageRow) bool {
-	candidateTS, candidateErr := time.Parse(time.RFC3339Nano, candidate.Timestamp)
-	currentTS, currentErr := time.Parse(time.RFC3339Nano, current.Timestamp)
-	if candidateErr == nil && currentErr == nil && !candidateTS.Equal(currentTS) {
-		return candidateTS.Before(currentTS)
+func earlierClaudeSnapshotAttribution(candidate, current UsageSelectionRow) bool {
+	if candidate.TimestampValid && current.TimestampValid && !candidate.Timestamp.Equal(current.Timestamp) {
+		return candidate.Timestamp.Before(current.Timestamp)
 	}
-	if (candidateErr == nil) != (currentErr == nil) {
-		return candidateErr == nil
+	if candidate.TimestampValid != current.TimestampValid {
+		return candidate.TimestampValid
 	}
 	if candidate.SessionID != current.SessionID {
 		return candidate.SessionID < current.SessionID
@@ -809,20 +848,18 @@ func earlierClaudeSnapshotAttribution(candidate, current UsageRow) bool {
 	if candidate.MessageOrdinal != current.MessageOrdinal {
 		return candidate.MessageOrdinal < current.MessageOrdinal
 	}
-	return candidateErr != nil && candidate.Timestamp < current.Timestamp
+	return !candidate.TimestampValid && candidate.RawTimestamp < current.RawTimestamp
 }
 
-func laterClaudeSnapshot(candidate, current UsageRow) bool {
+func laterClaudeSnapshot(candidate, current UsageSelectionRow) bool {
 	if candidate.OutputTokens != current.OutputTokens {
 		return candidate.OutputTokens > current.OutputTokens
 	}
-	candidateTS, candidateErr := time.Parse(time.RFC3339Nano, candidate.Timestamp)
-	currentTS, currentErr := time.Parse(time.RFC3339Nano, current.Timestamp)
-	if candidateErr == nil && currentErr == nil && !candidateTS.Equal(currentTS) {
-		return candidateTS.After(currentTS)
+	if candidate.TimestampValid && current.TimestampValid && !candidate.Timestamp.Equal(current.Timestamp) {
+		return candidate.Timestamp.After(current.Timestamp)
 	}
-	if (candidateErr == nil) != (currentErr == nil) {
-		return candidateErr == nil
+	if candidate.TimestampValid != current.TimestampValid {
+		return candidate.TimestampValid
 	}
 	if candidate.SessionID != current.SessionID {
 		return candidate.SessionID > current.SessionID
@@ -830,7 +867,7 @@ func laterClaudeSnapshot(candidate, current UsageRow) bool {
 	if candidate.MessageOrdinal != current.MessageOrdinal {
 		return candidate.MessageOrdinal > current.MessageOrdinal
 	}
-	return candidateErr != nil && candidate.Timestamp > current.Timestamp
+	return !candidate.TimestampValid && candidate.RawTimestamp > current.RawTimestamp
 }
 
 // UsageSurvivorSelection returns the survivor mask, accounting destination,
@@ -870,10 +907,23 @@ func usageSurvivorSelection(
 	usage []UsageRow,
 	allowed map[string]struct{},
 ) (mask []bool, attribution []string, webSearchRequests []int, err error) {
+	return usageSelection(ctx, start, end, effEnd, usageSelectionRows(usage), allowed)
+}
+
+// SelectUsageSurvivorsForSessions selects from compact, timestamp-parsed rows.
+func SelectUsageSurvivorsForSessions(ctx context.Context, start, end, effEnd time.Time, usage []UsageSelectionRow, sessionIDs []string) (mask []bool, attribution []string, webSearchRequests []int, err error) {
+	allowed := make(map[string]struct{}, len(sessionIDs))
+	for _, id := range sessionIDs {
+		allowed[id] = struct{}{}
+	}
+	return usageSelection(ctx, start, end, effEnd, usage, allowed)
+}
+
+func usageSelection(ctx context.Context, start, end, effEnd time.Time, usage []UsageSelectionRow, allowed map[string]struct{}) (mask []bool, attribution []string, webSearchRequests []int, err error) {
 	eligible := make([]bool, len(usage))
 	for i, u := range usage {
-		t, ok := parseTS(u.Timestamp)
-		if !ok || t.Before(start) || !t.Before(end) {
+		t := u.Timestamp
+		if !u.TimestampValid || t.Before(start) || !t.Before(end) {
 			continue
 		}
 		if !t.Before(effEnd) {
@@ -898,7 +948,7 @@ func usageSurvivorSelection(
 				continue
 			}
 		}
-		if k, ok := usageDedupTokenWithoutSourceGate(u.UsageIdentity()); ok && !AddUsageDedupToken(seen, k) {
+		if k, ok := usageDedupTokenWithoutSourceGate(u.UsageIdentity); ok && !AddUsageDedupToken(seen, k) {
 			continue
 		}
 		mask[i] = true
@@ -1010,7 +1060,7 @@ func buildSessionsTableFromDedupedUsage(
 	// float addition is not associative, so the unspecified per-backend row
 	// order (no activityReportSessions query imposes ORDER BY) would otherwise
 	// yield 1-ULP-different breakdown costs across SQLite, PostgreSQL, and
-	// DuckDB for identical data.
+	// ClickHouse for identical data.
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].SessionID < sessions[j].SessionID
 	})
@@ -1059,7 +1109,7 @@ func buildSessionsTableFromDedupedUsage(
 			Agent: s.Agent, TimingQuality: "untimed", IsAutomated: s.IsAutomated, IsSubagent: s.IsSubagent,
 		}
 		if a := agg[s.SessionID]; a != nil && a.hasIv {
-			mins := a.minutes
+			mins := a.duration.Minutes()
 			row.AgentMinutes = &mins
 			row.TimingQuality = "timed"
 			f := a.first.Format(time.RFC3339)
@@ -1072,8 +1122,8 @@ func buildSessionsTableFromDedupedUsage(
 			if err := addKey(byAgent, s.Agent, mins, money.Money{}, kind); err != nil {
 				return fmt.Errorf("summing activity agent minutes: %w", err)
 			}
-			for m, mm := range a.modelMins {
-				if err := addKey(byModel, m, mm, money.Money{}, kind); err != nil {
+			for m, d := range a.modelDuration {
+				if err := addKey(byModel, m, d.Minutes(), money.Money{}, kind); err != nil {
 					return fmt.Errorf("summing activity model minutes: %w", err)
 				}
 			}
@@ -1239,7 +1289,7 @@ func primaryAndMoneyModels(w map[string]money.Money) (string, []string) {
 			continue
 		}
 		keys = append(keys, k)
-		if v.Microdollars > best {
+		if v.Microdollars > best || v.Microdollars == best && best > 0 && k < primary {
 			best, primary = v.Microdollars, k
 		}
 	}

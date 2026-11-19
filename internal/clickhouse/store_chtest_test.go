@@ -42,7 +42,7 @@ func TestReadStatusHonorsProjectFilters(t *testing.T) {
 
 func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 	t.Parallel()
-	store, _, _ := newPushedStore(t)
+	store := newClonedReadStore(t)
 	ctx := t.Context()
 
 	t.Run("list_sessions_default_sort_and_cursor", func(t *testing.T) {
@@ -301,7 +301,7 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 
 func TestSearchContentExcludeActiveSince(t *testing.T) {
 	t.Parallel()
-	store, _, _ := newPushedStore(t)
+	store := newClonedReadStore(t)
 	for _, mode := range []string{"substring", "regex", "fts"} {
 		t.Run(mode, func(t *testing.T) {
 			page, err := store.SearchContent(t.Context(), db.ContentSearchFilter{
@@ -415,7 +415,7 @@ func TestStoreGetSessionVersionChangesAfterPush(t *testing.T) {
 
 func TestStoreMessageWindowReportsRevisionWithRows(t *testing.T) {
 	t.Parallel()
-	store, _, _ := newPushedStore(t)
+	store := newClonedReadStore(t)
 	ctx := t.Context()
 
 	from := 0
@@ -514,17 +514,17 @@ func TestMachineSelectorLookupIncludesUnmergedIdentity(t *testing.T) {
 	// Only the newest version owns the session identity.
 	_, err := conn.ExecContext(ctx, `INSERT INTO sessions (id, machine, push_version) VALUES ('updated', 'current-host', 2)`)
 	require.NoError(t, err)
-	ids, err := NewStoreFromDB(conn).GetMatchingMachineIDs(ctx, []string{"retired-host"})
+	ids, err := newTestStore(t, conn, Target{URL: dsn, Database: database}).GetMatchingMachineIDs(ctx, []string{"retired-host"})
 	require.NoError(t, err)
 	assert.Empty(t, ids)
-	ids, err = NewStoreFromDB(conn).GetMatchingMachineIDs(ctx, []string{"current-host"})
+	ids, err = newTestStore(t, conn, Target{URL: dsn, Database: database}).GetMatchingMachineIDs(ctx, []string{"current-host"})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"current-host"}, ids)
 }
 
 func TestStorePoolsCapQueryThreads(t *testing.T) {
 	t.Parallel()
-	store, _, _ := newPushedStore(t)
+	store := newClonedReadStore(t)
 	ctx := t.Context()
 	require.NotSame(t, store.conn, store.pages, "serve keeps page reads on their own pool")
 	for name, row := range map[string]*sql.Row{
@@ -537,4 +537,24 @@ func TestStorePoolsCapQueryThreads(t *testing.T) {
 	}
 	assert.Equal(t, 4, store.pages.Stats().MaxOpenConnections)
 	assert.Equal(t, 12, store.conn.Stats().MaxOpenConnections)
+}
+
+func TestStoreMessageWindowCompactBoundary(t *testing.T) {
+	t.Parallel()
+	store, syncer, local := newPushedStore(t)
+	ctx := t.Context()
+	session, err := local.GetSessionFull(ctx, fixtureAlphaID)
+	require.NoError(t, err)
+	messages, err := local.GetAllMessages(ctx, fixtureAlphaID)
+	require.NoError(t, err)
+	messages = append(messages, db.Message{SessionID: fixtureAlphaID, Ordinal: 2, Role: "assistant", IsSystem: true, IsCompactBoundary: true, Content: "summary"})
+	session.MessageCount = len(messages)
+	_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{Session: *session, Messages: messages, DataVersion: 1, ReplaceMessages: true}})
+	require.NoError(t, err)
+	_, err = syncer.Push(ctx, false, nil)
+	require.NoError(t, err)
+	got, err := store.GetMessagesWindow(ctx, fixtureAlphaID, db.MessageWindow{Limit: 10, Asc: true, CompactBoundaryOnly: true})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, 2, got[0].Ordinal)
 }

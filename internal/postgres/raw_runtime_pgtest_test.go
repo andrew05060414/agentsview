@@ -16,9 +16,11 @@ import (
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/rawderive"
 	"go.kenn.io/agentsview/internal/rawsync"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func TestHostedRuntimeAcceptanceSelectsAtomically(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	jobs, err := NewHostedRawIngestStore(f.runtime, f.tenant, "parser-1")
 	require.NoError(t, err)
@@ -42,6 +44,7 @@ func TestHostedRuntimeAcceptanceSelectsAtomically(t *testing.T) {
 }
 
 func TestHostedRuntimeClaimsOnlyConfiguredSelection(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	m, _ := f.accept(t, "device-a", "capture-a", "")
 	jobs, err := NewHostedRawIngestStore(f.runtime, f.tenant, "parser-2")
@@ -64,6 +67,7 @@ func TestHostedRuntimeClaimsOnlyConfiguredSelection(t *testing.T) {
 }
 
 func TestHostedRuntimeSettlesWithoutUpload(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	ended := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	now := ended.Add(time.Minute)
@@ -120,6 +124,7 @@ func TestHostedRuntimeSettlesWithoutUpload(t *testing.T) {
 }
 
 func TestHostedRuntimeRolloutResumesAndDoesNotResurrect(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	a, _ := f.accept(t, "device-a", "a", "")
 	require.NoError(t, f.sink.Project(t.Context(), f.lease(t, a), a, projectionOutcome("retained")))
@@ -173,6 +178,7 @@ func TestHostedRuntimeRolloutResumesAndDoesNotResurrect(t *testing.T) {
 }
 
 func TestHostedRuntimeRepairWaitsForHeadLock(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name           string
 		selectionMoved bool
@@ -254,6 +260,7 @@ func TestHostedRuntimeRepairWaitsForHeadLock(t *testing.T) {
 }
 
 func TestHostedRuntimeRepairReachesNextFailureAfterUploadAdvancesHead(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	a, receipt := f.accept(t, "device-a", "failed-a", "")
 	aLease := f.lease(t, a)
@@ -308,6 +315,7 @@ func TestHostedRuntimeRepairReachesNextFailureAfterUploadAdvancesHead(t *testing
 }
 
 func TestHostedRuntimeRepairFailedJobs(t *testing.T) {
+	t.Parallel()
 	t.Run("field_reset_and_healthy_job", func(t *testing.T) {
 		f := newProjectionFixture(t)
 		f.sink.options.RetryPolicy = rawderive.RetryPolicy{Base: time.Second, Maximum: time.Minute, MaxAttempts: 1}
@@ -376,6 +384,7 @@ func TestHostedRuntimeRepairFailedJobs(t *testing.T) {
 }
 
 func TestHostedRuntimeSelectionFailureRollsBackAcceptance(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	jobs, err := NewHostedRawIngestStore(f.runtime, f.tenant, "parser-1")
 	require.NoError(t, err)
@@ -402,6 +411,7 @@ func TestHostedRuntimeSelectionFailureRollsBackAcceptance(t *testing.T) {
 }
 
 func TestHostedRuntimeRefusesLegacyReaderAndPush(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	require.ErrorContains(t, RejectHostedPush(t.Context(), f.runtime), "hosted-owned")
 	_, err := NewStore(t.Context(), f.dsn, f.schema, false)
@@ -413,6 +423,7 @@ func TestHostedRuntimeRefusesLegacyReaderAndPush(t *testing.T) {
 }
 
 func TestHostedRuntimeRequiresFrictionProjectionPrivileges(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	for _, table := range []string{"friction_findings"} {
 		_, err := f.admin.ExecContext(t.Context(), `REVOKE DELETE ON "`+table+`" FROM "`+f.role+`"`)
@@ -436,7 +447,42 @@ func TestHostedRuntimeRequiresFrictionProjectionPrivileges(t *testing.T) {
 	require.NoError(t, CheckHostedRuntimeWritable(t.Context(), f.runtime, f.schema, config.ArchiveContentFull))
 }
 
+func TestHostedVectorProvisionAndPrivileges(t *testing.T) {
+	t.Parallel()
+	f := newProjectionFixture(t)
+	_, err := f.admin.ExecContext(t.Context(), `CREATE EXTENSION IF NOT EXISTS vector SCHEMA public`)
+	require.NoError(t, err)
+	gen := storage.VectorGenerationInfo{Fingerprint: "hosted-test", Model: "fixture", Dimension: 2}
+	require.ErrorContains(t, CheckHostedVectorPrivileges(t.Context(), f.runtime, f.schema, gen.Fingerprint), "hosted-provision")
+	require.NoError(t, ProvisionHostedVector(t.Context(), f.admin, f.schema, f.tenant, gen))
+	id, _, ok, err := LookupVectorGeneration(t.Context(), f.runtime, gen.Fingerprint)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.ErrorContains(t, CheckHostedVectorPrivileges(t.Context(), f.runtime, f.schema, gen.Fingerprint), vectorChunkTable(id))
+	_, err = f.admin.ExecContext(t.Context(), `GRANT SELECT,INSERT,DELETE ON `+vectorChunkTable(id)+` TO "`+f.role+`"`)
+	require.NoError(t, err)
+	oldGen := storage.VectorGenerationInfo{Fingerprint: "old-hosted-test", Model: "fixture", Dimension: 2}
+	require.NoError(t, ProvisionHostedVector(t.Context(), f.admin, f.schema, f.tenant, oldGen))
+	oldID, _, ok, err := LookupVectorGeneration(t.Context(), f.runtime, oldGen.Fingerprint)
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, err = f.admin.ExecContext(t.Context(), `GRANT DELETE ON `+vectorChunkTable(oldID)+` TO "`+f.role+`"`)
+	require.NoError(t, err)
+	require.ErrorContains(t, CheckHostedVectorPrivileges(t.Context(), f.runtime, f.schema, gen.Fingerprint), vectorChunkTable(oldID))
+	_, err = f.admin.ExecContext(t.Context(), `GRANT SELECT ON `+vectorChunkTable(oldID)+` TO "`+f.role+`"`)
+	require.NoError(t, err)
+	require.NoError(t, CheckHostedVectorPrivileges(t.Context(), f.runtime, f.schema, gen.Fingerprint))
+	_, err = f.admin.ExecContext(t.Context(), `CREATE TABLE vector_chunks_g999999 (doc_key text)`)
+	require.NoError(t, err)
+	badGen := storage.VectorGenerationInfo{Fingerprint: "rolled-back", Model: "fixture", Dimension: 2}
+	require.ErrorContains(t, ProvisionHostedVector(t.Context(), f.admin, f.schema, f.tenant, badGen), "hosted vector schema is unsupported")
+	_, _, ok, err = LookupVectorGeneration(t.Context(), f.runtime, badGen.Fingerprint)
+	require.NoError(t, err)
+	assert.False(t, ok)
+}
+
 func TestHostedRuntimeSettlingRechecksConcurrentVisibility(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"removal", "exclusion", "replacement", "curation"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newProjectionFixture(t)
@@ -511,6 +557,7 @@ func TestHostedRuntimeSettlingRechecksConcurrentVisibility(t *testing.T) {
 }
 
 func TestHostedRuntimeSubprocessTombstoneRetainsPublicSession(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	jobs, err := NewHostedRawIngestStore(f.runtime, f.tenant, "parser-1")
 	require.NoError(t, err)
@@ -559,6 +606,7 @@ func TestHostedRuntimeSubprocessTombstoneRetainsPublicSession(t *testing.T) {
 }
 
 func TestHostedRuntimeAcceptsOnlyRequiredProjectionMutations(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	// Friction rows are replaced on a rule-version refresh. Other child removal
 	// follows the sessions FK, so those immutable tables need no DELETE grant.
@@ -621,6 +669,7 @@ func TestHostedRuntimeAcceptsOnlyRequiredProjectionMutations(t *testing.T) {
 }
 
 func TestHostedRuntimeUsagePolicyRequiresVectorRemovalPrivileges(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	_, err := f.admin.ExecContext(t.Context(), `REVOKE DELETE ON vector_documents FROM "`+f.role+`"`)
 	require.NoError(t, err)
@@ -638,6 +687,7 @@ func TestHostedRuntimeUsagePolicyRequiresVectorRemovalPrivileges(t *testing.T) {
 }
 
 func TestHostedRuntimeRequiresProvisionedObservationColumns(t *testing.T) {
+	t.Parallel()
 	f := newProjectionFixture(t)
 	require.NoError(t, CheckHostedRuntimeWritable(t.Context(), f.runtime, f.schema, config.ArchiveContentFull))
 	// A schema that owner provisioning has not upgraded lacks the columns.

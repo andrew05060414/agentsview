@@ -25,6 +25,7 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentCopilot:        ProviderMigrationProviderAuthoritative,
 	AgentGemini:         ProviderMigrationProviderAuthoritative,
 	AgentGeminiApps:     ProviderMigrationImportOnly,
+	AgentGrokWeb:        ProviderMigrationImportOnly,
 	AgentOpenHands:      ProviderMigrationProviderAuthoritative,
 	AgentCursor:         ProviderMigrationProviderAuthoritative,
 	AgentCursorIDE:      ProviderMigrationProviderAuthoritative,
@@ -83,7 +84,9 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentAider:          ProviderMigrationProviderAuthoritative,
 	AgentOMP:            ProviderMigrationProviderAuthoritative,
 	AgentStepCode:       ProviderMigrationProviderAuthoritative,
+	AgentDirectAPI:      ProviderMigrationProviderAuthoritative,
 	AgentEvener:         ProviderMigrationProviderAuthoritative,
+	AgentMusePersonal:   ProviderMigrationProviderAuthoritative,
 	AgentReasonix:       ProviderMigrationProviderAuthoritative,
 	AgentRooCode:        ProviderMigrationProviderAuthoritative,
 	AgentCline:          ProviderMigrationProviderAuthoritative,
@@ -210,7 +213,7 @@ func validateProviderMigrationMode(
 
 func isImportOnlyAgentType(agent AgentType) bool {
 	switch agent {
-	case AgentClaudeAI, AgentChatGPT, AgentGeminiApps:
+	case AgentClaudeAI, AgentChatGPT, AgentGeminiApps, AgentGrokWeb:
 		return true
 	default:
 		return false

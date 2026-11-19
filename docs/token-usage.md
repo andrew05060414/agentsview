@@ -34,10 +34,10 @@ coding yesterday?" — across multiple coding agents from one archive.
     **Qwen Code**, **OpenClaw**, **QClaw**, **Hermes**, **WorkBuddy**, **Forge**,
     **Piebald**, **Antigravity IDE/CLI**, **Zed**, **VS Code Copilot**, **Visual
     Studio Copilot**, **Mistral Vibe**, **gptme**, **Amp**, **Junie CLI**, **OMO**,
-    and **StepCode**. Coverage also includes **Cline CLI**, **Tencent CodeBuddy
-    CN**, **Augure Code**, **Open Interpreter**, **Augure Desktop 3 beta**,
-    **Charm Crush**, **fx**, and **Muse Code**, and reads **DeepSeek Harness**
-    formats through version 3.
+    **StepCode**, and **Direct API** usage files. Coverage also includes **Cline
+    CLI**, **Tencent CodeBuddy CN**, **Augure Code**, **Open Interpreter**,
+    **Augure Desktop 3 beta**, **Charm Crush**, **fx**, and **Muse Code**, and
+    reads **DeepSeek Harness** formats through version 3.
 
     Command Code forks count only usage produced after the fork.
 
@@ -147,8 +147,8 @@ stores the returned rows in the local archive, and deduplicates rows by a stable
 event fingerprint. It is safe to rerun the same window after new events arrive.
 
 Imported admin rows are folded into the Usage dashboard,
-`agentsview report usage daily`, DuckDB mirrors, and PostgreSQL after the usual
-push/sync path. They appear as `agent = cursor`; because Cursor Admin events are
+`agentsview report usage daily`, and PostgreSQL after the usual push/sync path.
+They appear as `agent = cursor`; because Cursor Admin events are
 account-level billing rows rather than session transcripts, project, machine,
 session-count, and top-session filters do not apply to those rows. Model and
 date filters do apply.
@@ -513,6 +513,45 @@ fetched and embedded catalogs. Processing variants such as Batch, Flex,
 regional, Ultrafast, and one-hour cache pricing are not inferred when the stored
 usage does not identify that service tier. Codex Fast is the exception; see below.
 
+### Costs the Agent Records Itself
+
+Some agents compute a cost from their own price table and write it into the
+session. AgentsView keeps that figure as a recorded cost, but uses it as the
+price only when its own catalog has no rate for the model. When the catalog can
+price the model, the catalog price is used and the recorded cost is kept for
+comparison. A recorded cost of $0 never prices a row, because agents write $0
+for models they have no rate for; those rows stay unpriced.
+
+AgentsView keeps recorded costs from Pi and the agents built on it, OpenClaw,
+QClaw, Shelley, fx, and OpenCode, Kilo, and MiMo Code. For the OpenCode family
+it sums the cost of each model request in a message. Some of these figures are
+what a provider or gateway billed rather than an estimate; they follow the same
+rule. fx costs are kept only when fx has a billing record for every request.
+Existing sessions from these agents are re-read once after upgrading.
+
+`agentsview session usage <id>` compares the two: an `Agent cost:` line, and a
+`recorded_cost` object in JSON, show what the agent recorded next to what
+AgentsView charged for the same rows. A large gap usually means the agent
+used different rates, or that the transcript is missing calls the agent
+billed.
+
+Claude Code also writes a running total for each session: its own cost
+estimate and token counts per model, including subagents and side calls such
+as title generation that never reach the transcript. AgentsView keeps the last
+one and shows it as an `Agent total:` line and a `session_total` object. It is
+never added to usage totals, because it overlaps the per-call rows. Compare
+it with a report that includes subagents, which is the default. Expect it to
+run slightly above AgentsView's figure in short sessions, where the title call
+is a larger share of the work.
+
+Agents whose cost AgentsView already used as the price, such as Junie, gptme,
+Codebuff, Hermes, Goose, and Crush, keep that treatment: their reported cost is
+the price.
+
+A usage record that carries a cost but names no model is counted under the
+`<unknown>` model, the same label Cursor account imports use. Its cost and
+tokens appear in totals and breakdowns instead of being dropped.
+
 ### Anthropic Web Search Fee
 
 Anthropic charges a flat
@@ -563,16 +602,31 @@ output_microdollars_per_mtok = 800_000
 | `cache_creation_microdollars_per_mtok`    | Integer microdollars per million cache-creation tokens (optional)                                                                                           |
 | `cache_creation_1h_microdollars_per_mtok` | Integer microdollars per million 1-hour-TTL cache-creation tokens (optional; when omitted or `0`, 1h writes bill at `cache_creation_microdollars_per_mtok`) |
 | `cache_read_microdollars_per_mtok`        | Integer microdollars per million cache-read tokens (optional)                                                                                               |
+| `price_as`                                | Target model whose rates and tiers this name uses; excludes rate fields                                                                                    |
 
 The table key is the model name as it appears in your session data (match the
 string the agent itself writes, dots and all — quote the key if it contains
 special characters). Custom rates take precedence over LiteLLM, OpenRouter, and
 the embedded fallback, and apply to the Usage dashboard, the `agentsview report usage`
-CLI, and `pg serve` alike. A custom entry replaces the full rate row for that
-model, so omitted fields are treated as zero rather than falling through to
-another catalog. A custom row is flat and suppresses any fetched request bands
-for that model. Models without a custom entry continue to resolve through the
-stored catalog.
+CLI, and `pg serve` alike. An entry with explicit rates replaces the full rate
+row for that model, so omitted fields are treated as zero rather than falling
+through to another catalog. Explicit rates are flat and suppress fetched
+request bands for that model. Models without a custom entry continue to resolve
+through the stored catalog.
+
+To use a catalog model's rates and later updates for a deployment name:
+
+```toml
+[custom_model_pricing."gateway-deployment"]
+price_as = "gpt-6-sol"
+```
+
+A bare key also matches a provider-prefixed name; a key containing `/` matches
+only that exact name. An exact custom rate takes precedence. Each entry selects
+its target once, then uses the target's pricing ladder, including any custom rate.
+Unknown targets remain unpriced. Empty rate tables set all rates to zero.
+Restart after changing mappings, and use the same configuration on machines
+that share a mirror.
 
 ### Model aliases
 
@@ -801,6 +855,31 @@ Amp's exports record only main-thread inference, so tokens spent by `oracle`,
 Note that recent Amp versions keep complete threads server-side and leave only
 stub files on disk. AgentsView reports usage for whatever complete threads are
 present locally; threads that exist only as stubs have nothing to read.
+
+### Direct API Sessions
+
+Tools that call model APIs directly, with no coding agent in between, can
+record their token usage as **Direct API** sessions. The tool writes one
+body-free JSONL file per session: never prompts, documents, or replies. Each
+line is one JSON object. After the header, each line's `parentId` is the `id`
+of the line before it, and the first line after the header has a null
+`parentId`:
+
+1. Header, with a UUID4 `id`, an ISO `timestamp`, and the absolute `cwd`:
+   `{"type":"session","version":3,"id":<uuid4>,"timestamp":<iso>,"cwd":<cwd>}`
+2. Optional name, with an 8-hex `id`:
+   `{"type":"session_info","id":<8 hex>,"parentId":null,"timestamp":<iso>,"name":<name>}`
+3. One line per model call, with an 8-hex `id` and `timestamp` in epoch
+   milliseconds inside `message`:
+   `{"type":"message","id":<8 hex>,"parentId":<previous line id>,"timestamp":<iso>,"message":{"role":"assistant","provider":<provider>,"model":<model>,"content":[],"usage":{"input":I,"output":O,"cacheRead":C,"cacheWrite":0,"totalTokens":I+O+C},"timestamp":<epoch ms>}}`
+
+`input` excludes cached prompt tokens, and `cacheRead` is the cached prompt
+tokens, so `totalTokens` is `input + output + cacheRead`. AgentsView prices the
+tokens from the catalog.
+
+Files go in `~/.agentsview/direct-api/` by default. To read another directory,
+set `DIRECT_API_DIR`, or `dirs` under `[agents.direct-api]` in the
+[config file](configuration.md#multiple-directories).
 
 ## Reporting Model
 
@@ -1147,8 +1226,8 @@ removed. Absolute paths, raw remotes, and credentials do not cross the export
 boundary. Remote-backed catalog identities omit machine-local `root_key`;
 session rows retain their own complete root, worktree, and checkout facts.
 
-SQLite catalog keys are archive-scoped. Shared PostgreSQL and DuckDB dashboard
-responses may aggregate archives, so their catalog keys are response-scoped and
+SQLite catalog keys are archive-scoped. Shared PostgreSQL and ClickHouse
+dashboard responses may aggregate archives, so their catalog keys are response-scoped and
 must not be persisted as durable selectors. The canonical `identity.key`, not
 the display label or catalog key, represents project continuity.
 
@@ -1341,5 +1420,5 @@ in a small `model_pricing` table that's refreshed on each `usage` invocation.
 Usage data stays on your machine unless you enable a sharing feature. The usage
 command's only outbound requests are the LiteLLM and OpenRouter pricing fetches,
 which you can disable with `--offline`. See
-[Privacy and Telemetry](/docs/configuration/#privacy-and-telemetry) for the full
+[Privacy](/docs/configuration/#privacy) for the full
 picture.

@@ -27,8 +27,8 @@ The dashboard header includes:
 - **Search bar** — opens the command palette (`Cmd+K`)
 - **Sync button** — triggers a manual sync of session files
 - **Theme toggle** — switch between light and dark mode
-- **Import button** — opens the [Chat Import](/docs/chat-import/) dialog for
-  importing Claude.ai or ChatGPT conversations
+- **More actions → Import conversations** — opens the
+  [Chat Import](/docs/chat-import/) dialog
 - **Shortcuts button** (`?`) — shows all keyboard shortcuts
 
 The status bar at the bottom shows session count, message count, project count,
@@ -242,8 +242,8 @@ filter selects the calls made in that window or by that model.
 The Analyzed column shows analyzed calls out of all calls. After an upgrade,
 AgentsView recomputes older sessions in the background. Until a session's
 recompute finishes, its calls count as not analyzed. Archives that store no tool
-results never analyze calls. PostgreSQL, DuckDB, and ClickHouse mirrors receive
-the results through their normal pushes.
+results never analyze calls. PostgreSQL and ClickHouse replicas receive the
+results through their normal pushes.
 
 ![Tool usage](/docs/assets/generated/screenshots/tool-usage.png)
 
@@ -421,8 +421,6 @@ Each session item shows:
   `session_index.jsonl` for both current and archived sessions. Qwen Code,
   Gemini CLI, Kimi CLI, and OpenClaw titles, current Claude Code `/rename`
   names, and keeping titles out of the first message are included in 0.45.0.
-- **Model name** — the AI model used for the session, shown when available
-  (including Codex session models).
 - **Star button** — click the star icon or press `s` to star a session. Starred
   sessions persist in the SQLite database so they survive server restarts.
 - **Agent tag** — agent name on the right side, tinted with the agent's accent
@@ -430,8 +428,8 @@ Each session item shows:
 - **Machine label** — when using [PostgreSQL sync](/docs/pg-sync/), sessions
   from other machines show a machine name tag. Only visible in shared multi-host
   deployments.
-- **Project name** — abbreviated, right-aligned
-- **Relative time** — "2h ago", "Mon", "Dec 1"
+- **Project name**
+- **Session time** — relative time such as "2h ago", or the date and time with the year when **Always show year** is on
 - **User prompt count** — number of user messages in the session
 
 Antigravity sessions show the conversation title Antigravity saves in
@@ -559,8 +557,8 @@ attach independently launched workers to their manager and roll up their costs.
   linked to that pull request by Claude Code.
 - **Min Prompts** — filter to sessions with at least 2, 3, 5, or 10 user
   messages
-- **Include single-turn** — toggle to include sessions with one or fewer user
-  messages (excluded by default to reduce noise)
+- **Hide single-turn** — toggle to hide sessions with one or fewer user
+  messages (shown by default)
 - **Include automated** — toggle to include sessions classified as automation
   (roborev runs, title generation, AgentsView's own internal prompts, and any
   patterns you've added to
@@ -628,7 +626,7 @@ Available URL filters:
 | `active_since`                 | `true` to limit to the last 24 hours                                                                                      |
 | `min_messages`, `max_messages` | numeric message count bounds                                                                                              |
 | `min_user_messages`            | numeric user-message threshold                                                                                            |
-| `include_one_shot`             | `false` to hide single-turn sessions (default)                                                                            |
+| `include_one_shot`             | `false` to hide single-turn sessions; when omitted, they are shown                                                        |
 | `include_automated`            | `true` to include automated sessions                                                                                      |
 | `exclude_project`              | comma-separated projects to hide (e.g. `unknown`)                                                                         |
 
@@ -664,9 +662,10 @@ when that value is the most common effort for the displayed model. Effort is a
 model setting, not a measured token count. Upgrading resyncs existing sessions
 to populate it when the source files remain available.
 
-If a parser skipped malformed source lines while still recovering the session,
-the header shows a malformed-lines badge with the persisted count (for example
-"3 malformed lines"). For Antigravity IDE and CLI sessions decoded from an
+If a parser skipped malformed source lines, records larger than 64 MiB, or
+database rows it could not decode while still recovering the session, the
+header shows a malformed-lines badge with the persisted count (for example "3
+malformed lines"). For Antigravity IDE and CLI sessions decoded from an
 unrecognized SQLite schema fingerprint, the header also shows **Unverified
 schema**. That badge means the session was decoded heuristically from a newer
 schema and may be incomplete.
@@ -681,15 +680,15 @@ browser-local and is not synced through SQLite or PostgreSQL.
 ### Message Layouts
 
 Four layouts control how messages are rendered. Cycle between them with the `l`
-key or the layout button in the header, or pick one directly in Settings >
-Appearance:
+key, choose one under **Layout** in the session header's **View** menu, or set
+one in Settings > Appearance:
 
-| Layout  | Description                                               |
-| ------- | --------------------------------------------------------- |
-| Default | Full card layout with colored borders and spacing         |
-| Compact | Condensed view with minimal spacing                       |
-| Stream  | Continuous flow optimized for reading                     |
-| Skim    | Collapses tool calls to summary headers for fast skimming |
+| Layout  | Description                                |
+| ------- | ------------------------------------------ |
+| Default | Expanded messages                          |
+| Compact | The same content with tighter spacing      |
+| Stream  | Chat without speaker labels                |
+| Skim    | One line per message and tool call         |
 
 ### Focused Transcript Mode
 
@@ -702,9 +701,10 @@ agents still collapses to its prompts and final answers.
 
 ![Focused transcript mode](/docs/assets/generated/screenshots/focused-transcript.png)
 
-Toggle between Normal and Focused mode using the transcript mode button in the
-session header. The header adjusts responsively to fit the available space. The
-mode preference is saved in localStorage.
+Switch between Normal and Focused mode in the **View** menu in the session
+header: under **Content**, choose **All messages and tool calls** or
+**Only your prompts and final answers**. The mode preference is saved in
+localStorage.
 
 ### Message Display
 
@@ -823,8 +823,8 @@ so matches can be highlighted.
 
 ### Block-Type Filtering
 
-Click the filter icon in the message viewer header to open a dropdown that
-toggles visibility of seven content categories:
+Open the **View** menu in the session header. Its **Block Visibility** group
+toggles seven content categories:
 
 | Category  | What It Controls          |
 | --------- | ------------------------- |
@@ -847,9 +847,7 @@ resume, an interrupted request, a task notification, or stop hook feedback.
 Hiding the category removes all of them; the rest of the transcript is
 unaffected.
 
-All categories are visible by default. When any are hidden, a badge on the
-filter button shows the count of hidden types. Click **Show all** to restore
-visibility.
+All categories are visible by default. **Show all** in the menu restores them.
 
 ### Sorting
 
@@ -866,6 +864,12 @@ in the header. The arrow icon indicates the current direction.
 
 Prompt navigation follows the visible transcript, so it respects Focused mode
 and the active block-type filter.
+
+### Jump to a Prompt
+
+Press `t`, or click **Jump to prompt** in the session header, to search the
+prompts typed in the session and jump to one, even in a part of the transcript
+that has not loaded yet.
 
 ### In-Session Search
 
@@ -1073,6 +1077,9 @@ Search in one of three modes:
 The palette remembers the last mode you selected across openings and browser
 sessions. Results update after a 300ms typing pause.
 
+The palette automatically retries a transient Full text search failure once. If
+the search still fails, select **Retry** to try again.
+
 !!! tip
 
     For deeper searches across full transcripts — including thinking, tool inputs, tool result
@@ -1119,8 +1126,7 @@ controls. Search starts with the sidebar's selected project; choose another
 project or **All Projects** without changing the sidebar.
 
 Choose a relative period, calendar period, or custom dates. The filters apply
-to Full text, Semantic, and Hybrid searches. Closing the palette clears its date
-range; the next opening starts with the sidebar's current project again.
+to Full text, Semantic, and Hybrid searches.
 
 ![Command palette with project and date filters](/docs/assets/generated/screenshots/search-filters.png)
 
@@ -1268,13 +1274,33 @@ Then attach `session-context.md` to another agent run or paste its contents into
 a prompt so the next agent can inspect the full session tree without opening the
 AgentsView UI.
 
+### Secrets in exports
+
+The HTML and Markdown exports mask detected secrets, such as API keys, tokens
+and private keys. They use the same detector and masked form as search results,
+for example `AKIA…PLJM` for an AWS access key. Message text, thinking text, and
+tool input and output are all masked. Detection is best-effort; see
+[SECURITY.md](https://github.com/kenn-io/agentsview/blob/main/SECURITY.md#secrets-subsystem)
+for its limits.
+
+To export the stored text unchanged, add `reveal=true`:
+
+```bash
+curl "http://127.0.0.1:8080/api/v1/sessions/<session-id>/md?depth=all&reveal=true" \
+  -o session-context.md
+```
+
+Only a request made directly from localhost may use `reveal`. A remote or
+proxied request that asks for it gets HTTP 403, the same rule as revealing
+secrets in search and the secrets list.
+
 ______________________________________________________________________
 
 ## Publish to Gist
 
-Press `p` or click the publish button to share a session via GitHub Gist. As of
-0.33.0, the publish button is a dropdown with two entries: **Publish public
-Gist** and **Publish secret Gist**. The `p` shortcut publishes publicly.
+Press `p` or open the **More actions** menu in the header to share a session via
+GitHub Gist. The menu has two entries: **Publish public Gist** and **Publish
+secret Gist**. The `p` shortcut publishes publicly.
 
 ![Publish modal](/docs/assets/generated/screenshots/publish-modal.png)
 
@@ -1303,6 +1329,11 @@ After publishing, the modal shows two URLs:
 - **Gist URL** — direct GitHub link
 
 Both have copy buttons and an "Open in Browser" action.
+
+The published gist masks detected secrets in the transcript and in the gist
+description, the same way as [session export](#secrets-in-exports). The publish
+endpoint, `POST /api/v1/sessions/{id}/publish`, accepts the same
+localhost-only `reveal=true` parameter; the UI does not use it.
 
 ______________________________________________________________________
 
@@ -1338,6 +1369,7 @@ Press `?` to see all shortcuts in a modal overlay.
 | `k` / `↑` | Previous message                  |
 | `Shift+J` | Next user prompt                  |
 | `Shift+K` | Previous user prompt              |
+| `t`       | Jump to a prompt                  |
 | `]`       | Next session                      |
 | `[`       | Previous session                  |
 | `o`       | Toggle sort order                 |
@@ -1364,11 +1396,10 @@ organized into sections:
 | Section            | What You Can Configure                                                                                   |
 | ------------------ | -------------------------------------------------------------------------------------------------------- |
 | Language           | Interface language (Azerbaijani, English, French, Japanese, Korean, Spanish, Simplified Chinese, or Traditional Chinese)       |
-| Appearance         | Theme (light/dark), high-contrast mode, chart colors, message colors, message layout, zoom, block visibility |
+| Appearance         | Theme (light/dark), high-contrast mode, chart colors, message colors, message layout, reading width, zoom, always show year, block visibility |
 | Date ranges        | Browser-local checkbox for linking date selections across Sessions, Usage, Activity, Trends, and Quality |
 | Session Providers  | Enable session providers, inspect their session directories, and add alternate agent homes               |
-| Archive content    | Choose whether future imports keep, drop, or offload tool-result images                                  |
-| Tool-result images | Preview and remove images from stored tool results                                                       |
+| Tool-result images | Choose whether future imports keep, drop, or offload tool-result images; preview and remove images already stored |
 | Terminal           | Default terminal emulator for session resume                                                             |
 | Embeddings         | Current semantic-index build phase, progress, throughput, ETA, last result, and local generations        |
 | GitHub             | Personal access token for Gist publishing                                                                |
@@ -1385,8 +1416,9 @@ load; a saved language preference takes precedence.
 
 ![Chart color palette setting](/docs/assets/generated/screenshots/settings-chart-colors.png)
 
-Language, theme, high contrast, message colors, message layout, zoom, block
-visibility, and Date ranges preferences use local storage in the current browser or desktop
+Language, theme, high contrast, message colors, message layout, reading width,
+zoom, always show year, block visibility, and Date ranges preferences use local
+storage in the current browser or desktop
 webview profile. Each profile keeps its own choices. The optional `zoom_level`
 setting supplies a default when no local zoom or text-size preference exists.
 
@@ -1455,7 +1487,7 @@ dashboard skill trend, Trends, and Usage charts:
 
 This setting is server-wide rather than browser-local, so all clients connected to
 the same server use the same palette. You can change it even when the server
-reads from a read-only store such as PostgreSQL, ClickHouse, or DuckDB.
+reads from a read-only store such as PostgreSQL or ClickHouse.
 
 ### Message Colors
 

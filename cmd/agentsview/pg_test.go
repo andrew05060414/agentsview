@@ -364,7 +364,7 @@ func TestRunPGServeHelperProcess(t *testing.T) {
 	require.NoError(t, cmd.Flags().Parse(args[sep+1:]))
 	cfg, basePath, err := loadReplicaServeConfig(cmd)
 	require.NoError(t, err)
-	runReplicaServe(t.Context(), pgReplica{}, cfg, basePath, nil)
+	runReplicaServe(t.Context(), pgReplica{}, cfg, basePath, nil, false)
 }
 
 func TestWritePGPushSummaryIncludesSkippedConflicts(t *testing.T) {
@@ -634,4 +634,19 @@ func TestPGPushProgressPrinterKeepsCompletedStages(t *testing.T) {
 		assert.Regexp(t, ` \([0-9a-z.]+ elapsed\)$`, got,
 			"line %d must end with an elapsed suffix", i)
 	}
+}
+
+func TestWriteReplicaPushSummaryReportsPartialRewrites(t *testing.T) {
+	var out bytes.Buffer
+
+	writeReplicaPushSummary(&out, "ClickHouse", storage.PushResult{
+		SessionsPushed:  5,
+		SessionRowsOnly: 3,
+		CommitLinksOnly: 4,
+		Duration:        time.Second,
+	})
+
+	assert.Contains(t, out.String(),
+		"Rewrote only the session row of 3 pushed session(s) whose messages were unchanged")
+	assert.Contains(t, out.String(), "Rewrote only the commit links of 4 session(s)")
 }

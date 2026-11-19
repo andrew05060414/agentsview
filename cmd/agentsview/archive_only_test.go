@@ -160,7 +160,12 @@ func TestArchiveOnlyConfigOnlyBackgroundStart(t *testing.T) {
 	result, err := startServeBackground(t.Context(), cfg, []string{"serve"}, serveReplacementOptions{}, backgroundLaunchPolicy{ConfigOnly: true})
 	require.NoError(t, err)
 	require.NotNil(t, result.Runtime)
-	t.Cleanup(func() { _ = stopDaemonProcess(result.Runtime.Record, 5*time.Second) })
+	// Windows reports the killed daemon's exit before it releases the data
+	// directory's files, and the temp directory cannot be removed until then.
+	t.Cleanup(func() {
+		_ = stopDaemonProcess(result.Runtime.Record, 5*time.Second)
+		assert.NoError(t, waitForStoppedDaemonWriter(context.WithoutCancel(t.Context()), cfg))
+	})
 	client := &http.Client{Timeout: 5 * time.Second}
 	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, urlFromDaemonRuntime(result.Runtime)+"/api/v1/sessions", nil)
 	require.NoError(t, err)
@@ -262,9 +267,6 @@ func TestArchiveOnlyRefusesDaemonPushWatch(t *testing.T) {
 		name string
 		run  func(context.Context, daemonArchiveWriteBackend) error
 	}{
-		{name: "duckdb", run: func(ctx context.Context, b daemonArchiveWriteBackend) error {
-			return b.DuckDBPushWatch(ctx, config.DuckDBConfig{}, DuckDBPushConfig{}, nil, nil, time.Hour, time.Hour)
-		}},
 		{name: "replica", run: func(ctx context.Context, b daemonArchiveWriteBackend) error {
 			return b.ReplicaPushWatch(ctx, pgReplica{}, storage.ConfiguredReplica{}, ReplicaPushConfig{}, nil, nil, time.Hour, time.Hour)
 		}},

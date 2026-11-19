@@ -30,7 +30,6 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
-	"go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/postgres"
 	"go.kenn.io/agentsview/internal/remotesync"
@@ -171,7 +170,7 @@ func newSyncRouteFixture(
 		serverConfig.AgentDirs[agent] = append([]string(nil), dirs...)
 	}
 	serverOptions := []Option{
-		WithReplicas(postgres.Backend{}, clickhouse.Backend{}), WithMirror(duckdb.Mirror{}),
+		WithReplicas(postgres.Backend{}, clickhouse.Backend{}),
 	}
 	if cfg.broadcaster != nil {
 		serverOptions = append(serverOptions, WithBroadcaster(cfg.broadcaster))
@@ -2066,6 +2065,91 @@ func TestHumaSyncRemotesStreamsRemoteProgress(t *testing.T) {
 		"/api/v1/remote-sync/targets",
 		"/api/v1/remote-sync/manifest",
 	}, paths)
+}
+
+// A client that disconnects mid-sync, such as a CLI killed by its caller's
+// timeout, must not cancel the daemon's remote import: retries would restart
+// the whole download and reparse every time.
+func TestHumaSyncRemotesFinishesAfterClientDisconnects(t *testing.T) {
+	var mu stdlibsync.Mutex
+	var paths []string
+	targetsReached := make(chan struct{})
+	releaseTargets := make(chan struct{})
+	var reachedOnce stdlibsync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		remotesync.SetProtocolHeader(w.Header())
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/remote-sync/targets":
+			reachedOnce.Do(func() { close(targetsReached) })
+			<-releaseTargets
+			_, _ = w.Write([]byte(`{}`))
+		case "/api/v1/remote-sync/manifest":
+			_, _ = w.Write([]byte(`{"files":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(releaseTargets)
+		}
+		ts.Close()
+	})
+	f := newSyncRouteFixture(t, withRemoteHosts(config.RemoteHost{
+		Host: "alpha", URL: ts.URL, Token: "remote-token",
+	}))
+	logs := captureServerLogOutput(t)
+	requestCtx, disconnect := context.WithCancel(t.Context())
+	defer disconnect()
+	payload, err := json.Marshal(remoteSyncRequest{
+		Hosts: []config.RemoteHost{{Host: "alpha"}},
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(requestCtx, http.MethodPost,
+		"/api/v1/sync/remotes", bytes.NewReader(payload))
+	req.Host = "127.0.0.1:0"
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Origin", "http://127.0.0.1:0")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	w := httptest.NewRecorder()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		f.handler.ServeHTTP(w, req)
+	}()
+
+	select {
+	case <-targetsReached:
+	case <-time.After(30 * time.Second):
+		require.FailNow(t, "remote sync never reached the remote host")
+	}
+	disconnect()
+	released = true
+	close(releaseTargets)
+	select {
+	case <-served:
+	case <-time.After(30 * time.Second):
+		require.FailNow(t, "remote sync request never returned")
+	}
+
+	mu.Lock()
+	assert.Equal(t, []string{
+		"/api/v1/remote-sync/targets",
+		"/api/v1/remote-sync/manifest",
+	}, paths, "the sync continues to the manifest after the client leaves")
+	mu.Unlock()
+	output := logs.String()
+	assert.Contains(t, output, "remote sync host finished: host=alpha")
+	assert.Contains(t, output, "outcome=completed")
+	assert.NotContains(t, output, "context canceled")
+	assert.NotContains(t, w.Body.String(), "event: done",
+		"no events are written to a client that has gone")
 }
 
 func TestRunRemoteSyncRequestSerializesNoSyncRemoteWrites(t *testing.T) {

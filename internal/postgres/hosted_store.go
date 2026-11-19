@@ -55,7 +55,7 @@ func newHostedAdapter(ctx context.Context, pg *sql.DB, tenant string) (*HostedSt
  SELECT 1 FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_language l ON l.oid=p.prolang
  WHERE t.tgrelid='sessions'::regclass AND t.tgname='hosted_legacy_revision'
  AND t.tgenabled='O' AND t.tgtype=29 AND t.tgqual IS NULL AND t.tgnargs=0
- AND t.tgattr=''::int2vector AND NOT t.tgisinternal AND t.tgconstraint=0
+ AND t.tgattr='' AND NOT t.tgisinternal AND t.tgconstraint=0
  AND NOT t.tgdeferrable AND NOT t.tginitdeferred
  AND p.oid='hosted_legacy_revision()'::regprocedure
  AND p.pronamespace=(SELECT relnamespace FROM pg_class WHERE oid='sessions'::regclass)
@@ -76,7 +76,11 @@ func newHostedAdapter(ctx context.Context, pg *sql.DB, tenant string) (*HostedSt
 	if err != nil {
 		return nil, err
 	}
-	h := &HostedStore{physical: &Store{pg: pg, ownedDB: pg, hostedRelations: true}, core: core, tenant: tenant, cursor: &hostedCursorState{}}
+	cockroach, encoding, err := pgEngine(ctx, pg)
+	if err != nil {
+		return nil, err
+	}
+	h := &HostedStore{physical: &Store{pg: pg, ownedDB: pg, hostedRelations: true, cockroach: cockroach, serverEncoding: encoding}, core: core, tenant: tenant, cursor: &hostedCursorState{}}
 	core.curationGuard = h.guardCurationIdentity
 	if _, err = rand.Read(h.cursor.key[:]); err != nil {
 		return nil, err
@@ -85,6 +89,8 @@ func newHostedAdapter(ctx context.Context, pg *sql.DB, tenant string) (*HostedSt
 }
 func (h *HostedStore) DB() *sql.DB  { return h.physical.DB() }
 func (h *HostedStore) Close() error { return h.physical.Close() }
+
+func (h *HostedStore) MemoryBackendName() string { return h.physical.MemoryBackendName() }
 func (h *HostedStore) SetCustomPricing(p map[string]config.CustomModelRate) {
 	h.physical.SetCustomPricing(p)
 }

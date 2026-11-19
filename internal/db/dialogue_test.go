@@ -20,6 +20,7 @@ func TestDialogueFTSUpgradePreservesMessages(t *testing.T) {
 	insertSession(t, d, "legacy", "project", func(s *Session) { s.Agent = "pi"; s.UserMessageCount = 2 })
 	require.NoError(t, d.DropFTS(t.Context()))
 	_, err := d.getWriter().Exec(t.Context(), fmt.Sprintf(`DROP VIEW message_search_content;
+ DROP TRIGGER IF EXISTS trg_messages_search_dialogue;
  ALTER TABLE messages DROP COLUMN dialogue_text;
  WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < %d)
  INSERT INTO messages (session_id, ordinal, role, content, content_length)
@@ -119,6 +120,34 @@ END`,
 			}
 		})
 	}
+}
+
+func TestDialogueFTSRefreshImageText(t *testing.T) {
+	d := testDB(t)
+	seedSearchSession(t, d, "version", "proj", nil)
+	insertMessages(t, d, Message{SessionID: "version", Role: "user", Content: "existingneedle"})
+	var err error
+	_, err = d.getWriter().Exec(t.Context(), `DROP TRIGGER image_text_ai; DROP TRIGGER image_text_ad; DROP TRIGGER image_text_au;
+ DROP VIEW message_search_content;
+ CREATE VIEW message_search_content AS SELECT id, session_id, content AS rendered, COALESCE(dialogue_text, content) AS content FROM messages;`)
+	require.NoError(t, err)
+	var details []string
+	require.NoError(t, refreshDialogueFTS(t.Context(), d.getWriter(), func(progress OpenProgress) { details = append(details, progress.Detail) }))
+	require.Empty(t, details)
+	_, err = d.getWriter().Exec(t.Context(), `INSERT INTO image_text_cache(id,image_hash,processor,provider,model,revision,text) VALUES(-1,'hash','processor','provider','model','revision','oldneedle')`)
+	require.NoError(t, err)
+	_, err = d.getWriter().Exec(t.Context(), `UPDATE image_text_cache SET text='newneedle' WHERE id=-1`)
+	require.NoError(t, err)
+	for _, item := range []struct {
+		term  string
+		count int
+	}{{"oldneedle", 0}, {"newneedle", 1}, {"existingneedle", 1}} {
+		var count int
+		require.NoError(t, d.getReader().QueryRow(t.Context(), `SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?`, item.term).Scan(&count))
+		require.Equal(t, item.count, count, item.term)
+	}
+	_, err = d.getWriter().Exec(t.Context(), `INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)`)
+	require.NoError(t, err)
 }
 
 func TestDropFTSInterruptedKeepsIndexConsistent(t *testing.T) {

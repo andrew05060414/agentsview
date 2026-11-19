@@ -186,6 +186,46 @@ func TestRunServeBackgroundGeneratesAuthTokenForRemoteSync(t *testing.T) {
 	assert.Contains(t, string(data), `auth_token = "`)
 }
 
+func TestRunServeBackgroundStreamsStartupProgressUntilReady(t *testing.T) {
+	oldStart := startServeBackgroundForRun
+	startServeBackgroundForRun = func(_ context.Context,
+		_ config.Config, _ []string, _ serveReplacementOptions,
+		policy backgroundLaunchPolicy,
+	) (backgroundLaunchResult, error) {
+		assert.False(t, policy.Attached,
+			"serve --background must retain its inactivity timeout")
+		require.NotNil(t, policy.OnProgress)
+		policy.OnProgress(&startupState{Phase: "opening database"}, 2*time.Second)
+		policy.OnProgress(&startupState{
+			Phase: "initial sync", Detail: "local: 120/450 sessions (27%)",
+		}, 6*time.Second)
+		return backgroundLaunchResult{
+			Runtime: &DaemonRuntime{
+				Record: daemon.RuntimeRecord{PID: 92},
+				Host:   "127.0.0.1", Port: 8080,
+			},
+			Started: true, childPID: 92, LogPath: "/data/serve.log",
+		}, nil
+	}
+	t.Cleanup(func() { startServeBackgroundForRun = oldStart })
+
+	out := captureStdout(t, func() {
+		runServeBackground(t.Context(),
+			config.Config{DataDir: t.TempDir()},
+			[]string{"serve", "--background"},
+			serveReplacementOptions{},
+		)
+	})
+
+	assert.Equal(t,
+		"  opening database (2s)\n"+
+			"  initial sync: local: 120/450 sessions (27%) (6s)\n"+
+			"agentsview running at http://127.0.0.1:8080 (pid 92)\n"+
+			"Logs: /data/serve.log\n",
+		out,
+	)
+}
+
 func TestRunServeBackgroundReplaceWaitsForExternalStartLock(t *testing.T) {
 	setStartProbeTickForTest(t, 25*time.Millisecond)
 
@@ -819,23 +859,27 @@ func TestExternalServeStartupWaitReportsContinuingWork(t *testing.T) {
 	setStartProbeTickForTest(t, 10*time.Millisecond)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	writer := newStartupStateWriter(dir, time.Now)
+	// Each snapshot gets a strictly later UpdatedAt regardless of the
+	// platform's wall-clock resolution.
+	base := time.Now()
+	var ticks time.Duration
+	writer := newStartupStateWriter(dir, func() time.Time {
+		ticks += time.Millisecond
+		return base.Add(ticks)
+	})
 	writer.SetPhase("initial sync")
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-ticker.C:
-				writer.SetPhase("initial sync " + now.String())
-			}
-		}
-	}()
-	defer func() { cancel(); <-done }()
+	// The starting daemon publishes progress before every probe. Writing from
+	// the probe hook keeps the writer and the wait in lockstep: a goroutine
+	// writing on its own ticker shares this process's scheduler, so a stall
+	// longer than the inactivity limit would freeze both and end the wait
+	// even though progress never stopped.
+	var probes int
+	old := backgroundServeProbeHook
+	backgroundServeProbeHook = func() {
+		probes++
+		writer.SetPhase("initial sync " + strconv.Itoa(probes))
+	}
+	t.Cleanup(func() { backgroundServeProbeHook = old })
 	output := captureStderr(t, func() {
 		_, waited, err := waitForExternalServeStartup(ctx, dir, "", 500*time.Millisecond) //nolint:kennlint // deadlinetest: absence check; continuing startup progress must keep the inactivity deadline from ending the wait
 		assert.True(t, waited)

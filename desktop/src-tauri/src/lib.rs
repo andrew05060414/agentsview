@@ -37,6 +37,11 @@ use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
 
+#[cfg(all(test, windows))]
+mod update_archive_tests;
+#[cfg(test)]
+mod updater_key;
+
 const HOST: &str = "127.0.0.1";
 const LOCALHOST: &str = "localhost";
 const IPV6_HOST: &str = "[::1]";
@@ -365,22 +370,13 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     apply_appimage_host_wayland_preload();
 
-    let mut updater_builder = tauri_plugin_updater::Builder::new();
-    // Override the placeholder pubkey from tauri.conf.json with
-    // the real key when baked in at compile time via env var.
-    if let Some(pubkey) = option_env!("AGENTSVIEW_UPDATER_PUBKEY") {
-        if !pubkey.is_empty() {
-            updater_builder = updater_builder.pubkey(pubkey.to_string());
-        }
-    }
-
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(updater_builder.build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(init_navigation_guard_plugin())
@@ -4611,11 +4607,11 @@ async fn claude_auth_fetch(
 }
 
 fn claude_fetch_script(url: &str, request_id_json: &str) -> String {
-    let reader = include_str!("../../../frontend/chrome-extension/claude_fetch.js");
+    let reader = include_str!("../../../frontend/chrome-extension/page_fetch.js");
     format!(
         r#"(async () => {{
         {reader}
-        const result = await claudeFetch({url});
+        const result = await pageFetch({url});
         await window.__TAURI__.core.invoke("claude_auth_fetch_result", {{ payload: {{ requestId: {request_id_json}, ...result }} }});
     }})()"#
     )
@@ -4625,7 +4621,7 @@ fn validate_claude_fetch_path(path: &str) -> Result<(), String> {
     const ORGANIZATIONS_REQUEST: usize = 0;
     const CONVERSATIONS_REQUEST: usize = 1;
     const CONVERSATION_REQUEST: usize = 2;
-    let shapes: Vec<_> = include_str!("../../../internal/importer/claude_ai_requests.txt").lines().collect();
+    let shapes: Vec<_> = include_str!("../../../internal/importer/browser_requests/claude-ai.txt").lines().collect();
     if path == shapes[ORGANIZATIONS_REQUEST] {
         return Ok(());
     }
@@ -7817,7 +7813,7 @@ mod claude_sync_tests {
         let list = format!("{base}/chat_conversations_v2?limit=50&offset=0");
         let detail = format!("{base}/chat_conversations/22222222-2222-4222-8222-222222222222?tree=True&rendering_mode=messages&consistency=strong&render_all_tools=true&include_inline_comparison=true");
         assert!(super::validate_claude_fetch_path(&list).is_ok(), "{list}");
-        for template in include_str!("../../../internal/importer/claude_ai_requests.txt").lines() {
+        for template in include_str!("../../../internal/importer/browser_requests/claude-ai.txt").lines() {
             let path = template
                 .replace("{organization}", "11111111-1111-4111-8111-111111111111")
                 .replace("{conversation}", "22222222-2222-4222-8222-222222222222")

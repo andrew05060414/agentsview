@@ -16,7 +16,7 @@ import (
 // the next request scans those sessions again and returns full counts.
 func TestFrustrationMarkersAreNotMemoizedAfterFailedScan(t *testing.T) {
 	t.Parallel()
-	store, _, _ := newPushedStore(t)
+	store := newClonedReadStore(t)
 	rows := func() []db.SignalRow {
 		return []db.SignalRow{{ID: fixtureAlphaID}, {ID: fixtureBetaID}}
 	}
@@ -35,7 +35,7 @@ func TestFrustrationMarkersAreNotMemoizedAfterFailedScan(t *testing.T) {
 	scanned := rows()
 	require.NoError(t, store.chPopulateFrustrationMarkers(t.Context(), scanned, sessions))
 	fresh := rows()
-	require.NoError(t, NewStoreFromDB(store.DB()).chPopulateFrustrationMarkers(t.Context(), fresh, nil))
+	require.NoError(t, NewStoreFromDB(store.DB(), store.bulk).chPopulateFrustrationMarkers(t.Context(), fresh, nil))
 	require.Equal(t, fresh, scanned)
 	for id := range versions {
 		_, hit := store.frustrationMarkers.lookup(id, versions[id])

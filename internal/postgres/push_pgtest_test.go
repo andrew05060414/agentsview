@@ -5,9 +5,12 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -22,11 +25,15 @@ import (
 	"go.kenn.io/agentsview/internal/testutil"
 )
 
+// pgPushTestSchema is the schema push tests write to. Each top-level test has
+// its own database, so tests share this name and start from one template copy
+// in which EnsureSchema already created it.
+const pgPushTestSchema = "agentsview_push_test"
+
 func TestPushPreservesLegacyOffsetTimestamps(t *testing.T) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_push_legacy_time_test"
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 
 	ctx := t.Context()
 	pg, err := Open(t.Context(), pgURL, schema, true)
@@ -36,7 +43,6 @@ func TestPushPreservesLegacyOffsetTimestamps(t *testing.T) {
 
 	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err)
-	dbtest.SeedPricingMeta(t, local)
 	defer local.Close()
 
 	const sessionID = "legacy-offset-time"
@@ -113,10 +119,9 @@ func TestPushPreservesLegacyOffsetTimestamps(t *testing.T) {
 }
 
 func TestPGUsageEventFingerprintsPreserveExactMicrodollars(t *testing.T) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_usage_fingerprint_money_test"
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 
 	ctx := t.Context()
 	pg, err := Open(t.Context(), pgURL, schema, true)
@@ -164,14 +169,13 @@ func TestPGUsageEventFingerprintsPreserveExactMicrodollars(t *testing.T) {
 func TestPushMirrorsSessionProjectIdentitySnapshotsByArchiveGeneration(
 	t *testing.T,
 ) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_push_project_snapshot_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err)
 	defer pg.Close()
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err)
 	require.NoError(t, EnsureSchema(ctx, pg, schema))
 
 	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
@@ -258,16 +262,15 @@ func TestPushMirrorsSessionProjectIdentitySnapshotsByArchiveGeneration(
 }
 
 func TestFilteredIdentityPublicationPreservesUnfilteredMetadata(t *testing.T) {
+	t.Parallel()
 	const (
-		schema            = "agentsview_unfiltered_identity_owner_test"
+		schema            = pgPushTestSchema
 		includedSessionID = "snapshot-included"
 		excludedSessionID = "snapshot-excluded"
 		includedProject   = "included_project"
 		excludedProject   = "excluded_project"
 	)
-	pgURL := testPGURL(t)
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	pgURL := testPGSchemaURL(t, schema)
 	ctx := t.Context()
 	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err)
@@ -334,14 +337,13 @@ func TestFilteredIdentityPublicationPreservesUnfilteredMetadata(t *testing.T) {
 }
 
 func TestFilteredIdentityPublicationAdoptsLegacyOwnerlessScope(t *testing.T) {
+	t.Parallel()
 	const (
-		schema          = "agentsview_legacy_identity_scope_test"
+		schema          = pgPushTestSchema
 		includedProject = "included_project"
 		excludedProject = "excluded_project"
 	)
-	pgURL := testPGURL(t)
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	pgURL := testPGSchemaURL(t, schema)
 	ctx := t.Context()
 	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err)
@@ -432,10 +434,9 @@ func TestFilteredIdentityPublicationAdoptsLegacyOwnerlessScope(t *testing.T) {
 func TestFilteredThenUnfilteredIdentityPublicationIncludesExcludedProject(
 	t *testing.T,
 ) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_filtered_identity_revision_test"
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	ctx := t.Context()
 	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err)
@@ -503,10 +504,9 @@ func TestFilteredThenUnfilteredIdentityPublicationIncludesExcludedProject(
 func TestAlternatingFilteredPublicationsPreserveEachScopesMetadata(
 	t *testing.T,
 ) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_filtered_metadata_scope_test"
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	ctx := t.Context()
 	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err)
@@ -586,6 +586,7 @@ func TestAlternatingFilteredPublicationsPreserveEachScopesMetadata(
 }
 
 func TestPushProjectMoveReconcilesFilteredScope(t *testing.T) {
+	t.Parallel()
 	const (
 		sessionID     = "pg-project-move"
 		sourceProject = "source_project"
@@ -606,16 +607,16 @@ func TestPushProjectMoveReconcilesFilteredScope(t *testing.T) {
 		{name: "exclude former", excludeProjects: []string{sourceProject}, wantSession: true, wantTargetObs: true, wantSnapshot: true},
 		{name: "exclude target", excludeProjects: []string{targetProject}},
 	}
-	pgURL := testPGURL(t)
-	for i, tc := range tests {
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			schema := fmt.Sprintf("agentsview_project_move_%d", i)
-			cleanNamedPGSchema(t, pgURL, schema)
-			t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+			if !takeFreshSchemaCopy(t, pgURL, schema) {
+				cleanNamedPGSchema(t, pgURL, schema)
+			}
 			ctx := t.Context()
 			local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 			require.NoError(t, err)
-			dbtest.SeedPricingMeta(t, local)
 			t.Cleanup(func() { require.NoError(t, local.Close()) })
 			startedAt := "2026-07-16T12:00:00.000Z"
 			localModifiedAt := startedAt
@@ -653,6 +654,9 @@ func TestPushProjectMoveReconcilesFilteredScope(t *testing.T) {
 			)
 			require.NoError(t, err)
 
+			_, err = syncer.pg.ExecContext(ctx, `INSERT INTO commit_links (session_id,sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at,turn_ordinal,turn_text,project,retained)
+                SELECT id, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '', '', '', 0, 0, '', '', 0, 'prompt', '', false FROM sessions WHERE id=ANY($1)`, []string{sessionID, "other-owner-session"})
+			require.NoError(t, err)
 			_, err = local.CreateWorktreeProjectMapping(ctx, db.WorktreeProjectMapping{
 				Machine: "local", PathPrefix: "/srv/custom-worktrees",
 				Layout: db.WorktreeMappingLayoutExplicit, Project: targetProject,
@@ -683,6 +687,12 @@ func TestPushProjectMoveReconcilesFilteredScope(t *testing.T) {
 				`SELECT COUNT(*) FROM sessions WHERE id = $1`, "other-owner-session",
 			).Scan(&count))
 			assert.Equal(t, 1, count, "reconciliation must preserve another archive owner")
+			require.NoError(t, syncer.pg.QueryRowContext(ctx, `SELECT count(*) FROM commit_links WHERE session_id='other-owner-session' AND NOT retained`).Scan(&count))
+			assert.Equal(t, 1, count)
+			if !tc.wantSession {
+				require.NoError(t, syncer.pg.QueryRowContext(ctx, `SELECT count(*) FROM commit_links WHERE session_id=$1 AND NOT retained`, sessionID).Scan(&count))
+				assert.Zero(t, count)
+			}
 
 			targetObsCount := 0
 			if tc.wantTargetObs {
@@ -726,10 +736,9 @@ func TestPushProjectMoveReconcilesFilteredScope(t *testing.T) {
 func TestIdentityPublicationUpdatesOnlyChangedRowsAndAppliesTombstones(
 	t *testing.T,
 ) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_identity_delta_test"
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	ctx := t.Context()
 	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err)
@@ -830,16 +839,14 @@ func TestIdentityPublicationUpdatesOnlyChangedRowsAndAppliesTombstones(
 // reclassification at unchanged content length reaches the flags stream
 // and republishes the updated message flags.
 func TestPushSystemReclassificationRepublishes(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_sysfingerprint_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	// Local SQLite DB.
@@ -847,7 +854,6 @@ func TestPushSystemReclassificationRepublishes(t *testing.T) {
 		filepath.Join(t.TempDir(), "local.db"),
 	)
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -912,21 +918,18 @@ func TestPushSystemReclassificationRepublishes(t *testing.T) {
 }
 
 func TestPushMessageNanosecondTimestampNoRewriteRegression(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_msgtime_nanos_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -976,16 +979,14 @@ func TestPushMessageNanosecondTimestampNoRewriteRegression(t *testing.T) {
 // and a subsequent push with nil clears the column back to NULL via the
 // ON CONFLICT DO UPDATE path.
 func TestPushSessionTerminationStatus(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_termstatus_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
@@ -1049,16 +1050,14 @@ func TestPushSessionTerminationStatus(t *testing.T) {
 }
 
 func TestPushSessionPreservesSourceMachine(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_source_machine_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
@@ -1098,21 +1097,18 @@ func TestPushSessionPreservesSourceMachine(t *testing.T) {
 }
 
 func TestPushPreservesPGServeLocalCurationFields(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_preserve_pg_curation_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -1187,21 +1183,16 @@ func TestPushPreservesPGServeLocalCurationFields(t *testing.T) {
 }
 
 func TestPushKeepsSourceAvailabilityLocalAndPreservesPGUserTrash(t *testing.T) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_push_source_missing_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err)
 	defer pg.Close()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_, _ = pg.ExecContext(context.WithoutCancel(t.Context()), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	})
 	require.NoError(t, EnsureSchema(t.Context(), pg, schema))
 
 	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err)
-	dbtest.SeedPricingMeta(t, local)
 	defer local.Close()
 	syncer := &Sync{
 		pg: pg, local: local, machine: "test-machine",
@@ -1315,21 +1306,18 @@ func TestPushKeepsSourceAvailabilityLocalAndPreservesPGUserTrash(t *testing.T) {
 }
 
 func TestPushPreservesPGServePermanentDeletes(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_preserve_pg_deletes_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -1439,21 +1427,18 @@ func TestPushPreservesPGServePermanentDeletes(t *testing.T) {
 }
 
 func TestPushPurgesRowsForPGExcludedSessions(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_excluded_purge_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -1486,6 +1471,8 @@ func TestPushPurgesRowsForPGExcludedSessions(t *testing.T) {
 	_, err = sync.Push(ctx, false, nil)
 	require.NoError(t, err, "initial Push")
 
+	_, err = pg.ExecContext(ctx, `INSERT INTO commit_links (session_id,sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at,turn_ordinal,turn_text,project,retained) VALUES ($1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','','','',0,0,'','',0,'prompt','',false),($1,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','','','',0,0,'','',NULL,'','',true)`, sessionID)
+	require.NoError(t, err)
 	_, err = pg.ExecContext(t.Context(),
 		`INSERT INTO excluded_sessions (id) VALUES ($1)`,
 		sessionID,
@@ -1522,19 +1509,22 @@ func TestPushPurgesRowsForPGExcludedSessions(t *testing.T) {
 		sessionID,
 	).Scan(&count), "count purged session")
 	assert.Zero(t, count, "excluded session row should be purged")
+	var retained int
+	require.NoError(t, pg.QueryRowContext(ctx, `SELECT count(*) FILTER (WHERE NOT retained), count(*) FILTER (WHERE retained) FROM commit_links WHERE session_id=$1`, sessionID).Scan(&count, &retained))
+	assert.Zero(t, count)
+	assert.Equal(t, 1, retained)
+
 }
 
 func TestPushSessionSkipsPGExcludedSession(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_session_excluded_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
@@ -1579,21 +1569,18 @@ func TestPushSessionSkipsPGExcludedSession(t *testing.T) {
 }
 
 func TestPushUpdatesSourceCurationFieldsWithoutPGOverride(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_source_curation_update_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -1677,21 +1664,18 @@ func TestPushUpdatesSourceCurationFieldsWithoutPGOverride(t *testing.T) {
 }
 
 func TestPushPreservesLegacyPGCurationWithoutSourceBaseline(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_legacy_source_curation_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -1809,21 +1793,18 @@ func TestPushPreservesLegacyPGCurationWithoutSourceBaseline(t *testing.T) {
 // must not skip usage_event syncing just because the message count is 0 --
 // otherwise the dashboard shows tokens with a $0 cost.
 func TestPushSyncsUsageEventsForZeroMessageSession(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_zeromsg_usage_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -1911,16 +1892,14 @@ func TestPushSyncsUsageEventsForZeroMessageSession(t *testing.T) {
 }
 
 func TestPushSyncsCursorUsageEventsIntoPGDailyUsage(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_cursor_usage_pg_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "sessions.db"))
@@ -1988,6 +1967,7 @@ func TestPushSyncsCursorUsageEventsIntoPGDailyUsage(t *testing.T) {
 }
 
 func TestPushCursorUsageEventsDedupsAfterLegacyMoneyMigration(t *testing.T) {
+	t.Parallel()
 	pgURL := testPGURL(t)
 
 	const schema = "agentsview_cursor_usage_money_migration_push_test"
@@ -2039,7 +2019,6 @@ func TestPushCursorUsageEventsDedupsAfterLegacyMoneyMigration(t *testing.T) {
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "sessions.db"))
 	require.NoError(t, err, "open local db")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 	require.NoError(t, localDB.InsertCursorUsageEvents(t.Context(), []db.CursorUsageEvent{{
 		OccurredAt:       "2026-05-14T10:05:00.123456789Z",
@@ -2067,16 +2046,14 @@ func TestPushCursorUsageEventsDedupsAfterLegacyMoneyMigration(t *testing.T) {
 }
 
 func TestPushCursorUsageEventsPreservesRowsFromOtherMachines(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_cursor_usage_append_only_pg_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	_, err = pg.ExecContext(ctx, `
@@ -2098,7 +2075,6 @@ func TestPushCursorUsageEventsPreservesRowsFromOtherMachines(t *testing.T) {
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "sessions.db"))
 	require.NoError(t, err, "open local db")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 	require.NoError(t, localDB.InsertCursorUsageEvents(t.Context(), []db.CursorUsageEvent{{
 		OccurredAt:       "2026-05-14T10:05:00Z",
@@ -2128,6 +2104,79 @@ func TestPushCursorUsageEventsPreservesRowsFromOtherMachines(t *testing.T) {
 	require.NoError(t, err, "Push")
 
 	assert.Equal(t, 2, pgTableCount(t, ctx, pg, "cursor_usage_events"))
+}
+
+// An incremental push sends only the Cursor rows added since the last one;
+// a full push sends them all again.
+func TestPushSendsOnlyNewCursorUsageEvents(t *testing.T) {
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
+	pg, err := Open(t.Context(), pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := t.Context()
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(ctx, filepath.Join(t.TempDir(), "sessions.db"))
+	require.NoError(t, err, "open local db")
+	defer localDB.Close()
+	event := func(dedupKey string) []db.CursorUsageEvent {
+		return []db.CursorUsageEvent{{
+			OccurredAt: "2026-05-14T10:05:00Z", Model: "claude-4.6-opus-high-thinking",
+			Kind: "USAGE_EVENT_KIND_USAGE_BASED", InputTokens: 1234, OutputTokens: 567,
+			Charged: money.MustParseDollars("0.1566"), DedupKey: dedupKey,
+		}}
+	}
+	pgDedupKeys := func() []string {
+		rows, err := pg.QueryContext(ctx, `SELECT dedup_key FROM cursor_usage_events ORDER BY dedup_key`)
+		require.NoError(t, err)
+		defer rows.Close()
+		var keys []string
+		for rows.Next() {
+			var key string
+			require.NoError(t, rows.Scan(&key))
+			keys = append(keys, key)
+		}
+		require.NoError(t, rows.Err())
+		return keys
+	}
+	sync := &Sync{
+		local:      localDB,
+		pg:         pg,
+		machine:    "test-machine",
+		schema:     schema,
+		schemaDone: true,
+	}
+
+	require.NoError(t, localDB.InsertCursorUsageEvents(ctx, event("first")))
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "first push")
+	// A row the target lost stays lost until a full push, which shows the
+	// next incremental push did not resend it.
+	_, err = pg.ExecContext(ctx, `DELETE FROM cursor_usage_events`)
+	require.NoError(t, err)
+
+	require.NoError(t, localDB.InsertCursorUsageEvents(ctx, event("second")))
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "incremental push")
+	assert.Equal(t, []string{"second"}, pgDedupKeys())
+
+	_, err = sync.Push(ctx, true, nil)
+	require.NoError(t, err, "full push")
+	assert.Equal(t, []string{"first", "second"}, pgDedupKeys())
+
+	// A rebuild renumbers local ids under a new database generation, so an
+	// id recorded under another generation sends every row again.
+	_, err = pg.ExecContext(ctx, `DELETE FROM cursor_usage_events`)
+	require.NoError(t, err)
+	_, err = pg.ExecContext(ctx, `UPDATE sync_metadata SET value = '2:rebuilt-away'
+		WHERE key LIKE 'cursor_usage_max_id:%'`)
+	require.NoError(t, err)
+	_, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "push after a rebuild")
+	assert.Equal(t, []string{"first", "second"}, pgDedupKeys())
 }
 
 // checkIsSystem asserts that PG contains exactly wantTotal rows for the
@@ -2225,23 +2274,20 @@ func pgMessageCTID(
 // third-party session files, so the push boundary must be defensive
 // regardless of any single parser fix.
 func TestPushMessagesSanitizesNULBytes(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_nul_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(),
 		filepath.Join(t.TempDir(), "local.db"),
 	)
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -2322,27 +2368,86 @@ func TestPushMessagesSanitizesNULBytes(t *testing.T) {
 		"fast path should skip rewriting a NUL-field session")
 }
 
+// TestPushBoundaryStateKeepsOnlyWindowFingerprints verifies an incremental
+// push carries forward only fingerprints for sessions in its window, so the
+// boundary state stays bounded instead of growing with the whole archive.
+func TestPushBoundaryStateKeepsOnlyWindowFingerprints(t *testing.T) {
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pg, err := Open(t.Context(), testPGSchemaURL(t, schema), schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+	ctx := t.Context()
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	localDB, err := db.Open(ctx, filepath.Join(t.TempDir(), "local.db"))
+	require.NoError(t, err, "db.Open")
+	defer localDB.Close()
+
+	sync := &Sync{
+		pg: pg, local: localDB, machine: "test-machine",
+		schema: schema, schemaDone: true,
+	}
+	session := func(id string) db.Session {
+		return db.Session{
+			ID: id, Project: "proj", Machine: "local", Agent: "claude",
+			MessageCount: 1, CreatedAt: "2026-01-01T00:00:00Z",
+		}
+	}
+	for _, id := range []string{"window-old", "window-changed"} {
+		require.NoError(t, localDB.UpsertSession(ctx, session(id)))
+		require.NoError(t, localDB.InsertMessages(ctx, []db.Message{{
+			SessionID: id, Role: "user", Content: "hi", ContentLength: 2,
+		}}))
+	}
+	boundaryIDs := func(t *testing.T) []string {
+		t.Helper()
+		raw, err := sync.effectiveSyncState().GetSyncState(
+			ctx, lastPushBoundaryStateKey,
+		)
+		require.NoError(t, err)
+		var state pushBoundaryState
+		require.NoError(t, json.Unmarshal([]byte(raw), &state))
+		return slices.Sorted(maps.Keys(state.Fingerprints))
+	}
+
+	res, err := sync.Push(ctx, false, nil)
+	require.NoError(t, err, "first Push")
+	require.Equal(t, 2, res.SessionsPushed)
+	require.Equal(t, []string{"window-changed", "window-old"}, boundaryIDs(t))
+
+	// Only window-changed moves past the first push's cutoff, so the
+	// boundary state must drop window-old's fingerprint instead of
+	// carrying it forward.
+	changed := session("window-changed")
+	changed.MessageCount = 2
+	mtime := time.Now().UnixNano()
+	changed.FileMtime = &mtime
+	require.NoError(t, localDB.UpsertSession(ctx, changed))
+	res, err = sync.Push(ctx, false, nil)
+	require.NoError(t, err, "second Push")
+	assert.Equal(t, 1, res.SessionsPushed)
+	assert.Equal(t, []string{"window-changed"}, boundaryIDs(t))
+}
+
 // TestPushIncrementalWithOnlyForeignMachineSessions verifies reset detection
 // does not misfire when every local session carries a machine value other than
 // s.machine (e.g. orphan-copied sessions kept from a previous machine name).
 // The push marker, not a per-machine row count, drives reset detection, so the
 // second incremental push is a no-op rather than a forced full re-push.
 func TestPushIncrementalWithOnlyForeignMachineSessions(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_foreign_machine_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -2416,21 +2521,18 @@ func TestPushIncrementalWithOnlyForeignMachineSessions(t *testing.T) {
 // push, leaving this host's session missing; the push marker is per-pusher, so
 // the reset is detected and the session is re-pushed.
 func TestPushDetectsResetWhenCompetingMachineRowsExist(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_reset_competing_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -2496,21 +2598,18 @@ func TestPushDetectsResetWhenCompetingMachineRowsExist(t *testing.T) {
 // the old value while PG holds a fresh marker, and reset-lost sessions would be
 // skipped indefinitely.
 func TestPushMarkerNotWrittenWhenResetRecoveryFails(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_reset_recovery_fail_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -2603,21 +2702,18 @@ func TestPushMarkerNotWrittenWhenResetRecoveryFails(t *testing.T) {
 // the session is re-evaluated; without the resolved machine in the fingerprint
 // it would match and be skipped, leaving PG with the stale machine name.
 func TestPushUpdatesSentinelMachineWhenSyncMachineChanges(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_sentinel_machine_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -2672,21 +2768,18 @@ func TestPushUpdatesSentinelMachineWhenSyncMachineChanges(t *testing.T) {
 }
 
 func TestPushAdoptsOwnerlessRowsFromPreviousMarkerMachine(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_legacy_marker_machine_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	const markerID = "legacy-marker-1"
@@ -2797,21 +2890,18 @@ func TestPushAdoptsOwnerlessRowsFromPreviousMarkerMachine(t *testing.T) {
 }
 
 func TestFilteredPushAdoptsOwnerlessRowsFromLegacyUnscopedMarker(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_filtered_legacy_marker_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	const markerID = "legacy-marker-filtered-1"
@@ -2896,21 +2986,18 @@ func TestFilteredPushAdoptsOwnerlessRowsFromLegacyUnscopedMarker(t *testing.T) {
 }
 
 func TestPushReportsSkippedConflicts(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_push_skipped_conflicts_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	defer localDB.Close()
 
 	sync := &Sync{
@@ -2954,23 +3041,26 @@ func TestPushReportsSkippedConflicts(t *testing.T) {
 
 // newSessionProvenancePushSync creates a fresh schema and a Sync wired to a
 // local SQLite DB, for tests exercising session provenance push behavior.
+// The test's first call starts from a template copy holding schema; callers
+// that pass pgPushTestSchema share one template.
 func newSessionProvenancePushSync(
 	t *testing.T, schema string,
 ) (*Sync, *db.DB, *sql.DB, context.Context) {
 	t.Helper()
-	pgURL := testPGURL(t)
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	t.Cleanup(func() { _ = pg.Close() })
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
-	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+	if !takeFreshSchemaCopy(t, pgURL, schema) {
+		_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
+		require.NoError(t, err, "drop schema")
+		require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+	}
 
 	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
-	dbtest.SeedPricingMeta(t, localDB)
 	t.Cleanup(func() { _ = localDB.Close() })
 
 	sync := &Sync{
@@ -3013,7 +3103,8 @@ func seedProvenanceSession(
 // TestPushWritesSessionProvenance verifies that a push stamps the local
 // archive id and source file path onto the pushed PG sessions row.
 func TestPushWritesSessionProvenance(t *testing.T) {
-	const schema = "agentsview_push_provenance_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
 	sync, localDB, pg, ctx := newSessionProvenancePushSync(t, schema)
 
 	seedProvenanceSession(t, localDB, "sess-1", "workstation", "proj",
@@ -3035,9 +3126,11 @@ func TestPushWritesSessionProvenance(t *testing.T) {
 }
 
 func TestArchiveIdentityChangeRepublishesUnchangedSessions(t *testing.T) {
-	const schema = "agentsview_push_archive_identity_change_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
 	syncer, localDB, pg, ctx := newSessionProvenancePushSync(t, schema)
 	seedProvenanceSession(t, localDB, "sess-1", "workstation", "proj", "")
+	dbtest.SeedRetainedCommitLink(t, localDB, "retained", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	require.NoError(t, localDB.UpsertProjectIdentityObservation(
 		ctx, export.ProjectIdentityObservation{
 			SessionID: "sess-1", Project: "proj", Machine: "workstation",
@@ -3104,6 +3197,7 @@ func TestArchiveIdentityChangeRepublishesUnchangedSessions(t *testing.T) {
 		"source_project_identity_observation_scopes",
 		"source_session_project_identity_snapshots",
 		"source_session_project_identity_snapshot_scopes",
+		"retained_commit_links",
 		"source_worktree_project_mappings",
 		"source_worktree_project_mapping_scopes",
 	} {
@@ -3118,6 +3212,7 @@ func TestArchiveIdentityChangeRepublishesUnchangedSessions(t *testing.T) {
 		"source_archives",
 		"source_project_identity_observations",
 		"source_session_project_identity_snapshots",
+		"retained_commit_links",
 		"source_worktree_project_mappings",
 	} {
 		var repairedCount int
@@ -3133,14 +3228,12 @@ func TestArchiveIdentityChangeRepublishesUnchangedSessions(t *testing.T) {
 func TestFilteredArchiveIdentityRepairPreservesOtherPublicationScope(
 	t *testing.T,
 ) {
-	const schema = "agentsview_filtered_archive_identity_repair_test"
-	pgURL := testPGURL(t)
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	t.Parallel()
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	ctx := t.Context()
 	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err)
-	dbtest.SeedPricingMeta(t, local)
 	t.Cleanup(func() { require.NoError(t, local.Close()) })
 	for _, project := range []string{"alpha", "beta"} {
 		sessionID := "session-" + project
@@ -3183,6 +3276,8 @@ func TestFilteredArchiveIdentityRepairPreservesOtherPublicationScope(
 		require.NoError(t, err)
 	}
 	oldArchiveID, err := local.GetArchiveID(ctx)
+	require.NoError(t, err)
+	_, err = alpha.pg.ExecContext(ctx, `INSERT INTO retained_commit_links (source_archive_id,session_id,sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at) VALUES ($1,'retained','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','','','',0,0,'','')`, oldArchiveID)
 	require.NoError(t, err)
 	const repairedArchiveID = "filtered-repaired-archive-id"
 	require.NoError(t, local.SetArchiveIdentityForTest(
@@ -3251,6 +3346,7 @@ func TestFilteredArchiveIdentityRepairPreservesOtherPublicationScope(
 	_, err = beta.Push(ctx, false, nil)
 	require.NoError(t, err)
 	for _, table := range []string{
+		"retained_commit_links",
 		"source_archives",
 		"source_project_identity_observations",
 		"source_project_identity_observation_scopes",
@@ -3280,7 +3376,8 @@ func TestFilteredArchiveIdentityRepairPreservesOtherPublicationScope(
 // second push must not re-touch a session whose provenance was cleared
 // out-of-band after the marker was written.
 func TestSessionProvenanceBackfillForcesOneFullPush(t *testing.T) {
-	const schema = "agentsview_push_provenance_backfill_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
 	sync, localDB, pg, ctx := newSessionProvenancePushSync(t, schema)
 
 	seedProvenanceSession(t, localDB, "sess-1", "workstation", "proj", "")
@@ -3310,7 +3407,8 @@ func TestSessionProvenanceBackfillForcesOneFullPush(t *testing.T) {
 // failed push leaves the provenance backfill marker unset, so the next push
 // retries the one-time backfill instead of silently skipping it.
 func TestSessionProvenanceBackfillMarkerNotWrittenOnFailure(t *testing.T) {
-	const schema = "agentsview_push_provenance_backfill_fail_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
 	sync, localDB, pg, ctx := newSessionProvenancePushSync(t, schema)
 
 	seedProvenanceSession(t, localDB, "sess-1", "workstation", "proj", "")
@@ -3337,7 +3435,8 @@ func TestSessionProvenanceBackfillMarkerNotWrittenOnFailure(t *testing.T) {
 // provenance predates source_archive_id, without completing the target-wide
 // marker for sessions outside that filter.
 func TestSessionProvenanceBackfillCompletesPerFilterScope(t *testing.T) {
-	const schema = "agentsview_push_provenance_filtered_test"
+	t.Parallel()
+	const schema = pgPushTestSchema
 	unfiltered, localDB, _, ctx := newSessionProvenancePushSync(t, schema)
 
 	seedProvenanceSession(t, localDB, "sess-in", "workstation", "proj", "")
@@ -3411,13 +3510,15 @@ type usagePushFixture struct {
 // newUsagePushFixture stores one session with a single message and the given
 // usage events, then completes an initial push.
 func newUsagePushFixture(
-	t *testing.T, schema string, events []db.UsageEvent,
+	t *testing.T, events []db.UsageEvent,
 ) usagePushFixture {
 	t.Helper()
 	ctx := t.Context()
-	pgURL := testPGURL(t)
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	const schema = pgPushTestSchema
+	pgURL := testPGSchemaURL(t, schema)
+	if !takeFreshSchemaCopy(t, pgURL, schema) {
+		cleanNamedPGSchema(t, pgURL, schema)
+	}
 
 	local := testDB(t)
 	session := db.Session{
@@ -3459,6 +3560,7 @@ func (f *usagePushFixture) pushMetadataChange(
 }
 
 func TestPGPushMetadataChangesPreserveUnchangedUsage(t *testing.T) {
+	t.Parallel()
 	type mirroredMessage struct {
 		Version     string
 		SessionName string
@@ -3499,7 +3601,7 @@ func TestPGPushMetadataChangesPreserveUnchangedUsage(t *testing.T) {
 					OccurredAt: timestamp, DedupKey: fmt.Sprintf("event-%d", i),
 				}
 			}
-			f := newUsagePushFixture(t, "agentsview_usage_timestamp_test", events)
+			f := newUsagePushFixture(t, events)
 			archived, err := f.local.UsageEventFingerprints(t.Context(), []string{f.session.ID})
 			require.NoError(t, err)
 			before := readMessage(t, f)
@@ -3519,6 +3621,7 @@ func TestPGPushMetadataChangesPreserveUnchangedUsage(t *testing.T) {
 }
 
 func TestPGPushReplacesChangedUsage(t *testing.T) {
+	t.Parallel()
 	type mirroredUsage struct {
 		OutputTokens int
 		OccurredAt   sql.NullTime
@@ -3527,7 +3630,7 @@ func TestPGPushReplacesChangedUsage(t *testing.T) {
 		Source: "session", Model: "model", InputTokens: 10, OutputTokens: 2,
 		DedupKey: "session:usage",
 	}
-	f := newUsagePushFixture(t, "agentsview_usage_change_test", []db.UsageEvent{usage})
+	f := newUsagePushFixture(t, []db.UsageEvent{usage})
 	usage.SessionID = f.session.ID
 
 	_, err := f.pusher.DB().ExecContext(t.Context(), `UPDATE sessions SET updated_at='2000-01-01T00:00:00Z' WHERE id=$1`, f.session.ID)
@@ -3570,19 +3673,17 @@ func TestPGPushReplacesChangedUsage(t *testing.T) {
 // the session would stay remote under its old project with the watermark
 // already past the move.
 func TestFilteredPushReconcilesProjectMoveCommittedDuringPush(t *testing.T) {
+	t.Parallel()
 	const (
 		sessionID     = "pg-concurrent-move"
 		sourceProject = "source_project"
 		targetProject = "target_project"
-		schema        = "agentsview_concurrent_move"
+		schema        = pgPushTestSchema
 	)
-	pgURL := testPGURL(t)
-	cleanNamedPGSchema(t, pgURL, schema)
-	t.Cleanup(func() { cleanNamedPGSchema(t, pgURL, schema) })
+	pgURL := testPGSchemaURL(t, schema)
 	ctx := t.Context()
 	local, err := db.Open(ctx, filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err)
-	dbtest.SeedPricingMeta(t, local)
 	t.Cleanup(func() { require.NoError(t, local.Close()) })
 	startedAt := "2026-07-16T12:00:00.000Z"
 	require.NoError(t, local.UpsertSession(ctx, db.Session{

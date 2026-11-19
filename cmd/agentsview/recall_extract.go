@@ -61,6 +61,10 @@ func resolveExtractDistillation(
 		return dist, fmt.Errorf(
 			"parsing [recall.extract.servers.%s] timeout: %w", serverName, err)
 	}
+	apiKey, err := server.APIKey()
+	if err != nil {
+		return dist, fmt.Errorf("[recall.extract.servers.%s] %w", serverName, err)
+	}
 	profile, err := extract.ResolveProfile(cfg.Prompts.Profile, cfg.Model)
 	if err != nil {
 		return dist, err
@@ -101,7 +105,7 @@ func resolveExtractDistillation(
 	return extractDistillation{
 		Client: &extract.Client{
 			BaseURL:    server.Endpoint,
-			APIKey:     server.APIKey(),
+			APIKey:     apiKey,
 			Model:      cfg.Model,
 			HTTPClient: httpClient,
 			Request:    request,
@@ -371,7 +375,7 @@ type extractRunResult struct {
 func newRecallExtractStatusCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "status",
-		Short:        "Show extraction coverage for the configured generation",
+		Short:        "Show Recall processing progress for the current settings",
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {

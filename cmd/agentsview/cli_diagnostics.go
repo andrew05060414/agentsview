@@ -261,8 +261,6 @@ func commandRecoveryHint(cmd *cobra.Command) string {
 	switch name := recoveryCommandName(cmd); {
 	case name == "pg" || cmd.Name() == "clean-uploads":
 		return "check AGENTSVIEW_PG_URL or [pg].url in config.toml (named targets use default_pg); " + hint
-	case name == "duckdb":
-		return "check AGENTSVIEW_DUCKDB_PATH / AGENTSVIEW_DUCKDB_URL or [duckdb].path / [duckdb].url in config.toml; " + hint
 	case name == "clickhouse":
 		return "check AGENTSVIEW_CLICKHOUSE_URL or [clickhouse].url in config.toml (named targets use default_clickhouse); " + hint
 	case name == "raw" || name == "raw-sync":
@@ -320,7 +318,8 @@ func applyCLIRecovery(cmd *cobra.Command, err error, d *cliDiagnosticError) {
 	}
 	if errors.Is(err, db.ErrSemanticUnavailable) {
 		d.kind, d.code = "unavailable", cliUnavailableExitCode
-		d.hint = "run `agentsview index embeddings build` on the archive host; " + commandHelpHint(cmd)
+		d.display = strings.Replace(err.Error(), db.ErrSemanticUnavailable.Error(), "semantic search not available", 1)
+		d.hint = "run `agentsview index embeddings build` on the archive host or turn it on in Settings → Embeddings → Turn on; " + commandHelpHint(cmd)
 		if cmd != nil && cmd.CommandPath() == "agentsview session search" {
 			d.hint += "; use --fts or --regex while semantic search is unavailable"
 		}

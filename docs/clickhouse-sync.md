@@ -9,8 +9,7 @@ AgentsView stores sessions locally in SQLite.
 Keep the copy current with `push --watch` or `clickhouse service`.
 
 Each machine pushes its own sessions. SQLite stays the archive. ClickHouse is a
-remote copy, the same operator story as [PostgreSQL sync](/docs/pg-sync/), not a
-disposable local file like [DuckDB](/docs/duckdb/).
+remote copy with the same operator story as [PostgreSQL sync](/docs/pg-sync/).
 
 The UI includes the session browser, search, analytics, usage, activity, recent
 edits, and project inventory. Rename, trash, insights, stars, and pins stay on
@@ -42,9 +41,18 @@ binary has updated the schema.
 
 Commit lookups return the copied links and prompts.
 The first push after upgrading is a full push to copy existing commit links.
+Upgrade serving binaries before or with publishers; older readers cannot see the new table.
+A serving role that cannot create tables needs an upgraded push before commit
+lookups work. Each archive's rebuild removes only the deleted-session links that
+archive pushed. Links with no recorded archive, from older pushes, stay and can
+reappear after an archive discards its matching copy.
 A deleted session remains visible as a missing record. Project filters use the
 project saved with its links in SQLite, including after a rebuild or a deletion
 before the first push.
+
+Search matches text extracted from tool-result images when
+[`[image_text]`](configuration.md#image-text) is enabled locally. The first
+push after upgrading is a full push to copy existing image text.
 
 ## Quick Start
 
@@ -156,6 +164,9 @@ to fan out across every configured target. `--all --watch` is rejected.
    [Vector Push](#vector-push).
 1. Advances this archive's cursor in the mirror's `sync_metadata` only when
    every session succeeded.
+1. Compacts the rewritten tables when the push rewrote at least a quarter of
+   the mirror's live messages, as a `--full` push does: see
+   [Compaction after a large push](#compaction-after-a-large-push).
 
 Use `--full` to bypass fingerprints and re-push everything — for example after a
 schema reset or when message content was rewritten in place.
@@ -183,6 +194,31 @@ push cleanly.
 If any sessions fail during an incremental push, the cursor is not advanced, so
 the next push retries them. The exit code is 1 when any errors occur, 0
 otherwise.
+
+#### Compaction after a large push
+
+A rewritten session keeps its older rows on disk until ClickHouse merges them
+away, and after full pushes those merges rarely happen on their own. Every
+dashboard read then pays to skip the older copies. When a push rewrote at least
+a quarter of the mirror's live messages, it runs `OPTIMIZE TABLE ... FINAL` on
+each table it rewrote, largest first, and waits for each merge before it
+returns. The push log names each table and how long its merge took. A full push
+that resumes after an interruption counts the messages its earlier attempt
+wrote, so it compacts like a full push that ran straight through. A push that
+ends with session errors does not compact; the push that later finishes cleanly
+compacts what both wrote.
+
+Reads keep working during the merge, though they compete with it for CPU and
+disk. ClickHouse starts the merge only when the disk has free space for twice
+the size of the table it merges; otherwise the push logs the refusal.
+
+The push role needs the `OPTIMIZE` grant on the mirror database and
+`SELECT ON system.parts`. Without them, the push logs
+`skipped compacting the rewritten tables` with the server's error and still
+succeeds; reads stay correct but slow down as older copies pile up. To grant
+them, run `GRANT OPTIMIZE ON <database>.* TO <push_user>` and
+`GRANT SELECT ON system.parts TO <push_user>`, or add the matching `<query>`
+lines to an XML-managed user's `<grants>`.
 
 #### Automatic Push Watcher
 
@@ -291,21 +327,13 @@ matches a pushed generation.
 
 On the machine that owns the sessions, choose **Settings → Embeddings → Turn on** to approve the download and build the local index without restarting. For CLI setup, follow the steps below.
 
-1. Enable vectors in `~/.agentsview/config.toml`. AgentsView discovers Ollama
-   with Nomic or uses Kit's shared local server. Explicit recipes and server
-   settings are described in
-   [Enabling `[vector]`](/docs/semantic-search/#enabling-vector).
-
-    ```toml
-    [vector]
-    enabled = true
-    ```
-
-1. Restart the daemon, then build the local index. The CLI asks before the first
-   download; declining stops the download and build. `--yes` skips rebuild
-   confirmation but does not approve this download. Approve the first install
-   interactively before running unattended builds. Confirm an active
-   generation exists:
+1. Build the local index. AgentsView discovers Ollama with Nomic or uses Kit's
+   shared local server. For other providers, see
+   [Enabling `[vector]`](/docs/semantic-search/#enabling-vector). The CLI asks
+   before the first download; declining stops the download and build. `--yes`
+   skips rebuild confirmation but does not approve this download. Approve the
+   first install interactively before running unattended builds. Confirm an
+   active generation exists:
 
     ```bash
     agentsview index embeddings build --yes
@@ -549,6 +577,16 @@ only makes the next open of those days slower. A new binary rebuilds them on its
 own. If the directory cannot be created, serve logs a warning and keeps reports
 in memory only.
 
+Usage also keeps fully prepared selections under `agentsview/clickhouse-usage`
+in the same cache directory. Each selection can use up to 128 MiB, with a
+256 MiB limit per mirror. The next read rebuilds a selection after a push,
+pricing change, new binary, or deletion of the cache directory. If the cache is
+unavailable, Usage reads the mirror instead.
+
+Trends keeps per-session counts in the same cache. The first visit builds them,
+and after a push it recounts only changed sessions. Hour, model, Local timezone,
+and time-dependent selections still read the mirror directly.
+
 When `require_auth` is enabled, a bearer token is generated if needed and
 printed on startup. Pass it via `Authorization: Bearer <token>` on API requests.
 
@@ -652,8 +690,14 @@ ______________________________________________________________________
   rather than per-generation pgvector tables, and search is an exact cosine
   scan. There is no hosted raw-sync control plane.
 - `clickhouse serve` does not run PostgreSQL-style migrations beyond
-  `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, and the one-time
-  fill of derived usage and terminal-event tables described above.
+  `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, the one-time fill
+  of derived usage and terminal-event tables described above, and changing
+  string columns with few distinct values, such as message roles, models, and
+  agents, to `LowCardinality(String)`. That change keeps every value. The
+  `ALTER` returns at once, and ClickHouse rewrites existing data in a
+  background mutation, which on a large mirror takes a while and needs
+  temporary disk space. Older AgentsView versions can keep pushing to the
+  converted mirror.
 - Deletes are version-bounded `DELETE` statements. ClickHouse applies them at
   merge time; readers always open connections with `final=1` so they see one
   row per key without writing `FINAL` in query text.
@@ -701,8 +745,10 @@ The mirror is designed for MergeTree, not copied from PostgreSQL SQL.
   or starts the `prepare_usage` view's refresh, only when the table is empty,
   prices changed, or the rows reads compute themselves reach one-fiftieth of the
   stored rows. Other pushes write nothing to the table. Where the view exists,
-  its 15-minute schedule still refreshes the table. Rows of deleted sessions
-  stay in the table until the next rebuild; reads skip them.
+  it also refreshes the table once a day, at midnight in the ClickHouse
+  server's time zone, for a push that ended with errors or whose refresh
+  request failed. Rows of deleted sessions stay in the table until the next
+  rebuild; reads skip them.
 - **Lock of a stopped push.** A lock expires an hour after its push last renewed
   it, so a push stopped mid-rebuild makes later pushes skip their rebuilds for
   up to an hour. If the skip message names a held lock and you know no push is

@@ -2,12 +2,15 @@ package clickhouse
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +25,11 @@ const usagePriceInsertBatch = 20000
 // priced under. It is mirror-wide, not per archive: a pricing pass covers
 // every exporter's rows.
 const usagePricedDigestKey = "usage_prices_digest"
+
+// usagePricedCursorKey records what the last pricing pass over the Cursor
+// rows covered, as cursorPricingParts.mark renders it. It is mirror-wide,
+// like the Cursor rows themselves.
+const usagePricedCursorKey = "usage_prices_cursor"
 
 // usagePriceScope selects which mirrored usage rows a pricing pass reads.
 // The zero value covers the whole mirror, whichever archive pushed it,
@@ -50,8 +58,16 @@ type usagePricer struct {
 	pending  []chUsagePriceModel
 }
 
+// newUsagePricer prices with the mirror's catalog. After a pricing sync it
+// takes the GenAI row from that sync instead of reading the document back.
 func (s *Sync) newUsagePricer(ctx context.Context) (*usagePricer, error) {
-	catalog, err := chLoadPricingCatalog(ctx, s.conn, nil)
+	var catalog chPricingCatalog
+	var err error
+	if s.genAI != nil {
+		catalog, err = chLoadPricingCatalogWithGenAI(ctx, s.conn, s.genAI.row)
+	} else {
+		catalog, err = chLoadPricingCatalog(ctx, s.conn, nil)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -85,16 +101,15 @@ func (p *usagePricer) withModels(added []chUsagePriceModel) (*usagePricer, error
 	return &usagePricer{digest: digest, resolver: p.resolver, models: models}, nil
 }
 
-const chUsagePricingMessageEligibility = `
-			m.token_usage != ''
-			AND m.model != ''
-			AND m.model != '<synthetic>'`
+var chUsagePricingMessageEligibility = `
+			` + chStoredMessageUsable("m.usage_present", "m.model")
 
 // usagePricingRawSQL renders the raw usage rows of a scope. It reads what
 // the mirror holds, not the local archive, so a price is always derived
-// from the same normalized values the reader joins on. Session state is
-// ignored: no pricing input comes from the session row, and a batch is
-// priced before its session rows land.
+// from the same normalized values the reader joins on. It reads no session
+// rows: no pricing input comes from the session row, and a batch is priced
+// before its session rows land. Message usage comes from usage_messages;
+// see chUsageRawSQLFromWheres.
 func usagePricingRawSQL(scope usagePriceScope) (string, []any) {
 	cursorSQL, cursorArgs, _ := chCursorUsageRowsSQLForBounds(
 		db.UsageFilter{}, chUsageBounds{})
@@ -111,23 +126,43 @@ func usagePricingRawSQL(scope usagePriceScope) (string, []any) {
 		messageArgs, eventArgs = args, args
 	}
 	rawSQL, args := chUsageRawSQLFromWheres(
-		"LEFT JOIN", messageWhere, messageArgs, eventWhere, eventArgs)
+		true, messageWhere, messageArgs, eventWhere, eventArgs)
 	if len(scope.sessionIDs) > 0 {
 		return rawSQL, args
 	}
 	return rawSQL + "\n\t\tUNION ALL\n" + cursorSQL, append(args, cursorArgs...)
 }
 
-// forEachUnpricedUsageBatch streams distinct missing pricing inputs in bounded
-// batches. The callback must finish consuming a batch before returning.
-func (s *Sync) forEachUnpricedUsageBatch(
-	ctx context.Context, scope usagePriceScope, digest string,
-	visit func([]chUsagePriceInput) error,
-) error {
+// usagePricingCTE renders the usage CTEs over the raw usage rows of a scope.
+func usagePricingCTE(scope usagePriceScope) (string, []any) {
 	rawSQL, args := usagePricingRawSQL(scope)
-	cte, args := chUsageCTEFromRaw(
-		db.UsageFilter{Timezone: "UTC"}, rawSQL, args, false)
-	rows, err := s.conn.QueryContext(ctx, cte+`
+	return chUsageCTEFromRawSource(db.UsageFilter{Timezone: "UTC"}, rawSQL, args,
+		false, chUsageStoredNormSource(), "")
+}
+
+// unpricedUsageSQL renders the distinct pricing inputs of a scope that have
+// no price record under digest.
+//
+// usage_event_prices is sorted by (pricing_digest, price_key). A Cursor or
+// session-batch scope looks up only its own price keys, so the lookup reads
+// the granules that can hold them, and its key set stays small. Price keys
+// are hashes spread evenly over the digest's granules, so a scope with more
+// than a few hundred keys still reads nearly all of them: 885 keys of 100
+// sessions read 192 of 194 granules on a production mirror. The lookup
+// evaluates usage_normalized a second time, which costs little for these
+// scopes, but for the whole mirror it doubles the cost of the pass, so the
+// whole mirror filters on the digest's whole key set.
+//
+// Records are only ever inserted, and dropped a digest at a time, so a key
+// has a record whenever any part holds one: the lookup skips FINAL.
+func unpricedUsageSQL(scope usagePriceScope, digest string) (string, []any) {
+	cte, args := usagePricingCTE(scope)
+	candidates := ""
+	if scope.cursorOnly || len(scope.sessionIDs) > 0 {
+		candidates = `
+				AND price_key IN (SELECT price_key FROM usage_normalized)`
+	}
+	return cte + `
 		SELECT price_key, any(model), any(price_model), any(provider_id),
 			any(pricing_ts), any(source), any(message_ordinal IS NOT NULL),
 			any(input_tokens_norm), any(output_tokens_norm),
@@ -136,10 +171,22 @@ func (s *Sync) forEachUnpricedUsageBatch(
 			any(cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported')
 		FROM usage_normalized
 		WHERE price_key NOT IN (
-			SELECT price_key FROM usage_event_prices WHERE pricing_digest = ?
+			SELECT price_key FROM usage_event_prices
+			WHERE pricing_digest = ?` + candidates + `
+			SETTINGS final = 0
 		)
 		GROUP BY price_key
-		ORDER BY price_key`, append(args, digest)...)
+		ORDER BY price_key`, append(args, digest)
+}
+
+// forEachUnpricedUsageBatch streams distinct missing pricing inputs in bounded
+// batches. The callback must finish consuming a batch before returning.
+func (s *Sync) forEachUnpricedUsageBatch(
+	ctx context.Context, scope usagePriceScope, digest string,
+	visit func([]chUsagePriceInput) error,
+) error {
+	query, args := unpricedUsageSQL(scope, digest)
+	rows, err := s.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("querying unpriced clickhouse usage: %w", err)
 	}
@@ -234,6 +281,7 @@ func (s *Sync) adoptUsageModels(
 		return err
 	}
 	*pricer = *next
+	s.usageWritten = true
 	if err := writeMetadata(ctx, s.conn, map[string]string{
 		usagePricedDigestKey: pricer.digest,
 	}); err != nil {
@@ -289,6 +337,7 @@ func (s *Sync) insertUsagePrices(
 	if len(inputs) == 0 {
 		return nil
 	}
+	s.usageWritten = true
 	version := newPushVersion()
 	contexts := map[string]string{}
 	priceRows := make([][]any, 0, len(inputs))
@@ -329,9 +378,12 @@ func (s *Sync) insertUsagePrices(
 // The whole mirror is priced when the digest changed, on a full push, and on
 // a mirror no pass has covered yet, which is also the backfill for rows
 // written before price records existed. Otherwise session rows were priced
-// by the batch that wrote them, and only the Cursor rows need a pass. Rows
-// this misses, such as those of an exporter that writes no prices, stay
-// correct: the reader prices them per request until the next whole pass.
+// by the batch that wrote them, and only the Cursor rows can need a pass:
+// when there are Cursor rows and the last pass that covered them did not
+// see the same rows, digest, and price records; see cursorPricingParts.
+// Rows this misses, such as those of an exporter that writes no prices,
+// stay correct: the reader prices them per request until the next whole
+// pass.
 //
 // Models that pass finds uncovered, and models an earlier push left
 // pending, are adopted before any session batch. Every push then drops the
@@ -341,7 +393,12 @@ func (s *Sync) syncUsagePrices(ctx context.Context, full bool) (*usagePricer, er
 	if err != nil {
 		return nil, err
 	}
-	meta, err := readMetadata(ctx, s.conn, usagePricedDigestKey)
+	// Read before pricing, so a mark never claims rows the pass missed.
+	parts, err := s.readCursorPricingParts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	meta, err := readMetadata(ctx, s.conn, usagePricedDigestKey, usagePricedCursorKey)
 	if err != nil {
 		return nil, err
 	}
@@ -350,27 +407,117 @@ func (s *Sync) syncUsagePrices(ctx context.Context, full bool) (*usagePricer, er
 		return nil, err
 	}
 	whole := full || meta[usagePricedDigestKey] != pricer.digest
-	added, err := s.priceUsageScope(ctx, pricer, usagePriceScope{cursorOnly: !whole})
-	if err != nil {
-		return nil, err
+	cursorDue := parts.cursor != "" && meta[usagePricedCursorKey] != parts.mark(pricer.digest)
+	var added []chUsagePriceModel
+	if whole || cursorDue {
+		if added, err = s.priceUsageScope(ctx, pricer, usagePriceScope{cursorOnly: !whole}); err != nil {
+			return nil, err
+		}
 	}
 	if added = pricer.uncovered(slices.Concat(added, pending)); len(added) > 0 {
+		// Adoption prices the whole mirror, Cursor rows included, under the
+		// digest it moves to.
 		if err := s.adoptUsageModels(ctx, pricer, added); err != nil {
+			return nil, err
+		}
+		if parts.cursor == "" {
+			return pricer, nil
+		}
+		if err := writeMetadata(ctx, s.conn, map[string]string{
+			usagePricedCursorKey: parts.mark(pricer.digest),
+		}); err != nil {
 			return nil, err
 		}
 		return pricer, nil
 	}
+	covered := map[string]string{}
 	if whole {
-		if err := writeMetadata(ctx, s.conn, map[string]string{
-			usagePricedDigestKey: pricer.digest,
-		}); err != nil {
-			return nil, err
-		}
+		s.usageWritten = true
+		covered[usagePricedDigestKey] = pricer.digest
+	}
+	if parts.cursor != "" && (whole || cursorDue) {
+		covered[usagePricedCursorKey] = parts.mark(pricer.digest)
+	}
+	if err := writeMetadata(ctx, s.conn, covered); err != nil {
+		return nil, err
 	}
 	if err := s.pruneUsagePrices(ctx, pricer.digest); err != nil {
 		return nil, err
 	}
 	return pricer, nil
+}
+
+// cursorPricingParts identifies, from their active parts, what a pass over
+// the Cursor rows reads and what it leaves behind.
+//
+// cursor names every active part of cursor_usage_events with a hash of its
+// files, so it changes when an insert, merge, or mutation does, and two
+// equal values mean the same rows. It is empty when the table has no
+// active parts, and then there is nothing to price.
+//
+// firstBlock maps each digest to the lowest block number among its active
+// usage_event_prices parts. Merges and inserts keep it; dropping the
+// digest's partition, as pruneUsagePrices does, raises it, because every
+// part written afterwards has a higher block number. A pass that read the
+// value before writing records therefore sees it change if a drop
+// removed any of them.
+type cursorPricingParts struct {
+	cursor     string
+	firstBlock map[string]int64
+}
+
+func (s *Sync) readCursorPricingParts(ctx context.Context) (cursorPricingParts, error) {
+	rows, err := s.conn.QueryContext(ctx, `
+		SELECT table, partition, name, hash_of_all_files, min_block_number
+		FROM system.parts
+		WHERE database = currentDatabase() AND active
+			AND table IN ('cursor_usage_events', 'usage_event_prices')
+		ORDER BY table, name`)
+	if err != nil {
+		return cursorPricingParts{}, fmt.Errorf("reading clickhouse cursor pricing parts: %w", err)
+	}
+	defer rows.Close()
+	out := cursorPricingParts{firstBlock: map[string]int64{}}
+	cursor := sha256.New()
+	cursorParts := 0
+	for rows.Next() {
+		var table, partition, name, files string
+		var minBlock int64
+		if err := rows.Scan(&table, &partition, &name, &files, &minBlock); err != nil {
+			return cursorPricingParts{}, fmt.Errorf("scanning clickhouse cursor pricing parts: %w", err)
+		}
+		if table == "cursor_usage_events" {
+			_, _ = fmt.Fprintf(cursor, "%d:%s%d:%s", len(name), name, len(files), files)
+			cursorParts++
+			continue
+		}
+		if first, ok := out.firstBlock[partition]; !ok || minBlock < first {
+			out.firstBlock[partition] = minBlock
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return cursorPricingParts{}, fmt.Errorf("iterating clickhouse cursor pricing parts: %w", err)
+	}
+	if cursorParts > 0 {
+		out.cursor = hex.EncodeToString(cursor.Sum(nil))
+	}
+	return out, nil
+}
+
+// mark renders what a pass over the Cursor rows covers under digest: the
+// Cursor parts, the digest's first price record block, and the query that
+// derives their price keys, which a build can change without changing the
+// digest. A pass records its mark after it finishes, so a push that reads
+// the same mark has nothing to price.
+func (p cursorPricingParts) mark(digest string) string {
+	cte, args := usagePricingCTE(usagePriceScope{cursorOnly: true})
+	h := sha256.New()
+	for _, field := range []string{
+		digest, p.cursor, strconv.FormatInt(p.firstBlock[digest], 10), cte, fmt.Sprint(args),
+	} {
+		_, _ = fmt.Fprintf(h, "%d:%s", len(field), field)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // pruneUsagePrices drops the records and contexts of every pricing digest
@@ -411,6 +558,7 @@ func (s *Sync) pruneUsagePrices(ctx context.Context, current string) error {
 	if len(stale) == 0 {
 		return nil
 	}
+	s.usageWritten = true
 	for _, table := range []string{"usage_event_prices", "usage_price_contexts"} {
 		for batch := range slices.Chunk(stale, pricingUpsertBatch) {
 			drops := make([]string, len(batch))
@@ -430,13 +578,18 @@ func (s *Sync) pruneUsagePrices(ctx context.Context, current string) error {
 
 // idleUsagePriceDigests lists the digests nothing was written under for
 // usagePriceRetention.
+//
+// Both tables are partitioned by pricing_digest, so the partition value names
+// each row's digest without reading the digest column. Reading that column
+// for every price record took about 120 MB per push on production data;
+// push_version alone is about 13 MB.
 func (s *Sync) idleUsagePriceDigests(ctx context.Context) ([]string, error) {
 	cutoff := newPushVersion() - uint64(usagePriceRetention.Nanoseconds())
 	rows, err := s.conn.QueryContext(ctx, `
 		SELECT pricing_digest FROM (
-			SELECT pricing_digest, push_version FROM usage_event_prices
+			SELECT _partition_value.1 AS pricing_digest, push_version FROM usage_event_prices
 			UNION ALL
-			SELECT pricing_digest, push_version FROM usage_price_contexts
+			SELECT _partition_value.1 AS pricing_digest, push_version FROM usage_price_contexts
 		)
 		GROUP BY pricing_digest
 		HAVING max(push_version) < ?

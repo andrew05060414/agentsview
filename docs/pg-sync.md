@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-31
+last_edited: 2026-11-13
 title: PostgreSQL Sync
 description: Share sessions across machines with PostgreSQL push sync, an auto-push service, and a read-only server
 ---
@@ -19,17 +19,59 @@ writes. In addition to normal table access, installation requires `CREATE` on
 the schema and `TRIGGER` on the watched tables. Installation takes a
 `SHARE ROW EXCLUSIVE` lock on those tables until it commits: reads continue, and
 writes wait. CockroachDB skips this journal.
+Usage cache invalidation relies on `pg push` updating each parent session when
+it changes that session's messages. Direct SQL message edits must also change
+the parent session's `updated_at` to invalidate cached usage and Signals counts.
 Activity reuse needs `SELECT` on `usage_session_changes` for `pg serve`
-roles given access later.
+roles given access later. Signals count reuse needs `SELECT`, and saving counts
+needs `INSERT` and `UPDATE`, on `session_frustration_counts`.
 
 On `pg serve`, ended Activity ranges are reused in memory until a push touches
 their sessions or range, pricing changes, or project identity changes.
 Hosted PostgreSQL and archives without the journal rebuild every time.
+For ranges that include today, native PostgreSQL saves Activity inputs on a
+graceful close under `$CACHE_DIRECTORY/postgres-activity`, or
+`agentsview/postgres-activity` in the user cache directory. Each file and the
+whole cache are limited to 256 MiB. After restart, Activity refreshes changed
+sessions. Saving and reuse require the identity-function permissions described
+for the Usage cache below; without them, Activity reads directly and can still
+reuse inputs in memory.
 
 `pg serve` keeps finished Usage results in memory, up to 64 selections and
 64 MiB per read kind, until the journal revision or custom pricing changes.
 Hosted PostgreSQL, archives without the journal, and filters that compare against
 the current time read every time.
+
+Native PostgreSQL also keeps priced Usage rows in `<data-dir>/usage-postgres/`,
+so restarts reuse work and reads refresh sessions and prices changed by a push.
+When a read would first have to rebuild much of that cache, such as on first
+use, after a price or project identity change, or after new account usage, it
+returns the direct PostgreSQL result and the cache rebuilds in the background.
+Journals upgraded by a current writer need `SELECT` access. Persistent caching
+also needs `EXECUTE` access to PostgreSQL's `pg_control_system()`,
+`pg_current_wal_lsn()`, and `pg_walfile_name(pg_lsn)` functions. Readers without
+these permissions use direct reads. Hosted and borrowed transaction readers,
+CockroachDB, and unavailable journals also use direct reads. PostgreSQL
+standbys retain complete results in memory when a current writer has installed
+the journal history token; otherwise they read directly.
+Readers without a version 2 journal repeat direct reads until a current writer
+upgrades it. Readers without the identity functions can retain direct results
+when the journal has a history token.
+Recovery onto a different PostgreSQL timeline starts a new cache generation.
+If a cache attempt fails while the request is active, the existing direct
+PostgreSQL read supplies its result or error. A journal installed later enables
+persistent reuse without a server restart. If the cache directory can't be
+created, the reader uses temporary storage. The cache is disposable and contains
+no source sessions. Plan usage and per-session details retain their existing
+read paths.
+
+Trends keeps per-session counts under `$CACHE_DIRECTORY/postgres-trends`, or
+`agentsview/postgres-trends` in the user cache directory, and after a push
+recounts only changed sessions. Hosted and borrowed transaction readers read
+directly. The files are disposable.
+The same directory can contain saved search snippets. After a session is
+deleted, snippets can remain until the same search overwrites the page or the
+cache is trimmed.
 
 The sync direction is one-way: SQLite to PostgreSQL. Each machine pushes its own
 sessions; `pg serve` reads from the shared database. The resulting UI includes
@@ -48,6 +90,12 @@ dashboard as well.
 
 Commit lookups return the copied links and prompts.
 The first push after upgrading is a full push to copy existing commit links.
+Upgrade serving binaries before or with publishers; older readers cannot see the new table.
+A serving role that cannot create tables needs an upgraded push, or
+`hosted-provision` for a hosted schema, before commit lookups work. Each
+archive's rebuild removes only the deleted-session links that archive pushed.
+Links with no recorded archive, from older pushes or permanent deletion in the
+replica, stay and can reappear after an archive discards its matching copy.
 A deleted session remains visible as a missing record. Project filters use the
 project saved with its links in SQLite, including after a rebuild or a deletion
 before the first push.
@@ -65,8 +113,8 @@ See [Hosted Raw Sync](/docs/hosted-raw-sync/#provision-a-hosted-instance) for
 the configuration, least-privilege grants and platform limits. Use `agentsview
 pg raw-reparse <runtime-target> --run-id <id> --batch-size 64` for bounded
 parser-version rollouts. Exhausted jobs can resume after a new source arrives,
-a processing-version selection changes, or an operator runs `agentsview pg
-raw-reparse <runtime-target> --repair --batch-size 64`. Repair uses this
+a processing-version selection changes, or an operator runs `agentsview replica
+pg raw-reparse <runtime-target> --repair --batch-size 64`. Repair uses this
 executable's processing version. It's safe to repeat until it prints
 `Rescheduled 0 failed jobs`, and leaves healthy jobs, in-progress jobs, and heads
 at other versions unchanged. Use `--repair` separately from `--run-id`.
@@ -120,6 +168,15 @@ settings cause a full recheck and restamp. Publishers
 without schema-change privileges keep using a full audit until that upgrade.
 CockroachDB keeps the full audit.
 
+Push stores each message's output tokens and billed web searches in their own
+columns, so Usage reads them without parsing the message's token JSON. The
+first push after upgrading adds the columns and fills them for every existing
+message. Each later push also fills messages that an older binary pushed in
+the meantime. Until then, Usage leaves out those messages' web search fees, and
+when Claude logged one request more than once, Usage may count a copy with
+fewer output tokens. A read-only `pg serve` fails its schema check until a
+push upgrades the schema.
+
 The next push using the schema-owner connection installs
 `idx_sessions_data_version`, `idx_sessions_parentless_workers`, and
 `idx_sessions_source_missing` on existing archives. Each first build scans
@@ -146,8 +203,9 @@ agentsview replica pg serve
 ```
 
 Opens the read-only web UI at `http://127.0.0.1:8080`, backed entirely by
-PostgreSQL. It does not use local SQLite or file watching, and its session UI
-and APIs do not accept session uploads. A writable deployment can also expose
+PostgreSQL. Source sessions stay there; Usage keeps a disposable local cache.
+It does no file watching, and its session UI and APIs do not accept session
+uploads. A writable deployment can also expose
 the separate
 [hosted raw-sync control plane](/docs/hosted-raw-sync/#http-control-plane).
 
@@ -257,8 +315,7 @@ catch up.
 
 #### Automatic Push Watcher
 
-Auto-push watching has been available since 0.32.0. On `main`, start it in
-the foreground with `agentsview replica pg push --watch`:
+Start the watcher in the foreground with `agentsview replica pg push --watch`:
 
 ```bash
 agentsview replica pg push --watch
@@ -591,8 +648,9 @@ and the server falls back to the schema compatibility check.
 
 When `require_auth` is enabled, a bearer token is generated if needed and
 printed on startup. Pass it via `Authorization: Bearer <token>` on API requests.
-The SSE watch endpoint also accepts `?token=<token>` as a query parameter since
-the `EventSource` API cannot set custom headers.
+The SSE watch endpoint also accepts `?token=<token>` for native `EventSource`
+clients; see [SSE Endpoints](/docs/remote-access/#sse-endpoints) for when to use
+it.
 
 The raw-sync machine routes do not accept this shared bearer token. They use
 their own device credentials and operation-scoped tokens as described in the
@@ -628,7 +686,7 @@ expose child rows through a set-based predicate such as
 once per scanned row. If shared-dataset aggregates still need more time, raise
 the API deadline with `--write-timeout`; the
 [Remote Access](/docs/remote-access/#slow-aggregates-behind-a-proxy) page covers
-the flag and the larger troubleshooting path.
+the flag, its search exceptions, and the larger troubleshooting path.
 
 When a reverse proxy reaches the backend by an internal hostname or service
 name, keep `--public-url` on the browser origin and add the proxy's upstream

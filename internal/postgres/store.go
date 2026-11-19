@@ -35,7 +35,28 @@ func NewStore(
 		}
 		return nil, err
 	}
-	return &Store{pg: pg, ownedDB: pg}, nil
+	cockroach, encoding, err := pgEngine(ctx, pg)
+	if err != nil {
+		pg.Close()
+		return nil, err
+	}
+	return &Store{pg: pg, ownedDB: pg, cockroach: cockroach, serverEncoding: encoding}, nil
+}
+
+// pgEngine reports whether pg is CockroachDB, else its server encoding.
+func pgEngine(ctx context.Context, pg hostedQuerier) (bool, string, error) {
+	version, err := sessionVersionColumnPG(ctx, pg)
+	if err != nil {
+		return false, "", err
+	}
+	if version == "crdb_internal_mvcc_timestamp" {
+		return true, "", nil
+	}
+	var encoding string
+	if err := pg.QueryRowContext(ctx, `SELECT current_setting('server_encoding')`).Scan(&encoding); err != nil {
+		return false, "", fmt.Errorf("reading server encoding: %w", err)
+	}
+	return false, encoding, nil
 }
 
 // NewHostedStore opens the read adapter with the same fixed tenant boundary as
@@ -70,7 +91,12 @@ func (s *Store) DB() *sql.DB {
 // Close closes the underlying database connection.
 func (s *Store) Close() error {
 	if pool := s.DB(); pool != nil {
-		return pool.Close()
+		s.saveActivityInputs()
+		var cacheErr error
+		if s.usageCache != nil {
+			cacheErr = s.usageCache.Close()
+		}
+		return errors.Join(cacheErr, pool.Close())
 	}
 	return nil
 }
@@ -159,7 +185,7 @@ func (s *Store) GetSessionVersion(ctx context.Context,
 	var count int
 	var updatedAt time.Time
 	err := s.pg.QueryRowContext(ctx,
-		`SELECT message_count, COALESCE(updated_at, created_at)
+		`SELECT message_count, updated_at
 		 FROM sessions WHERE id = $1`,
 		id,
 	).Scan(&count, &updatedAt)
@@ -469,9 +495,9 @@ func (s *Store) restoreSession(ctx context.Context, id string) (int64, error) {
 func restorePGSessionTx(ctx context.Context, tx *sql.Tx, id string) (int64, error) {
 	res, err := tx.ExecContext(ctx, `UPDATE sessions
 		SET deleted_at = NULL, deletion_cause = NULL,
-			data_version = $2, updated_at = NOW()
+			data_version = CASE WHEN EXISTS (SELECT 1 FROM image_text WHERE session_id = $1) THEN GREATEST($2::int, $3::int) ELSE $2::int END, updated_at = NOW()
 		WHERE id = $1 AND deleted_at IS NOT NULL`,
-		id, max(db.CurrentDataVersion()-1, 0))
+		id, max(db.CurrentDataVersion()-1, 0), db.ImageTextDataVersion)
 	if err != nil {
 		return 0, err
 	}
@@ -541,7 +567,7 @@ func (s *Store) deleteSessionIfTrashed(ctx context.Context, id string) (int64, e
 			"deleting trashed session "+id, err,
 		)
 	}
-	if err := deletePGExcludedSessionRows(ctx, tx, excludedIDs); err != nil {
+	if err := deletePGExcludedTrashedSessionRows(ctx, tx, excludedIDs); err != nil {
 		return 0, mapPGWriteError(
 			"purging excluded session aliases for "+id, err,
 		)
@@ -615,7 +641,7 @@ func (s *Store) emptyTrashOnce(ctx context.Context, legacyOnly bool) (int, error
 	if legacyOnly {
 		err = deleteLegacyExcludedSessionRows(ctx, tx, excludedIDs)
 	} else {
-		err = deletePGExcludedSessionRows(ctx, tx, excludedIDs)
+		err = deletePGExcludedTrashedSessionRows(ctx, tx, excludedIDs)
 	}
 	if err != nil {
 		return 0, mapPGWriteError("purging excluded trashed session aliases", err)
@@ -757,4 +783,19 @@ func deletePGTrashedSessionRows(
 		return 0, err
 	}
 	return n, nil
+}
+
+func deletePGExcludedTrashedSessionRows(ctx context.Context, tx *sql.Tx, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	var hasCommitLinks bool
+	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('commit_links') IS NOT NULL`).Scan(&hasCommitLinks); err != nil {
+		return err
+	}
+	if hasCommitLinks {
+		return deletePGExcludedSessionRows(ctx, tx, ids)
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id = ANY($1)`, ids)
+	return err
 }

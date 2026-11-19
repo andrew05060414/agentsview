@@ -12,15 +12,16 @@
 
 ## Task Routes
 
-| Task or path                                                                            | Read before editing                  |
-| --------------------------------------------------------------------------------------- | ------------------------------------ |
-| Features, bug fixes, tests, or test helpers                                             | `docs/agents/testing.md`             |
-| SQLite, PostgreSQL, CockroachDB, DuckDB, ClickHouse, archive resync, or storage queries | `docs/agents/storage.md`             |
-| Watchers, polling, sync scheduling, background work, or memory investigations           | `docs/agents/background-work.md`     |
-| Build commands, toolchains, CI build tags, or dependencies                              | `docs/agents/build.md`               |
-| S3 ingest, `S3Provider`, or `Source.S3Discovery`                                        | `docs/agents/s3-providers.md`        |
-| Any frontend file                                                                       | `frontend/AGENTS.md`                 |
-| Frontend controls, styling, or reusable components                                      | `frontend/AGENTS.md` and `DESIGN.md` |
+| Task or path                                                                    | Read before editing                  |
+| ------------------------------------------------------------------------------- | ------------------------------------ |
+| Features, bug fixes, tests, or test helpers                                     | `docs/agents/testing.md`             |
+| SQLite, PostgreSQL, CockroachDB, ClickHouse, archive resync, or storage queries | `docs/agents/storage.md`             |
+| Database or Go backend optimizations, including read, sync, and push paths      | `docs/agents/storage.md`             |
+| Watchers, polling, sync scheduling, background work, or memory investigations   | `docs/agents/background-work.md`     |
+| Build commands, toolchains, CI build tags, or dependencies                      | `docs/agents/build.md`               |
+| S3 ingest, `S3Provider`, or `Source.S3Discovery`                                | `docs/agents/s3-providers.md`        |
+| Any frontend file                                                               | `frontend/AGENTS.md`                 |
+| Frontend controls, styling, or reusable components                              | `frontend/AGENTS.md` and `DESIGN.md` |
 
 The `README.md` and `Makefile` are the sources for project facts, setup, and
 commands. Do not copy their catalogues into this file.
@@ -51,8 +52,10 @@ approvals, token permissions, and secrets are separate controls.
 1. Keep commits focused. Write commit messages and pull request titles as
    [Commit Messages](#commit-messages) requires.
 1. Do not amend, squash, rebase, push, or pull unless the user asks.
-1. Do not add generated-with lines, attribution blocks, validation footers, or
-   command transcripts to commit messages.
+1. End every commit message with a `Co-authored-by:` trailer naming the agent
+   that wrote the change.
+1. End the pull request description with a `Model used:` line, as
+   [Contributing](docs/contributing.md#ai-assisted-contributions) requires.
 1. Deliver changes through pull requests from feature branches. Never merge a
    pull request; merging is the user's decision.
 
@@ -160,21 +163,19 @@ from a breaking change to `feat` to `fix`.
 When adding a provider, changing its format or usage/cost accounting, or
 investigating a provider release, new artifact generation, parser bug, or usage
 discrepancy, consult `docs/internal/session-format-sources.md` and reverify or
-update its evidence entry in the same change. Grok remains temporarily excluded
-only until its separately owned format-alignment work lands.
+update its evidence entry in the same change.
 
 ## Project Map
 
 agentsview syncs local AI agent sessions into SQLite, serves a Svelte 5 web UI,
-and can mirror data to PostgreSQL, DuckDB, or ClickHouse.
+and can replicate data to PostgreSQL or ClickHouse.
 
 - `cmd/agentsview/`: CLI and server entry points
 - `internal/db/`: SQLite archive and search
-- `internal/readbase/`: shared replica and mirror catalog, analytics, session
-  and transcript reads, and read-only stubs
+- `internal/readbase/`: shared replica catalog, analytics, session and
+  transcript reads, and read-only stubs
 - `internal/postgres/`: PostgreSQL sync and read store
-- `internal/duckdb/`: disposable DuckDB mirror and Quack reads
-- `internal/clickhouse/`: ClickHouse remote mirror and read store
+- `internal/clickhouse/`: ClickHouse sync and read store
 - `internal/parser/`: agent session parsers
 - `internal/server/`: HTTP API and SSE
 - `internal/sync/`: discovery, file watching, and sync
@@ -224,7 +225,7 @@ and can mirror data to PostgreSQL, DuckDB, or ClickHouse.
   canceled, use `context.WithoutCancel(t.Context())`.
 - `make lint` checks part of this with `noctx`, `usetesting`, `fatcontext`, and
   govet `lostcancel`. It compiles only `fts5` files, so check `pgtest`,
-  `chtest`, `duckdbtest`, and `s3test` files by hand.
+  `chtest`, and `s3test` files by hand.
 
 ## Pull Requests
 
@@ -239,3 +240,35 @@ and can mirror data to PostgreSQL, DuckDB, or ClickHouse.
   Verification, or Test plan.
 - Explain what the code does now, why it changed, tradeoffs, limits, and where
   reviewers should look.
+
+## Before opening a pull request
+
+- Build for a use you have. Run the change on your own real data, such as an
+  export, archive, or photo library, and say in the body what it did there. If
+  nothing you use needs it yet, don't open it.
+- Make it useful if nothing after it merges. Don't add code that works only once
+  a later PR lands, or a guard for something `main` can't do yet.
+- Start from what the repo already does. Find the closest command, importer,
+  query, or library it already uses, extend it, and name it in the body. If it
+  can't be extended, say why.
+- Add only what the change uses now. Leave out options, states, paging, flags,
+  and API surface until something calls them.
+- Review your diff as a maintainer would: cut what `main` already does and
+  anything without a caller.
+- When review findings keep landing in the same code, rethink the design there
+  instead of patching each one.
+- Before each push, check that your schema, API, and protocol version numbers
+  are still the next ones free on `main`.
+
+## Pull requests from a fork
+
+This section applies only to PRs opened from a fork. PRs from branches in this
+repository are not limited by it.
+
+- Keep one unreviewed PR per stack. Open the next only after a maintainer has
+  reviewed the one below, even if you were asked to open the whole plan.
+  Review usually reshapes a PR, and everything built on it then has to be
+  rebuilt.
+- Keep at most 10 PRs open. Each one waits for a maintainer, and the ones
+  nobody gets to go stale. At 10, hold the next PR and tell the user. Leave
+  open PRs as they are.

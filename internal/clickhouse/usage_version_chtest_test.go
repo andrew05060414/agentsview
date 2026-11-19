@@ -5,6 +5,7 @@ package clickhouse
 import (
 	"context"
 	"maps"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -16,11 +17,25 @@ import (
 )
 
 // QueryStart also records the identity probe while its progress callback runs.
+// Probes count the whole-table hashes of the small usage tables.
 func usageQueryCounts(t *testing.T, store *Store) (probes, results uint64) {
 	t.Helper()
-	execPreparedUsage(t, store, "SYSTEM FLUSH LOGS")
+	return usageQueryCountsOf(t, store, "startsWith(query, 'SELECT [assumeNotNull(')")
+}
+
+// identityQueryCounts counts every row identity query as a probe: the
+// whole-table hashes and the queries of the row trackers.
+func identityQueryCounts(t *testing.T, store *Store) (probes, results uint64) {
+	t.Helper()
+	return usageQueryCountsOf(t, store,
+		"startsWith(query, 'SELECT [assumeNotNull(') OR startsWith(query, '"+finalRowsQueryMark+"')")
+}
+
+func usageQueryCountsOf(t *testing.T, store *Store, probe string) (probes, results uint64) {
+	t.Helper()
+	execPreparedUsage(t, store, "SYSTEM FLUSH LOGS query_log")
 	require.NoError(t, store.DB().QueryRowContext(t.Context(), `
-		SELECT countIf(startsWith(query, 'SELECT [assumeNotNull(')),
+		SELECT countIf(`+probe+`),
 			countIf(startsWith(trimLeft(query, ' \n\t\r'), 'WITH usage_raw AS') AND
 				(position(query, 'FROM usage_classified') > 0 OR position(query, 'FROM usage_localized') > 0))
 		FROM system.query_log
@@ -62,14 +77,13 @@ func TestUsageRowsVersionProbeFailure(t *testing.T) {
 			require.Empty(t, slot)
 			require.Empty(t, version)
 			if failure == "parts timeout" {
-				execPreparedUsage(t, store, "SYSTEM FLUSH LOGS")
+				execPreparedUsage(t, store, "SYSTEM FLUSH LOGS query_log")
 				var timeouts uint64
 				require.NoError(t, store.DB().QueryRowContext(t.Context(), `
 			SELECT count() FROM system.query_log
 			WHERE current_database = currentDatabase() AND exception_code = 159
-				AND position(query, 'FROM system.parts') > 0
 		`).Scan(&timeouts))
-				require.EqualValues(t, 2, timeouts, "both optional parts re-reads must time out")
+				require.GreaterOrEqual(t, timeouts, uint64(2), "a probe query of both reads must time out")
 			}
 		})
 	}
@@ -110,12 +124,11 @@ func TestUsageMemosSurviveMerges(t *testing.T) {
 			probes, results := usageQueryCounts(t, store)
 			require.Equal(t, before, read())
 			mergedProbes, mergedResults := usageQueryCounts(t, store)
-			// Price records are probed per digest: the prepared state's stored
-			// digest, the digest the daily and Top sessions reads join, and the
-			// session counts' empty digest.
+			// The row trackers follow the sessions, snapshot, and price
+			// record rows without hashing their tables.
 			wantProbes := uint64(1)
-			if table == chUsagePriceTable {
-				wantProbes = 3
+			if slices.Contains(chUsageCoverageTables, table) {
+				wantProbes = 0
 			}
 			require.Equal(t, probes+wantProbes, mergedProbes)
 			require.Equal(t, results, mergedResults, "merge must reuse daily usage, Top sessions, and session count results")
@@ -180,13 +193,13 @@ func TestUsageReadsStayFreshAfterPushDuringIdentityProbe(t *testing.T) {
 					DataVersion: 1, ReplaceMessages: true,
 				}})
 				require.NoError(t, err)
-				probes, _ := usageQueryCounts(t, store)
+				probes, _ := identityQueryCounts(t, store)
 				var pushed atomic.Bool
 				ctx := chdriver.Context(t.Context(), chdriver.WithProgress(func(*chdriver.Progress) {
 					if pushed.Load() {
 						return
 					}
-					current, _ := usageQueryCounts(t, store)
+					current, _ := identityQueryCounts(t, store)
 					if current > probes && pushed.CompareAndSwap(false, true) {
 						pushPreparedUsage(t, syncer)
 					}
@@ -198,11 +211,11 @@ func TestUsageReadsStayFreshAfterPushDuringIdentityProbe(t *testing.T) {
 					// Unstable coverage must not be stored under the empty version,
 					// which another push during a probe would reuse.
 					store.coverageCache.mu.Lock()
-					fingerprint := store.coverageCache.fingerprint
+					fingerprint := store.coverageCache.key
 					store.coverageCache.mu.Unlock()
 					require.NotEmpty(t, fingerprint)
 				}
-				want, err := read(t.Context(), NewStoreFromDB(syncer.conn))
+				want, err := read(t.Context(), newTestStore(t, syncer.conn, syncer.target))
 				require.NoError(t, err)
 				require.NotEqual(t, before, want)
 				got, err := read(t.Context(), store)

@@ -13,9 +13,10 @@ import (
 )
 
 func TestPGPurgeWithoutCommitLinksTable(t *testing.T) {
+	t.Parallel()
 	for _, emptyTrash := range []bool{false, true} {
 		t.Run(map[bool]string{false: "delete-session", true: "empty-trash"}[emptyTrash], func(t *testing.T) {
-			syncer, _, pg, ctx := newSessionProvenancePushSync(t, "agentsview_commit_purge_old_test")
+			syncer, _, pg, ctx := newSessionProvenancePushSync(t, "agentsview")
 			_, err := pg.ExecContext(ctx, `DROP TABLE commit_links;
 				INSERT INTO sessions(id,project,machine,agent,deleted_at)
 				VALUES ('trashed','project','test','claude',NOW());
@@ -44,9 +45,10 @@ func TestPGPurgeWithoutCommitLinksTable(t *testing.T) {
 }
 
 func TestPGPurgeKeepsMissingCommitLinks(t *testing.T) {
+	t.Parallel()
 	for _, emptyTrash := range []bool{false, true} {
 		t.Run(map[bool]string{false: "delete-session", true: "empty-trash"}[emptyTrash], func(t *testing.T) {
-			syncer, local, pg, ctx := newSessionProvenancePushSync(t, "agentsview_commit_purge_test")
+			syncer, local, pg, ctx := newSessionProvenancePushSync(t, "agentsview")
 			dbtest.SeedCommitLinks(t, local)
 			_, err := syncer.Push(ctx, false, nil)
 			require.NoError(t, err)
@@ -86,7 +88,8 @@ func TestPGPurgeKeepsMissingCommitLinks(t *testing.T) {
 }
 
 func TestPGCommitLinkParity(t *testing.T) {
-	syncer, local, pg, ctx := newSessionProvenancePushSync(t, "agentsview_commit_links_test")
+	t.Parallel()
+	syncer, local, pg, ctx := newSessionProvenancePushSync(t, "agentsview")
 	dbtest.SeedCommitLinks(t, local)
 	_, err := syncer.Push(ctx, false, nil)
 	require.NoError(t, err)
@@ -112,9 +115,10 @@ func TestPGCommitLinkParity(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Record the parser fix", links.Commits[0].Turn.Text)
 	// The rollout marker must republish sessions whose cursor already exists.
-	_, err = pg.ExecContext(ctx, `DELETE FROM commit_links WHERE session_id='commit-live'`)
+	_, err = pg.ExecContext(ctx, `UPDATE commit_links SET turn_text='damaged' WHERE session_id='commit-live'`)
 	require.NoError(t, err)
-	require.NoError(t, local.SetSyncState(ctx, commitLinksBackfillStateKey, ""))
+	require.NoError(t, local.SetSyncState(ctx, "pg_commit_links_backfill_v2", ""))
+	require.NoError(t, local.SetSyncState(ctx, "pg_commit_links_backfill_v1", "1"))
 	result, err := syncer.Push(ctx, false, nil)
 	require.NoError(t, err)
 	assert.Zero(t, result.Errors)
@@ -134,11 +138,29 @@ func TestPGCommitLinkParity(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, wantLookup, gotLookup)
 	// Refresh retained metadata, including an already retained row.
-	_, err = pg.ExecContext(ctx, `UPDATE commit_links SET subject='stale' WHERE session_id='commit-delete'`)
+	_, err = pg.ExecContext(ctx, `UPDATE retained_commit_links SET subject='stale' WHERE session_id='commit-delete'`)
 	require.NoError(t, err)
 	_, err = syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	dbtest.AssertCommitLinkParity(t, local, store)
+	// A legacy copy loses to owned evidence; an orphan live row stays hidden.
+	_, err = pg.ExecContext(ctx, `INSERT INTO commit_links (session_id,sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at,turn_ordinal,turn_text,project,retained) SELECT session_id,sha,branch,'legacy',repository,message_ordinal,call_index,tool_use_id,committed_at,NULL,'','',true FROM retained_commit_links WHERE session_id='commit-delete'`)
+	require.NoError(t, err)
+	links, err = store.SessionCommitLinks(ctx, "commit-delete")
+	require.NoError(t, err)
+	require.Len(t, links.Commits, 1)
+	assert.Equal(t, wantDeleted.Commits[0].Subject, links.Commits[0].Subject)
+	_, err = pg.ExecContext(ctx, `INSERT INTO commit_links (session_id,sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at,turn_ordinal,turn_text,project,retained) SELECT 'orphan',sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at,NULL,'','',false FROM retained_commit_links WHERE session_id='commit-delete'`)
+	require.NoError(t, err)
+	links, err = store.SessionCommitLinks(ctx, "orphan")
+	require.NoError(t, err)
+	assert.Empty(t, links.Commits)
+	_, err = pg.ExecContext(ctx, `INSERT INTO retained_commit_links (source_archive_id,session_id,sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at) SELECT source_archive_id,'orphan',sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at FROM retained_commit_links WHERE session_id='commit-delete'`)
+	require.NoError(t, err)
+	links, err = store.SessionCommitLinks(ctx, "orphan")
+	require.NoError(t, err)
+	require.Len(t, links.Commits, 1)
+	assert.Equal(t, wantDeleted.Commits[0].Subject, links.Commits[0].Subject)
 	// PostgreSQL's restore decision reveals the prompt copied while locally trashed.
 	_, err = store.RestoreSession(ctx, "commit-trash")
 	require.NoError(t, err)
@@ -151,7 +173,8 @@ func TestPGCommitLinkParity(t *testing.T) {
 }
 
 func TestPGCommitLinksBeforeUpgradePush(t *testing.T) {
-	syncer, _, pg, ctx := newSessionProvenancePushSync(t, "agentsview_commit_links_old_test")
+	t.Parallel()
+	syncer, _, pg, ctx := newSessionProvenancePushSync(t, "agentsview")
 	store, err := NewStore(t.Context(), testPGURL(t), syncer.schema, true)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
@@ -164,7 +187,8 @@ func TestPGCommitLinksBeforeUpgradePush(t *testing.T) {
 }
 
 func TestPGCommitLinkScopeAndOwnership(t *testing.T) {
-	syncer, local, pg, ctx := newSessionProvenancePushSync(t, "agentsview_commit_link_scope_test")
+	t.Parallel()
+	syncer, local, pg, ctx := newSessionProvenancePushSync(t, "agentsview")
 	dbtest.SeedCommitLinks(t, local)
 	syncer.projects = []string{"commit-project"}
 	_, err := syncer.Push(ctx, true, nil)
@@ -198,7 +222,8 @@ func TestPGCommitLinkScopeAndOwnership(t *testing.T) {
 }
 
 func TestPGRetainedCommitLinkScope(t *testing.T) {
-	syncer, local, _, ctx := newSessionProvenancePushSync(t, "agentsview_retained_commit_scope_test")
+	t.Parallel()
+	syncer, local, _, ctx := newSessionProvenancePushSync(t, "agentsview")
 	dbtest.SeedCommitLinks(t, local)
 	require.NoError(t, syncer.EnsureSchema(ctx))
 	store, err := NewStore(t.Context(), testPGURL(t), syncer.schema, true)
@@ -209,4 +234,21 @@ func TestPGRetainedCommitLinkScope(t *testing.T) {
 		_, err := syncer.Push(ctx, true, nil)
 		require.NoError(t, err)
 	})
+}
+
+func TestPGCommitLinksRemovedWithDeletedSession(t *testing.T) {
+	t.Parallel()
+	syncer, local, pg, ctx := newSessionProvenancePushSync(t, "agentsview")
+	dbtest.SeedCommitLinks(t, local)
+	_, err := syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+	_, err = pg.ExecContext(ctx, `INSERT INTO commit_links (session_id,sha,branch,subject,repository,message_ordinal,call_index,tool_use_id,committed_at,turn_ordinal,turn_text,project,retained) VALUES ('commit-live','ffffffffffffffffffffffffffffffffffffffff','','legacy','',0,0,'','',NULL,'','',true)`)
+	require.NoError(t, err)
+	require.NoError(t, local.DeleteSession(ctx, "commit-live"))
+	_, err = syncer.Push(ctx, true, nil)
+	require.NoError(t, err)
+	var live, retained int
+	require.NoError(t, pg.QueryRowContext(ctx, `SELECT count(*) FILTER (WHERE NOT retained),count(*) FILTER (WHERE retained) FROM commit_links WHERE session_id='commit-live'`).Scan(&live, &retained))
+	require.Zero(t, live)
+	require.Equal(t, 1, retained)
 }

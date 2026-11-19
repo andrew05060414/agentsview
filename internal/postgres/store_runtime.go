@@ -22,7 +22,8 @@ func (s *Store) runtimeState() *storeRuntime {
 	s.runtimeOnce.Do(func() {
 		if s.runtime == nil {
 			s.runtime = &storeRuntime{
-				activityInputs: kept.Memo[pgActivityInputs]{MaxBytes: 128 << 20, Size: pgActivityInputBytes},
+				searchKept:     kept.Memo[pgSearchEntry]{Size: pgSearchEntryBytes},
+				activityInputs: kept.Memo[pgActivityInputs]{MaxBytes: 256 << 20, Size: pgActivityInputBytes, Shrink: pgActivityInputsWithoutPrices},
 				activityKept: kept.Memo[pgActivityKept]{
 					MaxBytes: 128 << 20,
 					Size: func(e pgActivityKept) int64 {
@@ -35,6 +36,7 @@ func (s *Store) runtimeState() *storeRuntime {
 				},
 			}
 			s.runtime.topUsage.Size = db.TopSessionsBytes
+			s.runtime.analytics.Size = func(b []byte) int64 { return int64(len(b)) }
 		}
 	})
 	return s.runtime
@@ -58,7 +60,7 @@ func (s *Store) beginTx(ctx context.Context, options *sql.TxOptions) (*sql.Tx, e
 
 func (s *Store) readView(tx *sql.Tx) *Store {
 	return &Store{
-		pg: tx, readTx: tx, hostedRelations: s.hostedRelations,
+		pg: tx, readTx: tx, hostedRelations: s.hostedRelations, cockroach: s.cockroach, serverEncoding: s.serverEncoding,
 		runtime: s.runtimeState(), pricingSnapshot: &pricingSnapshot{},
 	}
 }

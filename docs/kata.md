@@ -19,6 +19,7 @@ endpoint = "https://kata.example.test"
 # Unix socket: unix:///path/to/daemon.sock
 # Windows: unix:///C:/path/to/daemon.sock
 token_env = "AGENTSVIEW_KATA_TOKEN"    # variable name, never the token
+# token_file = "~/.config/agentsview/kata-token" # or a private file holding it
 project = "agentsview"
 actor = "agentsview"
 timeout = "10s"
@@ -26,8 +27,11 @@ timeout = "10s"
 
 - Leave `endpoint` empty to use `kata daemon locate --json`, Kata's own
   discovery command. It may start a stopped local daemon.
-- HTTPS endpoints need `token_env`. Use a dedicated token for AgentsView so its
-  writes are attributed to the integration. Under Kata identity mode, the
+- HTTPS endpoints need `token_env` or `token_file`, not both. `token_file`
+  names a private file holding the token; see
+  [Read secrets from files](/docs/configuration/#read-secrets-from-files). Use
+  a dedicated token for AgentsView so its writes are attributed to the
+  integration. Under Kata identity mode, the
   token decides attribution and `actor` is ignored.
 - `actor` names AgentsView on the issues it files.
 - Plain `http://` works only for loopback hosts unless `allow_insecure = true`.
@@ -119,6 +123,9 @@ min_sessions = 2 # Optional; file only patterns seen in at least this many sessi
   seen in at least `min_sessions` sessions (default 2). It uses the same
   lookup as `friction file`, so it links an issue Kata already holds instead
   of filing a duplicate.
+- With automatic filing on, the hourly job reopens a linked issue closed as
+  `done` when a signal in a saved digest within `backfill_days` occurred after
+  the close, and comments with the date it recurred.
 - Corrections, `pattern` findings, and deferrals are tracked per session, so
   each appears in one session only. At the default `min_sessions` they are
   never filed automatically; set `min_sessions = 1` to file every one of them.

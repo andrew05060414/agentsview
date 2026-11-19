@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -26,6 +27,28 @@ import (
 	"go.kenn.io/agentsview/internal/rawderive"
 	"go.kenn.io/agentsview/internal/rawsync"
 )
+
+func TestHostedProvisionVectorGenerationFollowsArchiveContent(t *testing.T) {
+	cfg, admin := hostedRuntimeConfig(t)
+	_, err := admin.ExecContext(t.Context(), `CREATE EXTENSION IF NOT EXISTS vector SCHEMA public`)
+	require.NoError(t, err)
+	t.Setenv("AGENTSVIEW_DATA_DIR", cfg.DataDir)
+	t.Setenv("AGENTSVIEW_PG_URL", "")
+	t.Setenv("AGENTSVIEW_PG_SCHEMA", "")
+	configText := fmt.Sprintf("archive_content = \"usage\"\n[pg.owner]\nurl = %q\nschema = %q\nraw_tenant = %q\n[vector]\nenabled = true\n", os.Getenv("TEST_PG_URL"), cfg.PG.Schema, cfg.PG.RawTenant)
+	require.NoError(t, os.WriteFile(filepath.Join(cfg.DataDir, "config.toml"), []byte(configText), 0600))
+	output, err := executeCommand(newPGHostedProvisionCommand(), "owner")
+	require.NoError(t, err, output)
+	var count int
+	require.NoError(t, admin.QueryRowContext(t.Context(), `SELECT count(*) FROM vector_generations`).Scan(&count))
+	assert.Zero(t, count)
+	configText = fmt.Sprintf("archive_content = \"full\"\n[pg.owner]\nurl = %q\nschema = %q\nraw_tenant = %q\n[vector]\nenabled = true\n", os.Getenv("TEST_PG_URL"), cfg.PG.Schema, cfg.PG.RawTenant)
+	require.NoError(t, os.WriteFile(filepath.Join(cfg.DataDir, "config.toml"), []byte(configText), 0600))
+	output, err = executeCommand(newPGHostedProvisionCommand(), "owner")
+	require.NoError(t, err, output)
+	require.NoError(t, admin.QueryRowContext(t.Context(), `SELECT count(*) FROM vector_generations`).Scan(&count))
+	assert.Equal(t, 1, count)
+}
 
 func hostedRuntimeConfig(t *testing.T) (config.Config, *sql.DB) {
 	t.Helper()
@@ -63,7 +86,7 @@ func TestHostedRuntimePreparationOffRetainsPublicReads(t *testing.T) {
 	cfg, _ := hostedRuntimeConfig(t)
 	// An occupied custody path makes any eager repository open fail decisively.
 	require.NoError(t, os.WriteFile(filepath.Join(cfg.DataDir, pgRawSyncDataDirectory), []byte("occupied"), 0600))
-	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil)
+	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil, false)
 	require.NoError(t, err)
 	require.Nil(t, startup.startWorker)
 	startup.cleanup()
@@ -74,7 +97,7 @@ func TestHostedRuntimePreparationOffRetainsPublicReads(t *testing.T) {
 	_, ok := store.(*postgres.HostedStore)
 	require.True(t, ok)
 	cfg.PG.RawTenant = ""
-	_, err = prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil)
+	_, err = prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil, false)
 	require.ErrorContains(t, err, "raw_tenant")
 }
 
@@ -90,7 +113,7 @@ func TestHostedRuntimeHealthRequiresStatusToken(t *testing.T) {
 	require.NoError(t, err)
 	uploadToken, err := auth.IssueToken(t.Context(), device.Identity.DeviceID, device.Credential, rawsync.ScopeUpload)
 	require.NoError(t, err)
-	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil)
+	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil, false)
 	require.NoError(t, err)
 	t.Cleanup(startup.cleanup)
 
@@ -135,7 +158,7 @@ func TestHostedRuntimePreparationSandboxAndIdle(t *testing.T) {
 		t.Fatal("mandatory sandbox unavailable")
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(cfg.DataDir, pgRawSyncDataDirectory), []byte("occupied"), 0600))
-	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil)
+	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil, false)
 	if !supported {
 		require.ErrorIs(t, err, rawderive.ErrSandboxUnavailable)
 		return
@@ -163,7 +186,7 @@ func TestHostedRuntimeDerivesAcceptedSource(t *testing.T) {
 	cfg, _ := hostedRuntimeConfig(t)
 	cfg.PG.RawDerivation = true
 	cfg.PG.RawPollSeconds = 1
-	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil)
+	startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil, false)
 	require.NoError(t, err)
 	defer startup.cleanup()
 	database, err := postgres.OpenHosted(t.Context(), cfg.PG.URL, cfg.PG.Schema, cfg.PG.RawTenant, false)
@@ -249,7 +272,7 @@ func TestHostedRuntimeRejectsMissingPublicationPrivilegesBeforeReadiness(t *test
 	endpoint, err := url.Parse(cfg.PG.URL)
 	require.NoError(t, err)
 	role := endpoint.User.Username()
-	control, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil)
+	control, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil, false)
 	require.NoError(t, err)
 	control.cleanup()
 	cfg.PG.RawDerivation = true
@@ -264,7 +287,7 @@ func TestHostedRuntimeRejectsMissingPublicationPrivilegesBeforeReadiness(t *test
 				_, err := admin.ExecContext(t.Context(), `GRANT `+tc.privilege+` ON `+tc.kind+` "`+tc.object+`" TO "`+role+`"`)
 				require.NoError(t, err)
 			}()
-			startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil)
+			startup, err := prepareReplicaServeImpl(t.Context(), pgReplica{}, cfg, "", nil, false)
 			if err == nil {
 				startup.cleanup()
 			}

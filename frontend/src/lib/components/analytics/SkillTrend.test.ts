@@ -70,7 +70,7 @@ describe("SkillTrend", () => {
     const component = mountWithData();
     await tick();
 
-    expect(document.body.textContent).toContain("Skill Usage Over Time");
+    expect(document.body.textContent).toContain("Skill usage over time");
 
     const chips = document.querySelectorAll<HTMLButtonElement>(".legend-chip");
     expect(chips).toHaveLength(3);
@@ -350,11 +350,11 @@ describe("SkillTrend", () => {
     const component = mount(SkillTrend, { target: document.body });
     await tick();
 
-    expect(document.querySelector(".loading")).not.toBeNull();
+    expect(document.querySelector(".loading-state")).not.toBeNull();
     analytics.skills = data;
     await tick();
     expect(document.body.textContent).toContain("No skill usage data");
-    expect(document.querySelector(".loading")).toBeNull();
+    expect(document.querySelector(".loading-state")).toBeNull();
 
     analytics.errors.skills = "request failed";
     await tick();
@@ -378,7 +378,7 @@ describe("SkillTrend", () => {
     await tick();
 
     expect(document.body.textContent).toContain("Failed to load");
-    document.querySelector<HTMLButtonElement>(".error button")!.click();
+    document.querySelector<HTMLButtonElement>(".load-error button")!.click();
     await tick();
 
     expect(retrySpy).toHaveBeenCalledExactlyOnceWith();

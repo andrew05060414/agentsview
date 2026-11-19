@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	chdriver "github.com/ClickHouse/clickhouse-go/v2"
+
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
@@ -40,10 +42,20 @@ type Store struct {
 	conn *sql.DB
 	// pages serves the session list, sidebar filters, and one-session reads
 	// apart from conn's dashboard and Usage scans; see pageMaxOpenConns.
-	pages         *sql.DB
-	cursorMu      sync.RWMutex
-	cursorSecret  []byte
-	customPricing map[string]config.CustomModelRate
+	pages *sql.DB
+	// bulk serves the Activity reads that return many rows; see openBulk.
+	bulk chdriver.Conn
+	// beforeUsageExtent lets tests change source rows after the request snapshot.
+	beforeUsageExtent func()
+	// beforeUsageCarryCheck lets tests change source rows after the carry proof.
+	beforeUsageCarryCheck func()
+	// afterTrackerReads, when set, runs after the row trackers read and
+	// before the parts are checked again. Tests use it to move parts.
+	afterTrackerReads func()
+	beforeSearch      func()
+	cursorMu          sync.RWMutex
+	cursorSecret      []byte
+	customPricing     map[string]config.CustomModelRate
 
 	// vectorMu guards the searcher and reason installed by the serve gate.
 	vectorMu                  sync.RWMutex
@@ -56,51 +68,64 @@ type Store struct {
 	frustrationMarkers frustrationMarkerMemo
 	// pricing memoizes the pricing catalog per set of active pricing parts.
 	pricing pricingCache
+	// priceContexts keeps the decoded usage price contexts of one digest.
+	priceContexts usagePriceContextCache
 	// coverageCache memoizes complete usage snapshot coverage per rows.
 	coverageCache usageCoverageCache
-	// usageVersions keeps one parts digest and row identity per usage table.
+	// usageVersions keeps one parts digest and row identity per small usage
+	// table, and the trackers of the sessions, snapshot, and price record
+	// rows; see finalRows.
 	usageVersions struct {
 		sync.Mutex
-		tables map[string]usageTableVersion
+		tables              map[string]usageTableVersion
+		sessions, snapshots *finalRows
+		prices              map[string]*finalRows
+		priceOrder          []string
 	}
 	// deltaCache keeps the prepared rows of changed snapshots.
 	deltaCache usageDeltaCache
+	// usageRollups keeps what reads checked about the current rollup.
+	usageRollups usageRollupCache
 	// The usage row memos keep recent range reads per rows and filter.
-	dailyUsageRows       kept.Memo[chDailyUsageGroupRow]
-	sessionAggregateRows kept.Memo[chUsageAggregateRow]
+	dailyUsageRows kept.Memo[chDailyUsageGroupRow]
+	usageDisk      kept.Disk
+	usageExtent    struct {
+		sync.Mutex
+		version string
+		latest  time.Time
+		unknown bool
+		valid   bool
+	}
+	sessionAggregateRows kept.Memo[CHUsageAggregateRow]
 	usageSessionRows     kept.Memo[chUsageSessionRow]
 	// topSessionTotals keeps each session's totals per top-sessions read.
 	topSessionTotals kept.Memo[db.TopSessionEntry]
 	// analyticsSessionRows keeps recent analytics session listings.
 	analyticsSessionRows kept.Memo[readbase.AnalyticsSession]
+	// trendsReads keeps finished Trends reports by selection and parts fingerprint.
+	trendsReads kept.Reads[db.TrendsTermsResponse]
+	searchReads kept.Reads[db.SearchPage]
 	// analyticsListings shares one listing read among concurrent requests.
 	analyticsListings singleflight.Group
 	// activitySessions keeps activity pairing inputs per session version.
 	activitySessions activitySessionMemo
 	// activityInputQueries counts pairing input reads that reached ClickHouse.
 	activityInputQueries atomic.Int64
-	// activityUsageRows keeps activity usage reads per source, set, and range.
-	activityUsageRows kept.Memo[*activityUsageKept]
-	// activityUsageRanges keeps every session's prepared usage rows per
-	// range in progress; see activityUsageRange.
-	activityUsageRanges kept.Memo[activityUsageRange]
+	// activityUsageSums keeps the result of the latest usage query per
+	// report selection; see keptActivityUsageSums.
+	activityUsageSums kept.Memo[*readbase.ActivityUsageSums]
 	// readinessLog holds the last prepared usage readiness logged.
 	readinessLog struct {
 		sync.Mutex
 		last string
 	}
-	// keeping tracks the encodes of activity usage reads being kept; see
-	// activityReportUsage. Close waits for them.
-	keeping sync.WaitGroup
 	// activitySessionListings keeps candidate listings per parts and predicate.
 	activitySessionListings kept.Memo[activitySessionListing]
 	projectIdentityMaps     kept.Memo[map[string]export.ProjectMapEntry]
 	reports                 kept.Reports
 	// activityChecks records the parts each report was last checked against.
-	activityChecks       kept.Memo[string]
-	activityUsageQueries atomic.Int64
-	// activityUsageRowsRead counts the activity usage rows scanned.
-	activityUsageRowsRead  atomic.Int64
+	activityChecks         kept.Memo[string]
+	activityUsageQueries   atomic.Int64
 	activitySessionQueries atomic.Int64
 }
 
@@ -135,24 +160,28 @@ func NewStore(ctx context.Context, t Target) (*Store, error) {
 		conn.Close()
 		return nil, err
 	}
-	s := NewStoreFromDB(conn)
+	bulk, err := openBulk(ctx, t)
+	if err != nil {
+		return nil, errors.Join(err, conn.Close(), pages.Close())
+	}
+	s := NewStoreFromDB(conn, bulk)
 	s.pages = pages
 	return s, nil
 }
 
-// NewStoreFromDB wraps an already open connection, which serves page reads
-// too. The caller owns the connection's compatibility checks.
-func NewStoreFromDB(conn *sql.DB) *Store {
-	s := &Store{conn: conn, pages: conn}
+// NewStoreFromDB wraps already open connections: conn serves page reads too,
+// and bulk serves the reads that return millions of rows; see openBulk. The
+// caller owns the connections' compatibility checks.
+func NewStoreFromDB(conn *sql.DB, bulk chdriver.Conn) *Store {
+	s := &Store{conn: conn, pages: conn, bulk: bulk}
 	s.usageVersions.tables = map[string]usageTableVersion{}
+	s.usageVersions.prices = map[string]*finalRows{}
 	s.dailyUsageRows.Size, s.dailyUsageRows.MaxBytes = dailyUsageRowBytes, dailyUsageRowsBytes
 	s.sessionAggregateRows.Size = aggregateRowBytes
 	s.usageSessionRows.Size = usageSessionRowBytes
 	s.topSessionTotals.Size = db.TopSessionBytes
 	s.analyticsSessionRows.Size = analyticsSessionBytes
-	s.activityUsageRows.Size, s.activityUsageRows.MaxBytes = keptUsageBytes, activityUsageRowsBytes
-	s.activityUsageRanges.Size, s.activityUsageRanges.MaxBytes = usageRangeBytes, activityUsageRangeBytes
-	s.activityUsageRanges.Limit = activityUsageRangeLimit
+	s.activityUsageSums.Size = (*readbase.ActivityUsageSums).Bytes
 	s.activitySessionListings.Size = sessionListingBytes
 	return s
 }
@@ -163,8 +192,7 @@ func (s *Store) DB() *sql.DB { return s.conn }
 func (s *Store) Close() error {
 	s.closeOnce.Do(func() {
 		s.stopBackground()
-		s.keeping.Wait()
-		s.closeErr = s.conn.Close()
+		s.closeErr = errors.Join(s.conn.Close(), s.bulk.Close())
 		if s.pages != s.conn {
 			s.closeErr = errors.Join(s.closeErr, s.pages.Close())
 		}

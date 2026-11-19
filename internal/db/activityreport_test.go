@@ -312,11 +312,25 @@ func TestSQLiteActivityReportCandidatesMatchGoPairingWithoutModels(t *testing.T)
 	}, priors)
 }
 
-func TestSQLiteActivityReportTerminalPriorModelSeeksAssistantModelIndex(t *testing.T) {
+func TestSQLiteActivityReportTerminalQuerySeeksSessionsWithStaleStats(t *testing.T) {
 	d := testDB(t)
+	ctx := t.Context()
+	_, err := d.getWriter().Exec(ctx, `ANALYZE;
+		DELETE FROM sqlite_stat1 WHERE idx IN ('idx_tool_result_events_terminal', 'idx_tool_result_events_session');
+		INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+			('tool_result_events', 'idx_tool_result_events_terminal', '2 1 1'),
+			('tool_result_events', 'idx_tool_result_events_session', '856763 28');
+		ANALYZE sqlite_schema;`)
+	require.NoError(t, err)
+	reader, err := OpenReadOnly(ctx, d.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reader.Close()) })
 	q := dayQuery(t, "2026-06-16", "UTC")
-	plan := queryPlanOf(t, d, activityReportTerminalCandidatesSQL, `["session"]`,
+	plan := queryPlanOf(t, reader, activityReportTerminalCandidatesSQL, `["session"]`,
 		q.RangeStart.Add(-5*time.Minute).UnixMicro(), q.EffectiveEnd.UnixMicro())
+	assert.Contains(t, plan, "MATERIALIZE terminal_events")
+	assert.Contains(t, plan, "SEARCH tre USING INDEX idx_tool_result_events_terminal (session_id=?")
+	assert.NotContains(t, plan, "SCAN tre")
 	assert.Contains(t, plan,
 		"SEARCH prior USING INDEX idx_messages_assistant_model (session_id=? AND ordinal<?)")
 }
@@ -433,25 +447,21 @@ func BenchmarkSQLiteActivityReportCandidateSource100K(b *testing.B) {
 	}
 }
 
-func BenchmarkSQLiteActivityReportCandidateSourceWarm100K(b *testing.B) {
+// BenchmarkSQLiteActivityReportRunsWarm100K reads the runs of 1,000 kept
+// sessions that hold 100,000 candidates.
+func BenchmarkSQLiteActivityReportRunsWarm100K(b *testing.B) {
 	d, ids, q := seedSQLiteActivityReportCandidateBenchmark(b)
-	source := d.activityReportCandidateSource(ids, q)
-	count := 0
-	require.NoError(b, source(b.Context(), func(activity.IntervalCandidate) error { count++; return nil }))
-	require.Equal(b, 100_000, count)
+	runs, _, err := d.activityReportRuns(b.Context(), ids, q)
+	require.NoError(b, err)
+	require.Len(b, runs, len(ids))
 	require.Len(b, d.activityMemo.entries, len(ids))
-	require.Equal(b, 100_000, d.activityMemo.rows)
 	rewriteActivityModels(b, d, "reread", ids...)
-	require.NoError(b, source(b.Context(), func(c activity.IntervalCandidate) error {
-		require.NotEqual(b, "reread", c.ClosingModel)
-		return nil
-	}))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		count := 0
-		require.NoError(b, source(b.Context(), func(activity.IntervalCandidate) error { count++; return nil }))
-		require.Equal(b, 100_000, count)
+		runs, _, err := d.activityReportRuns(b.Context(), ids, q)
+		require.NoError(b, err)
+		require.Empty(b, rereadRuns(runs, "reread"))
 	}
 }
 
@@ -1559,9 +1569,9 @@ func TestGetActivityReport_UsageDedupOrdering(t *testing.T) {
 			})
 			insertMessages(t, d, Message{
 				SessionID: tc.firstID, Ordinal: 0, Role: "assistant", Content: "x",
-				Timestamp:       "2026-06-16T10:30:00Z",
-				Model:           "claude-sonnet-4-20250514",
-				ClaudeMessageID: "m-dup", SourceUUID: "src-dup",
+				Timestamp:  "2026-06-16T10:30:00Z",
+				Model:      "claude-sonnet-4-20250514",
+				SourceUUID: "src-dup",
 				TokenUsage: jsontext.Value(fmt.Sprintf(`{"input_tokens":1000,"output_tokens":%d}`, tc.firstOutput)),
 			})
 			insertSession(t, d, tc.secondID, "proj2", func(s *Session) {
@@ -1571,9 +1581,9 @@ func TestGetActivityReport_UsageDedupOrdering(t *testing.T) {
 			})
 			insertMessages(t, d, Message{
 				SessionID: tc.secondID, Ordinal: 0, Role: "assistant", Content: "x",
-				Timestamp:       tc.secondTimestamp,
-				Model:           "claude-sonnet-4-20250514",
-				ClaudeMessageID: "m-dup", SourceUUID: "src-dup",
+				Timestamp:  tc.secondTimestamp,
+				Model:      "claude-sonnet-4-20250514",
+				SourceUUID: "src-dup",
 				TokenUsage: jsontext.Value(fmt.Sprintf(`{"input_tokens":1000,"output_tokens":%d}`, tc.secondOutput)),
 			})
 

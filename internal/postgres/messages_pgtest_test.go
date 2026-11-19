@@ -12,7 +12,8 @@ import (
 )
 
 func TestStoreSearchILIKE(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	store, err := NewStore(t.Context(), pgURL, testSchema, true)
@@ -33,7 +34,8 @@ func TestStoreSearchILIKE(t *testing.T) {
 }
 
 func TestPGSearchDeduplication(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	// store-test-001 has 2 messages; searching "hello" only matches ordinal 0.
@@ -51,8 +53,39 @@ func TestPGSearchDeduplication(t *testing.T) {
 	assert.Len(t, page.Results, 1, "deduplicated to session")
 }
 
+func TestPGSearchSnippetUsesWinningMessage(t *testing.T) {
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
+	ensureStoreSchema(t, pgURL)
+	pg, err := Open(t.Context(), pgURL, testSchema, false)
+	require.NoError(t, err)
+	defer pg.Close()
+	_, err = pg.ExecContext(t.Context(), `
+		INSERT INTO sessions (id, machine, project, agent, first_message)
+		VALUES ('snippet-winner', 'test-machine', 'test-project', 'claude', 'unrelated')
+		ON CONFLICT (id) DO NOTHING
+	`)
+	require.NoError(t, err)
+	_, err = pg.ExecContext(t.Context(), `
+		INSERT INTO messages (session_id, ordinal, role, content, content_length)
+		VALUES ('snippet-winner', 0, 'assistant', 'prefix uniquepreview losing', 27),
+		       ('snippet-winner', 1, 'assistant', 'uniquepreview winning', 21)
+		ON CONFLICT (session_id, ordinal) DO NOTHING
+	`)
+	require.NoError(t, err)
+	store, err := NewStore(t.Context(), pgURL, testSchema, true)
+	require.NoError(t, err)
+	defer store.Close()
+	page, err := store.Search(t.Context(), db.SearchFilter{Query: "uniquepreview", Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, page.Results, 1)
+	assert.Equal(t, 1, page.Results[0].Ordinal)
+	assert.Equal(t, "uniquepreview winning", page.Results[0].Snippet)
+}
+
 func TestPGSearchRecencySort(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	// Open a write connection to insert additional test data.
@@ -105,7 +138,8 @@ func TestPGSearchRecencySort(t *testing.T) {
 }
 
 func TestPGSearchRelevanceSort(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)
@@ -168,7 +202,8 @@ func TestPGSearchRelevanceSort(t *testing.T) {
 }
 
 func TestPGSearchNullTimestampSorting(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)
@@ -259,7 +294,8 @@ func TestPGSearchNullTimestampSorting(t *testing.T) {
 }
 
 func TestPGSearchSystemMessageExcluded(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)
@@ -315,7 +351,8 @@ func TestPGSearchSystemMessageExcluded(t *testing.T) {
 // does not appear in global search results when all its messages are
 // system messages (the EXISTS guard in the name branch).
 func TestPGSearchNameBranchExcludesSystemOnlySessions(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)
@@ -410,7 +447,8 @@ func TestPGSearchNameBranchExcludesSystemOnlySessions(t *testing.T) {
 // (the in-session Cmd+F find-bar) excludes system messages since the
 // frontend hides them and matching would produce phantom highlights.
 func TestPGSearchSessionExcludesSystemMessages(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)
@@ -459,7 +497,8 @@ func TestPGSearchSessionExcludesSystemMessages(t *testing.T) {
 }
 
 func TestPGSearchSessionNameMatch(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)
@@ -503,7 +542,8 @@ func TestPGSearchSessionNameMatch(t *testing.T) {
 }
 
 func TestPGSearchRecencyNameOnlyBeatsOlderContent(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)
@@ -557,7 +597,8 @@ func TestPGSearchRecencyNameOnlyBeatsOlderContent(t *testing.T) {
 // snippet returned is the first_message (the matching field), not the
 // display_name.
 func TestPGSearchSnippetMatchingField(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)
@@ -602,19 +643,20 @@ func TestPGSearchSnippetMatchingField(t *testing.T) {
 	assert.Equal(t, "snippetfieldterm in first message", r.Snippet)
 }
 
+// messagesTestSchema is the schema the GetMessages tests read through.
+const messagesTestSchema = "agentsview_messages_test"
+
 // TestGetMessagesIsSystemField verifies that GetMessages and GetAllMessages
 // correctly populate db.Message.IsSystem from the is_system column.
 func TestGetMessagesIsSystemField(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_is_system_test"
+	t.Parallel()
+	const schema = messagesTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	_, err = pg.ExecContext(t.Context(), `
@@ -661,16 +703,14 @@ func TestGetMessagesIsSystemField(t *testing.T) {
 // round-trip coverage (db.TestResolveToolCallsDerivesPositionalCallIndex) so
 // GetMessages/GetAllMessages consumers see these fields at parity.
 func TestGetMessagesToolCallFilePathAndCallIndex(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_toolcall_fields_test"
+	t.Parallel()
+	const schema = messagesTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	_, err = pg.ExecContext(t.Context(), `
@@ -727,16 +767,14 @@ func TestGetMessagesToolCallFilePathAndCallIndex(t *testing.T) {
 // ID matches the existing convention used by TurnRow.MessageID
 // and CallRow.MessageID in session_timing.go.
 func TestGetMessagesIDPopulated(t *testing.T) {
-	pgURL := testPGURL(t)
-
-	const schema = "agentsview_msg_id_test"
+	t.Parallel()
+	const schema = messagesTestSchema
+	pgURL := testPGSchemaURL(t, schema)
 	pg, err := Open(t.Context(), pgURL, schema, true)
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 
 	ctx := t.Context()
-	_, err = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
-	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
 	_, err = pg.ExecContext(t.Context(), `
@@ -817,7 +855,8 @@ func TestGetMessagesIDPopulated(t *testing.T) {
 // (hyphen, colon, embedded quote), whether raw or explicitly quoted, must match
 // content and not error. ILIKE has no FTS-operator hazard, but this pins parity.
 func TestPGSearchOperatorTokenNoError(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)
@@ -863,7 +902,8 @@ func TestPGSearchOperatorTokenNoError(t *testing.T) {
 // only when every term appears in its content (AND), matching SQLite FTS5's
 // implicit AND so the same user query behaves identically across backends.
 func TestPGSearchMultiTermAND(t *testing.T) {
-	pgURL := testPGURL(t)
+	t.Parallel()
+	pgURL := testPGStoreURL(t)
 	ensureStoreSchema(t, pgURL)
 
 	pg, err := Open(t.Context(), pgURL, testSchema, false)

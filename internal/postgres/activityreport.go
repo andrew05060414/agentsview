@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"time"
+	"unique"
 
 	"github.com/jackc/pgx/v5"
 	"go.kenn.io/agentsview/internal/activity"
@@ -15,6 +16,8 @@ import (
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/kept"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/usagefacts"
+	"golang.org/x/sync/errgroup"
 )
 
 // GetActivityReport assembles a concurrency- and usage-oriented report
@@ -63,7 +66,47 @@ func (b activityReportBackend) ActivityReportUsage(
 }
 
 func (b activityReportBackend) ActivityReportCandidateSource(ids []string, q activity.Query) activity.CandidateSource {
-	return b.activityReportCandidateSourceWithInputs(ids, q, b.inputs, b.counted)
+	return b.activityReportCandidateSourceWithCounts(ids, q, b.counted)
+}
+
+// activityReportRunBackend sweeps the runs kept in inputs.
+type activityReportRunBackend struct {
+	activityReportBackend
+}
+
+func (b activityReportRunBackend) ActivityReportRunSource(ids []string, q activity.Query) activity.RunSource {
+	return func(ctx context.Context, yield func(activity.Run) error) error {
+		runs, err := b.activityReportRuns(ctx, ids, q, b.inputs)
+		if err != nil {
+			return err
+		}
+		// The consumer checks for cancellation before each run.
+		for _, run := range runs {
+			if err := yield(run); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// ActivityReportMessageCounts counts the messages the kept sessions hold,
+// before the effective end at PostgreSQL's microsecond precision.
+func (b activityReportRunBackend) ActivityReportMessageCounts(
+	ctx context.Context, ids []string, q activity.Query, artifacts *activity.CandidateArtifacts,
+) error {
+	counts := activity.NewMessageAccumulator(q, artifacts)
+	upper := q.EffectiveEnd.UnixMicro()
+	before := func(micros []int64) []int64 {
+		i, _ := slices.BinarySearch(micros, upper)
+		return micros[:i]
+	}
+	for _, id := range ids {
+		session := b.inputs.sessions[id]
+		counts.AddSorted(id, "user", before(session.users))
+		counts.AddSorted(id, "assistant", before(session.assistants))
+	}
+	return ctx.Err()
 }
 
 func (b activityReportBackend) ActivityReportMessageCounts(
@@ -167,12 +210,16 @@ func (s *Store) BuildActivityReportArtifacts(
 		Store:         s,
 		lowerBound:    lowerBound, upperBound: upperBound,
 	}
+	var reportBackend activity.ReportBackend = backend
+	if inputs != nil {
+		reportBackend = activityReportRunBackend{backend}
+	}
 	artifacts, done, err := activity.BuildReportArtifacts(
-		ctx, backend, sessions, ids, q, onProgress, "aggregating pg activity report")
+		ctx, reportBackend, sessions, ids, q, onProgress, "aggregating pg activity report")
 	if err == nil && ctx.Err() == nil && inputs != nil {
-		for id := range inputs.transcripts {
+		for id := range inputs.sessions {
 			if !inputs.candidates[id] {
-				delete(inputs.transcripts, id)
+				delete(inputs.sessions, id)
 			}
 		}
 		s.runtimeState().activityInputs.Put(lowerBound+"|"+upperBound, inputVersion, []pgActivityInputs{*inputs})
@@ -305,6 +352,8 @@ func (s *Store) GetSessionUsageRows(
 			costRow.cost = sql.NullInt64{}
 			rateResolver.RecordUnattributedReported()
 		}
+		costRow.cost = db.ReportedCostForPricing(costRow.cost, costRow.costStatus,
+			pgCatalogPricesAt(rateResolver, costRow.model, costRow.pricingTS))
 		cost, priced, contributes, priceErr := pgSessionRowCostWithWebSearchRequests(
 			costRow, webSearches, rateResolver)
 		if priceErr != nil {
@@ -314,9 +363,10 @@ func (s *Store) GetSessionUsageRows(
 		if costRow.cost.Valid {
 			costSource = export.CostSourceReported
 		}
+		recorded, _ := db.RecordedRowCost(r.cost, r.costStatus, costRow.cost)
 		return activity.UsagePrice{
 			Cost: cost, CostSource: costSource, SessionCost: sessionCost,
-			Priced: priced, Contributes: contributes,
+			RecordedCost: recorded, Priced: priced, Contributes: contributes,
 		}, nil
 	})
 }
@@ -361,7 +411,7 @@ func pgSessionUsageRowLess(
 // The effective-end fallback for a session with no ended_at uses its
 // latest message timestamp before started_at, so a still-open session
 // that began before the range but has messages inside it is not dropped,
-// matching SQLite and DuckDB. COALESCE short-circuits, so the correlated
+// matching SQLite. COALESCE short-circuits, so the correlated
 // MAX subquery runs only for the rare sessions missing an ended_at.
 // A terminal tool event can outlive ended_at metadata, so it independently
 // keeps the session eligible when it reaches the report range.
@@ -388,7 +438,7 @@ func (s *Store) activityReportSessions(
 		s.machine,
 		s.started_at,
 		s.ended_at,
-		COALESCE(s.is_automated, false) AS is_automated,
+		s.is_automated,
 		s.relationship_type = 'subagent' AS is_subagent
 	FROM sessions s
 	WHERE ` + where + `
@@ -441,10 +491,12 @@ func (s *Store) activityReportSessions(
 func (s *Store) activityReportCandidateSource(
 	ids []string, q activity.Query,
 ) activity.CandidateSource {
-	return s.activityReportCandidateSourceWithInputs(ids, q, nil, nil)
+	return s.activityReportCandidateSourceWithCounts(ids, q, nil)
 }
 
-func (s *Store) activityReportCandidateSourceWithInputs(ids []string, q activity.Query, inputs *pgActivityInputs, counted *[]pgActivityCountedMessage) activity.CandidateSource {
+// activityReportCandidateSourceWithCounts also appends to counted, when set,
+// each counted message from the range start to the effective end.
+func (s *Store) activityReportCandidateSourceWithCounts(ids []string, q activity.Query, counted *[]pgActivityCountedMessage) activity.CandidateSource {
 	return func(
 		ctx context.Context,
 		yield func(activity.IntervalCandidate) error,
@@ -452,10 +504,47 @@ func (s *Store) activityReportCandidateSourceWithInputs(ids []string, q activity
 		if len(ids) == 0 {
 			return nil
 		}
-		lower := q.RangeStart.Add(
-			-time.Duration(q.GapCapSeconds) * time.Second,
-		)
-		terminalQuery := `WITH terminal_events AS (
+		terminal, pairs, read, err := s.readActivityCandidates(ctx, ids, q, counted != nil)
+		if err != nil {
+			return err
+		}
+		if counted != nil {
+			*counted = append(*counted, read...)
+		}
+		sort.Slice(pairs, func(i, j int) bool {
+			return activity.CandidateLess(pairs[i], pairs[j])
+		})
+		messageSource := func(
+			ctx context.Context,
+			yield func(activity.IntervalCandidate) error,
+		) error {
+			for _, candidate := range pairs {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if err := yield(candidate); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return activity.MergeCandidateSlice(terminal, messageSource)(ctx, yield)
+	}
+}
+
+// readActivityCandidates reads the sessions' terminal tool candidates, in
+// candidate stream order, beside their message pairs, which come from
+// slices of the sessions read at once on the pool and in order on a read
+// snapshot. Each session's pairs sit together in the result. With
+// withCounts, it also returns each counted message from the range start to
+// the effective end, in no set order.
+func (s *Store) readActivityCandidates(
+	ctx context.Context, ids []string, q activity.Query, withCounts bool,
+) (terminal, pairs []activity.IntervalCandidate, counted []pgActivityCountedMessage, err error) {
+	lower := q.RangeStart.Add(
+		-time.Duration(q.GapCapSeconds) * time.Second,
+	)
+	terminalQuery := `WITH terminal_events AS (
 			SELECT tre.session_id, tre.tool_call_message_ordinal AS ordinal,
 				tre.call_index, tre.event_index, tre.timestamp
 			FROM tool_result_events tre
@@ -479,7 +568,9 @@ func (s *Store) activityReportCandidateSourceWithInputs(ids []string, q activity
 			SELECT ot.*, next_message.ordinal AS next_message_ordinal,
 				next_message.timestamp AS next_message_timestamp,
 				next_message.role AS next_message_role,
-				next_message.model AS next_message_model
+				next_message.model AS next_message_model,
+				ot.next_terminal_timestamp IS NOT NULL AND (next_message.timestamp IS NULL OR
+					ot.next_terminal_timestamp < next_message.timestamp) AS tool_closes
 			FROM ordered_terminal ot
 			LEFT JOIN LATERAL (
 				SELECT next.ordinal, next.timestamp, next.role, next.model
@@ -514,35 +605,11 @@ func (s *Store) activityReportCandidateSourceWithInputs(ids []string, q activity
 			WHERE te.timestamp > lm.timestamp
 		), candidates AS (
 			SELECT twm.session_id, twm.ordinal AS start_ordinal,
-				CASE
-					WHEN twm.next_terminal_timestamp IS NOT NULL AND
-						(twm.next_message_timestamp IS NULL OR
-						 twm.next_terminal_timestamp < twm.next_message_timestamp)
-					THEN twm.next_terminal_ordinal
-					ELSE twm.next_message_ordinal
-				END AS end_ordinal,
+				CASE WHEN twm.tool_closes THEN twm.next_terminal_ordinal ELSE twm.next_message_ordinal END AS end_ordinal,
 				twm.timestamp AS start_timestamp,
-				CASE
-					WHEN twm.next_terminal_timestamp IS NOT NULL AND
-						(twm.next_message_timestamp IS NULL OR
-						 twm.next_terminal_timestamp < twm.next_message_timestamp)
-					THEN twm.next_terminal_timestamp
-					ELSE twm.next_message_timestamp
-				END AS end_timestamp,
-				CASE
-					WHEN twm.next_terminal_timestamp IS NOT NULL AND
-						(twm.next_message_timestamp IS NULL OR
-						 twm.next_terminal_timestamp < twm.next_message_timestamp)
-					THEN 'tool'
-					ELSE twm.next_message_role
-				END AS closing_role,
-				CASE
-					WHEN twm.next_terminal_timestamp IS NOT NULL AND
-						(twm.next_message_timestamp IS NULL OR
-						 twm.next_terminal_timestamp < twm.next_message_timestamp)
-					THEN ''
-					ELSE twm.next_message_model
-				END AS closing_model,
+				CASE WHEN twm.tool_closes THEN twm.next_terminal_timestamp ELSE twm.next_message_timestamp END AS end_timestamp,
+				CASE WHEN twm.tool_closes THEN 'tool' ELSE twm.next_message_role END AS closing_role,
+				CASE WHEN twm.tool_closes THEN '' ELSE twm.next_message_model END AS closing_model,
 				twm.call_index, twm.event_index
 			FROM terminal_with_message twm
 
@@ -573,84 +640,72 @@ func (s *Store) activityReportCandidateSourceWithInputs(ids []string, q activity
 			AND candidate.start_timestamp < $3
 		ORDER BY candidate.start_timestamp, candidate.session_id,
 			candidate.start_ordinal, candidate.call_index, candidate.event_index`
-		scanCandidate := func(
-			row interface{ Scan(dest ...any) error },
-		) (activity.IntervalCandidate, error) {
-			var candidate activity.IntervalCandidate
-			if err := row.Scan(
-				&candidate.SessionID, &candidate.StartOrdinal,
-				&candidate.EndOrdinal, &candidate.Start, &candidate.End,
-				&candidate.ClosingRole, &candidate.ClosingModel,
-				&candidate.PriorModel,
-			); err != nil {
-				return candidate, fmt.Errorf(
-					"scanning pg activity report candidate: %w", err)
-			}
-			candidate.Start = candidate.Start.UTC()
-			candidate.End = candidate.End.UTC()
-			return candidate, nil
+	scanCandidate := func(
+		row interface{ Scan(dest ...any) error },
+	) (activity.IntervalCandidate, error) {
+		var candidate activity.IntervalCandidate
+		if err := row.Scan(
+			&candidate.SessionID, &candidate.StartOrdinal,
+			&candidate.EndOrdinal, &candidate.Start, &candidate.End,
+			&candidate.ClosingRole, &candidate.ClosingModel,
+			&candidate.PriorModel,
+		); err != nil {
+			return candidate, fmt.Errorf(
+				"scanning pg activity report candidate: %w", err)
 		}
+		candidate.Start = candidate.Start.UTC()
+		candidate.End = candidate.End.UTC()
+		return candidate, nil
+	}
 
+	readTerminal := func(ctx context.Context) ([]activity.IntervalCandidate, error) {
 		terminalRows, err := s.pg.QueryContext(
 			ctx, terminalQuery, pgx.QueryExecModeDescribeExec, ids, lower, q.EffectiveEnd,
 		)
 		if err != nil {
-			return fmt.Errorf("querying pg activity report terminal candidates: %w", err)
+			return nil, fmt.Errorf("querying pg activity report terminal candidates: %w", err)
 		}
 		defer terminalRows.Close()
 		var terminal []activity.IntervalCandidate
 		for terminalRows.Next() {
 			candidate, scanErr := scanCandidate(terminalRows)
 			if scanErr != nil {
-				terminalRows.Close()
-				return scanErr
+				return nil, scanErr
 			}
 			terminal = append(terminal, candidate)
 		}
 		if err := terminalRows.Err(); err != nil {
-			terminalRows.Close()
-			return err
+			return nil, err
 		}
-		if err := terminalRows.Close(); err != nil {
-			return err
-		}
-
-		messageSource := func(
-			ctx context.Context,
-			yield func(activity.IntervalCandidate) error,
-		) error {
-			var pairs []activity.IntervalCandidate
-			// pgx truncates SQL timestamp bounds to microseconds.
-			lowerMicro, upperMicro := lower.UnixMicro(), q.EffectiveEnd.UnixMicro()
-			countLowerMicro := q.RangeStart.UnixMicro()
-			err := s.activityTranscriptSource(ctx, ids, inputs, func(id string, session []activity.TranscriptMessage) {
-				for i := range session {
-					us := session[i].At.UnixMicro()
-					if counted != nil && session[i].Counted && us >= countLowerMicro && us < upperMicro {
-						*counted = append(*counted, pgActivityCountedMessage{id, us, session[i].Role == "user"})
-					}
-					session[i].Starts = us >= lowerMicro && us < upperMicro
-				}
-				pairs = activity.AppendTranscriptPairs(pairs, id, session)
-			})
-			if err != nil {
-				return err
-			}
-			sort.Slice(pairs, func(i, j int) bool {
-				return activity.CandidateLess(pairs[i], pairs[j])
-			})
-			for _, candidate := range pairs {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-				if err := yield(candidate); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		return activity.MergeCandidateSlice(terminal, messageSource)(ctx, yield)
+		return terminal, terminalRows.Close()
 	}
+	n := max(1, min(activityMessageSlices, (len(ids)+activityMessageSliceSessions-1)/activityMessageSliceSessions))
+	parts := make([][]string, n)
+	for i, id := range ids {
+		parts[i%n] = append(parts[i%n], id)
+	}
+	slicePairs := make([][]activity.IntervalCandidate, n)
+	sliceCounted := make([][]pgActivityCountedMessage, n)
+	g, readCtx := errgroup.WithContext(ctx)
+	if !s.supportsConcurrentReads() {
+		// A read snapshot shares one transaction, which runs one statement
+		// at a time, so its reads run in order.
+		g.SetLimit(1)
+	}
+	g.Go(func() (err error) {
+		terminal, err = readTerminal(readCtx)
+		return err
+	})
+	for i, part := range parts {
+		g.Go(func() (err error) {
+			slicePairs[i], sliceCounted[i], err = s.readActivityMessagePairs(readCtx, part, q, withCounts)
+			return err
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, nil, nil, err
+	}
+	return terminal, slices.Concat(slicePairs...), slices.Concat(sliceCounted...), nil
 }
 
 // ActivityReportCandidateSource exposes the backend's mechanical pairing
@@ -669,7 +724,7 @@ func activityReportClaudePeerPredicate(sessions, lower, upper string) string {
 			FROM messages m JOIN sessions s ON s.id = m.session_id
 			WHERE ` + pgUsageMessageEligibility + `
 				AND m.session_id = ANY(` + sessions + `)
-				AND m.claude_message_id != '' AND m.claude_request_id != ''
+				AND m.claude_message_id != ''
 				AND COALESCE(m.timestamp, s.started_at) >= ` + lower + `::timestamptz
 				AND COALESCE(m.timestamp, s.started_at) <= ` + upper + `::timestamptz
 		)`
@@ -697,102 +752,122 @@ func (s *Store) activityReportUsage(
 		return out, &block, nil
 	}
 
-	type ordered struct {
-		row     activity.UsageRow
-		scan    pgActivityUsageRow
-		us      int64
-		ordinal int64
+	if inputs != nil && inputs.priced != nil && inputs.priced.covers(q, pricingDigest) {
+		return pgAssembleActivityUsage(raw, inputs.priced.rows), inputs.priced.block, nil
 	}
-	rowsAcc := make([]ordered, 0, len(raw))
-	for _, r := range raw {
+	saved := &pgActivityPriced{rangeStart: q.RangeStart, rangeEnd: q.RangeEnd, effectiveEnd: q.EffectiveEnd, pricingDigest: pricingDigest}
+	order := make([]int, len(raw))
+	for i, r := range raw {
+		order[i] = i
+		at := time.UnixMicro(r.us).UTC()
+		if !at.Before(q.EffectiveEnd) && at.Before(q.RangeEnd) && (saved.next.IsZero() || at.Before(saved.next)) {
+			saved.next = at
+		}
 		if read != nil {
 			read[r.sessionID.Value()] = struct{}{}
 		}
-		ord := int64(-1)
-		if r.ordinalValid {
-			ord = int64(r.ordinal)
-		}
-		rowsAcc = append(rowsAcc, ordered{
-			us:      r.us,
-			ordinal: ord,
-			scan:    r,
-			row: activity.UsageRow{
-				SessionID:       r.sessionID.Value(),
-				Model:           r.model.Value(),
-				Timestamp:       FormatISO8601(time.UnixMicro(r.us).UTC()),
-				Agent:           r.agent.Value(),
-				ProviderID:      r.providerID.Value(),
-				ClaudeMessageID: r.claudeMessageID,
-				ClaudeRequestID: r.claudeRequestID,
-				SourceUUID:      r.sourceUUID,
-				UsageDedupKey:   r.usageDedupKey,
-			},
-		})
 	}
-
-	sort.SliceStable(rowsAcc, func(i, j int) bool {
-		a, b := rowsAcc[i], rowsAcc[j]
+	sort.SliceStable(order, func(i, j int) bool {
+		a, b := raw[order[i]], raw[order[j]]
 		if a.us != b.us {
 			return a.us < b.us
 		}
-		if a.row.SessionID != b.row.SessionID {
-			return a.row.SessionID < b.row.SessionID
+		if a.sessionID != b.sessionID {
+			return a.sessionID.Value() < b.sessionID.Value()
 		}
-		return a.ordinal < b.ordinal
+		ao, bo := int64(-1), int64(-1)
+		if a.ordinalValid {
+			ao = int64(a.ordinal)
+		}
+		if b.ordinalValid {
+			bo = int64(b.ordinal)
+		}
+		return ao < bo
 	})
-	baseRows := make([]activity.UsageRow, len(rowsAcc))
-	for i, o := range rowsAcc {
-		row := o.row
-		row.InputTokens, row.OutputTokens = int(o.scan.input), int(o.scan.output)
-		row.WebSearchRequests = int(o.scan.webSearches)
-		baseRows[i] = row
+	selection := make([]activity.UsageSelectionRow, len(order))
+	for i, index := range order {
+		r := raw[index]
+		selection[i] = activity.UsageSelectionRow{SessionID: r.sessionID.Value(), Timestamp: time.UnixMicro(r.us).UTC(), TimestampValid: true, OutputTokens: int(r.output), WebSearchRequests: int(r.webSearches), Agent: r.agent.Value(), ClaudeMessageID: r.claudeMessageID, ClaudeRequestID: r.claudeRequestID, SourceUUID: r.sourceUUID, UsageDedupKey: r.usageDedupKey}
 	}
-	mask, attribution, webSearchRequests, err := activity.UsageSurvivorSelectionForSessions(
-		ctx, q.RangeStart, q.RangeEnd, q.EffectiveEnd, baseRows, ids,
-	)
+	mask, attribution, webSearchRequests, err := activity.SelectUsageSurvivorsForSessions(ctx, q.RangeStart, q.RangeEnd, q.EffectiveEnd, selection, ids)
 	if err != nil {
 		return nil, nil, err
 	}
-	out = make([]activity.UsageRow, 0, len(rowsAcc))
-	for i, o := range rowsAcc {
+	if inputs != nil {
+		saved.rows = make([]pgActivityPricedRow, 0, len(order))
+	} else {
+		out = make([]activity.UsageRow, 0, len(order))
+	}
+	for i, index := range order {
+		r := raw[index] //nolint:nilaway // order contains only indices from raw.
 		if !mask[i] {
 			continue
 		}
-		inputTok, outputTok := int(o.scan.input), int(o.scan.output)
-		costRow := o.scan
-		var sessionCost *money.Money
-		if o.scan.copilotReported && o.scan.costValid {
-			v := money.Money{Microdollars: o.scan.cost}
-			sessionCost = &v
+		costRow := r
+		if r.copilotReported && r.costValid {
 			costRow.costValid = false
 			rateResolver.RecordUnattributedReported()
+		}
+		if costRow.costValid && costRow.costRecorded {
+			pricingTS := sql.NullTime{
+				Time: time.UnixMicro(costRow.us).UTC(), Valid: !costRow.pricingTimeAbsent,
+			}
+			costRow.costValid = db.ReportedCostForPricing(
+				sql.NullInt64{Int64: costRow.cost, Valid: true},
+				usagefacts.CostStatusRecorded,
+				pgCatalogPricesAt(rateResolver, costRow.model.Value(), pricingTS)).Valid
 		}
 		cost, priced, contributes, priceErr := pgActivityReportRowStatusWithWebSearchRequests(
 			costRow, webSearchRequests[i], rateResolver)
 		if priceErr != nil {
 			return nil, nil, priceErr
 		}
-		costSource := export.CostSourceComputed
-		if costRow.costValid {
-			costSource = export.CostSourceReported
+		p := pgActivityPricedRow{
+			index: int32(index), attribution: unique.Make(attribution[i]), cost: cost.Microdollars,
+			webSearches: int32(webSearchRequests[i]), reported: costRow.costValid,
+			sessionCost: r.copilotReported && r.costValid, priced: priced, contributes: contributes,
 		}
-		row := o.row
-		row.SessionID = attribution[i]
-		row.InputTokens = inputTok
-		row.OutputTokens = outputTok
-		row.WebSearchRequests = webSearchRequests[i]
-		row.Cost = cost
-		row.CostSource = costSource
-		row.SessionCost = sessionCost
-		row.Priced = priced
-		row.Contributes = contributes
-		out = append(out, row)
+		if inputs != nil {
+			saved.rows = append(saved.rows, p)
+		} else {
+			out = append(out, pgAssembleActivityUsageRow(&raw[index], p))
+		}
 	}
 	block, err := rateResolver.BuildBlock()
 	if err != nil {
 		return nil, nil, fmt.Errorf("building pricing block: %w", err)
 	}
-	return out, &block, nil
+	saved.block = &block
+	if inputs != nil {
+		inputs.priced = saved
+		out = pgAssembleActivityUsage(raw, saved.rows)
+	}
+	return out, saved.block, nil
+}
+
+func pgAssembleActivityUsage(raw []pgActivityUsageRow, priced []pgActivityPricedRow) []activity.UsageRow {
+	out := make([]activity.UsageRow, 0, len(priced))
+	for _, p := range priced {
+		out = append(out, pgAssembleActivityUsageRow(&raw[p.index], p))
+	}
+	return out
+}
+
+func pgAssembleActivityUsageRow(r *pgActivityUsageRow, p pgActivityPricedRow) activity.UsageRow {
+	source := export.CostSourceComputed
+	if p.reported {
+		source = export.CostSourceReported
+	}
+	var sessionCost *money.Money
+	if p.sessionCost {
+		sessionCost = &money.Money{Microdollars: r.cost}
+	}
+	row := activity.UsageRow{SessionID: p.attribution.Value(), Model: r.model.Value(), Timestamp: FormatISO8601(time.UnixMicro(r.us).UTC()), Agent: r.agent.Value(), ProviderID: r.providerID.Value(), ClaudeMessageID: r.claudeMessageID, ClaudeRequestID: r.claudeRequestID, SourceUUID: r.sourceUUID, UsageDedupKey: r.usageDedupKey}
+	row.InputTokens, row.OutputTokens = int(r.input), int(r.output)
+	row.WebSearchRequests = int(p.webSearches)
+	row.Cost, row.CostSource, row.SessionCost = money.Money{Microdollars: p.cost}, source, sessionCost
+	row.Priced, row.Contributes = p.priced, p.contributes
+	return row
 }
 
 func pgActivityReportRowStatusWithWebSearchRequests(

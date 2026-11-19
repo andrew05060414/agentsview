@@ -61,9 +61,11 @@ func skipCLISearchCommand(cmd *cobra.Command) bool {
 		"agentsview recall", "agentsview secrets", "agentsview skills",
 		"agentsview source raw", "agentsview index embeddings",
 		"agentsview replica pg", "agentsview replica clickhouse",
-		"agentsview replica duckdb", "agentsview replica pg vectors",
-		"agentsview replica pg service", "agentsview replica clickhouse service",
-		"agentsview replica duckdb quack":
+		"agentsview replica pg vectors",
+		"agentsview replica pg service", "agentsview replica clickhouse service":
+		return true
+	case "agentsview sync":
+		// Search advertises the canonical source sync path, not the shortcut.
 		return true
 	case "agentsview recall extract":
 		// The legacy parent action has an explicit preview child.

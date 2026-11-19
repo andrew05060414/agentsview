@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -624,18 +625,18 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 		t, filepath.Join(os.Getenv("AGENTSVIEW_DATA_DIR"), "pg.db"),
 	)
 	ctx, cancel := context.WithCancel(t.Context())
-	port, err := server.FindAvailablePort(ctx, "127.0.0.1", 0)
+	listener, err := server.ListenAvailablePort(ctx, "127.0.0.1", 0)
 	require.NoError(t, err)
 	appCfg := config.Config{
 		Host:    "127.0.0.1",
-		Port:    port,
+		Port:    listener.Addr().(*net.TCPAddr).Port,
 		DataDir: os.Getenv("AGENTSVIEW_DATA_DIR"),
 	}
-	prepareReplicaServe = func(context.Context, storage.Replica, config.Config, string, *ReplicaPushConfig) (replicaServeStartup, error) {
+	prepareReplicaServe = func(context.Context, storage.Replica, config.Config, string, *ReplicaPushConfig, bool) (replicaServeStartup, error) {
 		return replicaServeStartup{
 			cfg: appCfg, ctx: ctx,
 			rtOpts: serveRuntimeOptions{
-				Mode: "pg-serve", RequestedPort: appCfg.Port,
+				Mode: "pg-serve", RequestedPort: appCfg.Port, Listener: listener,
 			},
 			srv: server.New(
 				appCfg, database, nil,
@@ -647,7 +648,7 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 	// This is only an orphan guard if the parent dies; normal completion is
 	// driven by the parent observing the warning on stdout.
 	time.AfterFunc(2*time.Minute, func() { os.Exit(0) })
-	runReplicaServe(t.Context(), pgReplica{}, appCfg, "", nil)
+	runReplicaServe(t.Context(), pgReplica{}, appCfg, "", nil, false)
 }
 
 func TestMustLoadConfig(t *testing.T) {
@@ -1009,8 +1010,8 @@ func (f *fakeUnwatchedPollSyncer) ReconcileProviderRoots(
 	return nil
 }
 
-func (f *fakeUnwatchedPollSyncer) ReconcileProviderRootsGrouped(
-	ctx context.Context, groups []agentsync.ProviderRootsGroup,
+func (f *fakeUnwatchedPollSyncer) PollProviderRootsGrouped(
+	ctx context.Context, groups []agentsync.ProviderRootsGroup, _ bool,
 ) error {
 	return reconcileGroupsSequentially(ctx, groups, f.ReconcileProviderRoots)
 }
@@ -1020,8 +1021,8 @@ func TestPollUnwatchedScopesOnceUsesScopedAuthoritativeReconciliation(t *testing
 	roots := []string{"/tmp/claude", "/tmp/codex"}
 	groups := map[parser.AgentType][]string{"": roots}
 
-	require.NoError(t, pollUnwatchedScopesOnce(t.Context(), fake, groups))
-	require.NoError(t, pollUnwatchedScopesOnce(t.Context(), fake, groups))
+	require.NoError(t, pollUnwatchedScopesOnce(t.Context(), fake, groups, false))
+	require.NoError(t, pollUnwatchedScopesOnce(t.Context(), fake, groups, false))
 
 	require.Equal(t, 2, fake.calls)
 	assert.Equal(t, roots, fake.callRoots[0])
@@ -1037,14 +1038,14 @@ func TestStartFileWatcherUsesSyncInterval(t *testing.T) {
 		AgentDirs:    map[parser.AgentType][]string{parser.AgentClaude: {projects}},
 	}
 	calls := make(chan time.Time, 8)
-	stop, open, unwatched, _, _ := startFileWatcher(cfg, nil,
+	watcher := startFileWatcher(cfg, cfg.SyncInterval, nil,
 		func(context.Context, agentsync.WatchBatch) error {
 			calls <- time.Now()
 			return nil
 		}, agentsync.WatcherOptions{})
-	t.Cleanup(stop)
-	require.Empty(t, unwatched)
-	open()
+	t.Cleanup(watcher.stop)
+	require.Empty(t, watcher.unwatchedDirs)
+	watcher.openDispatch()
 	path := filepath.Join(project, "active.jsonl")
 	require.NoError(t, os.WriteFile(path, []byte("first\n"), 0o600))
 	first := receiveArchiveTest(t, calls)
@@ -4132,4 +4133,34 @@ func TestNewDaemonIdleTrackerExplicitLifetime(t *testing.T) {
 		synctest.Wait()
 		assert.False(t, stopped)
 	})
+}
+
+func TestServeLifetimesReleaseDebugLog(t *testing.T) {
+	_, dir := isolateServeTestHome(t)
+	cfg, err := config.Load(nil)
+	require.NoError(t, err)
+	cfg.Host = "127.0.0.1"
+	cfg.Port = 0
+	cfg.NoSync = true
+	original := log.Writer()
+	for range 2 {
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- runServe(ctx, cfg, serveOptions{}, 0) }()
+		require.Eventually(t, func() bool { return FindDaemonRuntime(dir) != nil }, 30*time.Second, 100*time.Millisecond)
+		cancel()
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(30 * time.Second):
+			require.FailNow(t, "server did not stop")
+		}
+		require.Same(t, original, log.Writer())
+		if runtime.GOOS == "windows" {
+			path := filepath.Join(dir, "debug.log")
+			moved := filepath.Join(dir, "debug-moved.log")
+			require.NoError(t, os.Rename(path, moved))
+			require.NoError(t, os.Remove(moved))
+		}
+	}
 }

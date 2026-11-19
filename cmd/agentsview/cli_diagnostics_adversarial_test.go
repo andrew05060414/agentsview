@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -115,8 +116,9 @@ func TestCLIRecoveryGroupedCommandAdvice(t *testing.T) {
 	sessionSearch, _, err := root.Find([]string{"session", "search"})
 	require.NoError(t, err)
 
-	semantic := &cliDiagnosticError{}
-	applyCLIRecovery(sessionSearch, db.ErrSemanticUnavailable, semantic)
+	cause := fmt.Errorf("%w: index missing", db.ErrSemanticUnavailable)
+	semantic := &cliDiagnosticError{err: cause}
+	applyCLIRecovery(sessionSearch, cause, semantic)
 	assert.Equal(t, "unavailable", semantic.kind)
 	assert.Contains(t, semantic.hint, "agentsview index embeddings build")
 	assert.Contains(t, semantic.hint, "agentsview session search --help")
@@ -137,7 +139,6 @@ func TestCLIRecoveryGroupedCommandAdvice(t *testing.T) {
 		reject string
 	}{
 		{name: "postgres", path: []string{"replica", "pg", "push"}, want: "AGENTSVIEW_PG_URL"},
-		{name: "duckdb", path: []string{"replica", "duckdb", "status"}, want: "AGENTSVIEW_DUCKDB_PATH"},
 		{name: "clickhouse", path: []string{"replica", "clickhouse", "status"}, want: "AGENTSVIEW_CLICKHOUSE_URL"},
 		{name: "raw sync", path: []string{"source", "raw", "status"}, want: "AGENTSVIEW_RAW_SYNC_URL"},
 		{name: "raw cleanup", path: []string{"source", "raw", "clean-uploads"}, want: "AGENTSVIEW_PG_URL", reject: "AGENTSVIEW_RAW_SYNC_URL"},
@@ -183,6 +184,18 @@ func TestCLIRecoveryGroupedCommandAdvice(t *testing.T) {
 		assert.NotContains(ht, commandRecoveryHint(child), "--host")
 		assert.Contains(ht, commandRecoveryHint(child), child.CommandPath()+" --help")
 	}, hegel.WithTestCases(1000))
+}
+
+func TestWriteCLIDiagnosticDeduplicatesSemanticAdvice(t *testing.T) {
+	cmd, _, err := newRootCommand().Find([]string{"session", "search"})
+	require.NoError(t, err)
+	cause := fmt.Errorf("%w: index missing", db.ErrSemanticUnavailable)
+	diagnostic := &cliDiagnosticError{err: cause}
+	applyCLIRecovery(cmd, cause, diagnostic)
+	var output bytes.Buffer
+	writeCLIDiagnostic(&output, diagnostic)
+	assert.Equal(t, 1, strings.Count(output.String(), "index embeddings build"))
+	assert.Contains(t, output.String(), "index missing")
 }
 
 func TestCLIRecoveryRemoteSentinelsHideURLSecrets(t *testing.T) {

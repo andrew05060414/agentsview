@@ -321,6 +321,15 @@ host's syncable source corpus for it.
    requests a full archive instead of sending the full file list. Archive
    transfers prefer Zstandard compression; gzip remains available through HTTP
    encoding negotiation. Manifests use gzip.
+1. For a changed file the mirror already holds, the request also sends the
+   mirror copy's length and a SHA-256 hash of its last 64 KiB. When the file is
+   a JSON Lines (`.jsonl`) transcript, the remote copy is longer, and its bytes
+   before that length end the same way, the remote sends only the bytes past
+   it, and the collector appends them to the mirror copy. Agent transcripts
+   grow by appending, so a long session costs only its new lines. Any other
+   file, such as a SQLite database that rewrites earlier pages as it grows,
+   and every file from a remote that predates this check, arrives whole. An append that fails partway leaves the mirror copy at
+   its old length, so the next sync fetches the file again.
 1. The archive is extracted into the mirror with remote modification times
    preserved. AgentsView classifies the pending journal paths and imports only
    their affected sources. A provider whose exact scope cannot be proven falls
@@ -363,6 +372,11 @@ same-mtime extraction cannot be hidden by stale cache state. A deterministic
 parse failure is then retained in the existing error-skip cache, retried on
 replay as a skip, and re-armed only when the remote path changes again. Recovery
 work is bounded; overflow collapses to one conservative full import.
+
+A remote sync requested from a running daemon, such as `agentsview sync` while
+`agentsview serve` runs, belongs to the daemon. If the requesting client
+disconnects or is killed, the daemon stops sending it progress and finishes the
+import. Only daemon shutdown cancels the run.
 
 Windsurf is a special case. Its state database is sanitized into a curated
 export for every transfer, so the raw tree cannot safely participate in the
@@ -464,15 +478,24 @@ network and protect its `auth_token` as described above.
 
 ## SSE Endpoints
 
-The SSE endpoints also accept `?token=<token>` because browser `EventSource`
-cannot set custom headers:
+The live-update streams accept the same `Authorization: Bearer <token>` header
+as every other API call. The bundled web UI always sends the header, including
+for these streams.
+
+For clients built on the browser's native `EventSource`, which cannot set
+headers, the streams also accept the token as a `?token=` query parameter:
 
 ```text
 http://<host>:8080/api/v1/events?token=<token>
 http://<host>:8080/api/v1/sessions/<id>/watch?token=<token>
+http://<host>:8080/api/v1/changes/stream?token=<token>
 ```
 
-Use header-based auth for normal API calls whenever possible.
+A token in the URL can end up in proxy access logs and browser history, so
+send the header whenever your client can. Managed Caddy mode removes the
+`token` parameter from the request URLs it logs. If you run your own reverse
+proxy, filter the parameter out of its access logs. Other API endpoints never
+accept the query parameter.
 
 ## Public URL And Trusted Origins
 
@@ -621,11 +644,16 @@ location.reload()
 
 ### Slow Aggregates Behind A Proxy
 
-API responses have a write deadline; a request that exceeds it returns `503`
+Most API responses have a write deadline; a request that exceeds it returns `503`
 with a `{"error":"request timed out"}` body, and affected dashboard panels show
 "request timed out". The default is 30 seconds, which is comfortable for local
-archives but can be tight for large shared datasets — heatmap, activity, and
-usage summaries scan the full message history.
+archives but can be tight for large shared datasets.
+
+Long-running routes are exempt from this deadline. They include session and
+content search, session statistics, usage summaries, comparisons, and top
+sessions, activity report sessions, Kata status, single-session sync, archive
+maintenance, friction reviews, and conversation export. Cancelling a search
+request stops its search. A reverse proxy may impose its own timeout.
 
 Raise the deadline with `--write-timeout` (a Go duration). The flag is available
 on both the local SQLite server and the PostgreSQL read server:
@@ -731,7 +759,7 @@ Access** section lets you:
 
 ![Settings remote access](/docs/assets/generated/screenshots/settings-remote.png)
 
-Changes that affect bind or auth behavior may require a server restart.
+Auth changes take effect when you save.
 
 ## CLI Flags Reference
 
@@ -741,7 +769,7 @@ Changes that affect bind or auth behavior may require a server restart.
 | `--require-auth`    | `false`     | Require a bearer token for API requests             |
 | `--public-url`      |             | Browser URL, also added to trusted origins             |
 | `--public-origin`   |             | Trusted browser origin (repeatable/comma-separated) |
-| `--write-timeout`   | `30s`       | API response write deadline; `0` disables it        |
+| `--write-timeout`   | `30s`       | API response deadline; long-running routes are exempt; `0` disables it |
 | `--proxy`           |             | Managed proxy mode (`caddy`)                        |
 | `--caddy-bin`       | `caddy`     | Caddy binary path                                   |
 | `--proxy-bind-host` | `127.0.0.1` | Interface for managed proxy                         |

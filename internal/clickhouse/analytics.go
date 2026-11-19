@@ -108,8 +108,8 @@ func chAnalyticsLocalDateExpr(
 	return "formatDateTime(" + tsExpr + ", '%Y-%m-%d')", nil
 }
 
-// chAnalyticsDayOfWeekExpr is Monday=0..Sunday=6, matching DuckDB
-// ((strftime('%w') + 6) % 7). ClickHouse toDayOfWeek mode 1 uses that mapping.
+// chAnalyticsDayOfWeekExpr is Monday=0..Sunday=6, the mapping ClickHouse
+// toDayOfWeek mode 1 uses.
 func chAnalyticsDayOfWeekExpr(tsExpr string, f db.AnalyticsFilter) (string, []any) {
 	if f.Timezone != "" {
 		return "toDayOfWeek(" + tsExpr + ", 1, ?)", []any{f.Timezone}
@@ -173,8 +173,7 @@ func (s analyticsSQL) ToolCountsSQL(idSet string, args []any) (string, []any) {
 func chAnalyticsBucketExpr(dateExpr, granularity string) string {
 	switch granularity {
 	case "week":
-		// toStartOfWeek mode 1 starts the week on Monday, matching DuckDB
-		// date_trunc('week').
+		// toStartOfWeek mode 1 starts the week on Monday.
 		return "formatDateTime(toStartOfWeek(toDate(" + dateExpr + "), 1), '%Y-%m-%d')"
 	case "month":
 		return "formatDateTime(toStartOfMonth(toDate(" + dateExpr + ")), '%Y-%m-%d')"
@@ -206,7 +205,7 @@ func (s analyticsSQL) Autonomy(ctx context.Context, _ []string, f db.AnalyticsFi
 		UNION ALL
 		SELECT session_id,
 			toInt64(countIf(role = 'user' AND is_system = false
-				AND COALESCE(source_subtype, '') != 'tool_result')) AS user_count,
+				AND source_subtype != 'tool_result')) AS user_count,
 			toInt64(countIf(role = 'assistant' AND has_tool_use = true)) AS tool_count
 		FROM messages
 		WHERE `+sessionIn+`
@@ -237,14 +236,6 @@ func chSessionSetFromWhere(where string, args []any) chSessionSet {
 		body: "SELECT s.id FROM sessions s WHERE " + where,
 		args: args,
 	}
-}
-
-// chSessionSetFromIDs embeds an explicit ID list. It exists for callers
-// that pin exact sessions, such as contract tests; the list still grows the
-// statement, so production paths derive the set in SQL instead.
-func chSessionSetFromIDs(ids []string) chSessionSet {
-	ph, args := db.InPlaceholders(ids)
-	return chSessionSet{body: "SELECT arrayJoin([" + strings.Trim(ph, "()") + "]) AS id", args: args}
 }
 
 // in returns `col IN (...)` with a fresh copy of the bound arguments so
@@ -431,8 +422,9 @@ func (m *frustrationMarkerMemo) store(id string, pushVersion uint64, count int) 
 
 // chPopulateFrustrationMarkers fills each row's frustration marker count
 // from the count push stored on its session, else from the memo, else by
-// scanning the session's prompts. sessions are the listing rows were built
-// from; a session absent from it is always scanned.
+// scanning the session's prompts with chFrustrationPromptsSQL. sessions
+// are the listing rows were built from; a session absent from it is always
+// scanned.
 func (s *Store) chPopulateFrustrationMarkers(
 	ctx context.Context,
 	rows []db.SignalRow,
@@ -468,39 +460,28 @@ func (s *Store) chPopulateFrustrationMarkers(
 	if len(ids) == 0 {
 		return nil
 	}
-	err := db.QueryChunkedSize(ids, readbase.MaxSQLVars, func(chunk []string) error {
-		ph, args := db.InPlaceholders(chunk)
-		q := `SELECT session_id, content, is_system
-			FROM messages
-			WHERE role = 'user' AND COALESCE(source_subtype, '') <> 'tool_result' AND session_id IN ` + ph
-		msgRows, err := s.queryContext(ctx, q, args...)
-		if err != nil {
-			return fmt.Errorf("querying clickhouse frustration markers: %w", err)
-		}
-		defer msgRows.Close()
-		for msgRows.Next() {
-			var sessionID, content string
-			var isSystem bool
-			if err := msgRows.Scan(
-				&sessionID, &content, &isSystem,
-			); err != nil {
-				return fmt.Errorf("scanning clickhouse frustration marker: %w", err)
-			}
-			i, ok := idx[sessionID]
-			if !ok || isSystem {
-				continue
-			}
-			if signals.IsFrustrationMarker(content) {
-				rows[i].FrustrationMarkerCount++
-			}
-		}
-		if err := msgRows.Err(); err != nil {
-			return fmt.Errorf("iterating clickhouse frustration markers: %w", err)
-		}
-		return nil
-	})
+	ctx, ph, err := analyticsSessionIDsContext(ctx, ids)
 	if err != nil {
 		return err
+	}
+	msgRows, err := s.queryContext(ctx, fmt.Sprintf(chFrustrationPromptsSQL, ph), chFrustrationPromptsArgs...)
+	if err != nil {
+		return fmt.Errorf("querying clickhouse frustration markers: %w", err)
+	}
+	defer msgRows.Close()
+	for msgRows.Next() {
+		var sessionID, content string
+		var decided bool
+		if err := msgRows.Scan(&sessionID, &decided, &content); err != nil {
+			return fmt.Errorf("scanning clickhouse frustration marker: %w", err)
+		}
+		i, ok := idx[sessionID]
+		if ok && (decided || signals.IsFrustrationMarker(content)) {
+			rows[i].FrustrationMarkerCount++
+		}
+	}
+	if err := msgRows.Err(); err != nil {
+		return fmt.Errorf("iterating clickhouse frustration markers: %w", err)
 	}
 	// Only a complete scan is memoized; a failed or canceled read leaves
 	// every session in the batch to be scanned again next time.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"slices"
 	"sort"
@@ -132,10 +133,17 @@ type AnalyticsFilter struct {
 	IncludeForks bool
 }
 
+// TrendsSessionFilter keeps session-level filters for Trends candidate selection.
+func (f AnalyticsFilter) TrendsSessionFilter() AnalyticsFilter {
+	f.From, f.To, f.Model = "", "", ""
+	f.DayOfWeek, f.Hour = nil, nil
+	return f
+}
+
 // RelationshipExclusionSQL returns the relationship_type predicate for
 // analytics aggregation. The default excludes subagent and fork rows
 // (matching the session list); IncludeSubagents and IncludeForks each
-// lift one exclusion. Exported so the PostgreSQL and DuckDB analytics
+// lift one exclusion. Exported so the PostgreSQL and ClickHouse analytics
 // builders apply the same rule.
 func (f AnalyticsFilter) RelationshipExclusionSQL() string {
 	return RelationshipExclusionSQL(f.IncludeSubagents, f.IncludeForks, "")
@@ -456,15 +464,19 @@ func (db *DB) getAnalyticsModelsSQLiteSummary(
 	}
 
 	where, args := sqliteAnalyticsWhereSQL(f, dateCol, "s.id", true)
-	return db.queryAnalyticsModels(ctx, `
+	return db.queryAnalyticsModels(ctx, analyticsModelsQuery(where), args)
+}
+
+// analyticsModelsQuery lists the distinct models of the sessions matching
+// where. It reads messages through idx_messages_analytics_metadata.
+func analyticsModelsQuery(where string) string {
+	return `
 		SELECT DISTINCT m.model
 		FROM sessions s
 		JOIN messages m ON m.session_id = s.id
-		WHERE `+where+`
-		AND COALESCE(m.model, '') <> ''
-		ORDER BY m.model`,
-		args,
-	)
+		WHERE ` + where + `
+		AND m.model <> ''
+		ORDER BY m.model`
 }
 
 func (db *DB) getAnalyticsModelsForSessionIDs(
@@ -484,7 +496,7 @@ func (db *DB) getAnalyticsModelsForSessionIDs(
 			SELECT DISTINCT model
 			FROM messages
 			WHERE session_id IN `+ph+`
-			AND COALESCE(model, '') <> ''
+			AND model <> ''
 			ORDER BY model`,
 			args,
 		)
@@ -530,7 +542,7 @@ func (db *DB) getAnalyticsModelsForSessionIDsFiltered(
 			SELECT model, COALESCE(timestamp, '')
 			FROM messages
 			WHERE session_id IN `+ph+`
-			AND COALESCE(model, '') <> ''`,
+			AND model <> ''`,
 			args...,
 		)
 		if err != nil {
@@ -943,8 +955,8 @@ func (db *DB) GetAnalyticsSummary(
 				SELECT CAST(AVG(message_count) AS INTEGER)
 				FROM ranked
 				WHERE rn IN (
-					CAST(((n + 1) / 2) AS INTEGER),
-					CAST(((n + 2) / 2) AS INTEGER)
+					(n + 1) / 2,
+					(n + 2) / 2
 				)
 			), 0) AS median_messages,
 			COALESCE((
@@ -1023,7 +1035,7 @@ func (db *DB) GetAnalyticsSummary(
 			FROM sessions
 			WHERE `+where+`
 		)
-		SELECT agent, COUNT(*), COALESCE(SUM(message_count), 0)
+		SELECT agent, COUNT(*), SUM(message_count)
 		FROM filtered
 		GROUP BY agent`,
 		args...,
@@ -2492,7 +2504,7 @@ func (db *DB) GetAnalyticsSessionShape(
 func autonomyChunkSQL(placeholders string) string {
 	return `SELECT session_id,
 		SUM(CASE WHEN role='user' AND is_system=0
-			AND COALESCE(source_subtype, '') <> 'tool_result'
+			AND source_subtype <> 'tool_result'
 			THEN 1 ELSE 0 END),
 		SUM(CASE WHEN role='assistant'
 			AND has_tool_use=1 THEN 1 ELSE 0 END)
@@ -2978,9 +2990,10 @@ func analyticsToolsQuery(
 	modelPred string,
 	windowPred string,
 	includeMessageMeta bool,
+	groupExpr string,
 ) string {
 	query := `SELECT tc.session_id, tc.category,
-			TRIM(COALESCE(tc.tool_name, '')), COUNT(*)`
+			TRIM(tc.tool_name), COUNT(*)`
 	if includeMessageMeta {
 		query += `, MAX(COALESCE(m.timestamp, '')), MIN(m.ordinal)` + ToolEffectivenessSQL("tc", "s.quality_signal_version")
 	}
@@ -3002,11 +3015,79 @@ func analyticsToolsQuery(
 	}
 	query += `
 		GROUP BY tc.session_id, tc.category,
-			TRIM(COALESCE(tc.tool_name, ''))`
+			TRIM(tc.tool_name)`
 	if includeMessageMeta {
-		query += `, ` + sqliteAnalyticsMinuteKey()
+		query += `, ` + groupExpr
 	}
 	return query
+}
+
+// sqliteToolsDateKey uses SQLite for canonical UTC timestamps and keeps Go's
+// timestamp parsing for other inputs. The bounded offset periods cover the
+// padded message window; timestamps outside it, and ranges with no bounded
+// periods, use the same Go fallback.
+func sqliteToolsDateKey(f AnalyticsFilter) string {
+	sessionTS := `COALESCE(NULLIF(s.started_at, ''), s.created_at)`
+	ts := `(CASE WHEN COALESCE(m.timestamp, '') = '' THEN ` + sessionTS + ` ELSE m.timestamp END)`
+	fallback := `agentsview_local_date(COALESCE(m.timestamp, ''), ` + sessionTS + `, ?)`
+	loc := f.location()
+	if loc == time.UTC {
+		// SQLite counts characters; Go's invalid-date fallback takes ten bytes.
+		return `(CASE WHEN substr(` + ts + `, -1) = 'Z' AND length(CAST(substr(` + ts + `, 1, 10) AS BLOB)) = 10 THEN substr(` + ts + `, 1, 10) ELSE ` + fallback + ` END)`
+	}
+	periods := ToolsDatePeriods(f)
+	if len(periods) == 0 {
+		return fallback
+	}
+	seconds := `substr(` + ts + `, 1, 19)`
+	var localDate strings.Builder
+	localDate.WriteString(`(CASE WHEN ` + seconds + ` < '` + periods[0].Start.Format("2006-01-02T15:04:05") + `' THEN NULL`)
+	for _, period := range periods {
+		localDate.WriteString(` WHEN ` + seconds + ` < '` + period.End.Format("2006-01-02T15:04:05") + `' THEN strftime('%Y-%m-%d', ` + seconds + `, '` + fmt.Sprintf("%+d seconds", period.Offset) + `')`)
+	}
+	localDate.WriteString(` END)`)
+	// Invalid timestamps use their first ten bytes. When SQLite's date agrees
+	// with those bytes, both parsers produce the same date. Strip fractions
+	// before SQLite rounds; resolve the remaining cases with Go.
+	return `(CASE WHEN substr(` + ts + `, -1) = 'Z' AND ` + localDate.String() + ` = substr(` + ts + `, 1, 10) THEN substr(` + ts + `, 1, 10) ELSE ` + fallback + ` END)`
+}
+
+// ToolsDatePeriod describes one UTC interval with a constant local offset.
+type ToolsDatePeriod struct {
+	Start, End time.Time
+	Offset     int
+}
+
+// ToolsDatePeriods bounds the timezone transitions used for tool date grouping;
+// ranges needing more than 128 periods return nil.
+func ToolsDatePeriods(f AnalyticsFilter) []ToolsDatePeriod {
+	if f.From == "" || f.To == "" {
+		return nil
+	}
+	start, err := time.Parse("2006-01-02", f.From)
+	if err != nil {
+		return nil
+	}
+	end, err := time.Parse("2006-01-02", f.To)
+	if err != nil || end.Before(start) {
+		return nil
+	}
+	start, end = start.Add(-48*time.Hour), end.Add(72*time.Hour)
+	loc := LoadLocationOr(f.Timezone, time.UTC)
+	var periods []ToolsDatePeriod
+	for cursor := start; cursor.Before(end); {
+		_, offset := cursor.In(loc).Zone()
+		_, until := cursor.In(loc).ZoneBounds()
+		if until.IsZero() || until.After(end) {
+			until = end
+		}
+		if !until.After(cursor) || len(periods) == 128 {
+			return nil
+		}
+		periods = append(periods, ToolsDatePeriod{Start: cursor.UTC(), End: until.UTC(), Offset: offset})
+		cursor = until
+	}
+	return periods
 }
 
 func analyticsSkillsQuery(
@@ -3020,7 +3101,7 @@ func analyticsSkillsQuery(
 		LEFT JOIN messages m
 			ON m.session_id = tc.session_id AND m.id = tc.message_id
 		WHERE tc.session_id IN ` + placeholders + `
-			AND TRIM(COALESCE(tc.skill_name, '')) != ''`
+			AND TRIM(tc.skill_name) != ''`
 	if modelPred != "" {
 		query += `
 			AND ` + modelPred
@@ -3037,19 +3118,66 @@ func analyticsSkillsQuery(
 // GetAnalyticsTools returns tool usage analytics aggregated
 // from the tool_calls table.
 func (db *DB) GetAnalyticsTools(ctx context.Context, f AnalyticsFilter) (ToolsAnalyticsResponse, error) {
+	if TerminationUsesTime(f.Termination) {
+		return db.analyticsTools(ctx, f)
+	}
+	return keptAnalyticsWithIdentity(ctx, db, "tools", f, func(ctx context.Context, f AnalyticsFilter, identity string) (ToolsAnalyticsResponse, error) {
+		return db.analyticsToolsWithIdentity(ctx, f, &identity)
+	})
+}
+
+func (db *DB) analyticsTools(ctx context.Context, f AnalyticsFilter) (ToolsAnalyticsResponse, error) {
+	return db.analyticsToolsWithIdentity(ctx, f, nil)
+}
+
+func (db *DB) analyticsToolsWithIdentity(ctx context.Context, f AnalyticsFilter, identity *string) (ToolsAnalyticsResponse, error) {
 	release, err := db.acquireBulkRead(ctx)
 	if err != nil {
 		return ToolsAnalyticsResponse{}, err
 	}
 	defer release()
 
+	db.trendsPartsDisk()
+	if db.trendsDisk.Enabled() {
+		if identity == nil {
+			id, err := db.GetDatabaseID(ctx)
+			if err == nil {
+				identity = &id
+			}
+		}
+		if identity != nil && *identity != "" {
+			if result, handled, err := db.toolsFromParts(ctx, *identity, f); handled {
+				return result, err
+			}
+		}
+	}
 	rows, err := db.analyticsToolRows(ctx, f)
 	return BuildToolsAnalytics(rows), err
+}
+
+type toolSessionInfo struct {
+	ts, agent, project, fingerprint string
+	toolsGeneration                 *string
 }
 
 func (db *DB) analyticsToolRows(
 	ctx context.Context, f AnalyticsFilter,
 ) ([]ToolAnalyticsRow, error) {
+	sessions, err := db.toolSessions(ctx, f, false)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(sessions))
+	for id := range sessions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return db.toolRowsFor(ctx, f, sessions, ids)
+}
+
+const toolsSessionFingerprintSQL = `json_array(COALESCE(usage_generation, ''), COALESCE(quality_signal_version, ''), COALESCE(agent, ''), COALESCE(started_at, ''), COALESCE(created_at, ''), tools_generation)`
+
+func (db *DB) toolSessions(ctx context.Context, f AnalyticsFilter, withFingerprint bool) (map[string]toolSessionInfo, error) {
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
 	where, args := f.buildWhereWithoutDate()
 	if pred, windowArgs := f.toolSessionWindowSQL(dateCol, "sessions.id"); pred != "" {
@@ -3058,8 +3186,12 @@ func (db *DB) analyticsToolRows(
 	}
 
 	// Fetch filtered session IDs and their metadata.
-	sessQ := `SELECT id, ` + dateCol + `, agent, project
-		FROM sessions WHERE ` + where
+	fingerprint, generation := `''`, `NULL`
+	if withFingerprint {
+		fingerprint = toolsSessionFingerprintSQL
+		generation = `tools_generation`
+	}
+	sessQ := `SELECT id, ` + dateCol + `, agent, project, ` + fingerprint + `, ` + generation + ` FROM sessions WHERE ` + where
 
 	sessRows, err := db.getReader().QueryContext(ctx, sessQ, args...)
 	if err != nil {
@@ -3068,28 +3200,26 @@ func (db *DB) analyticsToolRows(
 	}
 	defer sessRows.Close()
 
-	type sessInfo struct {
-		ts      string
-		agent   string
-		project string
-	}
-	sessionMap := make(map[string]sessInfo)
-	var sessionIDs []string
+	sessionMap := make(map[string]toolSessionInfo)
 
 	for sessRows.Next() {
-		var id, ts, agent, project string
-		if err := sessRows.Scan(&id, &ts, &agent, &project); err != nil {
+		var id, ts, agent, project, fingerprint string
+		var generation *string
+		if err := sessRows.Scan(&id, &ts, &agent, &project, &fingerprint, &generation); err != nil {
 			return nil,
 				fmt.Errorf("scanning tool session: %w", err)
 		}
-		sessionMap[id] = sessInfo{ts: ts, agent: agent, project: project}
-		sessionIDs = append(sessionIDs, id)
+		sessionMap[id] = toolSessionInfo{ts: ts, agent: agent, project: project, fingerprint: fingerprint, toolsGeneration: generation}
 	}
 	if err := sessRows.Err(); err != nil {
 		return nil,
 			fmt.Errorf("iterating tool sessions: %w", err)
 	}
 
+	return sessionMap, nil
+}
+
+func (db *DB) toolRowsFor(ctx context.Context, f AnalyticsFilter, sessionMap map[string]toolSessionInfo, sessionIDs []string) ([]ToolAnalyticsRow, error) {
 	if len(sessionIDs) == 0 {
 		return nil, nil
 	}
@@ -3097,7 +3227,7 @@ func (db *DB) analyticsToolRows(
 	// Query tool_calls for filtered sessions (chunked).
 	var toolRows []ToolAnalyticsRow
 
-	err = queryChunked(sessionIDs,
+	err := queryChunked(sessionIDs,
 		func(chunk []string) error {
 			ph, chunkArgs := InPlaceholders(chunk)
 			modelPred, modelArgs := sqliteAnalyticsCSVPredicate(
@@ -3113,7 +3243,12 @@ func (db *DB) analyticsToolRows(
 			from, to := f.messageWindowBoundsUTC()
 			windowPred, windowArgs := analyticsMessageWindowPred("m.timestamp", from, to)
 			chunkArgs = append(chunkArgs, windowArgs...)
-			q := analyticsToolsQuery(ph, modelPred, windowPred, true)
+			groupExpr := sqliteAnalyticsMinuteKey()
+			if !f.HasTimeFilter() {
+				groupExpr = sqliteToolsDateKey(f)
+				chunkArgs = append(chunkArgs, f.Timezone)
+			}
+			q := analyticsToolsQuery(ph, modelPred, windowPred, true, groupExpr)
 			observeAnalyticsQuery(q)
 			rows, qErr := db.getReader().QueryContext(
 				ctx, q, chunkArgs...,
@@ -3337,7 +3472,7 @@ func (db *DB) queryVelocityMsgs(
 	// "converting NULL to string is unsupported". LocalTime treats "" as
 	// invalid, so the row is excluded from velocity stats rather than
 	// crashing the analytics endpoint. This matches the NULL-safe
-	// PostgreSQL and DuckDB velocity twins.
+	// PostgreSQL and ClickHouse velocity twins.
 	query := `SELECT session_id, ordinal, role,
 		COALESCE(timestamp, ''), content_length
 		FROM messages
@@ -3618,6 +3753,10 @@ func (a *velocityAccumulator) computeOverview() VelocityOverview {
 func (db *DB) GetAnalyticsVelocity(
 	ctx context.Context, f AnalyticsFilter,
 ) (VelocityResponse, error) {
+	return keptAnalytics(ctx, db, "velocity", f, db.analyticsVelocity)
+}
+
+func (db *DB) analyticsVelocity(ctx context.Context, f AnalyticsFilter) (VelocityResponse, error) {
 	release, err := db.acquireBulkRead(ctx)
 	if err != nil {
 		return VelocityResponse{}, err
@@ -4036,10 +4175,14 @@ type SignalRow struct {
 // used the model, but the totals stay session-level aggregates and are not
 // re-attributed per model -- per-model signal attribution is not well defined
 // for most signals and is intentionally not computed here. The PostgreSQL and
-// DuckDB stores mirror this.
+// ClickHouse stores mirror this.
 func (db *DB) GetAnalyticsSignals(
 	ctx context.Context, f AnalyticsFilter,
 ) (SignalsAnalyticsResponse, error) {
+	return keptAnalytics(ctx, db, "signals", f, db.analyticsSignals)
+}
+
+func (db *DB) analyticsSignals(ctx context.Context, f AnalyticsFilter) (SignalsAnalyticsResponse, error) {
 	release, err := db.acquireBulkRead(ctx)
 	if err != nil {
 		return SignalsAnalyticsResponse{}, err
@@ -4265,11 +4408,57 @@ func (db *DB) populateFrustrationMarkers(
 		idx[rows[i].ID] = i
 		ids = append(ids, rows[i].ID)
 	}
+	hasMarkers := true
+	// Read-only archives may predate this table. Remove this fallback if
+	// read-only open starts requiring the table.
+	if db.readOnly {
+		if err := db.getReader().QueryRowContext(ctx, `SELECT EXISTS(
+			SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_frustration_markers'
+		)`).Scan(&hasMarkers); err != nil {
+			return fmt.Errorf("checking frustration markers table: %w", err)
+		}
+	}
+	if hasMarkers {
+		err := queryChunked(ids, func(chunk []string) error {
+			ph, args := InPlaceholders(chunk)
+			args = append([]any{signals.FrustrationMarkerVersion}, args...)
+			stored, err := db.getReader().QueryContext(ctx, `SELECT session_id, transcript_key, count
+				FROM session_frustration_markers WHERE marker_version = ? AND session_id IN `+ph, args...)
+			if err != nil {
+				return err
+			}
+			defer stored.Close()
+			for stored.Next() {
+				var id, key string
+				var count int
+				if err := stored.Scan(&id, &key, &count); err != nil {
+					return err
+				}
+				if i, ok := idx[id]; ok && rows[i].transcriptVersion == key {
+					rows[i].FrustrationMarkerCount = count
+					m.Store(generation, id, key, count)
+					delete(idx, id)
+				}
+			}
+			return stored.Err()
+		})
+		if err != nil {
+			return fmt.Errorf("reading frustration markers: %w", err)
+		}
+	}
+	pending := ids[:0]
+	for _, id := range ids {
+		if _, ok := idx[id]; ok {
+			pending = append(pending, id)
+		}
+	}
+	ids = pending
 	err := queryChunked(ids, func(chunk []string) error {
 		ph, args := InPlaceholders(chunk)
-		q := `SELECT session_id, ordinal, content, is_system
+		q := `SELECT session_id, content
 			FROM messages
-			WHERE role = 'user' AND COALESCE(source_subtype, '') <> 'tool_result' AND session_id IN ` + ph
+			WHERE role = 'user' AND source_subtype <> 'tool_result'
+				AND is_system = 0 AND session_id IN ` + ph
 		msgRows, err := db.getReader().QueryContext(ctx, q, args...)
 		if err != nil {
 			return fmt.Errorf(
@@ -4279,17 +4468,13 @@ func (db *DB) populateFrustrationMarkers(
 		defer msgRows.Close()
 		for msgRows.Next() {
 			var sessionID, content string
-			var ordinal int
-			var isSystem bool
-			if err := msgRows.Scan(
-				&sessionID, &ordinal, &content, &isSystem,
-			); err != nil {
+			if err := msgRows.Scan(&sessionID, &content); err != nil {
 				return fmt.Errorf(
 					"scanning frustration marker: %w", err,
 				)
 			}
 			i, ok := idx[sessionID]
-			if !ok || isSystem {
+			if !ok {
 				continue
 			}
 			if signals.IsFrustrationMarker(content) {
@@ -4309,11 +4494,48 @@ func (db *DB) populateFrustrationMarkers(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if len(ids) > 0 && !db.readOnly && !db.usageOnlyStorage() {
+		if err := db.storeFrustrationMarkers(ctx, generation, ids, idx, rows); err != nil {
+			log.Printf("storing frustration markers: %v", err)
+			return ctx.Err()
+		}
+	}
 	for _, id := range ids {
 		r := rows[idx[id]]
 		m.Store(generation, id, r.transcriptVersion, r.FrustrationMarkerCount)
 	}
 	return nil
+}
+
+func (db *DB) storeFrustrationMarkers(ctx context.Context, generation uint64, ids []string, idx map[string]int, rows []SignalRow) error {
+	if err := db.lockWriterCtx(ctx); err != nil {
+		return err
+	}
+	defer db.mu.Unlock()
+	if db.frustrationMemo.Generation() != generation {
+		return nil
+	}
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, id := range ids {
+		r := rows[idx[id]]
+		_, err := tx.ExecContext(ctx, `INSERT INTO session_frustration_markers
+			(session_id, transcript_key, marker_version, count)
+			SELECT id, ?, ?, ? FROM sessions
+			WHERE id = ? AND transcript_revision || '|' || created_at = ?
+			ON CONFLICT(session_id) DO UPDATE SET
+				transcript_key = excluded.transcript_key,
+				marker_version = excluded.marker_version,
+				count = excluded.count`,
+			r.transcriptVersion, signals.FrustrationMarkerVersion, r.FrustrationMarkerCount, id, r.transcriptVersion)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func scanSignalRow(rs rowScanner, loc *time.Location) (SignalRow, error) {
@@ -4418,7 +4640,7 @@ func (db *DB) signalMessages(
 	err := queryChunked(ids, func(chunk []string) error {
 		ph, args := InPlaceholders(chunk)
 		q := `SELECT session_id, ordinal, role, content,
-					COALESCE(timestamp, ''), is_system, has_tool_use, COALESCE(source_subtype, '')
+					COALESCE(timestamp, ''), is_system, has_tool_use, source_subtype
 				FROM messages
 				WHERE session_id IN ` + ph
 		if len(filterModels) == 1 {
@@ -5444,8 +5666,7 @@ func (db *DB) GetAnalyticsTopSessions(
 	durationExpr := `ROUND((julianday(ended_at) -
 		julianday(started_at)) * 1440, 1)`
 	durationSelectExpr := "COALESCE(" + durationExpr + ", 0)"
-	activeDurationSelectExpr := "COALESCE(" +
-		sqliteActiveDurationExpr("sessions.id") + ", 0)"
+	activeDurationSelectExpr := sqliteActiveDurationExpr("sessions.id")
 	needsGoSort := metric == "duration"
 	var orderExpr string
 	switch metric {
@@ -5552,8 +5773,7 @@ func (db *DB) getAnalyticsTopSessionsGo(
 	// under concurrent requests.
 	activeDurationSelectExpr := "0.0"
 	if needsGoSort {
-		activeDurationSelectExpr = "COALESCE(" +
-			sqliteActiveDurationExpr("sessions.id") + ", 0)"
+		activeDurationSelectExpr = sqliteActiveDurationExpr("sessions.id")
 	}
 	query := `SELECT id, ` + dateCol + `, project,
 		first_message,

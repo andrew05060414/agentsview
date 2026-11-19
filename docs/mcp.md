@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-11-06
+last_edited: 2026-11-16
 title: MCP Server
 description: Connect assistant clients to your AgentsView session history with MCP
 ---
@@ -84,11 +84,13 @@ client will see these tools:
 | `search_sessions`             | Full-text search across recorded sessions                                |
 | `list_sessions`               | List recent or filtered sessions                                         |
 | `get_session_overview`        | Fetch metadata and a compact message preview                             |
+| `get_compaction_summaries`    | Read compaction summaries for one or more sessions                       |
 | `get_messages`                | Read paginated message bodies from one session                           |
 | `get_memory_status`           | Report archive, lexical, semantic, and source readiness                  |
 | `search_content`              | Substring, regex, terms, semantic, or hybrid search over session text    |
 | `get_usage_summary`           | Aggregate token and cost usage                                           |
 | `get_session_usage`           | Show one session's tokens and cost by model and by request               |
+| `list_recall`                 | List Recall entries, optionally changed or created since a time, when the backend supports Recall queries |
 | `query_recall`                | Search extracted Recall entries when the backend supports Recall queries |
 | `get_session_file_references` | Find retained image bytes in Docbank, including prior versions and trash |
 | `get_tool_calls`              | List the tool calls one session made, with inputs and result sizes       |
@@ -101,6 +103,11 @@ client will see these tools:
 | `search_docs`                 | Search the AgentsView guides bundled with this version                   |
 | `get_friction_digest`         | Read a dated Friction Log digest as Markdown or the summary object       |
 | `list_friction_patterns`      | List recurring friction patterns ranked by occurrences                   |
+
+`get_compaction_summaries` accepts a session ID or `active_since` timestamp.
+The limit counts sessions; 0 uses the default of 20. Resume `next_cursor` with
+the same `active_since`, even when a page has no summaries. Ambiguous older
+Evener labels appear separately with their session ID and ordinal.
 
 The two Friction Log tools appear when the backend stores the Friction Log.
 `get_friction_digest` defaults to the latest digest; pass `date` (YYYY-MM-DD)
@@ -135,8 +142,8 @@ profile:
 }
 ```
 
-This profile advertises only `get_memory_status`, `search_content`, and
-`get_messages`. The status tool reports the authenticated archive backend,
+This profile advertises only `get_memory_status`, `search_content`,
+`get_messages`, and `get_compaction_summaries`. The status tool reports the authenticated archive backend,
 read-only mode, server version, lexical availability, semantic generation
 coverage, and whether per-source freshness telemetry is available. Its `ready`,
 `partial`, `unavailable`, or `unknown` states come from the same provider as the
@@ -148,30 +155,60 @@ complete tool list above.
 
 This profile's tool list is about 21 KB, and the same test holds it under 24 KB.
 
-The native
-[AgentsView Memory package](https://github.com/kenn-io/agentsview/tree/main/plugins/agentsview-memory)
-registers this profile for Claude Code and Codex and bundles the recall skill,
-Claude's focused search agent, and a session-start hook. Install it through your
-client's native plugin flow and ensure `agentsview` is on the client's `PATH`.
-The package README explains local and hosted setup.
+### Choose an installation route
 
-For a standalone skill installation, use `agentsview skills install`; see
-[the CLI reference](/docs/commands/#agentsview-skills) for client and project
-scope. Choose one installation route per client to avoid loading duplicate
-skills. Both routes teach agents to search relevant history, distinguish
-proposals from accepted decisions, and cite transcript evidence.
+| Route                       | Clients               | What you get                                                                                             | When to use it                                                                                                                                                |
+| --------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Plugin                      | Claude Code           | Recall skill, search agent, memory-profile server, and SessionStart sync hook; updates through `/plugin` | Use the complete memory package in Claude Code.                                                                                                               |
+| `agentsview agent setup`    | Claude Code and Codex | Recall skill, Claude search agent, and memory-profile `agentsview` server; no hook                       | Set up memory for installed clients. Use `--agent claude` or `--agent codex` to select one, and `--check` to inspect setup.                                   |
+| Plain MCP entry             | MCP clients           | Full or memory-profile tools only                                                                        | Use the [Quick Start](#quick-start) entry for tools without a recall skill guiding proactive search.                                           |
+| `agentsview skills install` | Claude Code and Codex | Skill and Claude search agent only                                                                       | Install a skill with `--project` or `--server` and register a server named `agentsview` yourself. See the [CLI reference](/docs/commands/#agentsview-skills). |
 
-The native package's MCP process reads `AGENTSVIEW_MEMORY_SERVER`,
+For the Claude Code plugin, put `agentsview` on `PATH` and run:
+
+```text
+/plugin marketplace add kenn-io/agentsview
+/plugin install agentsview-memory@agentsview
+```
+
+Restart Claude Code and open `/mcp` to confirm the server. Choose one route per
+client. The startup diagnostic reports a standalone skill beside the plugin. The
+plugin's server and a standalone `agentsview` entry are separate connections, so
+running both connects two servers. `agentsview agent setup` refuses to replace a
+different `agentsview` MCP entry without `--force` and preserves other entries.
+`--force` also overwrites edited skills.
+
+### Memory everywhere, full tools in some projects
+
+Install the plugin at user scope. In each project where you want the full tool
+list, run:
+
+```bash
+claude mcp add --scope project agentsview -- agentsview mcp
+```
+
+Approve the project's `.mcp.json`. Use `--scope local` instead of
+`--scope project` to keep the entry out of the repository. Open `/mcp` in that
+project and turn off `plugin:agentsview-memory:agentsview`. Claude Code stores
+this project setting in `~/.claude.json`; repeat the toggle on each machine.
+The plugin's skill, agent, and hook keep working, and the agent uses the project
+server. Other projects keep the plugin's memory server. For a remote archive,
+add `--server <url>` and, if needed, `--server-token-file <path>` to the full
+server command, or use `--pg` for PostgreSQL. The `AGENTSVIEW_MEMORY_*`
+environment variables target the memory profile and do not target the full server.
+
+For a remote archive, set the hosted environment variables below for the focused
+profile.
+
+The memory profile reads `AGENTSVIEW_MEMORY_SERVER`,
 `AGENTSVIEW_MEMORY_SERVER_TOKEN_FILE`, or `AGENTSVIEW_MEMORY_PG`; explicit
 command flags still win. A token-file setting without a server fails instead of
 falling back to the local archive. PostgreSQL reads use the configured
 `default_pg` target.
 
 Run `agentsview doctor memory` to inspect this server status together with the
-local client integration. Pass the native package root with `--plugin-root` to
-check its skill, MCP profile, and SessionStart hook. The diagnostic uses
-read-only metadata and does not start a daemon, sync transcripts, or rebuild
-vectors.
+installed client integrations. Pass the native package root with `--plugin-root` to
+check its skill, MCP profile, and SessionStart hook. The client check may start the configured client and MCP process. It calls no data tools and does not start the local archive daemon, sync transcripts, or rebuild vectors. Codex may create its own runtime state.
 
 `search_sessions` accepts optional `date_from` and `date_to` bounds in
 `YYYY-MM-DD` format, just like `list_sessions` and `search_content`. Dates
@@ -215,11 +252,20 @@ especially when the exact wording is unknown. Hybrid combines semantic
 similarity with keyword matching. Use `context` to include surrounding messages.
 Hybrid returns its keyword matches when search by meaning is unavailable. The
 response includes `effective_mode: "hybrid_keyword"` and a `note` beside
-`coverage` explaining why. Keyword matches need the query words to appear. If
-there are no matches or only a few, try one or two short substring queries with
-key terms or synonyms. Preserve `scope`, inclusion, and current-session filters.
-Disclose keyword-only results once. Use substring/regex for exact errors,
+`coverage` explaining why. On SQLite, PostgreSQL, and ClickHouse, keyword matches rank messages holding
+every query word first, then those holding fewer of them.
+Preserve `scope`, inclusion, and current-session filters. Disclose keyword-only
+results once. Use fully quoted substring text or regex for exact errors,
 identifiers, and code fragments. The default remains substring.
+
+On SQLite, PostgreSQL, and ClickHouse, a substring search of several words lists matches of the exact text
+first, from every selected source, then messages holding every word, then those
+holding fewer of the words. Each match reports `matched_words`, the number of
+query words it holds, excluding unquoted stop words; other searches report `0`.
+A single word, a fully quoted pattern, and searches without the `messages`
+source match the exact text only. A quoted phrase inside a longer query requires
+its words together and in order. Hybrid keyword matches also report their word
+count.
 
 `search_content` accepts a `mode` of `substring` (default), `regex`, `terms`,
 `semantic`, or `hybrid`. `terms` splits `pattern` on whitespace and requires
@@ -533,11 +579,11 @@ configured bearer token and enforces `Authorization: Bearer <token>` on every
 request. If `require_auth` is enabled, loopback HTTP binds also require bearer
 auth so forwarded ports are not accidentally unauthenticated.
 
-## Server Identity (unreleased)
+## Server Identity
 
-On `main`, the MCP server declares the AgentsView website and icon. The icon is
-included as a PNG data URI, so stdio and HTTP clients can load it without an
-external request. Whether it appears depends on the client.
+The MCP server declares the AgentsView website and icon. The icon is included as
+a PNG data URI, so stdio and HTTP clients can load it without an external
+request. Whether it appears depends on the client.
 
 ## Security Notes
 
