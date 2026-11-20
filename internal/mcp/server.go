@@ -197,15 +197,10 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolGetMessages,
-		Description: "Read a slice of one session's transcript. Choose linear pagination (from/direction/" +
-			"limit) or a symmetric window centered on an ordinal (around, with before/after sizing each " +
-			"side, default 5; mutually exclusive with from/direction). Defaults return persisted user and " +
-			"assistant dialogue projections without inline thinking or tools; unclassified rows are withheld " +
-			"and counted in uncertain and filtered. Messages are truncated to 2000 characters; truncated messages are flagged so you " +
-			"can re-fetch with a higher max_chars_per_message. Each page reports how many scanned messages " +
-			"the role/system filter dropped as filtered, so across a full pagination sweep, returned plus " +
-			"filtered messages add up to the session's message_count (which counts all stored messages, " +
-			"system included).",
+		Description: "Read one session by page (from/direction/limit) or around an ordinal (before/after, default 5 each). " +
+			"Defaults to stored user and assistant dialogue, excluding inline thinking and tools. " +
+			"Unclassified rows count in uncertain and filtered. Use raw for stored content. " +
+			"Finish truncated messages with body_cursor, then continue with next_from.",
 		Annotations: readOnly,
 	}, t.getMessages)
 
@@ -218,23 +213,12 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolSearchContent,
-		Description: "Search session text. Substring and regex search dialogue messages only by default; " +
-			"pass sources to include thinking, tool inputs, or tool results. " +
-			"Prefer mode hybrid (semantic similarity plus keywords) for finding " +
-			"prior work and answering contextual questions, especially when the exact wording is unknown. " +
-			"Hybrid returns keyword matches with effective_mode hybrid_keyword and a note when search by meaning is unavailable. " +
-			"Use terms when every literal term must occur within one " +
-			"user/assistant exchange, or fully quoted substring text or regex for exact error messages, identifiers, and code fragments. " +
-			"Use concepts with two to five semantic ideas to keep only sessions with evidence for every idea. " +
-			"The default mode remains substring. On SQLite, a substring search of several words lists exact text first, " +
-			"then messages holding every word, then those holding more of the words, and reports matched_words. Scope defaults to all, including child sessions and sidechain messages; " +
-			"top excludes them and subordinate returns only them. Child sessions bypass the one-shot exclusion. " +
-			"The response reports effective_scope and exclusions.children. Set context to include N messages of " +
-			"surrounding conversation with each match. Matches from the last 10 minutes (including the " +
-			"current conversation) are excluded unless include_active is set; current_session_id replaces " +
-			"that heuristic with one exact exclusion. One-shot and automated " +
-			"sessions are excluded by default; set include_one_shot or include_automated to include them. " +
-			"Empty first pages return measured hints with code, message, and retry_with arguments; preserve other arguments when retrying.",
+		Description: "Search session text. Substring and regex default to dialogue; pass sources to inspect thinking or tool activity. " +
+			"Prefer hybrid for contextual questions; it falls back to keyword matches when semantic search is unavailable. " +
+			"Use terms to require all words in one exchange, fully quoted substring or regex for exact text, and concepts to require evidence for each idea in one session. " +
+			"SQLite ranks exact substring hits first, then by matched_words. Scope all includes child sessions and sidechains; top excludes them and subordinate returns only them. " +
+			"Set context for surrounding dialogue. One-shot and automated sessions are excluded by default; use include_one_shot or include_automated. " +
+			"Empty first pages may suggest retry_with arguments; preserve the other arguments.",
 		Annotations: externalRead,
 	}, t.searchContent)
 

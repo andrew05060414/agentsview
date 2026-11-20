@@ -197,6 +197,14 @@ func TestDialogueProjection_HTTPReadAndSearchContext(t *testing.T) {
 		{SessionID: "context", Ordinal: 2, Role: "assistant", Content: "[Thinking] legacy"},
 		dialogueAsstMsg("context", 3, "after"),
 	}, dbtest.WithMessageCounts(4, 1))
+	var dialogueIsContent, dialogueIsNull bool
+	require.NoError(t, d.Reader().QueryRow(t.Context(),
+		"SELECT dialogue_is_content, dialogue_text IS NULL FROM messages WHERE session_id = ? AND ordinal = ?",
+		"context", 1,
+	).Scan(&dialogueIsContent, &dialogueIsNull))
+	require.True(t, dialogueIsContent)
+	require.True(t, dialogueIsNull)
+
 	// Use the actual service JSON types, as the remote HTTP backend does.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -220,11 +228,16 @@ func TestDialogueProjection_HTTPReadAndSearchContext(t *testing.T) {
 		_, page, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "context"})
 		require.NoError(t, err)
 		assert.Equal(t, []int{0, 1, 3}, ordinals(page))
+		require.Len(t, page.Messages, 3)
 		assert.Equal(t, "before", page.Messages[0].Content)
+		assert.Equal(t, "needle", page.Messages[1].Content)
+		assert.Equal(t, 1, page.Filtered)
 		assert.Equal(t, 1, page.Uncertain)
 		_, found, err := ts.searchContent(t.Context(), nil, searchContentIn{Pattern: "needle", Context: 3, IncludeActive: true, IncludeOneShot: true, IncludeAutomated: true})
 		require.NoError(t, err)
 		require.Len(t, found.Matches, 1)
+		assert.Equal(t, "needle", found.Matches[0].Snippet)
+		assert.False(t, found.Matches[0].DialogueUnavailable)
 		assert.Equal(t, []contextMessage{{Ordinal: 0, Role: "assistant", Content: "before"}}, found.Matches[0].ContextBefore)
 		assert.Equal(t, []contextMessage{{Ordinal: 3, Role: "assistant", Content: "after"}}, found.Matches[0].ContextAfter)
 	}
