@@ -49,11 +49,12 @@ func (s *browserSync) labelAccount(ctx context.Context, account string, ids []st
 }
 
 func (s *browserSync) confirmAccount(ctx context.Context, fetch browserFetchFunc, path, before string, ids []string) error {
-	if err := ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil || before == "" {
 		return err
 	}
-	after, _ := browserAccount(ctx, fetch, path)
-	if before == "" || before != after {
+	// A different identity at the end means the browser switched accounts
+	// during the round, so no conversation from it is labelled.
+	if after, _ := browserAccount(ctx, fetch, path); before != after {
 		return ctx.Err()
 	}
 	return s.labelAccount(ctx, string(s.agent)+":"+before, ids)

@@ -132,7 +132,7 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 					CurrentLeaf jsontext.Value `json:"current_leaf_message_uuid"`
 				}
 				if err := json.Unmarshal(summary, &marker); err != nil || marker.UUID == "" || marker.UpdatedAt == "" {
-					log.Printf("import: claude.ai list item %d of org %s skipped: uuid %q: uuid or updated_at is missing or not a string", offset+i, org.UUID, marker.UUID)
+					log.Printf("import: claude.ai list item %d of org %s skipped: uuid %q: uuid or updated_at is missing or not a string", offset+i, org, marker.UUID)
 					stats.Errors++
 					cb.progress(stats)
 					continue

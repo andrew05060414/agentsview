@@ -34,10 +34,17 @@ globalThis.claudeFetch = async function claudeFetch(url, headers, requestBody) {
       body += decoder.decode();
     }
     if (new URL(url).pathname === "/api/organizations") {
-      if (!response.ok) return { status: response.status, body: "", retryAfter: response.headers.get("retry-after") ?? undefined };
+      if (!response.ok)
+        return {
+          status: response.status,
+          body: "",
+          retryAfter: response.headers.get("retry-after") ?? undefined,
+        };
       try {
         const organizations = JSON.parse(body);
-        body = JSON.stringify(organizations.map(({ uuid, capabilities }) => ({ uuid, capabilities })));
+        body = JSON.stringify(
+          organizations.map(({ uuid, capabilities }) => ({ uuid, capabilities })),
+        );
       } catch {
         return { status: 0, body: "", error: "Unexpected organization response" };
       }

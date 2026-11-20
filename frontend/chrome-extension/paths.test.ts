@@ -80,6 +80,7 @@ describe("ChatGPT request allowlist", () => {
     listPath("0", "true"),
     listPath("50", "true"),
     detailPath("22222222-2222-4222-8222-222222222222"),
+    "/backend-api/me",
   ])("accepts %s", async (path) => expect(await allowedPath("chatgpt", path)).toBe(true));
 
   it.each([
@@ -87,6 +88,7 @@ describe("ChatGPT request allowlist", () => {
     "/api/auth/session",
     "/backend-api/auth/session",
     "/backend-api/accounts/check",
+    "/backend-api/me?include=all",
     "https://chatgpt.com/backend-api/conversations?offset=0&limit=50&order=updated",
     listPath("0", "invalid"),
     listPath("-1"),
@@ -106,7 +108,7 @@ describe("ChatGPT request allowlist", () => {
 });
 
 describe("Gemini request allowlist", () => {
-  const rpc = "/_/BardChatUi/data/batchexecute?rpcids=";
+  const rpc = "/u/0/_/BardChatUi/data/batchexecute?rpcids=";
   const list = (cursor = "") => `${rpc}MaZiqc&cursor=${cursor}`;
   const detail = (chat: string, cursor = "") => `${rpc}hNvQHb&chat=${chat}&cursor=${cursor}`;
 
@@ -115,11 +117,18 @@ describe("Gemini request allowlist", () => {
     list("Ab12%2Bcd%2F%3D"),
     detail("c_0123456789abcdef"),
     detail("c_0123456789abcdef", "Ab12%2Bcd%2F%3D"),
+    list().replace("/u/0/", "/u/9/"),
+    "/u/0/app",
+    "/u/3/app",
   ])("accepts %s", async (path) => expect(await allowedPath("gemini", path)).toBe(true));
 
   it.each([
     "",
     "/app",
+    "/u/0/app/c_0123456789abcdef",
+    list().replace("/u/0", ""),
+    list().replace("/u/0/", "/u/10/"),
+    list().replace("/u/0/", "/u/x/"),
     `${rpc}ESY5D&cursor=`,
     `${list()}&rpcids=ESY5D`,
     list("a&rpcids=ESY5D"),
@@ -141,6 +150,7 @@ describe("Grok request allowlist", () => {
     `${conversations}?pageSize=100`,
     `${conversations}?pageSize=100&pageToken=${token}`,
     `${conversations}/${chat}/responses`,
+    "/rest/subscriptions",
   ])("accepts %s", async (path) => expect(await allowedPath("grok", path)).toBe(true));
 
   it.each([

@@ -70,7 +70,7 @@ func waitBrowserGap(ctx context.Context, gap time.Duration) error {
 // SyncChatGPT appends new turns and replaces edited conversation branches.
 func SyncChatGPT(ctx context.Context, store BrowserSyncStore, fetch func(context.Context, string) (ClaudeAIResponse, error), cb *ImportCallbacks, machine ...string,
 ) (stats ImportStats, retErr error) {
-	accountPath := browserRequest(chatgptRequests, chatGPTAccountRequest)
+	accountPath := browserRequest(chatGPTRequests, chatGPTAccountRequest)
 	account, _ := browserAccount(ctx, fetch, accountPath)
 	var accountIDs []string
 	seen := make(map[string]struct{})
