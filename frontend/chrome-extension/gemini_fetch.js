@@ -2,6 +2,7 @@
 // POSTs, so the two allowed request shapes carry named parameters that
 // geminiFetch turns into each RPC's argument. The page's request token stays
 // in the page.
+(() => {
 const geminiPageSize = 20;
 const geminiArguments = {
   MaZiqc: (query) =>
@@ -34,34 +35,39 @@ function geminiPageValue(html, key) {
   }
 }
 
-// geminiSession returns the request token and build identifiers, reading the
-// open tab first and the app page when the tab has none or the token was refused.
+// The open tab can belong to a different account than the requested slot.
 async function geminiSession(account, refresh) {
-  if (!refresh && globalThis.__agentsviewGemini) return globalThis.__agentsviewGemini;
-  globalThis.__agentsviewGemini = undefined;
-  let html = refresh ? "" : document.documentElement.innerHTML;
-  if (!geminiPageValue(html, "SNlM0e")) {
-    const page = await globalThis.claudeFetch(`${location.origin}${account}/app`);
-    if (page.status < 200 || page.status >= 300) return page;
-    html = page.body;
-  }
+  const sessions = (globalThis.__agentsviewGeminiSessions ??= new Map());
+  if (!refresh && sessions.has(account)) return sessions.get(account);
+  sessions.delete(account);
+  const page = await globalThis.claudeFetch(`${location.origin}${account}/app`);
+  if (page.status !== 200) return { status: page.status, body: "" };
+  const html = page.body;
+  const identity = geminiPageValue(html, "obfuscatedGaiaId");
   const session = {
     at: geminiPageValue(html, "SNlM0e"),
     sid: geminiPageValue(html, "FdrFJe"),
     bl: geminiPageValue(html, "cfb2h"),
+    accountReply: await globalThis.browserAccountReply(/^\d{10,30}$/.test(identity) ? identity : ""),
   };
   if (!session.at) return { status: 401, body: "" };
-  globalThis.__agentsviewGemini = session;
+  sessions.set(account, session);
   return session;
 }
 
-async function geminiFetch(url) {
+globalThis.geminiFetch = async function geminiFetch(url) {
   try {
     const request = new URL(url);
+    const slot = /^\/u\/([0-9])(?=\/)/.exec(request.pathname);
+    if (!slot) return { status: 0, body: "", error: "Unsupported Gemini account slot" };
+    const account = slot[1] === "0" ? "" : slot[0];
+    if (request.pathname === `${slot[0]}/app`) {
+      const session = await geminiSession(account, true);
+      return session.accountReply ?? session;
+    }
     const rpc = request.searchParams.get("rpcids");
     if (!Object.hasOwn(geminiArguments, rpc))
       return { status: 0, body: "", error: "Unsupported Gemini request" };
-    const account = location.pathname.match(/^\/u\/\d+(?=\/)/)?.[0] ?? "";
     for (const refresh of [false, true]) {
       const session = await geminiSession(account, refresh);
       if (!session.at) return session;
@@ -88,11 +94,12 @@ async function geminiFetch(url) {
       // A refused token is fetched again once; a second refusal reaches Sync.
       if (refresh || (response.status !== 400 && response.status !== 401)) {
         if (response.status === 400 || response.status === 401)
-          globalThis.__agentsviewGemini = undefined;
+          globalThis.__agentsviewGeminiSessions.delete(account);
         return response;
       }
     }
   } catch (error) {
     return { status: 0, body: "", error: String(error) };
   }
-}
+};
+})();

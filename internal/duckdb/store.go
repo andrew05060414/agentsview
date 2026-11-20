@@ -294,7 +294,7 @@ func (s *Store) SetCursorSecret(secret []byte) {
 
 func (s *Store) ReadOnly() bool { return true }
 
-const duckSessionCols = `id, project, project_assigned, machine, agent,
+const duckSessionCols = `id, project, project_assigned, machine, account, agent,
 	agent_label, entrypoint, session_kind,
 	first_message, COALESCE(display_name, session_name) AS display_name, created_at, started_at,
 	ended_at, message_count, user_message_count,
@@ -332,7 +332,7 @@ func scanSessionWithSource(
 	var createdAt, localModifiedAt any
 	var startedAt, endedAt, deletedAt any
 	targets := []any{
-		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Agent,
+		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Account, &s.Agent,
 		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 		&s.FirstMessage, &s.DisplayName,
 		&createdAt, &startedAt, &endedAt,

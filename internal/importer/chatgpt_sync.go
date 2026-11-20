@@ -26,6 +26,7 @@ var chatGPTRequests string
 const (
 	chatGPTListRequest = iota
 	chatGPTDetailRequest
+	chatGPTAccountRequest
 )
 
 // The list and detail endpoints stamp update_time independently; one real capture showed detail 0.68 s later.
@@ -69,6 +70,9 @@ func waitBrowserGap(ctx context.Context, gap time.Duration) error {
 // SyncChatGPT appends new turns and replaces edited conversation branches.
 func SyncChatGPT(ctx context.Context, store BrowserSyncStore, fetch func(context.Context, string) (ClaudeAIResponse, error), cb *ImportCallbacks, machine ...string,
 ) (stats ImportStats, retErr error) {
+	accountPath := browserRequest(chatgptRequests, chatGPTAccountRequest)
+	account, _ := browserAccount(ctx, fetch, accountPath)
+	var accountIDs []string
 	seen := make(map[string]struct{})
 	var formatErr error
 	runner := browserSync{
@@ -123,6 +127,7 @@ func SyncChatGPT(ctx context.Context, store BrowserSyncStore, fetch func(context
 				}
 				seen[marker.ID] = struct{}{}
 				id := "chatgpt:" + marker.ID
+				accountIDs = append(accountIDs, id)
 				err := runner.conversation(ctx, id, browserConversation{
 					freshness: func(session *db.Session) uint64 { return chatGPTFreshness(updatedAt, session) },
 					fetch: func(ctx context.Context) ([]byte, error) {
@@ -153,7 +158,7 @@ func SyncChatGPT(ctx context.Context, store BrowserSyncStore, fetch func(context
 			offset += len(page.Items)
 		}
 	}
-	return stats, formatErr
+	return stats, errors.Join(formatErr, runner.confirmAccount(ctx, fetch, accountPath, account, accountIDs))
 }
 
 var errChatGPTFormat = errors.New("ChatGPT returned a conversation format this version can't read. Update AgentsView and try again")

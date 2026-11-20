@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,
     project     TEXT NOT NULL,
     machine     TEXT NOT NULL DEFAULT 'local',
+    account     TEXT NOT NULL DEFAULT '',
     agent       TEXT NOT NULL DEFAULT 'claude',
     agent_label TEXT NOT NULL DEFAULT '',
     entrypoint  TEXT NOT NULL DEFAULT '',

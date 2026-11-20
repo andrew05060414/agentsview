@@ -1059,7 +1059,7 @@ func (s *Sync) sessionFingerprints(
 func duckSessionFingerprintFields(sess db.Session, machine string) []any {
 	return []any{
 		sess.ID, sess.Project, sess.ProjectAssigned,
-		db.MirroredSessionMachine(sess, machine), sess.Agent,
+		db.MirroredSessionMachine(sess, machine), sess.Account, sess.Agent,
 		sess.AgentLabel, sess.Entrypoint, sess.SessionKind,
 		nilString(sess.FirstMessage), nilString(sess.DisplayName),
 		nilString(sess.SessionName),

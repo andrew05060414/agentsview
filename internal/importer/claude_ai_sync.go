@@ -86,31 +86,22 @@ type ClaudeAIResponse struct {
 // SyncClaudeAI imports changed conversations through the existing export importer.
 func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(context.Context, string) (ClaudeAIResponse, error), orgs []string, cb *ImportCallbacks, machine ...string,
 ) (stats ImportStats, retErr error) {
-	raw, err := fetchClaudeAI(ctx, fetch, claudeAIRequest(claudeAIOrganizationsRequest, "", "", 0))
+	organizations, err := claudeAIChatOrganizations(ctx, fetch)
 	if err != nil {
 		return stats, err
 	}
-	var organizations []struct {
-		UUID         string   `json:"uuid"`
-		Capabilities []string `json:"capabilities"`
-	}
-	if err := json.Unmarshal(raw, &organizations); err != nil {
-		return stats, err
-	}
-	if organizations == nil {
-		return stats, errors.New("claude organizations must be an array")
-	}
+	accountIDs := make(map[string][]string)
 
 	runner := browserSync{
 		store: store, agent: parser.AgentClaudeAI, stats: &stats, cb: cb, machine: machine,
 		tooLarge: ErrClaudeAIResponseTooLarge, stop: func(err error) bool { return errors.Is(err, ErrClaudeAIAuthRequired) },
 	}
 	for _, org := range organizations {
-		if !slices.Contains(org.Capabilities, "chat") || (len(orgs) > 0 && !slices.Contains(orgs, strings.ToLower(org.UUID))) {
+		if len(orgs) > 0 && !slices.Contains(orgs, strings.ToLower(org)) {
 			continue
 		}
 		for offset := 0; ; {
-			raw, err := fetchClaudeAI(ctx, fetch, claudeAIRequest(claudeAIConversationsRequest, org.UUID, "", offset))
+			raw, err := fetchClaudeAI(ctx, fetch, claudeAIRequest(claudeAIConversationsRequest, org, "", offset))
 			if err != nil {
 				return stats, err
 			}
@@ -166,10 +157,11 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 					continue
 				}
 				id := "claude-ai:" + marker.UUID
+				accountIDs[org] = append(accountIDs[org], id)
 				err := runner.conversation(ctx, id, browserConversation{
 					freshness: func(session *db.Session) uint64 { return claudeAIFreshness(store, marker.UpdatedAt, leaf, session) },
 					fetch: func(ctx context.Context) ([]byte, error) {
-						return fetchClaudeAI(ctx, fetch, claudeAIRequest(claudeAIConversationRequest, org.UUID, marker.UUID, 0))
+						return fetchClaudeAI(ctx, fetch, claudeAIRequest(claudeAIConversationRequest, org, marker.UUID, 0))
 					},
 					parse: func(detail []byte) (parser.ParseResult, error) {
 						result, err := parser.ParseClaudeAIDetail(detail)
@@ -197,7 +189,40 @@ func SyncClaudeAI(ctx context.Context, store BrowserSyncStore, fetch func(contex
 			}
 		}
 	}
-	return stats, nil
+	after, err := claudeAIChatOrganizations(ctx, fetch)
+	if err == nil && slices.Equal(organizations, after) {
+		for _, org := range organizations {
+			if err := runner.labelAccount(ctx, "claude-ai:"+org, accountIDs[org]); err != nil {
+				return stats, err
+			}
+		}
+	}
+	return stats, ctx.Err()
+}
+
+func claudeAIChatOrganizations(ctx context.Context, fetch browserFetchFunc) ([]string, error) {
+	raw, err := fetchClaudeAI(ctx, fetch, claudeAIRequest(claudeAIOrganizationsRequest, "", "", 0))
+	if err != nil {
+		return nil, err
+	}
+	var organizations []struct {
+		UUID         string   `json:"uuid"`
+		Capabilities []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &organizations); err != nil {
+		return nil, err
+	}
+	if organizations == nil {
+		return nil, errors.New("claude organizations must be an array")
+	}
+	ids := make([]string, 0, len(organizations))
+	for _, org := range organizations {
+		if org.UUID != "" && slices.Contains(org.Capabilities, "chat") {
+			ids = append(ids, org.UUID)
+		}
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids), nil
 }
 
 // claudeAILeafKind names the JSON shape of a list item's current leaf without

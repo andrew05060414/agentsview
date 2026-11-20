@@ -70,6 +70,7 @@ type ConfiguredReplica struct {
 
 // PusherOptions scopes one connected push session.
 type PusherOptions struct {
+	AccountAliases map[string]string
 	// Projects limits push scope to these project names.
 	// Mutually exclusive with ExcludeProjects.
 	Projects []string
