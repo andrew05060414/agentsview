@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -27,24 +28,24 @@ const machineFilterHelp = "Exact machine IDs or aliases (comma-separated), or on
 
 func newSessionListCommand() *cobra.Command {
 	var (
-		project, excludeProject, machine, agent string
-		date, dateFrom, dateTo, activeSince     string
-		since                                   string
-		minMessages, maxMessages                int
-		minUserMessages                         int
-		includeOneShot                          bool
-		includeAutomated, includeChildren       bool
-		includeSource                           bool
-		outcome, healthGrade                    string
-		minToolFailures                         int
-		hasSecret                               bool
-		labels                                  []string
-		pr                                      string
-		cursor                                  string
-		limit                                   int
-		sort                                    string
-		reverse                                 bool
-		resume, active                          bool
+		project, excludeProject, machine, account, agent string
+		date, dateFrom, dateTo, activeSince              string
+		since                                            string
+		minMessages, maxMessages                         int
+		minUserMessages                                  int
+		includeOneShot                                   bool
+		includeAutomated, includeChildren                bool
+		includeSource                                    bool
+		outcome, healthGrade                             string
+		minToolFailures                                  int
+		hasSecret                                        bool
+		labels                                           []string
+		pr                                               string
+		cursor                                           string
+		limit                                            int
+		sort                                             string
+		reverse                                          bool
+		resume, active                                   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "list",
@@ -70,6 +71,7 @@ func newSessionListCommand() *cobra.Command {
 				Project:            project,
 				ExcludeProject:     excludeProject,
 				Machine:            machine,
+				Account:            account,
 				Agent:              agent,
 				Date:               date,
 				DateFrom:           dateFrom,
@@ -181,6 +183,7 @@ func newSessionListCommand() *cobra.Command {
 		"Filter by project name")
 	flags.StringVar(&excludeProject, "exclude-project", "",
 		"Exclude sessions from the given project")
+	flags.StringVar(&account, "account", "", "Filter by web account ID or alias")
 	flags.StringVar(&machine, "machine", "",
 		machineFilterHelp)
 	flags.StringVar(&agent, "agent", "",
@@ -330,14 +333,19 @@ func printSessionListHuman(
 		return nil
 	}
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "\tID\tAGE\tAGENT\tPROJECT\tBRANCH\tMSGS\tNAME\tCWD")
+	hasAccount := slices.ContainsFunc(list.Sessions, func(s db.Session) bool { return s.Account != "" })
+	fmt.Fprint(tw, "\tID\tAGE\tAGENT\tPROJECT\tBRANCH\tMSGS\tNAME\tCWD")
+	if hasAccount {
+		fmt.Fprint(tw, "\tACCOUNT")
+	}
+	fmt.Fprintln(tw)
 	for _, s := range list.Sessions {
 		marker := ""
 		if isSessionRecentlyActive(s, now) {
 			marker = activeMarker
 		}
 		name := truncName(sessionDisplayName(s), sessionNameWidth)
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s",
 			marker,
 			sanitizeTerminal(s.ID),
 			humanizeSessionAge(s, now),
@@ -348,6 +356,10 @@ func printSessionListHuman(
 			sanitizeTerminal(name),
 			sanitizeTerminal(collapseHome(s.Cwd, home)),
 		)
+		if hasAccount {
+			fmt.Fprintf(tw, "\t%s", sanitizeTerminal(orEmDash(displayAccount(s.Account, list.AccountAliases[s.Account]))))
+		}
+		fmt.Fprintln(tw)
 	}
 	if err := tw.Flush(); err != nil {
 		return err

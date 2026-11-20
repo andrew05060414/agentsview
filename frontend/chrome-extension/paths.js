@@ -50,6 +50,11 @@ function shapePattern(shape) {
 
 export async function allowedPath(platform, path) {
   if (typeof path !== "string") return false;
+  if (platform === "gemini") {
+    const account = /^\/u\/[0-9](?=\/)/.exec(path);
+    if (!account) return false;
+    path = path.slice(account[0].length);
+  }
   const shapes = await shapesFor(platform);
   return shapes?.some((shape) => shape.test(path)) ?? false;
 }

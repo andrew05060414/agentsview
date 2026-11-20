@@ -48,6 +48,7 @@ type contentSearchInput struct {
 	Reveal             bool               `query:"reveal" doc:"Return unredacted secret matches for localhost callers"`
 	Project            string             `query:"project" doc:"Filter by project"`
 	ExcludeProject     string             `query:"exclude_project" doc:"Exclude a project"`
+	Account            string             `query:"account" doc:"Web account ID or alias"`
 	Machine            string             `query:"machine" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Blank means all machines; unknown or ambiguous values return HTTP 400."`
 	GitBranch          string             `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	SessionID          string             `query:"session_id" doc:"Filter by exact full stored session ID"`
@@ -153,6 +154,7 @@ func (s *Server) humaSearchContent(
 		Project:            in.Project,
 		ExcludeProject:     in.ExcludeProject,
 		Machine:            in.Machine,
+		Account:            in.Account,
 		GitBranch:          in.GitBranch,
 		SessionID:          in.SessionID,
 		GitBranchExact:     in.GitBranchExact,

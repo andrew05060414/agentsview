@@ -79,6 +79,10 @@ func (s *Store) GetMachineAliases(ctx context.Context) (map[string]string, error
 	return s.sessions().GetMachineAliases(ctx)
 }
 
+func (s *Store) GetAccountAliases(context.Context) (map[string]string, error) {
+	return nil, nil
+}
+
 func (s *Store) SecretFindingSource(
 	ctx context.Context, f db.SecretFinding,
 ) (string, bool, error) {

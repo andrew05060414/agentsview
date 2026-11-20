@@ -9,7 +9,7 @@ import (
 const FrameLimit = 64 << 20
 
 // Version covers message encoding and supported request shapes; bump both peers together.
-const Version = 4
+const Version = 5
 
 type Platform string
 
