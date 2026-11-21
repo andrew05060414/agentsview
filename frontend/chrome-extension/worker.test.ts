@@ -28,7 +28,7 @@ const chrome = {
     query: vi.fn(),
     create: vi.fn(),
     get: vi.fn(),
-    remove: vi.fn(),
+    remove: vi.fn(async () => {}),
     onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
     onRemoved: { addListener: vi.fn(), removeListener: vi.fn() },
   },
@@ -153,7 +153,7 @@ describe("Chrome native host worker", () => {
     },
   );
 
-  it("injects pageFetch into a fresh tab and leaves it open", async () => {
+  it("injects pageFetch into a fresh tab and closes it afterwards", async () => {
     const pageFetch = vi.fn(() => ({ status: 200, body: "chats" }));
     chrome.scripting.executeScript.mockImplementation(async (options) => {
       if (options.files) {
@@ -168,13 +168,78 @@ describe("Chrome native host worker", () => {
       url: "https://claude.ai/new",
       active: false,
     });
-    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledExactlyOnceWith(8));
     expect(chrome.scripting.executeScript).toHaveBeenNthCalledWith(1, {
       target: { tabId: 8 },
       files: ["page_fetch.js"],
       world: "ISOLATED",
     });
     expect(pageFetch).toHaveBeenCalledExactlyOnceWith("https://claude.ai/api/organizations", {});
+  });
+
+  it("shares one background tab per site across concurrent requests and closes each once", async () => {
+    chrome.tabs.query.mockResolvedValue([]);
+    chrome.tabs.create.mockImplementation(async ({ url }: { url: string }) => ({
+      id: url.includes("claude") ? 8 : 9,
+    }));
+    chrome.tabs.get.mockImplementation(async (id: number) => ({ id, status: "complete" }));
+    for (const id of ["a", "b", "c"])
+      message({ id, platform: "claude-ai", path: "/api/organizations", version: 2 });
+    for (const id of ["d", "e"])
+      message({ id, platform: "claude-ai", path: "/api/organizations", version: 2 });
+    message({
+      id: "f",
+      platform: "grok-web",
+      path: "/rest/app-chat/conversations?pageSize=100",
+      version: 2,
+    });
+    await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledTimes(6));
+    expect(chrome.tabs.create).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledTimes(2));
+    expect(chrome.tabs.remove).toHaveBeenCalledWith(8);
+    expect(chrome.tabs.remove).toHaveBeenCalledWith(9);
+  });
+
+  it("retries once on a fresh tab when the tab dies mid-request", async () => {
+    chrome.tabs.query.mockResolvedValue([]);
+    chrome.tabs.create
+      .mockResolvedValueOnce({ id: 8 })
+      .mockResolvedValueOnce({ id: 9 });
+    chrome.tabs.get.mockImplementation(async (id: number) => ({ id, status: "complete" }));
+    let injected = 0;
+    chrome.scripting.executeScript.mockImplementation(async (options) => {
+      if (options.files) {
+        injected += 1;
+        if (injected === 1) throw new Error("Frame with ID 0 was removed");
+        return [{ result: true }];
+      }
+      return [{ result: { status: 200, body: "chats" } }];
+    });
+    expect(await request()).toEqual({ id: "a", version: 2, status: 200, body: "chats" });
+    expect(chrome.tabs.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips a dead tab the query still returns on the retry", async () => {
+    // The first attempt reuses the user's tab; it dies mid-request. The retry's
+    // query still lists it briefly, so it must be filtered out.
+    chrome.tabs.query.mockResolvedValue([{ id: 7 }]);
+    chrome.tabs.get.mockImplementation(async (id: number) => ({ id, status: "complete" }));
+    chrome.tabs.create.mockResolvedValue({ id: 8 });
+    let injected = 0;
+    chrome.scripting.executeScript.mockImplementation(async (options) => {
+      if (options.files) {
+        injected += 1;
+        if (options.target.tabId === 7) throw new Error("No tab with id: 7");
+        return [{ result: true }];
+      }
+      return [{ result: { status: 200, body: "chats" } }];
+    });
+    expect(await request()).toEqual({ id: "a", version: 2, status: 200, body: "chats" });
+    expect(injected).toBe(2);
+    expect(chrome.tabs.create).toHaveBeenCalledOnce();
+    // The dead tab belonged to the user: it is never closed by the worker.
+    // The tab the retry created is the worker's own and is closed.
+    await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledExactlyOnceWith(8));
   });
 
   it("sends a platform's headers with the page's cookies", async () => {
