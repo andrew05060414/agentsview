@@ -5669,6 +5669,25 @@ func reconciliationWatchRoot(
 	return best
 }
 
+// cursorIDEContainerCandidateSource reports whether a reconciliation
+// candidate's resolved source addresses a whole Cursor IDE state.vscdb
+// container. Lost-events recovery normally force-parses every candidate so a
+// dropped watcher event can never leave a stale source resting on an
+// inherited cache hit; a Cursor IDE container is the one exception, because
+// clearWatcherOverflowCaches already retains (and the forced discovery pass
+// would otherwise discard) a cache entry whose key proves freshness on its
+// own, independent of which events were lost. Forcing the candidate anyway
+// would still have defeated that retained entry: forceParseBypassesCache
+// skips the cache lookup entirely whenever file.ForceParse is set, so the
+// container would be fully reparsed despite the entry surviving in memory
+// and in skipped_files.
+func cursorIDEContainerCandidateSource(
+	agent parser.AgentType, source parser.SourceRef,
+) bool {
+	return agent == parser.AgentCursorIDE &&
+		parser.IsCursorIDEContainerSource(source)
+}
+
 func (e *Engine) rehydrateReconciliationPage(
 	ctx context.Context, page []reconciliationCandidate,
 	providers map[parser.AgentType]parser.Provider,
@@ -5677,7 +5696,6 @@ func (e *Engine) rehydrateReconciliationPage(
 	e.refreshReconciliationPageContainerCaptures(page)
 	files := make([]parser.DiscoveredFile, 0, len(page))
 	for _, candidate := range page {
-		forceCandidate := force
 		provider := providers[candidate.Provider]
 		if provider == nil {
 			return nil, fmt.Errorf("rehydrate %s source: provider unavailable", candidate.Provider)
@@ -5706,7 +5724,10 @@ func (e *Engine) rehydrateReconciliationPage(
 				) {
 					file := parser.DiscoveredFile{
 						Path: candidate.Path, Project: source.ProjectHint,
-						Agent: candidate.Provider, ForceParse: forceCandidate,
+						Agent: candidate.Provider,
+						ForceParse: force && !cursorIDEContainerCandidateSource(
+							candidate.Provider, source,
+						),
 						Machine:        candidate.Machine,
 						ProviderSource: &source, ProviderProcess: true,
 					}
@@ -5748,7 +5769,10 @@ func (e *Engine) rehydrateReconciliationPage(
 		)
 		file := parser.DiscoveredFile{
 			Path: candidate.Path, Project: source.ProjectHint,
-			Agent: candidate.Provider, ForceParse: forceCandidate,
+			Agent: candidate.Provider,
+			ForceParse: force && !cursorIDEContainerCandidateSource(
+				candidate.Provider, source,
+			),
 			// Carry the candidate's stored attribution: recomputing it from the
 			// physical path is wrong for providers whose source can sit outside
 			// the labeled root it was configured under.
