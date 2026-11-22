@@ -468,3 +468,34 @@ func TestCodexPlainChangedPathStaysGoneWhenNothingRolledOver(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, found)
 }
+
+func TestCodexRolloverBetweenDiscoveryAndParse(t *testing.T) {
+	root := t.TempDir()
+	content := codexRolloutContent(compressedThreadA, "rolled over mid-sync")
+	name := compressedDayPrefix + compressedThreadA + ".jsonl"
+	plain := writeFileIn(t, codexDayDir(root), name, []byte(content))
+
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source, ok := provider.(interface {
+		SourceRefForPath(string) (SourceRef, bool)
+	}).SourceRefForPath(plain)
+	require.True(t, ok)
+
+	// Codex compresses the rollout in place between discovery and parse.
+	require.NoError(t, os.Remove(plain))
+	compressed := writeFileIn(t, codexDayDir(root), name+".zst",
+		zstdCompress(t, []byte(content)))
+
+	// The source captured before the rollover must still fingerprint and
+	// parse the compressed sibling.
+	fingerprint, err := provider.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source, Fingerprint: fingerprint})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0].Result
+	assert.Equal(t, compressed, result.Session.File.Path)
+	assert.Equal(t, 2, result.Session.MessageCount)
+	assert.NotEmpty(t, result.Session.FirstMessage)
+}

@@ -1390,10 +1390,12 @@ func (s codexSourceSet) Fingerprint(
 func (s codexSourceSet) pathFromSource(source SourceRef) (string, bool) {
 	switch src := source.Opaque.(type) {
 	case codexSource:
-		return src.Path, src.Path != ""
+		if src.Path != "" {
+			return codexRolloverSibling(src.Path), true
+		}
 	case *codexSource:
 		if src != nil && src.Path != "" {
-			return src.Path, true
+			return codexRolloverSibling(src.Path), true
 		}
 	case MaterializedFileSource:
 		return src.Path, src.Path != ""
@@ -1403,6 +1405,7 @@ func (s codexSourceSet) pathFromSource(source SourceRef) (string, bool) {
 		source.FingerprintKey,
 		source.Key,
 	} {
+		candidate = codexRolloverSibling(candidate)
 		for _, root := range s.roots {
 			if ref, ok := s.sourceRef(root, candidate, true); ok {
 				src := ref.Opaque.(codexSource)
