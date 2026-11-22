@@ -42,6 +42,25 @@ func TestRunDoesNotPrintPaths(t *testing.T) {
 	assert.NotContains(t, diagnostics.String(), root)
 }
 
+func TestRunIgnoresNonTranscriptJSONL(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "agent-10000000-0000-4000-8000-000000000001", "sessions")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "notes.jsonl"), []byte("{}\n"), 0o600))
+
+	var output, diagnostics bytes.Buffer
+	assert.Equal(t, 2, run(t.Context(), root, &output, &diagnostics))
+	assert.JSONEq(t, `{"parsed":0,"skipped":0,"failed":0,"messages":0,"malformed_lines":0}`, output.String())
+	assert.Contains(t, diagnostics.String(), "No Muse transcript files were found")
+
+	writeTranscript(t, root, 1, 2, "")
+	output.Reset()
+	diagnostics.Reset()
+	assert.Equal(t, 0, run(t.Context(), root, &output, &diagnostics))
+	assert.JSONEq(t, `{"parsed":0,"skipped":1,"failed":0,"messages":0,"malformed_lines":0}`, output.String())
+	assert.Empty(t, diagnostics.String())
+}
+
 func writeTranscript(t *testing.T, root string, n, version int, records string) string {
 	t.Helper()
 	id := fmt.Sprintf("10000000-0000-4000-8000-%012d", n)

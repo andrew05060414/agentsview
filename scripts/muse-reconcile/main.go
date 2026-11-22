@@ -103,8 +103,12 @@ func reconcile(ctx context.Context, root string) (counts, error) {
 			if err := ctx.Err(); err != nil {
 				return counts{}, err
 			}
-			if file.Type().IsRegular() && strings.HasSuffix(file.Name(), ".jsonl") {
-				auditFile(ctx, provider, root, filepath.Join(dir, file.Name()), seen, &total)
+			if !file.Type().IsRegular() || !strings.HasSuffix(file.Name(), ".jsonl") {
+				continue
+			}
+			rel := filepath.Join(agent.Name(), "sessions", file.Name())
+			if parser.MusePersonalSessionFileShape(rel) {
+				auditFile(ctx, provider, root, filepath.Join(root, rel), seen, &total)
 			}
 		}
 	}
@@ -112,11 +116,6 @@ func reconcile(ctx context.Context, root string) (counts, error) {
 }
 
 func auditFile(ctx context.Context, provider parser.Provider, root, path string, seen map[string]bool, total *counts) {
-	rel, err := filepath.Rel(root, path)
-	if err != nil || !parser.MusePersonalSessionFileShape(rel) {
-		total.Skipped++
-		return
-	}
 	// The provider rejects unsupported versions. Classify them separately from
 	// malformed or unreadable files in this audit.
 	version, err := headerVersion(path)
