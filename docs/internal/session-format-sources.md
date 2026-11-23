@@ -332,7 +332,8 @@ fixtures retain this field; missing identities remain source-local.
   disagrees with its repository or number. The record does not say whether the
   session opened the pull request. Undocumented upstream; evidence is
   `no-public-source`. See `claudePRLink` in `internal/parser/claude.go` and
-  `internal/parser/pr_links.go`.
+  `internal/parser/pr_links.go`. AgentsView also extracts URLs from retained
+  user prompts across providers; a mention does not establish active work.
 
 - **Continuation parsing (2026-10-01):** Rechecked the native provider with the
   synthetic two-parent fixture in
@@ -3084,6 +3085,16 @@ schemas keep their existing ordering behavior.
 
 ## Cursor (`cursor`)
 
+- **Team usage:** The [Admin API](https://cursor.com/docs/account/teams/admin-api)
+  documents numeric user IDs in paginated daily usage data and as a filter for
+  usage events; its usage-event example does not include a user ID. An
+  unfiltered sync uses member-filtered responses to match accounts and records
+  the matched account and unfiltered fetch completion time in separate columns.
+  Events absent from that unfiltered fetch wait for a later sync.
+  A later empty poll replaces an earlier covered account-hour with zero usage.
+  Archives with account stamps require data version 185 or newer. The event's original `user_id`, `user_email`, and dedup key
+  remain unchanged.
+
 - **Dialogue projection:** Reverified 2026-10-17 against the JSONL parser and
   shared block fixtures. Assistant text and thinking blocks remain separate.
   Cursor IDE uses a different parser.
@@ -4891,6 +4902,52 @@ schemas keep their existing ordering behavior.
   session moved between two configured roots: syncing its former root, even
   after removing the old profile, preserves the complete archived session as
   source-present. This includes profiles named `sessions` or `state.db`.
+
+## Factory Droid (`factory`)
+
+- **Format:** One `<uuid>.jsonl` transcript per session under
+  `~/.factory/sessions/<cwd-slug>/` (the working directory with `/` replaced
+  by `-`), plus a `<uuid>.settings.json` sidecar. The transcript opens with a
+  `session_start` record (`id`, `title`, `cwd`, `owner`, and, for a session
+  started by another session's tool call, `callingSessionId` and
+  `callingToolUseId`) followed by `message` records whose `message.content`
+  uses Anthropic-shaped blocks (`text`, `thinking`, `tool_use`, `tool_result`,
+  `image`); `todo_state`, `agent_turn_outcome`, `compaction_state`, and
+  `session_end` records carry no transcript content. Assistant messages carry
+  `modelId` and `reasoningEffort`.
+- **Visibility:** User records with `visibility: "llm_only"` are Droid-injected
+  `<system-reminder>` context. `visibility: "user_only"` marks three things:
+  hook runs (`hookEventName` with empty `content`), UI notices such as
+  provider errors and MCP status (user text), and nested Script tool calls
+  (assistant `tool_use` and user `tool_result` pairs). A prompt with pasted
+  images carries `image` blocks and an "Attached image local file paths"
+  `<system-reminder>` text block ahead of the typed text.
+- **Evidence:** `no-public-source`.
+- **Upstream:** The [Factory documentation](https://docs.factory.ai) was checked
+  2026-09-02; the Droid CLI is closed source and no persistence schema is
+  published. The format above is recorded from local observation of
+  `version: 2` transcripts, rechecked 2026-11-16 against current Droid output;
+  see kenn-io/agentsview#1358.
+- **Usage and cost:** The transcript carries no per-message usage. The
+  `settings.json` sidecar keeps session-cumulative `tokenUsage`
+  (`inputTokens`, `outputTokens`, `cacheCreationTokens`, `cacheReadTokens`,
+  `thinkingTokens`) plus a proprietary `factoryCredits` figure that Agentsview
+  does not use, the session `model`, and the provider in `providerLock`
+  (earlier releases wrote `apiProviderLock`). `inclusiveTokenUsage` equals
+  `tokenUsage` plus every entry in `childInclusiveTokenUsageBySessionId`,
+  which holds the totals of subagent sessions this session started. Most
+  subagents leave no transcript; a persisted one sits beside its parent with a
+  `session_start.callingSessionId` link and matching totals in its own
+  sidecar. Agentsview emits one aggregate usage event from `tokenUsage`, plus
+  one event per child, priced as the parent's model because the sidecar does
+  not record the child's model. A session with `callingSessionId` emits no
+  usage, so each child is counted once, on its parent, whether or not its
+  transcript exists. All Factory events use the `session` source because they
+  are cumulative totals, so per-request token bounds do not apply and peak
+  context stays unknown. Bring-your-own-key models are recorded as
+  `custom:<name>-<index>` and stay unpriced without a custom pricing entry.
+- **Agentsview:** `internal/parser/factory.go` and
+  `internal/parser/factory_provider.go`.
 
 ## Forge (`forge`)
 

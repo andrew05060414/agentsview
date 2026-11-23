@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-11-18
+last_edited: 2026-11-20
 title: Changelog
 description: Release history for AgentsView
 ---
@@ -10,6 +10,10 @@ The latest release is
 ## Unreleased
 
 **New features**
+
+- Read large MCP pattern-search results, messages, and tool calls in pages that fit
+  within a 12,000-byte response budget. A page can contain fewer items than the
+  requested limit or a shorter message chunk, and reports how to continue.
 
 - Sync ChatGPT chats into AgentsView without waiting for an export email. Run
   `agentsview source import --type chatgpt --sync` with Chrome open and signed
@@ -42,6 +46,14 @@ The latest release is
   `cursor_admin_api_key_file`. A missing or unsafe file is an error that names
   the setting; AgentsView never falls back to another source. See
   [Read secrets from files](/docs/configuration/#read-secrets-from-files).
+
+- Browse, search, and track usage for Factory Droid sessions. AgentsView reads
+  `~/.factory/sessions/` by default, including prompts with pasted images and
+  nested tool calls, and links subagent sessions to the session that started
+  them. Token totals come from each session's settings file, so usage appears
+  per session rather than per message. Each subagent's usage is counted once,
+  on the session that started it, including subagents that left no
+  transcript. `FACTORY_DIR` or `factory_dirs` change the directory.
 
 - Track token usage and cost for tools that call model APIs directly, with no
   coding agent in between. Such a tool writes body-free session files to
@@ -103,7 +115,8 @@ The latest release is
   tool. See [Recall](/docs/recall/#current-surface).
 
 - `agentsview agent setup` installs the AgentsView skills and registers the MCP
-  server for Claude Code and Codex in one step. See
+  server for Claude Code and Codex in one step. Use `--mcp=false` to leave an
+  existing MCP entry alone while installing or checking skills. See
   [`agentsview agent setup`](/docs/commands/#agentsview-agent-setup).
 
 - Claude Code users can install AgentsView Memory from the repository's plugin
@@ -133,6 +146,29 @@ The latest release is
 
 - `integrations.docbank.allow_http = true` allows plain HTTP to Docbank on a
   trusted network.
+
+- Hosted raw sync servers can embed uploaded sessions themselves, so
+  `agentsview session search --pg --semantic` finds them and laptops do no
+  embedding work. Install pgvector, set `[vector]` and `[vector.embeddings]` on
+  the server, provision again, and grant the runtime role the vector tables.
+  See
+  [Provision a hosted instance](/docs/hosted-raw-sync/#provision-a-hosted-instance).
+
+- Apply a changed tool-result image policy from Settings with **Restart now**
+  instead of restarting AgentsView by hand. Servers that cannot restart
+  themselves show the manual steps. See
+  [`agentsview daemon`](/docs/commands/#agentsview-daemon).
+
+- New users see a **Get started** card on the dashboard that points to opening a
+  session, searching, token use, and insights. It goes away once every step is
+  done or you dismiss it.
+
+- The command palette reopens your last search after you pick a result, with
+  the result you picked highlighted, so trying the next one is one arrow key
+  away. Escape or the clear button starts fresh.
+
+- When a full-text search in the command palette fails, it retries once and
+  then offers **Retry**. See [Search Modes](/docs/usage/#search-modes).
 
 **Improvements**
 
@@ -240,7 +276,40 @@ The latest release is
   kept, as after an interrupted push, the push uploads the whole snapshot as
   before.
 
+- Remote syncs download only the new lines of a growing transcript instead of
+  the whole file, so a host with long active sessions sends kilobytes instead of
+  hundreds of megabytes. Both ends need this release; an older remote still
+  sends whole files. See
+  [How A Sync Works](/docs/remote-access/#how-a-sync-works).
+
+- A sync gives up on an offline HTTP remote after 10 seconds instead of 30, so
+  the hosts after it start sooner. On Windows, a refused or unreachable remote
+  is now skipped as offline instead of failing the sync, as on macOS and Linux.
+
+- A remote sync started through the daemon now finishes even if the
+  `agentsview sync` that asked for it is killed or times out, so a long
+  re-parse completes once instead of restarting on every scheduled run. Ctrl-C
+  stops only the CLI; stop the daemon to stop the import.
+
+- A page or panel whose data fails to load now says so, shows the server's
+  message, and offers **Retry**, instead of looking empty. The status bar shows
+  "status unavailable" with Retry when the local server stops answering.
+
+- Broad searches through a server, from the command palette or the
+  `search_sessions` MCP tool, no longer fail with `503 request timed out` after
+  `--write-timeout`. Cancelling still stops the search.
+
 **Bug fixes**
+
+- Search session messages by ID without a pattern, and use concepts with any
+  mode.
+
+- The container image now accepts hosted raw-sync uploads when it runs as a
+  non-root uid with no passwd entry, such as a Kubernetes pod with `runAsUser`.
+  Before, every upload failed and the client kept retrying it as pending. The
+  image now sets `DOCBANK_LOCK_DIR=/data/docbank-locks`. The server also logs
+  the cause of any unexpected raw-sync failure. See
+  [Hosted Raw Sync](/docs/hosted-raw-sync/#provision-a-hosted-instance).
 
 - `agentsview source cursor sync-usage` no longer aborts when Cursor rate-limits
   it. Cursor allows 60 requests per minute per team, so a sync that needed more
@@ -250,6 +319,13 @@ The latest release is
   or a server error, waiting as long as Cursor's `Retry-After` asks or backing
   off when it does not say, and reports each wait on stderr. See
   [`source cursor sync-usage`](/docs/commands/#agentsview-source-cursor-sync-usage).
+
+- Daemon-backed PostgreSQL and ClickHouse push watchers no longer reject
+  change-triggered pushes when the client and daemon use different source roots.
+  Push watchers follow committed archive changes from the daemon without starting
+  a second filesystem watcher. Startup, periodic catch-up and shutdown still sync
+  sources through the archive owner.
+
 - A growing Codex session no longer leaves a removed copy of every earlier
   message in the conversation export index each time it is fully re-read. A
   long session could add millions of such rows and many gigabytes to the
@@ -348,12 +424,61 @@ The latest release is
   the lost records are still missing, but the count shows that the totals may
   be low. Existing sessions pick up the count the next time their source
   changes; the upgrade does not trigger a resync.
+- Grok sessions keep their history from before each compaction and mark each
+  compaction with a divider holding its summary. Tool calls now show in the
+  transcript. Existing Grok sessions are reread on upgrade.
+- Mistral Vibe 3.1 sessions sync again instead of failing with
+  `unsupported Vibe unified version`.
+- Cursor IDE chats in the newer `_v: 18` format appear instead of being
+  skipped.
+- Antigravity CLI sessions keep the prompt you typed when a skill expands in the
+  same step.
+- Claude.ai Sync no longer reports an error for chats with no message tree; it
+  skips them.
+- DeepSeek Harness messages keep their native IDs, so pins and conversation
+  exports keep a stable identity across rescans.
+- Commits made through Codex's older `shell` tool, such as
+  `["bash","-lc","git commit -m fix"]`, now get commit links.
+- Pi, OMO, and StepCode discovery no longer descends into `subagent-artifacts`,
+  where a dangling symlink could keep sync rescanning.
+- Usage and cost now include model calls that recorded tokens but showed no text
+  for OpenCode, Kilo, MiMo Code, iCodeMate, OpenClaw, QClaw, Forge, Cline, and
+  Gemini CLI. The next sync reparses these sessions in place.
+- PostgreSQL sync works with CockroachDB 25.4: schema setup finishes and session
+  pushes no longer fail on `starts_with()`.
+- ClickHouse global search on a large mirror returns results instead of an HTTP
+  500 from ClickHouse's per-query memory limit.
+- The AgentsView Memory plugin's search agent now starts in Claude Code,
+  instead of being refused for having no tools.
+- Daemon restarts on Windows no longer fail to open the archive while the old
+  process is still releasing its database lock or shared-memory file.
+- On macOS, folders watched one level deep, such as OpenHands conversations, use
+  FSEvents. The old watcher could rarely close an unrelated file or hang the
+  daemon.
+- AgentsView Desktop shows startup progress for large archives instead of
+  looking frozen.
+- In-session find no longer jumps back to the current match each time a live
+  session adds messages.
+- `agentsview serve` no longer prints "Using available port N" and then fails
+  with `address already in use`.
+- `capture report` says `finalization_timeout`, not `no_session`, when its wait
+  ends before it looked for the session.
+- Semantic search builds of messages and Recall that run at the same time no
+  longer fail with `database is locked`.
 
 **Upgrade notes**
 
+- Usage telemetry is off unless you have opted in or set `TELEMETRY_ENABLED=1`.
+- PostgreSQL semantic search now requires pgvector 0.8 or newer. On pgvector
+  0.7, `pg serve` reports semantic search unavailable, and CLI and MCP hybrid
+  searches return keyword matches. Upgrade pgvector to restore semantic results
+  without rebuilding vectors.
 - If you turned on built-in search by meaning in another app that uses Kit,
   AgentsView now turns it on too. Set `[vector] enabled = false` to keep it off.
   See [Turned on in another app](/docs/semantic-search/#turned-on-in-another-app).
+- The **Trends** page is no longer in the web UI, and old `/trends` links open
+  Sessions. Agent harnesses that read term counts can call the new
+  `get_term_trends` MCP tool, and `GET /api/v1/trends/terms` still works.
 - Chrome Sync users must rerun `agentsview source chrome setup` and reload the
   extension at `chrome://extensions` once. The extension and AgentsView now
   speak a new version of their protocol, and the extension asks for access to
@@ -370,6 +495,19 @@ The latest release is
   `config.toml` is ignored, and `AGENTSVIEW_DUCKDB_*` variables have no effect.
   For a read-only copy of your archive, use the
   [PostgreSQL](/docs/pg-sync/) or [ClickHouse](/docs/clickhouse-sync/) replica.
+- Hosted raw sync operators: the runtime role now needs `SELECT, INSERT` on
+  `session_usage_totals` and `INSERT, UPDATE` on `excluded_sessions`. A role
+  created from the 0.47.0 grants lacks both, and startup fails with
+  `hosted runtime projection privileges for ... are incomplete`. Grant them as
+  the owner before upgrading; see
+  [Provision a hosted instance](/docs/hosted-raw-sync/#provision-a-hosted-instance).
+- ClickHouse: after a push that rewrites at least a quarter of the mirror, such
+  as `clickhouse push --full`, the push compacts the rewritten tables. That
+  needs `GRANT OPTIMIZE ON <database>.*` and `GRANT SELECT ON system.parts` for
+  the push user. Without them the push still succeeds but logs
+  `skipped compacting the rewritten tables`, and reads stay slower until
+  ClickHouse merges the old rows. See
+  [Compaction after a large push](/docs/clickhouse-sync/#compaction-after-a-large-push).
 
 ## 0.47.0
 
@@ -857,6 +995,9 @@ Thanks to [@azylman](https://github.com/azylman) for the Antigravity fixes in
 - Keep Windows daemon commands from marking the entire data directory as changed
   for backup and sync tools. Stop the daemon before downgrading to 0.45.x or
   earlier.
+- Honor `DO_NOT_TRACK=1` and suppress telemetry in CI and non-release builds.
+  Browser telemetry also waits for the selected server's response before
+  sending further reports.
 - Reject compromised eMudhra/emSign certificate chains in HTTPS connections and
   desktop updates. Linux and Windows desktop builds also update their bundled
   trust roots.
@@ -865,7 +1006,7 @@ Thanks to [@azylman](https://github.com/azylman) for the Antigravity fixes in
 
 - [@rodboev](https://github.com/rodboev) for Chrome Sync, fx support,
   tool-effectiveness reports and rates, model aliases, Hermes cron costs,
-  faster reports, and archive fixes.
+  faster reports, and archive and telemetry fixes.
 - [@cpcloud](https://github.com/cpcloud) for Codex cloud chats and live token
   capture, resumable mirror pushes, continued local sync during pushes, and
   ClickHouse transfer improvements.
@@ -1029,6 +1170,9 @@ Thanks to [@azylman](https://github.com/azylman) for the Antigravity fixes in
   or server failures prevent embedding.
 - Sync remote hosts over HTTP. SSH sync is removed; configure each remote with a
   daemon URL and token. Existing archived sessions remain available.
+- Measure app opens, screen visits, core actions, and visible visit duration
+  through the existing telemetry opt-out. Daily daemon activity counts at most
+  once per installation per UTC day.
 - Diagnose desktop startup and database delays with logs that show backend port
   selection, readiness results, stalled database checkpoints, and connection or
   write-lock waits.
@@ -3301,6 +3445,11 @@ ______________________________________________________________________
     EGL error and leaves a blank window, the desktop app now detects the dead
     WebView, opens the UI in your default browser, and explains what happened —
     the backend keeps running either way.
+- Add **anonymous daemon telemetry**. The server now sends a daily liveness ping
+    (version, commit, OS, architecture, and a random per-machine install ID — no
+    session data, paths, hostnames, or prompts). Disable it with
+    `AGENTSVIEW_TELEMETRY_ENABLED=0`. See
+    [Privacy and Telemetry](/docs/configuration/#privacy-and-telemetry).
 
 **Bug fixes**
 
@@ -3325,7 +3474,7 @@ ______________________________________________________________________
 
 - Thanks to [Marius van Niekerk](https://github.com/mariusvniekerk) for the
     secret gist publishing, nested workflow subagent discovery, untruncated
-    session labels.
+    session labels, and daemon telemetry.
 - Thanks to [Matthew Jacobs](https://github.com/mjacobs) for the Antigravity CLI
     sidecar token usage, trajectory-sidecar preference, project inference, and
     parser fuzz hardening.
@@ -3998,7 +4147,7 @@ ______________________________________________________________________
 
 **New features**
 
-- Add a [Trends page](/docs/usage/#trends) for ad-hoc term-frequency line charts
+- Add a Trends page for ad-hoc term-frequency line charts
     over your session history. Plot up to 12 terms — each with optional
     pipe-separated variants like `cat|cats` — at day, week, or month
     granularity, and optionally normalize counts by message volume. Backed by

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -177,6 +178,15 @@ func newRemoteUsageServer(
 	t *testing.T, spec remoteUsageSpec,
 ) (*httptest.Server, *remoteUsageRequests) {
 	t.Helper()
+	handler, reqs := newRemoteUsageHandler(t, spec)
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+	return ts, reqs
+}
+
+// newRemoteUsageHandler shares the usage fixture between socket and in-memory tests.
+func newRemoteUsageHandler(t *testing.T, spec remoteUsageSpec) (http.Handler, *remoteUsageRequests) {
+	t.Helper()
 	if spec.agent == "" {
 		spec.agent = "codex"
 	}
@@ -195,8 +205,7 @@ func newRemoteUsageServer(
 	detailJSON := fmt.Sprintf(`{"id":%q,"agent":%q,"project":%q}`,
 		spec.canonicalID, spec.agent, spec.project)
 	usageJSON := remoteUsageJSON(spec)
-	var serverURL string
-	ts := httptest.NewServer(http.HandlerFunc(func(
+	handler := http.HandlerFunc(func(
 		w http.ResponseWriter, r *http.Request,
 	) {
 		if spec.bearer != "" {
@@ -220,7 +229,7 @@ func newRemoteUsageServer(
 			if !assert.Equal(t, http.MethodPost, r.Method) {
 				return
 			}
-			if !assert.Equal(t, serverURL, r.Header.Get("Origin")) {
+			if !assert.Equal(t, "http://"+r.Host, r.Header.Get("Origin")) {
 				return
 			}
 			if !assert.NoError(t, json.UnmarshalRead(r.Body, &reqs.SyncInput)) {
@@ -237,10 +246,8 @@ func newRemoteUsageServer(
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	serverURL = ts.URL
-	t.Cleanup(ts.Close)
-	return ts, reqs
+	})
+	return handler, reqs
 }
 
 // remoteUsageJSON builds the session-usage response body for a
@@ -2669,6 +2676,21 @@ func shortenSessionUsagePoll(t *testing.T) {
 	t.Cleanup(func() { sessionUsagePollInterval = previous })
 }
 
+// sessionUsageHandlerTransport runs the fixture handler without socket I/O,
+// allowing synctest to control the polling deadline.
+type sessionUsageHandlerTransport struct {
+	handler http.Handler
+}
+
+func (transport sessionUsageHandlerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if err := r.Context().Err(); err != nil {
+		return nil, err
+	}
+	response := httptest.NewRecorder()
+	transport.handler.ServeHTTP(response, r)
+	return response.Result(), nil
+}
+
 func TestSessionUsageWait(t *testing.T) {
 	shortenSessionUsagePoll(t)
 	for _, tc := range []struct {
@@ -2681,47 +2703,57 @@ func TestSessionUsageWait(t *testing.T) {
 		{name: "still missing after catch-up", missing: true, missingForever: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if tc.missingForever {
-				previous := sessionUsageWaitTimeout
-				sessionUsageWaitTimeout = 100 * time.Millisecond
-				t.Cleanup(func() { sessionUsageWaitTimeout = previous })
-			}
-			ts, _ := newRemoteUsageServer(t, remoteUsageSpec{canonicalID: "codex:remote-session"})
-			original := ts.Config.Handler
-			statuses, syncs := 0, 0
-			ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case "/api/v1/sync/status":
-					statuses++
-					if statuses == 1 {
-						writeJSONResponse(w, `{"startup_pending":true}`)
-					} else {
-						writeJSONResponse(w, `{}`)
-					}
-					return
-				case "/api/v1/sessions/codex:remote-session":
-					if tc.missing && (statuses < 2 || tc.missingForever) {
-						http.NotFound(w, r)
-						return
-					}
-				case "/api/v1/sessions/sync":
-					syncs++
+			synctest.Test(t, func(t *testing.T) {
+				if tc.missingForever {
+					previous := sessionUsageWaitTimeout
+					// Expire halfway between polls so the deadline and next retry
+					// cannot become runnable at the same virtual instant.
+					sessionUsageWaitTimeout = 105 * time.Millisecond
+					t.Cleanup(func() { sessionUsageWaitTimeout = previous })
 				}
-				original.ServeHTTP(w, r)
+				original, _ := newRemoteUsageHandler(t, remoteUsageSpec{canonicalID: "codex:remote-session"})
+				statuses, syncs := 0, 0
+				handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case "/api/v1/sync/status":
+						statuses++
+						if statuses == 1 {
+							writeJSONResponse(w, `{"startup_pending":true}`)
+						} else {
+							writeJSONResponse(w, `{}`)
+						}
+						return
+					case "/api/v1/sessions/codex:remote-session":
+						if tc.missing && (statuses < 2 || tc.missingForever) {
+							http.NotFound(w, r)
+							return
+						}
+					case "/api/v1/sessions/sync":
+						syncs++
+					}
+					original.ServeHTTP(w, r)
+				})
+				// Serve requests in memory so virtual time advances only between polls,
+				// never while the operating system is scheduling a socket response.
+				previousTransport := http.DefaultTransport
+				http.DefaultTransport = sessionUsageHandlerTransport{handler}
+				t.Cleanup(func() { http.DefaultTransport = previousTransport })
+				started := time.Now()
+				out, code, err := httpSessionUsageData(t.Context(), "http://usage.test", "", sessionUsageQuery{SessionID: "codex:remote-session", Wait: true})
+				require.NoError(t, err)
+				if tc.missingForever {
+					assert.Equal(t, sessionUsageWaitTimeout, time.Since(started))
+					assert.Nil(t, out)
+					assert.Equal(t, tokenUseExitNotFound, code)
+					assert.Zero(t, syncs)
+					return
+				}
+				require.NotNil(t, out)
+				assert.Equal(t, tokenUseExitOK, code)
+				assert.Equal(t, 42, out.TotalOutputTokens)
+				assert.False(t, out.RefreshIncomplete)
+				assert.Equal(t, tc.wantSyncs, syncs)
 			})
-			out, code, err := httpSessionUsageData(t.Context(), ts.URL, "", sessionUsageQuery{SessionID: "codex:remote-session", Wait: true})
-			require.NoError(t, err)
-			if tc.missingForever {
-				assert.Nil(t, out)
-				assert.Equal(t, tokenUseExitNotFound, code)
-				assert.Zero(t, syncs)
-				return
-			}
-			require.NotNil(t, out)
-			assert.Equal(t, tokenUseExitOK, code)
-			assert.Equal(t, 42, out.TotalOutputTokens)
-			assert.False(t, out.RefreshIncomplete)
-			assert.Equal(t, tc.wantSyncs, syncs)
 		})
 	}
 }
@@ -3157,9 +3189,6 @@ func TestSessionUsageWaitCancellation(t *testing.T) {
 }
 
 func TestSessionUsageArchiveOnlyWaitIncomplete(t *testing.T) {
-	previous := sessionUsageWaitTimeout
-	sessionUsageWaitTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { sessionUsageWaitTimeout = previous })
 	for _, tc := range []struct {
 		name                         string
 		ownOnly, noSync, statusError bool
@@ -3170,32 +3199,44 @@ func TestSessionUsageArchiveOnlyWaitIncomplete(t *testing.T) {
 		{name: "no sync status error", noSync: true, statusError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ts, _ := newRemoteUsageServer(t, remoteUsageSpec{canonicalID: "remote-session"})
-			original := ts.Config.Handler
-			ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/api/v1/sync/status" {
-					if tc.statusError {
-						http.Error(w, "unavailable", http.StatusServiceUnavailable)
-					} else {
-						writeJSONResponse(w, `{"archive_stale":true}`)
-					}
-					return
-				}
-				original.ServeHTTP(w, r)
-			})
 			stderr := captureStderr(t, func() {
-				out, code, err := httpSessionUsageData(t.Context(), ts.URL, "", sessionUsageQuery{SessionID: "remote-session", Wait: true, OwnOnly: tc.ownOnly, NoSync: tc.noSync})
-				require.NoError(t, err)
-				require.NotNil(t, out)
-				assert.Equal(t, tokenUseExitOK, code)
-				assert.True(t, out.WaitIncomplete)
-				assert.False(t, out.RefreshIncomplete)
-				data, err := json.Marshal(out)
-				require.NoError(t, err)
-				assert.Contains(t, string(data), `"wait_incomplete":true`)
-				var human strings.Builder
-				require.NoError(t, renderSessionUsageHuman(&human, out))
-				assert.NotContains(t, human.String(), "Waiting for ingestion did not finish")
+				synctest.Test(t, func(t *testing.T) {
+					previous := sessionUsageWaitTimeout
+					sessionUsageWaitTimeout = 100 * time.Millisecond
+					t.Cleanup(func() { sessionUsageWaitTimeout = previous })
+					original, _ := newRemoteUsageHandler(t, remoteUsageSpec{canonicalID: "remote-session"})
+					handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if r.URL.Path == "/api/v1/sync/status" {
+							if tc.statusError {
+								http.Error(w, "unavailable", http.StatusServiceUnavailable)
+							} else {
+								writeJSONResponse(w, `{"archive_stale":true}`)
+							}
+							return
+						}
+						original.ServeHTTP(w, r)
+					})
+					// Serve requests in memory so the virtual deadline cannot expire
+					// while the operating system is scheduling the session lookup.
+					previousTransport := http.DefaultTransport
+					http.DefaultTransport = sessionUsageHandlerTransport{handler}
+					t.Cleanup(func() { http.DefaultTransport = previousTransport })
+					started := time.Now()
+					out, code, err := httpSessionUsageData(t.Context(), "http://usage.test", "", sessionUsageQuery{SessionID: "remote-session", Wait: true, OwnOnly: tc.ownOnly, NoSync: tc.noSync})
+					assert.Equal(t, sessionUsageWaitTimeout, time.Since(started))
+					require.NoError(t, err)
+					require.NotNil(t, out)
+					assert.Equal(t, tokenUseExitOK, code)
+					assert.Equal(t, 42, out.TotalOutputTokens)
+					assert.True(t, out.WaitIncomplete)
+					assert.False(t, out.RefreshIncomplete)
+					data, err := json.Marshal(out)
+					require.NoError(t, err)
+					assert.Contains(t, string(data), `"wait_incomplete":true`)
+					var human strings.Builder
+					require.NoError(t, renderSessionUsageHuman(&human, out))
+					assert.NotContains(t, human.String(), "Waiting for ingestion did not finish")
+				})
 			})
 			assert.Contains(t, stderr, "waiting for ingestion did not finish")
 			assert.Contains(t, stderr, "saved totals may be out of date")
@@ -3246,25 +3287,33 @@ func TestSessionUsageWaitContinuesAfterStartupFailure(t *testing.T) {
 		t.Run(fmt.Sprintf("missing=%v", missing), func(t *testing.T) {
 			ts, reqs := newRemoteUsageServer(t, remoteUsageSpec{canonicalID: "remote-session"})
 			original := ts.Config.Handler
-			statuses, starts := 0, 0
+			startupFailed := make(chan struct{})
+			starts := 0
 			ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/api/v1/sync/status":
-					statuses++
-					if statuses == 1 {
-						writeJSONResponse(w, `{"startup_pending":true}`)
-					} else {
+					// Keep startup pending until the failed request reaches the server.
+					// Clearing it on a poll count can cancel that request before it arrives.
+					select {
+					case <-startupFailed:
 						writeJSONResponse(w, `{}`)
+					default:
+						writeJSONResponse(w, `{"startup_pending":true}`)
 					}
 					return
 				case "/api/v1/sync":
 					starts++
 					http.Error(w, "startup failed", http.StatusServiceUnavailable)
+					close(startupFailed)
 					return
 				case "/api/v1/sessions/remote-session":
-					if missing && statuses < 2 {
-						http.NotFound(w, r)
-						return
+					if missing {
+						select {
+						case <-startupFailed:
+						default:
+							http.NotFound(w, r)
+							return
+						}
 					}
 				}
 				original.ServeHTTP(w, r)
