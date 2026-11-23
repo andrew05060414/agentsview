@@ -1039,7 +1039,7 @@ func sessionInsertArgs(
 ) []any {
 	return []any{
 		sess.ID, sess.Project, sess.ProjectAssigned,
-		db.MirroredSessionMachine(sess, fallbackMachine), sess.Agent,
+		db.MirroredSessionMachine(sess, fallbackMachine), sess.Account, sess.Agent,
 		sess.AgentLabel, sess.Entrypoint, sess.SessionKind,
 		nilString(sess.FirstMessage), nilString(sess.DisplayName),
 		nilString(sess.SessionName),

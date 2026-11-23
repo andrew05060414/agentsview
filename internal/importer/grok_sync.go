@@ -25,6 +25,7 @@ const (
 	grokListRequest = iota
 	grokListPageRequest
 	grokResponsesRequest
+	grokAccountRequest
 )
 
 // grokPageLimit bounds list paging against a token loop.
@@ -60,6 +61,9 @@ type grokChat struct {
 // SyncGrok imports new and changed Grok conversations through Chrome.
 func SyncGrok(ctx context.Context, store BrowserSyncStore, fetch func(context.Context, string) (ClaudeAIResponse, error), cb *ImportCallbacks, machine ...string,
 ) (stats ImportStats, retErr error) {
+	accountPath := browserRequest(grokRequests, grokAccountRequest)
+	account, _ := browserAccount(ctx, fetch, accountPath)
+	var accountIDs []string
 	seen := make(map[string]struct{})
 	var formatErr error
 	runner := browserSync{
@@ -104,7 +108,9 @@ func SyncGrok(ctx context.Context, store BrowserSyncStore, fetch func(context.Co
 				continue
 			}
 			seen[chat.ConversationID] = struct{}{}
-			err := runner.conversation(ctx, "grok-web:"+chat.ConversationID, browserConversation{
+			id := "grok-web:" + chat.ConversationID
+			accountIDs = append(accountIDs, id)
+			err := runner.conversation(ctx, id, browserConversation{
 				freshness: func(session *db.Session) uint64 {
 					return browserFreshness(updatedAt.UTC().Format(time.RFC3339Nano), session)
 				},
@@ -142,7 +148,7 @@ func SyncGrok(ctx context.Context, store BrowserSyncStore, fetch func(context.Co
 		}
 		token = next
 	}
-	return stats, formatErr
+	return stats, errors.Join(formatErr, runner.confirmAccount(ctx, fetch, accountPath, account, accountIDs))
 }
 
 // fetchGrokConversation reads one chat's responses and wraps them with the

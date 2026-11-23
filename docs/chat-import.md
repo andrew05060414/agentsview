@@ -277,8 +277,11 @@ agentsview source import --type gemini-apps --sync
 ```
 
 The import dialog does not offer Gemini Sync yet; use the CLI. If no Gemini tab
-is open, Sync opens one in the background and leaves it open. When the open tab
-is a second Google account (`/u/1/`), Sync reads that account.
+is open, Sync opens one in the background and leaves it open. Sync reads every
+Google account signed in to that Chrome profile, starting at the first one
+(`/u/0/`) and stopping at the first slot with no new account, up to ten
+accounts. Each account gets its own request token, whatever account the open
+tab shows.
 
 Gemini has no public API. The extension calls the same two read requests the
 Gemini web app uses: the chat list and one chat's turns. It reads the page's
@@ -340,6 +343,31 @@ Each chat has a 32 MiB limit. Two chat failures in a row, an expired sign-in
 (HTTP 401 or 403), or a rate limit ends Sync. A Grok response this version
 can't read ends Sync with a message to update AgentsView. Completed chats stay
 imported; run Sync again later to continue.
+
+## Which account a chat came from
+
+Chrome Sync records the web account each Claude.ai, ChatGPT, Gemini, and Grok
+chat belongs to, so chats from two accounts on the same site stay apart.
+`agentsview session list` and `agentsview session search` show an `ACCOUNT`
+column when any result has one, and `--account` filters by it.
+
+- The account is stored as `<type>:<id>`. Claude.ai uses the organization
+  UUID. ChatGPT, Gemini, and Grok use the first 12 hex digits of the SHA-256 of
+  the site's account ID; the extension computes the hash in the browser, so
+  email addresses and names never reach AgentsView.
+- Sync reads the account at the start and end of each run. If the browser
+  switched accounts in between, that run labels nothing; the chats still sync
+  and get labelled on a later run.
+- A chat keeps the first account it was labelled with. Chats synced before
+  this version, or when the account can't be read, have no account until a
+  later Sync sees them.
+- Give accounts readable names in `config.toml`. Pushes to PostgreSQL carry
+  the names, so other machines show them too:
+
+  ```toml
+  [account_aliases]
+  "chatgpt:0123456789ab" = "work"
+  ```
 
 ## Importing via the CLI
 

@@ -2438,6 +2438,7 @@ func legacySchemaColumnMigrations() []schemaColumnMigration {
 
 func schemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
+		{"sessions", "account", "ALTER TABLE sessions ADD COLUMN account TEXT NOT NULL DEFAULT ''"},
 		{"sessions", "usage_generation", "ALTER TABLE sessions ADD COLUMN usage_generation TEXT;" +
 			" UPDATE sessions SET usage_generation=lower(hex(randomblob(8)))"},
 		{

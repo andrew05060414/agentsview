@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { describe, expect, it, vi } from "vite-plus/test";
@@ -13,7 +14,9 @@ function loadFetch(fetch: typeof globalThis.fetch) {
     atob,
     TextDecoder,
     TextEncoder,
+    URL,
     clearTimeout,
+    crypto,
     fetch,
     setTimeout,
   };
@@ -152,4 +155,33 @@ describe("ChatGPT page fetch", () => {
       expect(fetch).toHaveBeenCalledTimes(target === "session" ? 1 : 2);
     },
   );
+
+  it("answers the identity request with a hash of the user ID only", async () => {
+    const me = { id: "user-Synthetic123", email: "someone@example.com", name: "Some One" };
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ accessToken: "synthetic-test-value" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify(me)));
+    const chatgptFetch = loadFetch(fetch);
+
+    const response = (await chatgptFetch("https://chatgpt.com/backend-api/me")) as { body: string };
+
+    const account = createHash("sha256").update(me.id).digest("hex").slice(0, 12);
+    expect(response).toEqual({ status: 200, body: JSON.stringify({ account }) });
+    expect(response.body).not.toContain("Synthetic123");
+    expect(response.body).not.toContain("example.com");
+  });
+
+  it("answers an empty identity when the user ID is not recognized", async () => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ accessToken: "synthetic-test-value" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ email: "someone@example.com" })));
+    const chatgptFetch = loadFetch(fetch);
+
+    expect(await chatgptFetch("https://chatgpt.com/backend-api/me")).toEqual({
+      status: 200,
+      body: JSON.stringify({ account: "" }),
+    });
+  });
 });

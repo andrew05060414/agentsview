@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS sync_metadata (
 CREATE TABLE IF NOT EXISTS sessions (
     id                 TEXT PRIMARY KEY,
     machine            TEXT NOT NULL,
+    account            TEXT NOT NULL DEFAULT '',
     owner_marker       TEXT NOT NULL DEFAULT '',
     project            TEXT NOT NULL,
     project_assigned   BOOLEAN NOT NULL DEFAULT FALSE,

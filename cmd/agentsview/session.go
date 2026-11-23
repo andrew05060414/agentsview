@@ -19,6 +19,13 @@ import (
 	"go.kenn.io/agentsview/internal/timeutil"
 )
 
+func displayAccount(id, alias string) string {
+	if alias != "" {
+		return alias
+	}
+	return id
+}
+
 func newSessionCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "session",

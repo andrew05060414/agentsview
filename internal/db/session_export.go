@@ -72,6 +72,7 @@ type SessionSummaryRow struct {
 	Project               string                       `json:"-"`
 	ProjectReference      export.ProjectReference      `json:"project"`
 	Machine               string                       `json:"-"`
+	Account               string                       `json:"account,omitempty"`
 	Agent                 string                       `json:"agent"`
 	Cwd                   string                       `json:"-"`
 	GitBranch             string                       `json:"-"`
@@ -824,6 +825,7 @@ SELECT
 	sessions.local_modified_at,
 	sessions.project,
 	sessions.machine,
+	sessions.account,
 	sessions.agent,
 	sessions.cwd,
 	sessions.git_branch,
@@ -888,6 +890,7 @@ func (db *DB) querySessionExportRowsFrom(
 			&localModifiedAt,
 			&row.Project,
 			&row.Machine,
+			&row.Account,
 			&row.Agent,
 			&row.Cwd,
 			&row.GitBranch,

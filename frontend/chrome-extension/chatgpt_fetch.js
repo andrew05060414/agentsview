@@ -11,6 +11,20 @@ function jwtExpiryMs(token) {
 }
 
 async function chatgptFetch(url) {
+  if (new URL(url).pathname === "/backend-api/me") {
+    try {
+      const response = await chatgptConversationFetch(url);
+      if (response.status !== 200) return { status: response.status, body: "" };
+      const { id } = JSON.parse(response.body);
+      return await globalThis.browserAccountReply(/^user-[A-Za-z0-9_-]+$/.test(id) ? id : "");
+    } catch {
+      return globalThis.browserAccountReply("");
+    }
+  }
+  return chatgptConversationFetch(url);
+}
+
+async function chatgptConversationFetch(url) {
   try {
     // Reuse the page token until shortly before it expires, so a sync does not
     // add a /api/auth/session request in front of every conversation request.

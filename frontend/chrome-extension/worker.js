@@ -1,7 +1,7 @@
 import { allowedPath } from "./paths.js";
 
 // Covers message encoding and request shapes; bump both peers together.
-const version = 4;
+const version = 5;
 
 async function loadedTab(id) {
   await new Promise((resolve, reject) => {
