@@ -21,6 +21,7 @@ import (
 	"time"
 	_ "time/tzdata"
 
+	"github.com/cenkalti/backoff/v7"
 	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/archivesource"
@@ -242,6 +243,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	workerSyncDone := false
 	startupRebuild := false
 	skipInitialSync := opts.SkipInitialSync
+	firstImport := false
 	if !cfg.NoSync || archiveOnly {
 		needsResync, fullRebuild, err := db.ArchiveResyncState(ctx, cfg.DBPath)
 		if err != nil && skipInitialSync {
@@ -249,6 +251,15 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		}
 		// Scoped upgrades and schema repairs finish before startup publishes readiness.
 		startupRebuild = err == nil && fullRebuild
+		if err == nil && !needsResync && !cfg.NoSync && !archiveOnly {
+			firstImport, err = isFirstImport(ctx, cfg)
+			if err != nil {
+				log.Printf("checking first import: %v", err)
+			}
+			if firstImport {
+				skipInitialSync = true
+			}
+		}
 		if skipInitialSync {
 			skipInitialSync = !needsResync
 		}
@@ -281,7 +292,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	startupProgress.SetPhase("opening database")
 	databaseProgress := newResyncProgressPrinter(os.Stdout, time.Now)
 	database, writeLock, err := openWriteDBWith(ctx, cfg, func(ctx context.Context, cfg config.Config) (*db.DB, error) {
-		return openDBWithProgress(ctx, cfg, func(p db.OpenProgress) {
+		return openDBWithOpener(ctx, cfg, db.OpenDaemonWithProgress, func(p db.OpenProgress) {
 			if p.ResyncRequired {
 				fmt.Println(p.Detail)
 			} else {
@@ -828,12 +839,29 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		go idleTracker.Run(ctx)
 	}
 	startDaemonUsageCacheBackfill(ctx, database, idleTracker)
+	repairDone := make(chan struct{})
+	go func() {
+		defer close(repairDone)
+		repairMessageFTS(ctx, idleTracker, database.RepairMessageFTS)
+	}()
+	defer func() { requestRestart(nil); <-repairDone }()
 	if engine != nil && !cfg.NoSync && skipInitialSync {
+		fallbackCtx, cancelFallback := context.WithCancel(ctx)
+		fallbackDone := make(chan struct{})
+		defer func() {
+			cancelFallback()
+			<-fallbackDone
+		}()
 		go func() {
-			timer := time.NewTimer(deferredStartupSyncGracePeriod)
+			defer close(fallbackDone)
+			grace := deferredStartupSyncGracePeriod
+			if firstImport && !opts.SkipInitialSync {
+				grace = 0
+			}
+			timer := time.NewTimer(grace)
 			defer timer.Stop()
 			ran, fallbackErr := runDeferredStartupSyncFallback(
-				ctx, cfg, engine, database, writeLock, idleTracker, timer.C,
+				fallbackCtx, cfg, engine, database, writeLock, idleTracker, timer.C, firstImport,
 			)
 			if fallbackErr != nil && ctx.Err() == nil {
 				log.Printf("deferred startup sync: %v", fallbackErr)
@@ -888,6 +916,24 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	return err
 }
 
+func repairMessageFTS(ctx context.Context, idleTracker *server.IdleTracker, repair func(context.Context) error) {
+	policy := backoff.NewExponentialBackOff()
+	policy.InitialInterval = time.Minute
+	policy.MaxInterval = time.Hour
+	_, _ = backoff.Retry(ctx, func() (struct{}, error) {
+		done, ok := idleTracker.BeginWork()
+		if !ok {
+			return struct{}{}, backoff.Permanent(context.Canceled)
+		}
+		err := repair(ctx)
+		done()
+		if err != nil && ctx.Err() == nil {
+			log.Printf("search index repair: %v", err)
+		}
+		return struct{}{}, err
+	}, backoff.WithBackOff(policy), backoff.WithMaxElapsedTime(0))
+}
+
 type foregroundRestartError struct {
 	args    []string
 	release func()
@@ -931,6 +977,26 @@ func startDaemonUsageCacheBackfill(
 	}
 }
 
+func isFirstImport(ctx context.Context, cfg config.Config) (bool, error) {
+	if _, err := os.Stat(cfg.DBPath); errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	database, err := openReadOnlyDB(ctx, cfg)
+	if err != nil {
+		return false, err
+	}
+	defer database.Close()
+	pending, err := database.GetSyncState(ctx, sync.FirstImportPendingKey)
+	if err != nil || pending == "1" {
+		return pending == "1", err
+	}
+	var exists bool
+	err = database.Reader().QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sessions)").Scan(&exists)
+	return !exists, err
+}
+
 func runDeferredStartupSyncFallback(
 	ctx context.Context,
 	cfg config.Config,
@@ -939,6 +1005,7 @@ func runDeferredStartupSyncFallback(
 	lock *writeOwnerLock,
 	idleTracker *server.IdleTracker,
 	timeout <-chan time.Time,
+	firstImport bool,
 ) (bool, error) {
 	select {
 	case <-ctx.Done():
@@ -960,6 +1027,11 @@ func runDeferredStartupSyncFallback(
 	// firing mid-pass cannot launch a second archive-scale worker.
 	if engine.StartupReconciled() {
 		return false, nil
+	}
+
+	if firstImport {
+		_, ran, err := engine.RunFirstImport(ctx, nil)
+		return ran, err
 	}
 
 	// Route the skipped startup sync through the worker so it does not run at
@@ -1823,11 +1895,15 @@ func openDB(ctx context.Context, cfg config.Config) (*db.DB, error) {
 }
 
 func openDBWithProgress(ctx context.Context, cfg config.Config, progress db.OpenProgressFunc) (*db.DB, error) {
+	return openDBWithOpener(ctx, cfg, db.OpenWithProgress, progress)
+}
+
+func openDBWithOpener(ctx context.Context, cfg config.Config, open func(context.Context, string, config.ArchiveContent, db.OpenProgressFunc) (*db.DB, error), progress db.OpenProgressFunc) (*db.DB, error) {
 	if err := clearUsageOnlyVectors(ctx, cfg); err != nil {
 		return nil, err
 	}
 	applyClassifierConfig(cfg)
-	database, err := db.OpenWithProgress(ctx, cfg.DBPath, cfg.ArchiveContent, progress)
+	database, err := open(ctx, cfg.DBPath, cfg.ArchiveContent, progress)
 	if err != nil {
 		return nil, err
 	}
