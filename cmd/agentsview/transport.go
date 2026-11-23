@@ -609,7 +609,7 @@ func newService(ctx context.Context,
 		// is handled via the HTTP daemon when one is running.
 		return service.NewDirectBackend(
 			d, nil, service.WithModelGroups(service.NewModelGroups(cfg.ModelAliases)),
-			service.WithConfiguredDocbank(cfg),
+			service.WithConfiguredDocbank(cfg), service.WithAccountAliases(cfg.AccountAliases),
 		), cleanup, nil
 	}
 }

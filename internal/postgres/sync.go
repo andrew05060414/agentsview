@@ -253,6 +253,7 @@ type Sync struct {
 	targetFingerprint      string
 	syncStateTarget        string
 	migrateLegacySyncState bool
+	accountAliases         map[string]string
 
 	// archiveID caches this local archive's stable identifier, populated at
 	// the top of Push and stamped onto every pushed session's
@@ -395,6 +396,7 @@ func New(
 		targetFingerprint:      targetFingerprint,
 		syncStateTarget:        syncStateScope,
 		migrateLegacySyncState: migrateLegacySyncState,
+		accountAliases:         opts.AccountAliases,
 		projects:               opts.Projects,
 		excludeProjects:        opts.ExcludeProjects,
 		vectorSource:           opts.VectorSource,

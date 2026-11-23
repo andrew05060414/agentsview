@@ -1,3 +1,4 @@
 /rest/app-chat/conversations?pageSize=100
 /rest/app-chat/conversations?pageSize=100&pageToken={pageToken}
 /rest/app-chat/conversations/{conversation}/responses
+/rest/subscriptions

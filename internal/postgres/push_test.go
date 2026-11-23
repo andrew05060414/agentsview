@@ -1170,6 +1170,13 @@ func TestSessionPushFingerprintDiffers(t *testing.T) {
 			},
 		},
 		{
+			name: "account filled",
+			modify: func(s db.Session) db.Session {
+				s.Account = "chatgpt:0123456789ab"
+				return s
+			},
+		},
+		{
 			name: "entrypoint change",
 			modify: func(s db.Session) db.Session {
 				s.Entrypoint = "sdk-cli"

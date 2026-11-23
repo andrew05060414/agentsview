@@ -2,7 +2,7 @@ import { allowedPath } from "./paths.js";
 import { platforms } from "./platforms.js";
 
 // Covers message encoding and request shapes; bump both peers together.
-const version = 2;
+const version = 3;
 
 async function loadedTab(id) {
   await new Promise((resolve, reject) => {

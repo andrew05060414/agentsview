@@ -22,6 +22,7 @@ var chatGPTRequests = browserRequests(parser.AgentChatGPT)
 const (
 	chatGPTListRequest = iota
 	chatGPTDetailRequest
+	chatGPTAccountRequest
 )
 
 // The list and detail endpoints stamp update_time independently; one real capture showed detail 0.68 s later.
@@ -51,6 +52,9 @@ var chatGPTDetailGap = 3 * time.Second
 // syncChatGPT appends new turns and replaces edited conversation branches.
 func syncChatGPT(ctx context.Context, store BrowserSyncStore, fetch BrowserFetch, opts BrowserSyncOptions, cb *ImportCallbacks) (stats ImportStats, retErr error) {
 	platform := chatGPTPlatform()
+	accountPath := browserRequest(chatGPTRequests, chatGPTAccountRequest)
+	account, _ := browserAccount(ctx, fetch, accountPath)
+	var accountIDs []string
 	seen := make(map[string]struct{})
 	runner := newBrowserSync(store, platform, &stats, opts, cb)
 	for _, archived := range []bool{false, true} {
@@ -98,6 +102,7 @@ func syncChatGPT(ctx context.Context, store BrowserSyncStore, fetch BrowserFetch
 				}
 				seen[marker.ID] = struct{}{}
 				id := "chatgpt:" + marker.ID
+				accountIDs = append(accountIDs, id)
 				err := runner.conversation(ctx, id, browserConversation{
 					freshness: func(session *db.Session) uint64 { return chatGPTFreshness(updatedAt, session) },
 					fetch: func(ctx context.Context) ([]byte, error) {
@@ -124,7 +129,7 @@ func syncChatGPT(ctx context.Context, store BrowserSyncStore, fetch BrowserFetch
 			offset += len(page.Items)
 		}
 	}
-	return stats, runner.formatErr
+	return stats, errors.Join(runner.formatErr, runner.confirmAccount(ctx, fetch, accountPath, account, accountIDs))
 }
 
 func parseChatGPTSyncConversation(platform BrowserPlatform, detail []byte, id string) (parser.ParseResult, error) {
