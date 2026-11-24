@@ -68,6 +68,7 @@ var browserPathBuilders = map[parser.AgentType]func() []string{
 	},
 	parser.AgentChatGPT: func() []string {
 		return []string{
+			browserRequest(chatGPTRequests, chatGPTAccountRequest),
 			chatGPTRequest(chatGPTListRequest, "", 0, false),
 			chatGPTRequest(chatGPTListRequest, "", 50, true),
 			chatGPTRequest(chatGPTDetailRequest, browserPathConversation, 0, false),
@@ -75,14 +76,17 @@ var browserPathBuilders = map[parser.AgentType]func() []string{
 	},
 	parser.AgentGeminiApps: func() []string {
 		return []string{
-			geminiRequest(geminiListRequest, "", ""),
-			geminiRequest(geminiListRequest, "", "cursor+1/="),
-			geminiRequest(geminiDetailRequest, browserPathGeminiChat, ""),
-			geminiRequest(geminiDetailRequest, browserPathGeminiChat, "cursor+43/"),
+			geminiAccountPath(geminiRequest(geminiAccountRequest, "", ""), 0),
+			geminiAccountPath(geminiRequest(geminiListRequest, "", ""), 0),
+			geminiAccountPath(geminiRequest(geminiListRequest, "", "cursor+1/="), 0),
+			geminiAccountPath(geminiRequest(geminiDetailRequest, browserPathGeminiChat, ""), 0),
+			geminiAccountPath(geminiRequest(geminiDetailRequest, browserPathGeminiChat, "cursor+43/"), 0),
+			geminiAccountPath(geminiRequest(geminiListRequest, "", ""), 9),
 		}
 	},
 	parser.AgentGrokWeb: func() []string {
 		return []string{
+			browserRequest(grokWebRequests, grokAccountRequest),
 			grokRequest(grokListRequest, "", ""),
 			grokRequest(grokListPageRequest, "", browserPathGrokPageToken),
 			grokRequest(grokResponsesRequest, browserPathConversation, ""),

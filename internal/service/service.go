@@ -76,6 +76,7 @@ type SessionService interface {
 	FindSessionIDsByPartial(ctx context.Context, partial string, limit int) ([]string, error)
 	// FindSessionIDsByRawSuffix matches an exact stored ID or a literal
 	// colon/tilde-delimited suffix before applying limit.
+	// An exact ID that names a trashed session matches nothing.
 	FindSessionIDsByRawSuffix(ctx context.Context, raw string, limit int) ([]string, error)
 	List(ctx context.Context, f ListFilter) (*SessionList, error)
 	Messages(ctx context.Context, id string, f MessageFilter) (*MessageList, error)
@@ -199,7 +200,7 @@ type ContentSearchRequest struct {
 	// match (0 = off, max 10). See directBackend.SearchContent.
 	Context int `json:"context,omitempty"`
 
-	Project, ExcludeProject, Machine, Agent           string
+	Project, ExcludeProject, Machine, Account, Agent  string
 	SessionID, GitBranchExact                         string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	ExcludeActiveSince                                string
@@ -428,6 +429,7 @@ func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 
 // SessionList mirrors GET /api/v1/sessions.
 type SessionList struct {
+	AccountAliases  map[string]string          `json:"account_aliases,omitempty"`
 	ExclusionCounts *db.SessionExclusionCounts `json:"exclusion_counts,omitempty"`
 	Sessions        []db.Session               `json:"sessions"`
 	NextCursor      string                     `json:"next_cursor,omitempty"`
@@ -442,6 +444,10 @@ const SessionAnnotationsAPIVersion = 11
 // lists by updated_since and created_since; older daemons ignore them.
 const RecallTimeBoundsAPIVersion = 21
 
+// RawSessionLookupAPIVersion is the first daemon API that protects trashed
+// exact IDs during raw-suffix lookup.
+const RawSessionLookupAPIVersion = 29
+
 // ListFilter mirrors the HTTP query parameters in handleListSessions.
 // Field names map to HTTP query param names via json tags.
 type ListFilter struct {
@@ -454,6 +460,7 @@ type ListFilter struct {
 	Project            string `json:"project,omitempty"`
 	ExcludeProject     string `json:"exclude_project,omitempty"`
 	Machine            string `json:"machine,omitempty"`
+	Account            string `json:"account,omitempty"`
 	GitBranch          string `json:"git_branch,omitempty"`
 	Agent              string `json:"agent,omitempty"`
 	Date               string `json:"date,omitempty"`

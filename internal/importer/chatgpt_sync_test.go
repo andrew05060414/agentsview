@@ -44,7 +44,7 @@ func TestSyncChatGPTAppendFreshnessAndBranchChanges(t *testing.T) {
 	details := 0
 	syncWith := func(updated float64, body string) ImportStats {
 		t.Helper()
-		stats, err := syncChatGPT(t.Context(), d, func(_ context.Context, path string) (BrowserResponse, error) {
+		stats, err := syncChatGPTTest(t.Context(), d, func(_ context.Context, path string) (BrowserResponse, error) {
 			switch path {
 			case chatGPTRequest(chatGPTListRequest, "", 0, true):
 				return BrowserResponse{Status: 200, Body: []byte(`{"items":[],"total":0}`)}, nil
@@ -160,7 +160,7 @@ func TestSyncChatGPTMissingCreateTime(t *testing.T) {
 				detail = strings.Replace(detail, `"create_time":1.7067456e+09,`, "", 1)
 			}
 			details := 0
-			stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745711", detail, &details), BrowserSyncOptions{}, nil)
+			stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745711", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Zero(t, stats.Errors)
 			assert.Equal(t, 1, details)
@@ -189,13 +189,13 @@ func TestSyncChatGPTUsageArchiveShorterBranchKeepsTrashedCopy(t *testing.T) {
 				), "["), "]")
 				wantPreviousCount = 3
 			}
-			stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1", detail, &details), BrowserSyncOptions{}, nil)
+			stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			require.Equal(t, ImportStats{Imported: 1}, stats)
 			id := "chatgpt:" + chatGPTSyncID
 			assert.Empty(t, replacedCopies(t, d, id))
 
-			stats, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "2", chatGPTSyncDetail(2, false, "Question"), &details), BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "2", chatGPTSyncDetail(2, false, "Question"), &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, ImportStats{Updated: 1}, stats)
 			copies := replacedCopies(t, d, id)
@@ -221,7 +221,7 @@ func TestSyncChatGPTUsageArchiveShorterBranchRefreshesMetadata(t *testing.T) {
 		chatGPTNodeSpec{"assistant", "text", "Answer"},
 		chatGPTNodeSpec{"user", "text", "Follow up"},
 	), "["), "]")
-	stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745710", detail, &details), BrowserSyncOptions{}, nil)
+	stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745710", detail, &details), BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, ImportStats{Imported: 1}, stats)
 	session, err := d.GetSessionFull(t.Context(), "chatgpt:"+chatGPTSyncID)
@@ -237,7 +237,7 @@ func TestSyncChatGPTUsageArchiveShorterBranchRefreshesMetadata(t *testing.T) {
 
 	detail = strings.ReplaceAll(chatGPTSyncDetail(1706745711, false, "Question"), `"metadata":{}`, `"metadata":{"model_slug":"gpt-4o"}`)
 	fetch := chatGPTSyncFetch(t, "1706745711", detail, &details)
-	stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+	stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, ImportStats{Updated: 1}, stats)
 	session, err = d.GetSessionFull(t.Context(), session.ID)
@@ -255,7 +255,7 @@ func TestSyncChatGPTUsageArchiveShorterBranchRefreshesMetadata(t *testing.T) {
 	before[0].ID = after[0].ID
 	assert.Equal(t, before, after)
 	assert.Len(t, replacedCopies(t, d, session.ID), 1)
-	stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+	stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, ImportStats{Skipped: 1}, stats)
 	assert.Equal(t, 2, details)
@@ -267,7 +267,7 @@ func TestSyncChatGPTUsageArchiveAppendKeepsAssistantPin(t *testing.T) {
 	d := testDB(t)
 	d.SetArchiveContent(config.ArchiveContentUsage)
 	details := 0
-	_, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1", chatGPTSyncDetail(1, false, "Question"), &details), BrowserSyncOptions{}, nil)
+	_, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1", chatGPTSyncDetail(1, false, "Question"), &details), BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	id := "chatgpt:" + chatGPTSyncID
 	before, err := d.GetAllMessages(t.Context(), id)
@@ -277,7 +277,7 @@ func TestSyncChatGPTUsageArchiveAppendKeepsAssistantPin(t *testing.T) {
 	_, err = d.PinMessage(t.Context(), id, before[0].ID, nil)
 	require.NoError(t, err)
 
-	stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "2", chatGPTSyncDetail(2, true, "Question"), &details), BrowserSyncOptions{}, nil)
+	stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "2", chatGPTSyncDetail(2, true, "Question"), &details), BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, ImportStats{Updated: 1}, stats)
 	assert.Empty(t, replacedCopies(t, d, id), "appending makes no copy")
@@ -302,7 +302,7 @@ func TestSyncChatGPTArchiveUpdatesAppendedTurns(t *testing.T) {
 			d.SetArchiveContent(policy)
 			details := 0
 			detail := strings.ReplaceAll(chatGPTSyncDetail(1706745711, false, "Question"), `"metadata":{}`, `"metadata":{"model_slug":"gpt-4o"}`)
-			stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745711", detail, &details), BrowserSyncOptions{}, nil)
+			stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745711", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			require.Equal(t, 1, stats.Imported)
 			session, err := d.GetSessionFull(t.Context(), "chatgpt:"+chatGPTSyncID)
@@ -315,7 +315,7 @@ func TestSyncChatGPTArchiveUpdatesAppendedTurns(t *testing.T) {
 			assert.Equal(t, "gpt-4o", messages[len(messages)-1].Model)
 
 			detail = strings.Replace(chatGPTSyncDetail(1706745712, true, "Question"), `"parts":["Second answer"]},"status":"finished_successfully","metadata":{}`, `"parts":["Second answer"]},"status":"finished_successfully","metadata":{"model_slug":"gpt-5"}`, 1)
-			stats, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745712", detail, &details), BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745712", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, 1, stats.Updated)
 			assert.Zero(t, stats.Errors)
@@ -345,7 +345,7 @@ func TestSyncChatGPTArchiveUpdatesAppendedTurns(t *testing.T) {
 			// Regenerating the later reply preserves the earlier reply's stored model.
 			detail = strings.Replace(detail, `"parts":["Second answer"]`, `"parts":["Regenerated answer"]`, 1)
 			detail = strings.Replace(detail, `"update_time":1.706745712e+09`, `"update_time":1706745712.5`, 1)
-			stats, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745712.5", detail, &details), BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745712.5", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, 1, stats.Updated)
 			assert.Zero(t, stats.Errors)
@@ -366,7 +366,7 @@ func TestSyncChatGPTArchiveUpdatesAppendedTurns(t *testing.T) {
 			detail = strings.ReplaceAll(detail, `"metadata":{"model_slug":"gpt-5"}`, `"metadata":{}`)
 			detail = strings.Replace(detail, `"update_time":1706745712.5`, `"update_time":1706745713`, 1)
 			detail = strings.Replace(detail, `"title":"Tool"`, `"title":"Renamed"`, 1)
-			_, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745713", detail, &details), BrowserSyncOptions{}, nil)
+			_, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745713", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			messages, err = d.GetAllMessages(t.Context(), session.ID)
 			require.NoError(t, err)
@@ -378,7 +378,7 @@ func TestSyncChatGPTArchiveUpdatesAppendedTurns(t *testing.T) {
 			}
 			assert.Equal(t, []string{"gpt-4o", "gpt-5"}, models)
 
-			stats, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745713", detail, &details), BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745713", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, 1, stats.Skipped)
 			assert.Equal(t, 4, details)
@@ -392,7 +392,7 @@ func TestSyncChatGPTUpdatesRetainedModelAndCachesFreshness(t *testing.T) {
 			d := testDB(t)
 			details := 0
 			detail := strings.ReplaceAll(chatGPTSyncDetail(1, false, "Question"), `"metadata":{}`, fmt.Sprintf(`"metadata":{"model_slug":%q}`, initialModel))
-			_, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1", detail, &details), BrowserSyncOptions{}, nil)
+			_, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			id := "chatgpt:" + chatGPTSyncID
 			before, err := d.GetAllMessages(t.Context(), id)
@@ -405,7 +405,7 @@ func TestSyncChatGPTUpdatesRetainedModelAndCachesFreshness(t *testing.T) {
 
 			detail = strings.ReplaceAll(chatGPTSyncDetail(2, false, "Question"), `"metadata":{}`, `"metadata":{"model_slug":"gpt-4o"}`)
 			fetch := chatGPTSyncFetch(t, "2", detail, &details)
-			stats, err := syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			stats, err := syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Zero(t, stats.Errors)
 			after, err := d.GetAllMessages(t.Context(), id)
@@ -424,7 +424,7 @@ func TestSyncChatGPTUpdatesRetainedModelAndCachesFreshness(t *testing.T) {
 			assert.Equal(t, before[1].ID, pins[0].MessageID)
 			assert.Equal(t, new("Keep this answer"), pins[0].Note)
 
-			stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Zero(t, stats.Errors)
 			assert.Equal(t, 1, stats.Skipped)
@@ -456,7 +456,7 @@ func TestSyncChatGPTUsageArchiveFillsModelWithUnchangedTimestamp(t *testing.T) {
 				detail = strings.ReplaceAll(detail, `"metadata":{}`, `"metadata":{"model_slug":"gpt-4o"}`)
 			}
 			fetch := chatGPTSyncFetch(t, "1706745710", detail, &details)
-			stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Zero(t, stats.Errors)
 			if model == "" {
@@ -471,7 +471,7 @@ func TestSyncChatGPTUsageArchiveFillsModelWithUnchangedTimestamp(t *testing.T) {
 			assert.Equal(t, before[0].ID, after[0].ID)
 			assert.Empty(t, after[0].Content)
 
-			stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, ImportStats{Skipped: 1}, stats)
 			assert.Equal(t, 1, details, "the next sync fetches no detail")
@@ -488,7 +488,7 @@ func TestSyncChatGPTRejectsInvalidSummary(t *testing.T) {
 		{name: "missing update time", list: fmt.Sprintf(`{"items":[{"id":%q}],"total":1}`, chatGPTSyncID)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			stats, err := syncChatGPT(t.Context(), testDB(t), func(_ context.Context, path string) (BrowserResponse, error) {
+			stats, err := syncChatGPTTest(t.Context(), testDB(t), func(_ context.Context, path string) (BrowserResponse, error) {
 				if path == chatGPTRequest(chatGPTListRequest, "", 0, true) {
 					return BrowserResponse{Status: 200, Body: []byte(`{"items":[],"total":0}`)}, nil
 				}
@@ -614,9 +614,9 @@ func TestSyncChatGPTEquivalentTimestampsSkipSecondDetail(t *testing.T) {
 				detail = chatGPTSyncDetail(tc.detailTime, false, "Question")
 			}
 			fetch := chatGPTSyncFetch(t, tc.listTime, detail, &details, tc.id)
-			_, err := syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			_, err := syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
-			stats, err := syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			stats, err := syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantSkipped, stats.Skipped)
 			assert.Equal(t, tc.wantDetails, details)
@@ -658,7 +658,7 @@ func TestSyncChatGPTEmptyConversationFreshness(t *testing.T) {
 					return BrowserResponse{}, nil
 				}
 			}
-			stats, err := syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			stats, err := syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, ImportStats{Imported: 1, Skipped: 1}, stats)
 			messages, err := d.GetAllMessages(t.Context(), "chatgpt:"+laterID)
@@ -668,14 +668,14 @@ func TestSyncChatGPTEmptyConversationFreshness(t *testing.T) {
 			require.NoError(t, err)
 			assert.Nil(t, session, "empty chats stay out of the archive")
 
-			stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, ImportStats{Skipped: 2}, stats)
 			assert.Equal(t, 2, details, "an unchanged empty chat is not fetched again")
 
 			// The chat gains content, and the list shows a newer update time.
 			listTime = "2"
-			stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, ImportStats{Imported: 1, Skipped: 1}, stats)
 			assert.Equal(t, 3, details)
@@ -691,7 +691,7 @@ func TestSyncChatGPTRenameWithSameMessagesCountsUpdate(t *testing.T) {
 		t.Run(fmt.Sprintf("rename=%t", rename), func(t *testing.T) {
 			d := testDB(t)
 			details := 0
-			_, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745711", chatGPTSyncDetail(1706745711, false, "Question"), &details), BrowserSyncOptions{}, nil)
+			_, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745711", chatGPTSyncDetail(1706745711, false, "Question"), &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 
 			id := "chatgpt:" + chatGPTSyncID
@@ -709,7 +709,7 @@ func TestSyncChatGPTRenameWithSameMessagesCountsUpdate(t *testing.T) {
 				renamed = strings.Replace(renamed, `"title":"Tool"`, `"title":"Renamed"`, 1)
 				wantTitle = "Renamed"
 			}
-			stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745712", renamed, &details), BrowserSyncOptions{}, nil)
+			stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745712", renamed, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, ImportStats{Updated: 1}, stats)
 			stored, err := d.GetSessionFull(t.Context(), "chatgpt:"+chatGPTSyncID)
@@ -749,7 +749,7 @@ func TestSyncChatGPTUnsupportedFormatCountsTowardDetailStop(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			d := testDB(t)
 			details := 0
-			stats, err := syncChatGPT(t.Context(), d, func(_ context.Context, path string) (BrowserResponse, error) {
+			stats, err := syncChatGPTTest(t.Context(), d, func(_ context.Context, path string) (BrowserResponse, error) {
 				if path == chatGPTRequest(chatGPTListRequest, "", 0, true) {
 					return BrowserResponse{Status: 200, Body: []byte(`{"items":[],"total":0}`)}, nil
 				}
@@ -807,7 +807,7 @@ func TestSyncChatGPTSingleUnsupportedDetail(t *testing.T) {
 				}
 			}
 			for run := range 2 {
-				stats, err := syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+				stats, err := syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 				require.ErrorIs(t, err, ErrBrowserFormat)
 				assert.Equal(t, 1, stats.Errors)
 				if run == 0 {
@@ -841,7 +841,7 @@ func TestSyncChatGPTLongRetryAfterKeepsEarlierWrites(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				d := testDB(t)
 				rateLimitedRequests := 0
-				stats, err := syncChatGPT(t.Context(), d, func(_ context.Context, path string) (BrowserResponse, error) {
+				stats, err := syncChatGPTTest(t.Context(), d, func(_ context.Context, path string) (BrowserResponse, error) {
 					switch path {
 					case chatGPTRequest(chatGPTListRequest, "", 0, true):
 						return BrowserResponse{Status: 200, Body: []byte(`{"items":[],"total":0}`)}, nil
@@ -940,7 +940,7 @@ func TestSyncChatGPTZipImageReconciliation(t *testing.T) {
 						// case skips it to extend legacy rows on its first sync.
 						if !tc.extend || !tc.legacy {
 							details := 0
-							_, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1", string(unchangedDetail), &details), BrowserSyncOptions{}, nil)
+							_, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1", string(unchangedDetail), &details), BrowserSyncOptions{}, nil)
 							require.NoError(t, err)
 							assert.Empty(t, replacedCopies(t, d, "chatgpt:"+chatGPTSyncID))
 						}
@@ -982,7 +982,7 @@ func TestSyncChatGPTZipImageReconciliation(t *testing.T) {
 								return BrowserResponse{}, nil
 							}
 						}
-						stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+						stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 						require.NoError(t, err)
 						assert.Equal(t, 1, stats.Updated)
 						assert.Zero(t, stats.Errors)
@@ -1009,7 +1009,7 @@ func TestSyncChatGPTZipImageReconciliation(t *testing.T) {
 						assert.Equal(t, after[0].Content, *stored.FirstMessage)
 						require.NoError(t, d.UpsertProviderStatHash(t.Context(), parser.AgentChatGPT, "chatgpt:"+id, 0))
 						detail = []byte(strings.Replace(string(detail), "See this:", "Changed text:", 1))
-						stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+						stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 						require.NoError(t, err)
 						assert.Equal(t, 1, stats.Updated)
 						assert.Empty(t, stats.Refusals)
@@ -1037,7 +1037,7 @@ func TestSyncChatGPTZipImageReconciliation(t *testing.T) {
 						}
 						detail := strings.TrimSuffix(strings.TrimPrefix(body, "["), "]")
 						details := 0
-						_, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745720", detail, &details), BrowserSyncOptions{}, nil)
+						_, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745720", detail, &details), BrowserSyncOptions{}, nil)
 						require.NoError(t, err)
 						after, err := d.GetAllMessages(t.Context(), "chatgpt:"+chatGPTSyncID)
 						require.NoError(t, err)
@@ -1051,7 +1051,7 @@ func TestSyncChatGPTZipImageReconciliation(t *testing.T) {
 							assert.Equal(t, messageContents(before), messageContents(saved))
 							// Force another fetch to check that the same loss creates only one copy.
 							require.NoError(t, d.UpsertProviderStatHash(t.Context(), parser.AgentChatGPT, "chatgpt:"+chatGPTSyncID, 0))
-							_, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745720", detail, &details), BrowserSyncOptions{}, nil)
+							_, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745720", detail, &details), BrowserSyncOptions{}, nil)
 							require.NoError(t, err)
 							assert.Len(t, replacedCopies(t, d, "chatgpt:"+chatGPTSyncID), 1)
 						} else {
@@ -1083,7 +1083,7 @@ func TestSyncChatGPTUpdatesArchivedToolCalls(t *testing.T) {
 				body = strings.ReplaceAll(body, "cg-tool", chatGPTSyncID)
 				body = strings.Replace(body, `"update_time":1706745710.0`, fmt.Sprintf(`"update_time":%d`, i+1), 1)
 				body = strings.TrimSuffix(strings.TrimPrefix(body, "["), "]")
-				_, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, strconv.Itoa(i+1), body, &details), BrowserSyncOptions{}, nil)
+				_, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, strconv.Itoa(i+1), body, &details), BrowserSyncOptions{}, nil)
 				require.NoError(t, err)
 				if i == 0 {
 					messages, err := d.GetAllMessages(t.Context(), "chatgpt:"+chatGPTSyncID)
@@ -1124,7 +1124,7 @@ func TestSyncChatGPTUpdatesToolResultLengthsUnderTranscriptsPolicy(t *testing.T)
 		body := strings.ReplaceAll(chatGPTToolRunConv(tc.output, false), "cg-tool", chatGPTSyncID)
 		body = strings.Replace(body, `"update_time":1706745710.0`, fmt.Sprintf(`"update_time":%d`, i+1), 1)
 		body = strings.TrimSuffix(strings.TrimPrefix(body, "["), "]")
-		stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, strconv.Itoa(i+1), body, &details), BrowserSyncOptions{}, nil)
+		stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, strconv.Itoa(i+1), body, &details), BrowserSyncOptions{}, nil)
 		require.NoError(t, err)
 		assert.Zero(t, stats.Errors)
 		if i == 1 {
@@ -1217,14 +1217,14 @@ func TestSyncChatGPTPagesActiveAndArchivedLists(t *testing.T) {
 				}
 				return BrowserResponse{Status: 200, Body: []byte(body)}, nil
 			}
-			stats, err := syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+			stats, err := syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantImported, stats.Imported)
 			assert.Zero(t, stats.Errors)
 			assert.Equal(t, tc.wantImported, details)
 			assert.Equal(t, tc.wantPaths, paths)
 			if tc.withTotal {
-				stats, err = syncChatGPT(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
+				stats, err = syncChatGPTTest(t.Context(), d, fetch, BrowserSyncOptions{}, nil)
 				require.NoError(t, err)
 				assert.Equal(t, 52, stats.Skipped)
 				assert.Equal(t, 52, details)
@@ -1263,7 +1263,7 @@ func TestSyncChatGPTBackfillsLegacyIdentityBeforeReplacingEditedTurn(t *testing.
 			preventChatGPTMessageIDReuse(t, d)
 			_, err = d.PinMessage(t.Context(), id, seeded[2].ID, new("Keep the original"))
 			require.NoError(t, err)
-			stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745710", detail, &details), BrowserSyncOptions{}, nil)
+			stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745710", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Equal(t, 1, stats.Updated)
 			before, err := d.GetAllMessages(t.Context(), id)
@@ -1276,7 +1276,7 @@ func TestSyncChatGPTBackfillsLegacyIdentityBeforeReplacingEditedTurn(t *testing.
 			detail = strings.NewReplacer(`"id":"m-n3"`, `"id":"new-user-message"`,
 				`"Follow up"`, `"Follow up with more detail"`,
 				`"update_time":1706745710.0`, `"update_time":1706745711`).Replace(detail)
-			stats, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1706745711", detail, &details), BrowserSyncOptions{}, nil)
+			stats, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1706745711", detail, &details), BrowserSyncOptions{}, nil)
 			require.NoError(t, err)
 			assert.Zero(t, stats.Errors)
 			assert.Equal(t, 1, stats.Updated)
@@ -1308,7 +1308,7 @@ func TestSyncChatGPTBackfillsLegacyIdentityBeforeReplacingEditedTurn(t *testing.
 func TestSyncChatGPTReplacesShorterBranchAndPreservesLostPins(t *testing.T) {
 	d := testDB(t)
 	details := 0
-	_, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1", chatGPTSyncDetail(1, true, "Question"), &details), BrowserSyncOptions{}, nil)
+	_, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1", chatGPTSyncDetail(1, true, "Question"), &details), BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	id := "chatgpt:" + chatGPTSyncID
 	before, err := d.GetAllMessages(t.Context(), id)
@@ -1316,7 +1316,7 @@ func TestSyncChatGPTReplacesShorterBranchAndPreservesLostPins(t *testing.T) {
 	require.Len(t, before, 4)
 	_, err = d.PinMessage(t.Context(), id, before[3].ID, nil)
 	require.NoError(t, err)
-	stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "2", chatGPTSyncDetail(2, false, "Edited question"), &details), BrowserSyncOptions{}, nil)
+	stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "2", chatGPTSyncDetail(2, false, "Edited question"), &details), BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Updated)
 	after, err := d.GetAllMessages(t.Context(), id)
@@ -1332,7 +1332,7 @@ func TestSyncChatGPTReplacesShorterBranchAndPreservesLostPins(t *testing.T) {
 	require.Len(t, pins, 1)
 	assert.Equal(t, 3, pins[0].Ordinal)
 	require.NoError(t, d.UpsertProviderStatHash(t.Context(), parser.AgentChatGPT, id, 0))
-	_, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "2", chatGPTSyncDetail(2, false, "Edited question"), &details), BrowserSyncOptions{}, nil)
+	_, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "2", chatGPTSyncDetail(2, false, "Edited question"), &details), BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	assert.Len(t, replacedCopies(t, d, id), 1, "re-syncing the same shorter branch makes no further copy")
 }
@@ -1351,7 +1351,7 @@ func TestSyncChatGPTUsageArchiveShorterCompatiblePrefixKeepsTrashedCopy(t *testi
 		chatGPTNodeSpec{"user", "text", "Another"},
 		chatGPTNodeSpec{"user", "text", "And another"},
 	), "[]")
-	stats, err := syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "1", longer, &details), BrowserSyncOptions{}, nil)
+	stats, err := syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "1", longer, &details), BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	require.Equal(t, ImportStats{Imported: 1}, stats)
 	id := "chatgpt:" + chatGPTSyncID
@@ -1365,7 +1365,7 @@ func TestSyncChatGPTUsageArchiveShorterCompatiblePrefixKeepsTrashedCopy(t *testi
 		chatGPTNodeSpec{"user", "text", "Follow up"},
 		chatGPTNodeSpec{"assistant", "text", "Second answer"},
 	), "[]")
-	stats, err = syncChatGPT(t.Context(), d, chatGPTSyncFetch(t, "2", strings.Replace(shorter, `"update_time":1706745710.0`, `"update_time":2`, 1), &details), BrowserSyncOptions{}, nil)
+	stats, err = syncChatGPTTest(t.Context(), d, chatGPTSyncFetch(t, "2", strings.Replace(shorter, `"update_time":1706745710.0`, `"update_time":2`, 1), &details), BrowserSyncOptions{}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, ImportStats{Updated: 1}, stats)
 	session, err := d.GetSessionFull(t.Context(), id)

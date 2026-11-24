@@ -416,6 +416,7 @@ func schemaColumnMigrations() []columnMigration {
 			`session_name TEXT`,
 			"adding sessions.session_name",
 		},
+		{"sessions", "account", `account TEXT NOT NULL DEFAULT ''`, "adding sessions.account"},
 		{
 			"sessions", "agent_label",
 			`agent_label TEXT NOT NULL DEFAULT ''`,

@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
@@ -627,30 +626,58 @@ func TestGetMessages_BodyCursorContinuesUnicodeMessage(t *testing.T) {
 	assert.Equal(t, 2, *third.NextFrom)
 }
 
-func TestGetMessages_BodyCursorContinuesPastMaximumChunk(t *testing.T) {
+func TestGetMessages_BodyCursorSplitsMessageOverBudget(t *testing.T) {
 	ts, d := newTestToolset(t)
 	body := strings.Repeat("界", maxMaxCharsPerMessage+5)
 	dbtest.SeedSessionWithMessages(t, d, "oversized", "proj", []db.Message{
 		dbtest.UserMsg("oversized", 0, body),
 	}, dbtest.WithMessageCounts(1, 1))
 
-	_, first, err := ts.getMessages(t.Context(), nil, getMessagesIn{
-		SessionID: "oversized", MaxCharsPerMessage: maxMaxCharsPerMessage,
-	})
-	require.NoError(t, err)
-	require.Len(t, first.Messages, 1)
-	assert.Equal(t, maxMaxCharsPerMessage, utf8.RuneCountInString(first.Messages[0].Content))
-	assert.Equal(t, maxMaxCharsPerMessage+5, first.Messages[0].FullLength)
-	require.NotEmpty(t, first.Messages[0].BodyCursor)
+	in := getMessagesIn{SessionID: "oversized", MaxCharsPerMessage: maxMaxCharsPerMessage}
+	var got strings.Builder
+	for i := 0; ; i++ {
+		require.Less(t, i, len(body), "body continuation did not end")
+		_, out, err := ts.getMessages(t.Context(), nil, in)
+		require.NoError(t, err)
+		require.Len(t, out.Messages, 1)
+		assert.True(t, fitsResponse(out))
+		if in.BodyCursor == "" {
+			assert.Equal(t, maxMaxCharsPerMessage+5, out.Messages[0].FullLength)
+			assert.True(t, out.Messages[0].Truncated)
+		}
+		got.WriteString(out.Messages[0].Content)
+		in.BodyCursor = out.Messages[0].BodyCursor
+		if in.BodyCursor == "" {
+			break
+		}
+	}
+	assert.Equal(t, body, got.String())
+}
 
-	_, rest, err := ts.getMessages(t.Context(), nil, getMessagesIn{
-		SessionID: "oversized", BodyCursor: first.Messages[0].BodyCursor,
-		MaxCharsPerMessage: maxMaxCharsPerMessage,
-	})
+func TestGetMessages_AroundBodyCursorSplitsMessageOverBudget(t *testing.T) {
+	ts, d := newTestToolset(t)
+	body := strings.Repeat("界", maxMaxCharsPerMessage+5)
+	dbtest.SeedSessionWithMessages(t, d, "oversized", "proj", []db.Message{
+		dbtest.UserMsg("oversized", 0, body),
+	}, dbtest.WithMessageCounts(1, 1))
+
+	anchor := 0
+	_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "oversized", Around: &anchor, MaxCharsPerMessage: maxMaxCharsPerMessage})
 	require.NoError(t, err)
-	require.Len(t, rest.Messages, 1)
-	assert.Equal(t, strings.Repeat("界", 5), rest.Messages[0].Content)
-	assert.False(t, rest.Messages[0].Truncated)
+	require.Len(t, out.Messages, 1)
+	assert.True(t, fitsResponse(out))
+	require.NotEmpty(t, out.Messages[0].BodyCursor)
+	var got strings.Builder
+	got.WriteString(out.Messages[0].Content)
+	for i, cursor := 0, out.Messages[0].BodyCursor; cursor != ""; i++ {
+		require.Less(t, i, len(body), "body continuation did not end")
+		_, next, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "oversized", BodyCursor: cursor, MaxCharsPerMessage: maxMaxCharsPerMessage})
+		require.NoError(t, err)
+		require.Len(t, next.Messages, 1)
+		got.WriteString(next.Messages[0].Content)
+		cursor = next.Messages[0].BodyCursor
+	}
+	assert.Equal(t, body, got.String())
 }
 
 func TestGetMessages_BodyCursorRejectsChangedTranscript(t *testing.T) {
@@ -672,6 +699,68 @@ func TestGetMessages_BodyCursorRejectsChangedTranscript(t *testing.T) {
 		SessionID: "body", BodyCursor: first.Messages[0].BodyCursor,
 		MaxCharsPerMessage: 4,
 	})
+	require.ErrorIs(t, err, service.ErrSourceChanged)
+}
+
+func TestGetMessages_RevisionDoesNotSwitchHostCopy(t *testing.T) {
+	ts, d := newTestToolset(t)
+	dbtest.SeedSessionWithMessages(t, d, "codex:uuid", "proj", []db.Message{
+		dbtest.UserMsg("codex:uuid", 0, "original message"),
+	}, dbtest.WithMessageCounts(1, 1))
+	_, first, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "uuid"})
+	require.NoError(t, err)
+	require.NotEmpty(t, first.TranscriptRevision)
+	original, err := d.GetSession(t.Context(), "codex:uuid")
+	require.NoError(t, err)
+	t.Run("matching revisions", func(t *testing.T) {
+		_, continuation, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "uuid", ExpectedRevision: first.TranscriptRevision})
+		require.NoError(t, err)
+		require.Len(t, continuation.Messages, 1)
+		require.Equal(t, "original message", continuation.Messages[0].Content)
+		_, _, err = ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "codex:uuid", ExpectedRevision: *original.TranscriptRevision})
+		require.NoError(t, err)
+	})
+	dbtest.SeedSessionWithMessages(t, d, "host~codex:uuid", "proj", []db.Message{
+		dbtest.UserMsg("host~codex:uuid", 0, "other host message"),
+	}, dbtest.WithMessageCounts(1, 1))
+	t.Run("body cursor with sibling", func(t *testing.T) {
+		_, truncated, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "codex:uuid", MaxCharsPerMessage: 4})
+		require.NoError(t, err)
+		require.Len(t, truncated.Messages, 1)
+		_, chunk, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "uuid", BodyCursor: truncated.Messages[0].BodyCursor, MaxCharsPerMessage: 4})
+		require.NoError(t, err)
+		require.Len(t, chunk.Messages, 1)
+		require.Equal(t, "inal", chunk.Messages[0].Content)
+	})
+	sibling, err := d.GetSession(t.Context(), "host~codex:uuid")
+	require.NoError(t, err)
+	// Equal revisions ensure a counter comparison alone cannot reject the sibling.
+	require.Equal(t, original.TranscriptRevision, sibling.TranscriptRevision)
+	require.NoError(t, d.DeleteSession(t.Context(), "codex:uuid"))
+	t.Run("bound revision after delete", func(t *testing.T) {
+		_, _, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "uuid", ExpectedRevision: first.TranscriptRevision})
+		require.ErrorIs(t, err, service.ErrSourceChanged)
+	})
+	t.Run("unbound revision after delete", func(t *testing.T) {
+		for _, id := range []string{"uuid", "codex:uuid"} {
+			_, _, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: id, ExpectedRevision: *original.TranscriptRevision})
+			assert.ErrorIs(t, err, service.ErrSourceChanged)
+		}
+	})
+}
+
+func TestGetMessages_ContinuationRejectsDeletedSession(t *testing.T) {
+	ts, d := newTestToolset(t)
+	dbtest.SeedSessionWithMessages(t, d, "codex:body", "proj", []db.Message{
+		dbtest.UserMsg("codex:body", 0, "abcdefghij"),
+	}, dbtest.WithMessageCounts(1, 1))
+
+	_, first, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "body"})
+	require.NoError(t, err)
+	require.NotEmpty(t, first.TranscriptRevision)
+	require.NoError(t, d.DeleteSession(t.Context(), "codex:body"))
+
+	_, _, err = ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "body", ExpectedRevision: first.TranscriptRevision})
 	require.ErrorIs(t, err, service.ErrSourceChanged)
 }
 
@@ -1478,13 +1567,19 @@ func TestServer_SearchContentIncludeOneShot(t *testing.T) {
 // fakeContentSearchService captures the first ContentSearchRequest a tool builds
 // and returns a canned result or error, so semantic-mode passthrough and
 // context-mapping can be asserted without a full backend. Unused methods
-// fall through to the embedded nil interface (never called by searchContent
-// when IncludeActive is set, which skips the session-activity lookup).
+// fall through to the embedded nil interface.
 type fakeContentSearchService struct {
 	service.SessionService
 	lastReq service.ContentSearchRequest
 	result  *service.ContentSearchResult
 	err     error
+}
+
+func (f *fakeContentSearchService) Get(_ context.Context, id string) (*service.SessionDetail, error) {
+	if id == "child" || id == "older" || id == "current" {
+		return &service.SessionDetail{ID: id}, nil
+	}
+	return nil, fmt.Errorf("unexpected session lookup: %s", id)
 }
 
 func (f *fakeContentSearchService) SearchContent(
@@ -2317,4 +2412,278 @@ func TestListRecallPagesWithEvidenceAndSourceSessionFilter(t *testing.T) {
 	filtered := decodeStructured[listRecallOut](t, res)
 	require.Len(t, filtered.Entries, 1)
 	assert.Equal(t, "s2", filtered.Entries[0].SourceSessionID)
+}
+
+func TestGetMessages_BudgetPages(t *testing.T) {
+	ts, d := newTestToolset(t)
+	messages := make([]db.Message, 0, 101)
+	for i := range 100 {
+		messages = append(messages, dbtest.UserMsg("budget", i, strings.Repeat("x", 2000)))
+	}
+	messages = append(messages, db.Message{SessionID: "budget", Ordinal: 100, Role: "system", Content: "hidden", IsSystem: true})
+	dbtest.SeedSessionWithMessages(t, d, "budget", "proj", messages, dbtest.WithMessageCounts(101, 100))
+	for _, direction := range []string{"asc", "desc"} {
+		t.Run(direction, func(t *testing.T) {
+			in := getMessagesIn{SessionID: "budget", Limit: 100, Direction: direction, MaxCharsPerMessage: 2000}
+			var ordinals []int
+			filtered := 0
+			cutPage := false
+			for i := 0; ; i++ {
+				require.Less(t, i, len(messages)+1, "message pagination did not end")
+				_, out, err := ts.getMessages(t.Context(), nil, in)
+				require.NoError(t, err)
+				assert.True(t, fitsResponse(out))
+				filtered += out.Filtered
+				if out.Omitted > 0 {
+					assert.Equal(t, 101, out.MessageCount)
+				}
+				for _, m := range out.Messages {
+					ordinals = append(ordinals, m.Ordinal)
+				}
+				if len(out.Messages) == 0 {
+					break
+				}
+				if out.Omitted > 0 {
+					cutPage = true
+					require.NotNil(t, out.NextFrom)
+					want := out.Messages[len(out.Messages)-1].Ordinal + 1
+					if direction == "desc" {
+						want -= 2
+					}
+					assert.Equal(t, want, *out.NextFrom)
+				}
+				if out.NextFrom == nil {
+					break
+				}
+				in.From = out.NextFrom
+			}
+			assert.True(t, cutPage)
+			require.Len(t, ordinals, 100)
+			for i, ordinal := range ordinals {
+				want := i
+				if direction == "desc" {
+					want = 99 - i
+				}
+				assert.Equal(t, want, ordinal)
+			}
+			assert.Equal(t, 101, len(ordinals)+filtered)
+		})
+	}
+}
+
+func TestGetMessages_BudgetOversizedMetadata(t *testing.T) {
+	ts, d := newTestToolset(t)
+	message := dbtest.UserMsg("large-model", 0, "message")
+	message.Model = strings.Repeat("x", 12000)
+	dbtest.SeedSessionWithMessages(t, d, "large-model", "proj", []db.Message{message}, dbtest.WithMessageCounts(1, 1))
+	_, _, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "large-model"})
+	require.ErrorContains(t, err, "message metadata exceeds response budget")
+}
+
+type pagedContentSearchService struct {
+	service.SessionService
+	matches []db.ContentMatch
+	legacy  bool
+}
+
+func (f *pagedContentSearchService) SearchContent(_ context.Context, req service.ContentSearchRequest) (*service.ContentSearchResult, error) {
+	start := min(req.Cursor, len(f.matches))
+	end := min(start+req.Limit, len(f.matches))
+	result := &service.ContentSearchResult{Matches: f.matches[start:end], ActiveFilterApplied: !f.legacy}
+	if end < len(f.matches) && req.Mode != "semantic" && req.Mode != "hybrid" {
+		result.NextCursor = end
+	}
+	return result, nil
+}
+
+func (f *pagedContentSearchService) Get(_ context.Context, _ string) (*service.SessionDetail, error) {
+	return nil, service.ErrSessionNotFound
+}
+
+func TestSearchContent_BudgetTotal(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode     string
+		count, want    int
+		capped, legacy bool
+	}{
+		{name: "legacy", count: 36, want: 18, legacy: true},
+		{name: "capped", count: 600, want: 500, capped: true},
+		{name: "semantic", mode: "semantic", count: 30},
+		{name: "hybrid", mode: "hybrid", count: 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &pagedContentSearchService{matches: make([]db.ContentMatch, tc.count), legacy: tc.legacy}
+			for i := range fake.matches {
+				var timestamp string
+				if tc.legacy {
+					timestamp = "2024-06-15T11:59:00Z"
+					if i%2 == 0 {
+						timestamp = "2024-06-15T11:00:00Z"
+					}
+				}
+				fake.matches[i] = db.ContentMatch{SessionID: "session", Ordinal: i, Timestamp: timestamp, Snippet: "needle", ContextBefore: []db.Message{{Content: strings.Repeat("x", 500)}, {Content: strings.Repeat("x", 500)}, {Content: strings.Repeat("x", 500)}, {Content: strings.Repeat("x", 500)}}}
+			}
+			ts := &toolset{svc: fake, now: func() time.Time { return fixedNow }}
+			_, out, err := ts.searchContent(t.Context(), nil, searchContentIn{Pattern: "needle", Mode: tc.mode, IncludeActive: !tc.legacy, Limit: 20, Context: 4})
+			require.NoError(t, err)
+			assert.True(t, fitsResponse(out))
+			assert.Equal(t, tc.want, out.Total)
+			assert.Equal(t, tc.capped, out.TotalCapped)
+			if tc.mode != "" {
+				assert.Positive(t, out.Omitted)
+				assert.Contains(t, out.Note, "Reduce limit")
+			}
+			if tc.legacy {
+				require.NotEmpty(t, out.Matches)
+				require.NotNil(t, out.NextCursor)
+				assert.Equal(t, out.Matches[len(out.Matches)-1].Ordinal+1, *out.NextCursor)
+			}
+		})
+	}
+}
+
+func TestSearchContent_BudgetOversized(t *testing.T) {
+	context := make([]db.Message, 10)
+	for i := range context {
+		context[i] = dbtest.UserMsg("session", i, strings.Repeat("<", 500))
+	}
+	for _, tc := range []struct {
+		name           string
+		matches        []db.ContentMatch
+		currentSession string
+	}{
+		{name: "context", matches: []db.ContentMatch{{SessionID: "session", Ordinal: 10, Snippet: "needle", ContextBefore: context}}},
+		{name: "empty result", currentSession: strings.Repeat("x", 12000)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := &toolset{svc: &pagedContentSearchService{matches: tc.matches}, now: func() time.Time { return fixedNow }}
+			_, _, err := ts.searchContent(t.Context(), nil, searchContentIn{Pattern: "needle", CurrentSessionID: tc.currentSession, IncludeActive: true, Context: 10})
+			require.ErrorContains(t, err, "search metadata exceeds response budget")
+		})
+	}
+}
+
+func TestGetMessages_BudgetAroundLinearContinuation(t *testing.T) {
+	ts, d := newTestToolset(t)
+	messages := make([]db.Message, 5)
+	for i := range messages {
+		messages[i] = dbtest.UserMsg("around-budget", i, strings.Repeat("x", 5000))
+	}
+	dbtest.SeedSessionWithMessages(t, d, "around-budget", "proj", messages, dbtest.WithMessageCounts(5, 5))
+	anchor, before, after := 2, 2, 2
+	in := getMessagesIn{SessionID: "around-budget", Around: &anchor, Before: &before, After: &after, MaxCharsPerMessage: 5000}
+	_, out, err := ts.getMessages(t.Context(), nil, in)
+	require.NoError(t, err)
+	assert.True(t, fitsResponse(out))
+	require.NotEmpty(t, out.Messages)
+	assert.Equal(t, anchor, out.Messages[0].Ordinal)
+	require.NotNil(t, out.NextFrom)
+	assert.Equal(t, 0, *out.NextFrom)
+}
+
+func TestSessionToolsResolvePlainIDs(t *testing.T) {
+	ts, d := newTestToolset(t)
+	ts.svc = service.NewDirectBackend(d, nil, withTestDocbank())
+	seedFTSSession(t, d, "codex:plain", "proj", "needle in the transcript", "2024-06-14T10:00:00Z")
+	dbtest.SeedMessages(t, d, toolCallMsg("codex:plain", 1, db.ToolCall{ToolName: "Bash", Category: "Bash"}))
+	dbtest.SeedSession(t, d, "child", "proj", func(s *db.Session) { s.ParentSessionID = new("codex:plain") })
+	dbtest.SeedSession(t, d, "codex:empty", "proj")
+
+	_, overview, err := ts.sessionOverview(t.Context(), nil, sessionOverviewIn{SessionID: "plain"})
+	require.NoError(t, err)
+	assert.Equal(t, "codex:plain", overview.Session.SessionID)
+	assert.NotEmpty(t, overview.LastMessages)
+	_, messages, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "plain"})
+	require.NoError(t, err)
+	require.NotEmpty(t, messages.Messages)
+	assert.Equal(t, "needle in the transcript", messages.Messages[0].Content)
+	_, tools, err := ts.toolCalls(t.Context(), nil, toolCallsIn{SessionID: "plain"})
+	require.NoError(t, err)
+	require.Len(t, tools.ToolCalls, 1)
+	assert.Equal(t, "Bash", tools.ToolCalls[0].ToolName)
+	_, kids, err := ts.childSessions(t.Context(), nil, childSessionsIn{SessionID: "plain"})
+	require.NoError(t, err)
+	require.Len(t, kids.Sessions, 1)
+	assert.Equal(t, "child", kids.Sessions[0].SessionID)
+	_, _, err = ts.fileReferences(t.Context(), nil, fileReferencesIn{SessionID: "plain"})
+	require.NoError(t, err)
+
+	_, calls, err := ts.toolCalls(t.Context(), nil, toolCallsIn{SessionID: "empty"})
+	require.NoError(t, err)
+	assert.Empty(t, calls.ToolCalls)
+	_, children, err := ts.childSessions(t.Context(), nil, childSessionsIn{SessionID: "empty"})
+	require.NoError(t, err)
+	assert.Empty(t, children.Sessions)
+}
+
+func TestListRecall_SourceSessionRawID(t *testing.T) {
+	ts, d := newTestToolset(t)
+	dbtest.SeedSession(t, d, "codex:source", "project")
+	_, err := d.InsertRecallEntry(t.Context(), db.RecallEntry{
+		ID: "entry", Type: "fact", Scope: "project", Status: "accepted",
+		Title: "entry", Body: "entry", SourceSessionID: "codex:source",
+	})
+	require.NoError(t, err)
+
+	_, out, err := ts.listRecall(t.Context(), nil, listRecallIn{SourceSessionID: "source"})
+	require.NoError(t, err)
+	require.Len(t, out.Entries, 1)
+	assert.Equal(t, "codex:source", out.Entries[0].SourceSessionID)
+	dbtest.SeedSession(t, d, "host~codex:source", "project")
+	require.NoError(t, d.SoftDeleteSession(t.Context(), "codex:source"))
+	_, out, err = ts.listRecall(t.Context(), nil, listRecallIn{SourceSessionID: "codex:source"})
+	require.NoError(t, err)
+	require.Len(t, out.Entries, 1)
+	assert.Equal(t, "entry", out.Entries[0].ID)
+}
+
+func TestOptionalSessionFiltersOlderServer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/sessions/unindexed":
+			w.WriteHeader(http.StatusNotFound)
+		case "/api/v1/search/content":
+			assert.Equal(t, "unindexed", r.URL.Query().Get("exclude_session"))
+			_, _ = fmt.Fprint(w, `{"matches":[{"session_id":"other","snippet":"needle"}],"active_filter_applied":true}`)
+		default:
+			assert.Fail(t, "unexpected request", "path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ts := &toolset{svc: servicehttp.NewHTTPBackendForServer(srv.URL, "", servicehttp.HTTPServerCapabilities{APIVersion: 27})}
+	_, search, err := ts.searchContent(t.Context(), nil, searchContentIn{Pattern: "needle", CurrentSessionID: "unindexed"})
+	require.NoError(t, err)
+	require.Len(t, search.Matches, 1)
+	assert.Equal(t, "other", search.Matches[0].SessionID)
+}
+
+func TestSessionResolutionAmbiguousCandidates(t *testing.T) {
+	ts, d := newTestToolset(t)
+	for _, id := range []string{"codex:uuid", "host-a~uuid", "host-b~uuid", "host-c~uuid", "host-d~uuid"} {
+		dbtest.SeedSession(t, d, id, "project")
+	}
+	_, _, err := ts.sessionOverview(t.Context(), nil, sessionOverviewIn{SessionID: "uuid"})
+	require.ErrorContains(t, err, "codex:uuid")
+	require.ErrorContains(t, err, "host-a~uuid")
+	require.ErrorContains(t, err, "host-b~uuid")
+	require.ErrorContains(t, err, "host-c~uuid")
+	require.ErrorContains(t, err, "host-d~uuid")
+}
+
+func TestSessionResolutionTrashedExactID(t *testing.T) {
+	for _, tc := range []struct{ name, id string }{
+		{"qualified", "codex:source"},
+		{"bare", "5d416183-b894-47ef-9cba-47d5a1201234"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, d := newTestToolset(t)
+			dbtest.SeedSession(t, d, "host~"+tc.id, "project")
+			dbtest.SeedSession(t, d, tc.id, "project")
+			require.NoError(t, d.SoftDeleteSession(t.Context(), tc.id))
+			_, _, err := ts.sessionOverview(t.Context(), nil, sessionOverviewIn{SessionID: tc.id})
+			require.ErrorIs(t, err, service.ErrSessionNotFound)
+		})
+	}
 }

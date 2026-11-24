@@ -194,11 +194,7 @@ func (p *codexProvider) SourceForReconciliation(
 	if err := ctx.Err(); err != nil {
 		return SourceRef{}, false, err
 	}
-	// Reconciliation already ranked this path. Only check its plain sibling;
-	// searching by UUID here repeats discovery for every compressed rollout.
-	if isCompressedCodexRolloutPath(path) && IsRegularFile(codexPlainRolloutPath(path)) {
-		path = codexPlainRolloutPath(path)
-	}
+	path = codexRolloverSibling(path)
 	for _, root := range p.sources.roots {
 		source, ok := p.sources.sourceRef(root, path, true)
 		if !ok {
@@ -268,12 +264,7 @@ func (p *codexProvider) RawCaptureSourcesForChangedPath(
 		filepath.Base(req.Path) == CodexSessionIndexFilename {
 		return nil, nil
 	}
-	if isCompressedCodexRolloutPath(req.Path) {
-		plain := codexPlainRolloutPath(req.Path)
-		if IsRegularFile(plain) {
-			req.Path = plain
-		}
-	}
+	req.Path = codexRolloverSibling(req.Path)
 	roots := p.sources.roots
 	if req.WatchRoot != "" {
 		roots = nil
@@ -1282,6 +1273,13 @@ func (s codexSourceSet) SourcesForChangedPath(
 		if IsRegularFile(plain) {
 			req.Path = plain
 		}
+	} else if strings.HasSuffix(req.Path, codexRolloutSuffix) &&
+		!IsRegularFile(req.Path) && IsRegularFile(req.Path+".zst") {
+		// Codex compresses completed rollouts in place; an event on the just
+		// removed plain path resolves to the compressed sibling, not the
+		// missing-path fallback.
+		req.Path += ".zst"
+		compressed = true
 	}
 	for _, root := range s.roots {
 		source, ok := s.sourceRef(root, req.Path, true)
@@ -1319,6 +1317,9 @@ func (s codexSourceSet) FindSource(
 		if path == "" {
 			continue
 		}
+		// A source stored before in-place compression still names the plain
+		// file; redirect to the existing sibling form.
+		path = codexRolloverSibling(path)
 		for _, root := range s.roots {
 			if source, ok := s.sourceRef(root, path, true); ok {
 				if !req.RequireFreshSource || req.PreferStoredSource {
@@ -1389,10 +1390,12 @@ func (s codexSourceSet) Fingerprint(
 func (s codexSourceSet) pathFromSource(source SourceRef) (string, bool) {
 	switch src := source.Opaque.(type) {
 	case codexSource:
-		return src.Path, src.Path != ""
+		if src.Path != "" {
+			return codexRolloverSibling(src.Path), true
+		}
 	case *codexSource:
 		if src != nil && src.Path != "" {
-			return src.Path, true
+			return codexRolloverSibling(src.Path), true
 		}
 	case MaterializedFileSource:
 		return src.Path, src.Path != ""
@@ -1402,6 +1405,7 @@ func (s codexSourceSet) pathFromSource(source SourceRef) (string, bool) {
 		source.FingerprintKey,
 		source.Key,
 	} {
+		candidate = codexRolloverSibling(candidate)
 		for _, root := range s.roots {
 			if ref, ok := s.sourceRef(root, candidate, true); ok {
 				src := ref.Opaque.(codexSource)

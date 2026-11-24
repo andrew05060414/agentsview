@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,
     project     TEXT NOT NULL,
     machine     TEXT NOT NULL DEFAULT 'local',
+    account     TEXT NOT NULL DEFAULT '',
     agent       TEXT NOT NULL DEFAULT 'claude',
     agent_label TEXT NOT NULL DEFAULT '',
     entrypoint  TEXT NOT NULL DEFAULT '',
@@ -356,6 +357,8 @@ CREATE TABLE IF NOT EXISTS cursor_usage_events (
     cursor_token_fee_microdollars INTEGER NOT NULL DEFAULT 0,
     user_id TEXT NOT NULL DEFAULT '',
     user_email TEXT NOT NULL DEFAULT '',
+    account_user_id TEXT NOT NULL DEFAULT '',
+    account_polled_at TEXT NOT NULL DEFAULT '',
     is_headless INTEGER NOT NULL DEFAULT 0,
     dedup_key TEXT NOT NULL DEFAULT ''
 );
@@ -367,6 +370,14 @@ CREATE INDEX IF NOT EXISTS idx_cursor_usage_events_occurred
     ON cursor_usage_events(occurred_at);
 CREATE INDEX IF NOT EXISTS idx_cursor_usage_events_model
     ON cursor_usage_events(model);
+
+CREATE TABLE IF NOT EXISTS cursor_account_polls (
+    account_user_id TEXT NOT NULL,
+    hour_start INTEGER NOT NULL,
+    polled_at TEXT NOT NULL,
+    PRIMARY KEY (account_user_id, hour_start)
+);
+CREATE INDEX IF NOT EXISTS idx_cursor_account_polls_hour ON cursor_account_polls(hour_start);
 
 -- Tool calls table
 CREATE TABLE IF NOT EXISTS tool_calls (

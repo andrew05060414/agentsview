@@ -3,6 +3,8 @@ package importer
 import (
 	"context"
 	"embed"
+	"encoding/hex"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -41,6 +43,7 @@ type BrowserFetch func(ctx context.Context, path string) (BrowserResponse, error
 // BrowserSyncStore keeps browser freshness alongside the local archive.
 type BrowserSyncStore interface {
 	db.Store
+	BackfillSessionAccount(context.Context, string, []string) error
 	IsSessionTrashed(context.Context, string) bool
 	IsSessionExcluded(context.Context, string) bool
 	GetProviderStatHash(context.Context, parser.AgentType, string) (uint64, bool, error)
@@ -166,6 +169,43 @@ func waitBrowserGap(ctx context.Context, gap time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func browserAccount(ctx context.Context, fetch BrowserFetch, path string) (string, bool) {
+	response, err := fetch(ctx, path)
+	if err != nil || response.Status != 200 {
+		return "", false
+	}
+	var identity struct {
+		Account string `json:"account"`
+	}
+	if json.Unmarshal(response.Body, &identity) != nil || len(identity.Account) != 12 {
+		return "", true
+	}
+	if _, err := hex.DecodeString(identity.Account); err != nil {
+		return "", true
+	}
+	return identity.Account, true
+}
+
+func (s *browserSync) labelAccount(ctx context.Context, account string, ids []string) error {
+	write := func() error { return s.store.BackfillSessionAccount(ctx, account, ids) }
+	if s.cb != nil && s.cb.SerializeWrite != nil {
+		return s.cb.SerializeWrite(write)
+	}
+	return write()
+}
+
+func (s *browserSync) confirmAccount(ctx context.Context, fetch BrowserFetch, path, before string, ids []string) error {
+	if err := ctx.Err(); err != nil || before == "" {
+		return err
+	}
+	// A different identity at the end means the browser switched accounts
+	// during the round, so no conversation from it is labelled.
+	if after, _ := browserAccount(ctx, fetch, path); before != after {
+		return ctx.Err()
+	}
+	return s.labelAccount(ctx, string(s.agent)+":"+before, ids)
 }
 
 type browserHTTPError struct {

@@ -2,7 +2,7 @@ import { allowedPath } from "./paths.js";
 import { platforms } from "./platforms.js";
 
 // Covers message encoding and request shapes; bump both peers together.
-const version = 2;
+const version = 3;
 
 async function loadedTab(id) {
   await new Promise((resolve, reject) => {
@@ -28,20 +28,79 @@ async function loadedTab(id) {
   });
 }
 
-async function request({ id, platform, path }, port) {
-  let result;
-  try {
-    if (!Object.hasOwn(platforms, platform)) {
-      // An older extension than the server: the server reports that the
-      // extension needs an update without dropping the connection.
-      result = { id, version, status: 0, unsupported: true };
-    } else {
-      const config = platforms[platform];
-      if (!(await allowedPath(platform, path))) throw new Error("Unsupported browser fetch path");
-      let [tab] = await chrome.tabs.query({ url: `${config.origin}/*`, discarded: false });
-      if (!tab) tab = await chrome.tabs.create({ url: config.newTabURL, active: false });
-      await loadedTab(tab.id);
-      const target = { tabId: tab.id };
+// Sync sends several requests at once, one stream per site. Requests for the
+// same site share one background tab that this worker opens, and the last of
+// them to finish closes it. A tab the user already has open is reused and
+// never closed. Before this, every request could open a fresh tab and none
+// were ever closed: the orphans accumulated until Chrome discarded tabs
+// mid-request, which surfaced as "Frame with ID 0 was removed" and
+// "No tab with id" failures.
+const owned = new Map(); // platform -> { tab: Promise<Tab>, users: number }
+
+// Tabs that died mid-request. The next acquire skips them so a retry does not
+// race Chrome and pick the same closing or discarded tab again.
+const deadTabs = new Set();
+
+async function acquireTab(platform, config) {
+  const share = (entry) => {
+    entry.users++;
+    return { entry, tab: entry.tab };
+  };
+  const entry = owned.get(platform);
+  if (entry) return share(entry);
+  const [existing] = (
+    await chrome.tabs.query({ url: `${config.origin}/*`, discarded: false })
+  ).filter((tab) => !deadTabs.has(tab.id));
+  if (existing) return { entry: undefined, tab: Promise.resolve(existing) };
+  // Another request may have started opening the tab while we were querying.
+  const raced = owned.get(platform);
+  if (raced) return share(raced);
+  const created = { users: 0 };
+  created.tab = chrome.tabs.create({ url: config.newTabURL, active: false }).then(
+    (tab) => tab,
+    (error) => {
+      if (owned.get(platform) === created) owned.delete(platform);
+      throw error;
+    },
+  );
+  owned.set(platform, created);
+  return share(created);
+}
+
+function releaseTab(platform, entry) {
+  if (!entry || --entry.users > 0) return;
+  if (owned.get(platform) === entry) owned.delete(platform);
+  entry.tab.then(
+    (tab) => chrome.tabs.remove(tab.id).catch(() => {}),
+    () => {},
+  );
+}
+
+// tabGone reports the errors Chrome raises when the tab a request was using
+// is unusable: the user closed it, the browser discarded or crashed its
+// renderer (a crashed tab keeps its URL but rejects script injection with
+// "Cannot access contents of the page"), or Chrome refused to attach.
+function tabGone(error) {
+  const message = String(error?.message ?? error);
+  return (
+    message.includes("No tab with id") ||
+    message.includes("Frame with ID") ||
+    message.includes("Browser tab closed") ||
+    message.includes("Cannot access contents of the page")
+  );
+}
+
+async function fetchOnTab({ id, platform, path }, config) {
+  // A tab Chrome killed between requests leaves no reason to fail the run:
+  // drop it and retry once on a fresh one.
+  for (let attempt = 0; ; attempt++) {
+    const claim = await acquireTab(platform, config);
+    let tabId;
+    try {
+      const tab = await claim.tab;
+      tabId = tab.id;
+      await loadedTab(tabId);
+      const target = { tabId };
       await chrome.scripting.executeScript({ target, files: config.scripts, world: "ISOLATED" });
       const [reply] = await chrome.scripting.executeScript({
         target,
@@ -52,7 +111,31 @@ async function request({ id, platform, path }, port) {
       });
       if (typeof reply?.result?.status !== "number")
         throw new Error("The page changed during Sync; try Sync again");
-      result = { ...reply.result, id, version };
+      return { ...reply.result, id, version };
+    } catch (error) {
+      if (attempt === 0 && tabGone(error)) {
+        if (tabId !== undefined) deadTabs.add(tabId);
+        if (claim.entry && owned.get(platform) === claim.entry) owned.delete(platform);
+        continue;
+      }
+      throw error;
+    } finally {
+      releaseTab(platform, claim.entry);
+    }
+  }
+}
+
+async function request({ id, platform, path }, port) {
+  let result;
+  try {
+    if (!Object.hasOwn(platforms, platform)) {
+      // An older extension than the server: the server reports that the
+      // extension needs an update without dropping the connection.
+      result = { id, version, status: 0, unsupported: true };
+    } else {
+      const config = platforms[platform];
+      if (!(await allowedPath(platform, path))) throw new Error("Unsupported browser fetch path");
+      result = await fetchOnTab({ id, platform, path }, config);
     }
   } catch (error) {
     result = { id, version, status: 0, error: error.message };

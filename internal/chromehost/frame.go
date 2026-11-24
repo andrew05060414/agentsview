@@ -12,7 +12,7 @@ const FrameLimit = 64 << 20
 // peers together. A new request field, or a new or changed path shape for a
 // platform an older extension already knows, needs a bump. A new platform does
 // not: an extension that does not know it replies unsupported.
-const Version = 2
+const Version = 3
 
 var ErrCompatibility = errors.New("Restart AgentsView if you upgraded it, run agentsview source chrome setup, reload the extension at chrome://extensions, then Sync again.") //nolint:staticcheck // Recovery instructions appear directly in the UI.
 

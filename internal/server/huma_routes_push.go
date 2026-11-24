@@ -698,6 +698,7 @@ func (s *Server) humaReplicaPush(
 			session := &archivepush.ReplicaSession{
 				Connect: func(c context.Context) (storage.Pusher, error) {
 					return replica.NewPusher(c, target, local, storage.PusherOptions{
+						AccountAliases:         s.cfg.AccountAliases,
 						Projects:               body.Projects,
 						ExcludeProjects:        body.ExcludeProjects,
 						SyncStateTarget:        body.SyncStateTarget,

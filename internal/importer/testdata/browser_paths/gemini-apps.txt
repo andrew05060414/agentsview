@@ -1,4 +1,6 @@
-/_/BardChatUi/data/batchexecute?rpcids=MaZiqc&cursor=
-/_/BardChatUi/data/batchexecute?rpcids=MaZiqc&cursor=cursor%2B1%2F%3D
-/_/BardChatUi/data/batchexecute?rpcids=hNvQHb&chat=c_0123456789abcdef&cursor=
-/_/BardChatUi/data/batchexecute?rpcids=hNvQHb&chat=c_0123456789abcdef&cursor=cursor%2B43%2F
+/u/0/app
+/u/0/_/BardChatUi/data/batchexecute?rpcids=MaZiqc&cursor=
+/u/0/_/BardChatUi/data/batchexecute?rpcids=MaZiqc&cursor=cursor%2B1%2F%3D
+/u/0/_/BardChatUi/data/batchexecute?rpcids=hNvQHb&chat=c_0123456789abcdef&cursor=
+/u/0/_/BardChatUi/data/batchexecute?rpcids=hNvQHb&chat=c_0123456789abcdef&cursor=cursor%2B43%2F
+/u/9/_/BardChatUi/data/batchexecute?rpcids=MaZiqc&cursor=

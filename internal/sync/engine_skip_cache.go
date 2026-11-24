@@ -502,16 +502,35 @@ func (e *Engine) removeSkipHashSiblingsLocked(path string) int {
 // clearWatcherOverflowCaches invalidates every freshness shortcut whose
 // correctness can depend on receiving a concrete changed path. The following
 // forced discovery pass rebuilds these caches from parsed source state.
+//
+// Whole Cursor IDE state.vscdb containers are the one exception: their
+// skip-cache entry (see retainedCursorIDEContainerSkipEntries) survives.
+// providerProcessCacheKey bakes the container's filesystem-derived state hash
+// and parser data version into that entry's key, and the hash is
+// recomputed from disk on every pass regardless of which watcher events were
+// lost, so a stale key can never be mistaken for a current one: an unchanged
+// container keeps the same key and the entry still safely skips it, and a
+// changed container gets a different key and falls straight through to a
+// full reparse. Clearing it anyway (the prior behavior) had no correctness
+// benefit and forced a full re-parse of these multi-gigabyte containers,
+// which can take minutes to tens of minutes, on every overflow. Composer
+// member entries are not in this set and are cleared as before: nothing
+// recomputes a per-composer fingerprint independent of watcher events.
 func (e *Engine) clearWatcherOverflowCaches(ctx context.Context) {
 	e.skipMu.Lock()
-	e.skipCache = make(map[string]int64)
+	retainedCache, retainedFingerprints := retainedCursorIDEContainerSkipEntries(
+		e.skipCache, e.skipFingerprints,
+	)
+	e.skipCache = retainedCache
 	e.skipCacheDirty = true
-	e.skipFingerprints = make(map[string]string)
-	e.skipHashKeys = make(map[string]string)
+	e.skipFingerprints = retainedFingerprints
+	e.skipHashKeys, _ = normalizeSourceHashSkipCache(
+		e.skipCache, e.skipFingerprints,
+	)
 	e.skipMu.Unlock()
 	e.ResetFailureCache(ctx)
 	if !e.ephemeral {
-		if err := e.db.ReplaceSkippedFiles(ctx, map[string]int64{}); err != nil {
+		if err := e.db.ReplaceSkippedFiles(ctx, retainedCache); err != nil {
 			log.Printf("clearing skipped files after watcher overflow: %v", err)
 		}
 	}
@@ -519,6 +538,52 @@ func (e *Engine) clearWatcherOverflowCaches(ctx context.Context) {
 	e.clearTrustedSQLiteContainers()
 	e.clearVerifiedSources()
 	parser.EvictAllCodexSessionIndexes()
+}
+
+// retainedCursorIDEContainerSkipEntries returns the subset of a watcher-time
+// skip cache (and its parallel fingerprint map) that addresses whole Cursor
+// IDE state.vscdb containers, keyed exactly as the live cache already keys
+// them. See clearWatcherOverflowCaches for why this subset survives a
+// watcher overflow while every other entry, including Cursor IDE composer
+// members, is cleared.
+func retainedCursorIDEContainerSkipEntries(
+	cache map[string]int64, fingerprints map[string]string,
+) (map[string]int64, map[string]string) {
+	retainedCache := make(map[string]int64)
+	retainedFingerprints := make(map[string]string)
+	for key, mtime := range cache {
+		if !cursorIDEContainerSkipCacheKey(key) {
+			continue
+		}
+		retainedCache[key] = mtime
+		if fp, ok := fingerprints[key]; ok {
+			retainedFingerprints[key] = fp
+		}
+	}
+	return retainedCache, retainedFingerprints
+}
+
+// cursorIDEContainerSkipCacheKey reports whether key addresses a whole
+// Cursor IDE state.vscdb container rather than one "<db>#<composerID>"
+// virtual member. providerProcessCacheKey builds container keys as
+// "<path>?agent=<agent>?source_hash=<hash>&data_version=<n>"; a container key
+// always carries the cursor-ide agent qualifier (see
+// providerPersistentSharedContainerSource) and its path has no "#<memberID>"
+// suffix.
+func cursorIDEContainerSkipCacheKey(key string) bool {
+	path, suffix := SplitProviderSkipCachePath(key)
+	if suffix == "" {
+		return false
+	}
+	qualified := strings.TrimPrefix(suffix, db.ProviderAgentSkipMarker)
+	agent, _, _ := strings.Cut(qualified, "?")
+	if parser.AgentType(agent) != parser.AgentCursorIDE {
+		return false
+	}
+	return parser.IsCursorIDEContainerSource(parser.SourceRef{
+		Provider:    parser.AgentCursorIDE,
+		DisplayPath: path,
+	})
 }
 
 // InjectSkipCache merges entries into the in-memory skip

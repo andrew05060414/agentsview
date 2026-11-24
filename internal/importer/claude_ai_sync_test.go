@@ -447,13 +447,7 @@ func TestSyncClaudeAIDetailProcessingFailureStreak(t *testing.T) {
 					require.FailNow(t, "detail must use its own response")
 					return BrowserResponse{}, nil
 				})
-				var store interface {
-					db.Store
-					IsSessionTrashed(context.Context, string) bool
-					IsSessionExcluded(context.Context, string) bool
-					GetProviderStatHash(context.Context, parser.AgentType, string) (uint64, bool, error)
-					UpsertProviderStatHash(context.Context, parser.AgentType, string, uint64) error
-				} = d
+				var store BrowserSyncStore = d
 				if tt.failWrite {
 					store = failedSyncStore{d}
 				}
