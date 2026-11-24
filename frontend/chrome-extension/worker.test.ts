@@ -242,6 +242,25 @@ describe("Chrome native host worker", () => {
     await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledExactlyOnceWith(8));
   });
 
+  it("retries on a fresh tab when the reused tab crashed and rejects injection", async () => {
+    // A crashed renderer keeps the tab's URL, so the query still matches it,
+    // but Chrome refuses executeScript. The worker must move on to a new tab.
+    chrome.tabs.query.mockResolvedValue([{ id: 7 }]);
+    chrome.tabs.get.mockImplementation(async (id: number) => ({ id, status: "complete" }));
+    chrome.tabs.create.mockResolvedValue({ id: 8 });
+    chrome.scripting.executeScript.mockImplementation(async (options) => {
+      if (options.files) {
+        if (options.target.tabId === 7)
+          throw new Error("Cannot access contents of the page. Extension manifest must request permission to access the respective host.");
+        return [{ result: true }];
+      }
+      return [{ result: { status: 200, body: "chats" } }];
+    });
+    expect(await request()).toEqual({ id: "a", version: 3, status: 200, body: "chats" });
+    expect(chrome.tabs.create).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledExactlyOnceWith(8));
+  });
+
   it("sends a platform's headers with the page's cookies", async () => {
     const pageFetchSource = readFileSync("chrome-extension/page_fetch.js", "utf8");
     const siteFetch = vi.fn(async () => new Response('{"conversations":[]}'));

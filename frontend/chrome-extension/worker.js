@@ -75,14 +75,16 @@ function releaseTab(platform, entry) {
 }
 
 // tabGone reports the errors Chrome raises when the tab a request was using
-// disappeared mid-request: the user closed it, or the browser discarded or
-// crashed its renderer.
+// is unusable: the user closed it, the browser discarded or crashed its
+// renderer (a crashed tab keeps its URL but rejects script injection with
+// "Cannot access contents of the page"), or Chrome refused to attach.
 function tabGone(error) {
   const message = String(error?.message ?? error);
   return (
     message.includes("No tab with id") ||
     message.includes("Frame with ID") ||
-    message.includes("Browser tab closed")
+    message.includes("Browser tab closed") ||
+    message.includes("Cannot access contents of the page")
   );
 }
 
