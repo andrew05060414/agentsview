@@ -678,7 +678,7 @@ func (db *DB) termsSearchPage(
 		query, args = buildTermsAnchorSQL(f, terms, anchor, indexed[anchor])
 	} else {
 		var err error
-		query, args, err = buildTermsSearchSQL(f, terms, SQLiteQueryDialect(), indexed)
+		query, args, err = buildTermsSearchSQL(f, terms, SQLiteQueryDialect(), indexed, false)
 		if err != nil {
 			return ContentSearchPage{}, err
 		}
