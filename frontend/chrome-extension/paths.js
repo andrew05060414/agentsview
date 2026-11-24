@@ -37,6 +37,11 @@ function shapesFor(platform) {
 
 export async function allowedPath(platform, path) {
   if (typeof path !== "string" || !Object.hasOwn(platforms, platform)) return false;
+  if (platform === "gemini-apps") {
+    const account = /^\/u\/[0-9](?=\/)/.exec(path);
+    if (!account) return false;
+    path = path.slice(account[0].length);
+  }
   const shapes = await shapesFor(platform);
   return shapes.some((shape) => shape.test(path));
 }

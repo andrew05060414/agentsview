@@ -12,6 +12,10 @@ func (s *Store) GetMachineLabels(ctx context.Context) (map[string]string, error)
 	return s.getMachineMetadata(ctx, db.MachineLabelKeyPrefix)
 }
 
+func (s *Store) GetAccountAliases(ctx context.Context) (map[string]string, error) {
+	return s.getMachineMetadata(ctx, db.AccountAliasKeyPrefix)
+}
+
 func (s *Store) GetMachineAliases(ctx context.Context) (map[string]string, error) {
 	return s.getMachineMetadata(ctx, db.MachineAliasKeyPrefix)
 }
@@ -52,6 +56,7 @@ func (s *Sync) syncMachineMetadata(ctx context.Context) error {
 	for prefix, values := range map[string]map[string]string{
 		db.MachineLabelKeyPrefix: labels,
 		db.MachineAliasKeyPrefix: aliases,
+		db.AccountAliasKeyPrefix: s.accountAliases,
 	} {
 		for machine, value := range values {
 			if _, err := tx.ExecContext(ctx, `

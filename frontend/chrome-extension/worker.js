@@ -2,7 +2,7 @@ import { allowedPath } from "./paths.js";
 import { platforms } from "./platforms.js";
 
 // Covers message encoding and request shapes; bump both peers together.
-const version = 2;
+const version = 3;
 
 async function loadedTab(id) {
   await new Promise((resolve, reject) => {
@@ -48,19 +48,21 @@ async function acquireTab(platform, config) {
   };
   const entry = owned.get(platform);
   if (entry) return share(entry);
-  const [existing] = (await chrome.tabs.query({ url: `${config.origin}/*`, discarded: false }))
-    .filter((tab) => !deadTabs.has(tab.id));
+  const [existing] = (
+    await chrome.tabs.query({ url: `${config.origin}/*`, discarded: false })
+  ).filter((tab) => !deadTabs.has(tab.id));
   if (existing) return { entry: undefined, tab: Promise.resolve(existing) };
   // Another request may have started opening the tab while we were querying.
   const raced = owned.get(platform);
   if (raced) return share(raced);
   const created = { users: 0 };
-  created.tab = chrome.tabs
-    .create({ url: config.newTabURL, active: false })
-    .then((tab) => tab, (error) => {
+  created.tab = chrome.tabs.create({ url: config.newTabURL, active: false }).then(
+    (tab) => tab,
+    (error) => {
       if (owned.get(platform) === created) owned.delete(platform);
       throw error;
-    });
+    },
+  );
   owned.set(platform, created);
   return share(created);
 }
@@ -75,14 +77,16 @@ function releaseTab(platform, entry) {
 }
 
 // tabGone reports the errors Chrome raises when the tab a request was using
-// disappeared mid-request: the user closed it, or the browser discarded or
-// crashed its renderer.
+// is unusable: the user closed it, the browser discarded or crashed its
+// renderer (a crashed tab keeps its URL but rejects script injection with
+// "Cannot access contents of the page"), or Chrome refused to attach.
 function tabGone(error) {
   const message = String(error?.message ?? error);
   return (
     message.includes("No tab with id") ||
     message.includes("Frame with ID") ||
-    message.includes("Browser tab closed")
+    message.includes("Browser tab closed") ||
+    message.includes("Cannot access contents of the page")
   );
 }
 

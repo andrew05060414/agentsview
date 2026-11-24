@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -29,7 +30,7 @@ func newSessionSearchCommand() *cobra.Command {
 		in, scope                                string
 		excludeSystem, reveal                    bool
 		project, excludeProject, agent           string
-		machine, date, dateFrom, dateTo          string
+		machine, account, date, dateFrom, dateTo string
 		activeSince, since                       string
 		includeChildren, includeAutomated        bool
 		includeOneShot                           bool
@@ -87,6 +88,7 @@ func newSessionSearchCommand() *cobra.Command {
 				Project:           project,
 				ExcludeProject:    excludeProject,
 				Machine:           machine,
+				Account:           account,
 				Agent:             agent,
 				Date:              date,
 				DateFrom:          dateFrom,
@@ -143,6 +145,7 @@ func newSessionSearchCommand() *cobra.Command {
 	flags.BoolVar(&reveal, "reveal", false, "Show full secret values (unredacted)")
 	flags.StringVar(&project, "project", "", "Filter by project name")
 	flags.StringVar(&excludeProject, "exclude-project", "", "Exclude project")
+	flags.StringVar(&account, "account", "", "Filter by web account ID or alias")
 	flags.StringVar(&machine, "machine", "", machineFilterHelp)
 	flags.StringVar(&agent, "agent", "", "Filter by agent")
 	flags.StringVar(&date, "date", "", "Sessions active on YYYY-MM-DD")
@@ -353,6 +356,10 @@ func printContentMatchesTable(
 	if hasScore {
 		headers = append(headers, "SCORE")
 	}
+	hasAccount := slices.ContainsFunc(res.Matches, func(m db.ContentMatch) bool { return m.Account != "" })
+	if hasAccount {
+		headers = append(headers, "ACCOUNT")
+	}
 	headers = append(headers, "PROJECT", "LOCATION", "SNIPPET")
 
 	// Column caps only apply when a real terminal width constrains the
@@ -382,6 +389,9 @@ func printContentMatchesTable(
 				score = fmt.Sprintf("%.2f", *m.Score)
 			}
 			cells = append(cells, score)
+		}
+		if hasAccount {
+			cells = append(cells, sanitizeTerminal(orEmDash(displayAccount(m.Account, m.AccountAlias))))
 		}
 		cells = append(cells,
 			truncCell(sanitizeTerminal(orEmDash(m.Project)), projectCap),
@@ -461,9 +471,13 @@ func printContentMatchesHuman(w io.Writer, res *service.ContentSearchResult, now
 		if m.Score != nil {
 			fmt.Fprintf(w, " score=%.2f", *m.Score)
 		}
-		fmt.Fprintf(w, "  %s  %s  %s\n",
+		fmt.Fprintf(w, "  %s  %s  %s",
 			humanizeMatchAge(m.Timestamp, now),
 			sanitizeTerminal(m.Project), sanitizeTerminal(loc))
+		if m.Account != "" {
+			fmt.Fprintf(w, "  account=%s", sanitizeTerminal(displayAccount(m.Account, m.AccountAlias)))
+		}
+		fmt.Fprintln(w)
 		fmt.Fprintf(w, "    %s\n",
 			sanitizeTerminal(strings.ReplaceAll(m.Snippet, "\n", " ")))
 		for _, cm := range m.ContextAfter {

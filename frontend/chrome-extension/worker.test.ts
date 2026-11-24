@@ -64,18 +64,18 @@ afterEach(() => {
 });
 
 async function request(path = "/api/organizations") {
-  message({ id: "a", platform: "claude-ai", path, version: 2 });
+  message({ id: "a", platform: "claude-ai", path, version: 3 });
   await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledOnce());
   return port.postMessage.mock.calls[0]![0];
 }
 
 describe("Chrome native host worker", () => {
   it("refuses unsupported paths before touching tabs", async () => {
-    message({ id: "a", platform: "claude-ai", path: "/api/settings", version: 2 });
+    message({ id: "a", platform: "claude-ai", path: "/api/settings", version: 3 });
     await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledOnce());
     expect(port.postMessage).toHaveBeenCalledWith({
       id: "a",
-      version: 2,
+      version: 3,
       status: 0,
       error: "Unsupported browser fetch path",
     });
@@ -87,11 +87,11 @@ describe("Chrome native host worker", () => {
   it.each([undefined, "", "codex", "__proto__", "toString"])(
     "replies unsupported for platform %s without touching tabs",
     async (platform) => {
-      message({ id: "a", platform, path: "/api/organizations", version: 2 });
+      message({ id: "a", platform, path: "/api/organizations", version: 3 });
       await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledOnce());
       expect(port.postMessage).toHaveBeenCalledWith({
         id: "a",
-        version: 2,
+        version: 3,
         status: 0,
         unsupported: true,
       });
@@ -107,7 +107,7 @@ describe("Chrome native host worker", () => {
       await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledOnce());
       expect(port.postMessage).toHaveBeenCalledWith({
         id: "a",
-        version: 2,
+        version: 3,
         status: 200,
         body: "chats",
       });
@@ -121,11 +121,11 @@ describe("Chrome native host worker", () => {
         `../internal/importer/testdata/browser_paths/${platform}.txt`,
         "utf8",
       ).split("\n");
-      message({ id: "a", platform, path, version: 2 });
+      message({ id: "a", platform, path, version: 3 });
       await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledOnce());
       expect(port.postMessage).toHaveBeenCalledWith({
         id: "a",
-        version: 2,
+        version: 3,
         status: 200,
         body: "chats",
       });
@@ -163,7 +163,7 @@ describe("Chrome native host worker", () => {
       return [{ result: (await options.func(...(options.args ?? []))) ?? null }];
     });
     chrome.tabs.query.mockResolvedValue([]);
-    expect(await request()).toEqual({ id: "a", version: 2, status: 200, body: "chats" });
+    expect(await request()).toEqual({ id: "a", version: 3, status: 200, body: "chats" });
     expect(chrome.tabs.create).toHaveBeenCalledWith({
       url: "https://claude.ai/new",
       active: false,
@@ -184,14 +184,14 @@ describe("Chrome native host worker", () => {
     }));
     chrome.tabs.get.mockImplementation(async (id: number) => ({ id, status: "complete" }));
     for (const id of ["a", "b", "c"])
-      message({ id, platform: "claude-ai", path: "/api/organizations", version: 2 });
+      message({ id, platform: "claude-ai", path: "/api/organizations", version: 3 });
     for (const id of ["d", "e"])
-      message({ id, platform: "claude-ai", path: "/api/organizations", version: 2 });
+      message({ id, platform: "claude-ai", path: "/api/organizations", version: 3 });
     message({
       id: "f",
       platform: "grok-web",
       path: "/rest/app-chat/conversations?pageSize=100",
-      version: 2,
+      version: 3,
     });
     await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledTimes(6));
     expect(chrome.tabs.create).toHaveBeenCalledTimes(2);
@@ -202,9 +202,7 @@ describe("Chrome native host worker", () => {
 
   it("retries once on a fresh tab when the tab dies mid-request", async () => {
     chrome.tabs.query.mockResolvedValue([]);
-    chrome.tabs.create
-      .mockResolvedValueOnce({ id: 8 })
-      .mockResolvedValueOnce({ id: 9 });
+    chrome.tabs.create.mockResolvedValueOnce({ id: 8 }).mockResolvedValueOnce({ id: 9 });
     chrome.tabs.get.mockImplementation(async (id: number) => ({ id, status: "complete" }));
     let injected = 0;
     chrome.scripting.executeScript.mockImplementation(async (options) => {
@@ -215,7 +213,7 @@ describe("Chrome native host worker", () => {
       }
       return [{ result: { status: 200, body: "chats" } }];
     });
-    expect(await request()).toEqual({ id: "a", version: 2, status: 200, body: "chats" });
+    expect(await request()).toEqual({ id: "a", version: 3, status: 200, body: "chats" });
     expect(chrome.tabs.create).toHaveBeenCalledTimes(2);
   });
 
@@ -234,7 +232,7 @@ describe("Chrome native host worker", () => {
       }
       return [{ result: { status: 200, body: "chats" } }];
     });
-    expect(await request()).toEqual({ id: "a", version: 2, status: 200, body: "chats" });
+    expect(await request()).toEqual({ id: "a", version: 3, status: 200, body: "chats" });
     expect(injected).toBe(2);
     expect(chrome.tabs.create).toHaveBeenCalledOnce();
     // The dead tab belonged to the user: it is never closed by the worker.
@@ -242,23 +240,48 @@ describe("Chrome native host worker", () => {
     await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledExactlyOnceWith(8));
   });
 
+  it("retries on a fresh tab when the reused tab crashed and rejects injection", async () => {
+    // A crashed renderer keeps the tab's URL, so the query still matches it,
+    // but Chrome refuses executeScript. The worker must move on to a new tab.
+    chrome.tabs.query.mockResolvedValue([{ id: 7 }]);
+    chrome.tabs.get.mockImplementation(async (id: number) => ({ id, status: "complete" }));
+    chrome.tabs.create.mockResolvedValue({ id: 8 });
+    chrome.scripting.executeScript.mockImplementation(async (options) => {
+      if (options.files) {
+        if (options.target.tabId === 7)
+          throw new Error(
+            "Cannot access contents of the page. Extension manifest must request permission to access the respective host.",
+          );
+        return [{ result: true }];
+      }
+      return [{ result: { status: 200, body: "chats" } }];
+    });
+    expect(await request()).toEqual({ id: "a", version: 3, status: 200, body: "chats" });
+    expect(chrome.tabs.create).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledExactlyOnceWith(8));
+  });
+
   it("sends a platform's headers with the page's cookies", async () => {
-    const pageFetchSource = readFileSync("chrome-extension/page_fetch.js", "utf8");
+    const injected =
+      readFileSync("chrome-extension/page_fetch.js", "utf8") +
+      "\n" +
+      readFileSync("chrome-extension/grok_fetch.js", "utf8") +
+      "\nglobalThis.grokFetch = grokFetch;";
     const siteFetch = vi.fn(async () => new Response('{"conversations":[]}'));
     chrome.scripting.executeScript.mockImplementation(async (options) => {
       if (options.files) {
-        // Run the injected page_fetch.js against the page's fetch.
-        new Function("fetch", pageFetchSource)(siteFetch);
+        // Run the injected fetch scripts against the page's fetch.
+        new Function("fetch", injected)(siteFetch);
         return [];
       }
       return [{ result: (await options.func(...(options.args ?? []))) ?? null }];
     });
     const path = "/rest/app-chat/conversations?pageSize=100";
-    message({ id: "a", platform: "grok-web", path, version: 2 });
+    message({ id: "a", platform: "grok-web", path, version: 3 });
     await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledOnce());
     expect(port.postMessage).toHaveBeenCalledWith({
       id: "a",
-      version: 2,
+      version: 3,
       status: 200,
       body: '{"conversations":[]}',
       retryAfter: undefined,
@@ -283,7 +306,7 @@ describe("Chrome native host worker", () => {
     updated(9, { status: "complete" });
     expect(chrome.scripting.executeScript).not.toHaveBeenCalled();
     updated(7, { status: "complete" });
-    expect(await pending).toEqual({ id: "a", version: 2, status: 200, body: "chats" });
+    expect(await pending).toEqual({ id: "a", version: 3, status: 200, body: "chats" });
     expect(chrome.tabs.onUpdated.removeListener).toHaveBeenCalledWith(updated);
   });
 
@@ -291,7 +314,7 @@ describe("Chrome native host worker", () => {
     chrome.scripting.executeScript
       .mockResolvedValueOnce([{ result: true }])
       .mockResolvedValueOnce([{ result: { status: 200, body: '"'.repeat(32 * 1024 * 1024) } }]);
-    expect(await request()).toEqual({ id: "a", version: 2, status: 413 });
+    expect(await request()).toEqual({ id: "a", version: 3, status: 413 });
   });
 
   it.each([null, {}, { status: "200" }])(
@@ -302,7 +325,7 @@ describe("Chrome native host worker", () => {
         .mockResolvedValueOnce([{ result }]);
       expect(await request()).toEqual({
         id: "a",
-        version: 2,
+        version: 3,
         status: 0,
         error: "The page changed during Sync; try Sync again",
       });

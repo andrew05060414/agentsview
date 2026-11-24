@@ -34,6 +34,22 @@ globalThis.pageFetch = async function pageFetch(url, headers, requestBody) {
       }
       body += decoder.decode();
     }
+    if (new URL(url).pathname === "/api/organizations") {
+      if (!response.ok)
+        return {
+          status: response.status,
+          body: "",
+          retryAfter: response.headers.get("retry-after") ?? undefined,
+        };
+      try {
+        const organizations = JSON.parse(body);
+        body = JSON.stringify(
+          organizations.map(({ uuid, capabilities }) => ({ uuid, capabilities })),
+        );
+      } catch {
+        return { status: 0, body: "", error: "Unexpected organization response" };
+      }
+    }
     const retryAfter = response.headers.get("retry-after") ?? undefined;
     return { status: response.status, body, retryAfter };
   } catch (error) {
@@ -41,4 +57,15 @@ globalThis.pageFetch = async function pageFetch(url, headers, requestBody) {
   } finally {
     clearTimeout(timer);
   }
+};
+
+globalThis.browserAccountReply = async function browserAccountReply(identity) {
+  let account = "";
+  if (typeof identity === "string" && identity) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
+    account = Array.from(new Uint8Array(digest, 0, 6), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+  }
+  return { status: 200, body: JSON.stringify({ account }) };
 };

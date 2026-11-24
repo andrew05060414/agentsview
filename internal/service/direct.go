@@ -39,6 +39,7 @@ import (
 type directBackend struct {
 	docbank        *docbank.Client
 	modelGroups    ModelGroups
+	accountAliases map[string]string
 	db             db.Store
 	local          *db.DB
 	engine         *sync.Engine
@@ -78,6 +79,11 @@ type DirectBackendOption func(*directBackend)
 // WithModelGroups configures model filters and optional display grouping.
 func WithModelGroups(groups ModelGroups) DirectBackendOption {
 	return func(b *directBackend) { b.modelGroups = groups }
+}
+
+// WithAccountAliases provides the configured display names for web accounts.
+func WithAccountAliases(aliases map[string]string) DirectBackendOption {
+	return func(b *directBackend) { b.accountAliases = aliases }
 }
 
 // newEvidenceSource returns a random ID for this backend instance, so a
@@ -213,6 +219,17 @@ func (b *directBackend) FindSessionIDsByPartial(
 func (b *directBackend) FindSessionIDsByRawSuffix(
 	ctx context.Context, raw string, limit int,
 ) ([]string, error) {
+	// An exact trashed ID must not resolve to another session's suffix.
+	session, err := b.db.GetSessionFull(ctx, raw)
+	if err != nil {
+		identity, ok := errors.AsType[*db.SessionIdentityError](err)
+		if !ok || identity.State != "ambiguous" {
+			return nil, err
+		}
+	}
+	if session != nil && session.ID == raw && session.DeletedAt != nil {
+		return nil, nil
+	}
 	return b.db.FindSessionIDsByRawSuffix(ctx, raw, limit)
 }
 
@@ -315,6 +332,10 @@ func (b *directBackend) List(
 		f.Limit = db.DefaultSessionLimit
 	}
 
+	accountAliases, err := b.resolveAccountFilter(ctx, &f.Account)
+	if err != nil {
+		return nil, err
+	}
 	filter := listFilterToDB(f)
 	filter.PR = pr
 	page, err := b.db.ListSessions(ctx, filter)
@@ -322,7 +343,25 @@ func (b *directBackend) List(
 		return nil, err
 	}
 	hideStaleSecretCounts(page.Sessions, filter.SecretsRulesVersions)
+	if accountAliases == nil {
+		for _, session := range page.Sessions {
+			if session.Account != "" {
+				accountAliases, err = b.sessionAccountAliases(ctx)
+				if err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+	}
+	pageAliases := make(map[string]string)
+	for _, session := range page.Sessions {
+		if alias := accountAliases[session.Account]; alias != "" {
+			pageAliases[session.Account] = alias
+		}
+	}
 	return &SessionList{
+		AccountAliases:  pageAliases,
 		ExclusionCounts: page.ExclusionCounts,
 		Sessions:        page.Sessions,
 		NextCursor:      page.NextCursor,
@@ -340,6 +379,7 @@ func listFilterToDB(f ListFilter) db.SessionFilter {
 		Project:              f.Project,
 		ExcludeProject:       f.ExcludeProject,
 		Machine:              f.Machine,
+		Account:              f.Account,
 		GitBranch:            f.GitBranch,
 		Agent:                f.Agent,
 		Date:                 f.Date,
@@ -1222,6 +1262,10 @@ func (b *directBackend) SearchContent(
 	if err != nil {
 		return nil, err
 	}
+	accountAliases, err := b.resolveAccountFilter(ctx, &req.Account)
+	if err != nil {
+		return nil, err
+	}
 	filter := db.ContentSearchFilter{
 		Pattern:            req.Pattern,
 		Mode:               req.Mode,
@@ -1230,6 +1274,7 @@ func (b *directBackend) SearchContent(
 		Project:            req.Project,
 		ExcludeProject:     req.ExcludeProject,
 		Machine:            req.Machine,
+		Account:            req.Account,
 		GitBranch:          req.GitBranch,
 		SessionID:          req.SessionID,
 		GitBranchExact:     req.GitBranchExact,
@@ -1275,6 +1320,9 @@ func (b *directBackend) SearchContent(
 		page, err = b.db.SearchContent(ctx, filter)
 	}
 	if err != nil {
+		return nil, err
+	}
+	if err := b.attachContentAccounts(ctx, page.Matches, accountAliases); err != nil {
 		return nil, err
 	}
 	revisionBound := true
