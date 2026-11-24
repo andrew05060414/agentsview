@@ -48,19 +48,21 @@ async function acquireTab(platform, config) {
   };
   const entry = owned.get(platform);
   if (entry) return share(entry);
-  const [existing] = (await chrome.tabs.query({ url: `${config.origin}/*`, discarded: false }))
-    .filter((tab) => !deadTabs.has(tab.id));
+  const [existing] = (
+    await chrome.tabs.query({ url: `${config.origin}/*`, discarded: false })
+  ).filter((tab) => !deadTabs.has(tab.id));
   if (existing) return { entry: undefined, tab: Promise.resolve(existing) };
   // Another request may have started opening the tab while we were querying.
   const raced = owned.get(platform);
   if (raced) return share(raced);
   const created = { users: 0 };
-  created.tab = chrome.tabs
-    .create({ url: config.newTabURL, active: false })
-    .then((tab) => tab, (error) => {
+  created.tab = chrome.tabs.create({ url: config.newTabURL, active: false }).then(
+    (tab) => tab,
+    (error) => {
       if (owned.get(platform) === created) owned.delete(platform);
       throw error;
-    });
+    },
+  );
   owned.set(platform, created);
   return share(created);
 }

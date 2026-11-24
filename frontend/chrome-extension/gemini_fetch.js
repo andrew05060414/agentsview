@@ -46,7 +46,9 @@ async function geminiSession(account, refresh) {
     at: geminiPageValue(html, "SNlM0e"),
     sid: geminiPageValue(html, "FdrFJe"),
     bl: geminiPageValue(html, "cfb2h"),
-    accountReply: await globalThis.browserAccountReply(/^\d{10,30}$/.test(identity) ? identity : ""),
+    accountReply: await globalThis.browserAccountReply(
+      /^\d{10,30}$/.test(identity) ? identity : "",
+    ),
   };
   if (!session.at) return { status: 401, body: "" };
   sessions.set(account, session);

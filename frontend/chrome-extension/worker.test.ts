@@ -202,9 +202,7 @@ describe("Chrome native host worker", () => {
 
   it("retries once on a fresh tab when the tab dies mid-request", async () => {
     chrome.tabs.query.mockResolvedValue([]);
-    chrome.tabs.create
-      .mockResolvedValueOnce({ id: 8 })
-      .mockResolvedValueOnce({ id: 9 });
+    chrome.tabs.create.mockResolvedValueOnce({ id: 8 }).mockResolvedValueOnce({ id: 9 });
     chrome.tabs.get.mockImplementation(async (id: number) => ({ id, status: "complete" }));
     let injected = 0;
     chrome.scripting.executeScript.mockImplementation(async (options) => {
@@ -251,7 +249,9 @@ describe("Chrome native host worker", () => {
     chrome.scripting.executeScript.mockImplementation(async (options) => {
       if (options.files) {
         if (options.target.tabId === 7)
-          throw new Error("Cannot access contents of the page. Extension manifest must request permission to access the respective host.");
+          throw new Error(
+            "Cannot access contents of the page. Extension manifest must request permission to access the respective host.",
+          );
         return [{ result: true }];
       }
       return [{ result: { status: 200, body: "chats" } }];
@@ -262,12 +262,16 @@ describe("Chrome native host worker", () => {
   });
 
   it("sends a platform's headers with the page's cookies", async () => {
-    const pageFetchSource = readFileSync("chrome-extension/page_fetch.js", "utf8");
+    const injected =
+      readFileSync("chrome-extension/page_fetch.js", "utf8") +
+      "\n" +
+      readFileSync("chrome-extension/grok_fetch.js", "utf8") +
+      "\nglobalThis.grokFetch = grokFetch;";
     const siteFetch = vi.fn(async () => new Response('{"conversations":[]}'));
     chrome.scripting.executeScript.mockImplementation(async (options) => {
       if (options.files) {
-        // Run the injected page_fetch.js against the page's fetch.
-        new Function("fetch", pageFetchSource)(siteFetch);
+        // Run the injected fetch scripts against the page's fetch.
+        new Function("fetch", injected)(siteFetch);
         return [];
       }
       return [{ result: (await options.func(...(options.args ?? []))) ?? null }];
