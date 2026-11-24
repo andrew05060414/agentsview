@@ -47,12 +47,22 @@ describe("Grok page fetch", () => {
     );
   });
 
-  it("answers the identity request with a hash of the user ID only", async () => {
+  it.each([
+    { name: "top-level userId", body: { userId: "55555555-5555-4555-8555-555555555555" } },
+    {
+      name: "nested xaiUserId",
+      body: {
+        subscriptions: [
+          { xaiUserId: "55555555-5555-4555-8555-555555555555", tier: "SUBSCRIPTION_TIER" },
+        ],
+      },
+    },
+  ])("answers the identity request with a hash of the user ID only ($name)", async ({ body }) => {
     const userId = "55555555-5555-4555-8555-555555555555";
     const fetch = vi
       .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ userId, email: "someone@example.com" })),
+        new Response(JSON.stringify({ ...body, email: "someone@example.com" })),
       );
     const grokFetch = loadFetch(fetch);
 
@@ -67,7 +77,11 @@ describe("Grok page fetch", () => {
   });
 
   it("answers an empty identity when the user ID is missing or unreadable", async () => {
-    for (const body of [JSON.stringify({ email: "someone@example.com" }), "not json"]) {
+    for (const body of [
+      JSON.stringify({ email: "someone@example.com" }),
+      JSON.stringify({ subscriptions: [] }),
+      "not json",
+    ]) {
       const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValueOnce(new Response(body));
       const grokFetch = loadFetch(fetch);
       expect(await grokFetch("https://grok.com/rest/subscriptions")).toEqual({

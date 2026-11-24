@@ -7,7 +7,14 @@ async function grokFetch(url, headers) {
   if (new URL(url).pathname !== "/rest/subscriptions") return response;
   if (response.status !== 200) return { status: response.status, body: "" };
   try {
-    const { userId } = JSON.parse(response.body);
+    const parsed = JSON.parse(response.body);
+    // The account id sits in the first subscription's xaiUserId; userId at the
+    // top level is kept for an older response shape.
+    const userId =
+      parsed.userId ??
+      (parsed.subscriptions ?? [])
+        .map((entry) => entry?.xaiUserId)
+        .find((id) => typeof id === "string");
     const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
     return await globalThis.browserAccountReply(uuid.test(userId) ? userId : "");
   } catch {
