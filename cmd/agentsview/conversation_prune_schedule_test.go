@@ -17,6 +17,7 @@ import (
 // drain on the first tick, and Run returns once that happens.
 func drainedIdleTracker(t *testing.T) *server.IdleTracker {
 	t.Helper()
+	//nolint:kennlint // deadlinetest: the drained state under test is the idle deadline expiring; a 1ns budget forces drain on the first tick.
 	tracker := server.NewIdleTracker(time.Nanosecond, func() {})
 	tracker.Run(t.Context())
 	done, ok := tracker.BeginWork()
@@ -53,7 +54,7 @@ func TestConversationPruneJobSwallowsWriterClosed(t *testing.T) {
 	})
 
 	job := conversationPruneJob(database, nil)
-	assert.NoError(t, job.Run(ctx))
+	require.NoError(t, job.Run(ctx))
 	assert.True(t, database.WriterClosed(),
 		"the job must not clear the maintenance barrier it found")
 }

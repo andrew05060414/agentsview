@@ -28,6 +28,17 @@ func startupProbeGet(
 	return resp
 }
 
+// startupProbeStatus issues the GET, closes the body, and returns the status
+// code for checks that only care about routing.
+func startupProbeStatus(
+	t *testing.T, ts *httptest.Server, challenge string,
+) int {
+	t.Helper()
+	resp := startupProbeGet(t, ts, challenge)
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
 func TestStartupProbeChallengeRequiresEnabledProbe(t *testing.T) {
 	s := testServer(t, 0)
 	_, _, err := s.StartupProbeChallenge()
@@ -44,32 +55,31 @@ func TestStartupProbeEndpointProof(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	// Disabled: the endpoint does not exist for clients.
-	resp := startupProbeGet(t, ts, "")
-	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound, startupProbeStatus(t, ts, ""))
 
 	require.NoError(t, s.EnableStartupProbe())
 
 	// Missing or malformed challenges are still rejected.
-	resp = startupProbeGet(t, ts, "")
-	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
-	resp = startupProbeGet(t, ts, "not-valid-base64!!")
-	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound, startupProbeStatus(t, ts, ""))
+	assert.Equal(t, http.StatusNotFound,
+		startupProbeStatus(t, ts, "not-valid-base64!!"))
 	// Well-formed base64 of the wrong length is also rejected.
-	resp = startupProbeGet(t, ts, "aGVsbG8")
-	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound,
+		startupProbeStatus(t, ts, "aGVsbG8"))
 
 	challenge, expectedProof, err := s.StartupProbeChallenge()
 	require.NoError(t, err)
-	resp = startupProbeGet(t, ts, challenge)
+	resp := startupProbeGet(t, ts, challenge)
 	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 	assert.Equal(t, expectedProof, resp.Header.Get(startupProbeProofHeader))
 	assert.True(t, ValidStartupProbeResponse(resp, expectedProof))
 	assert.False(t, ValidStartupProbeResponse(resp, expectedProof+"x"))
 	assert.False(t, ValidStartupProbeResponse(resp, ""))
+	resp.Body.Close()
 
 	s.DisableStartupProbe()
-	resp = startupProbeGet(t, ts, challenge)
-	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	assert.Equal(t, http.StatusNotFound,
+		startupProbeStatus(t, ts, challenge))
 }
 
 // TestValidStartupProbeResponseEmptyExpected reproduces a latent footgun:

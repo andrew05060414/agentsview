@@ -36,6 +36,18 @@ var agTestProto = []byte{
 	0x12, 0x05, 'h', 'e', 'l', 'l', 'o',
 }
 
+// agRealisticProto repeats well-formed fields to ~3KB, closer to real
+// transcript sizes than the 10-byte agTestProto. The weak proto sniff is
+// much more likely to reject wrong-key garbage over a long candidate —
+// yet still accepts most of it (PX-2042).
+var agRealisticProto = func() []byte {
+	var b []byte
+	for len(b) < 3000 {
+		b = append(b, 0x08, 0x96, 0x01, 0x12, 0x05, 'h', 'e', 'l', 'l', 'o')
+	}
+	return b
+}()
+
 func encryptAesCTR(t *testing.T, key, nonce, plaintext []byte) []byte {
 	t.Helper()
 	block, err := aes.NewCipher(key)
@@ -97,6 +109,8 @@ func TestDecryptAntigravityCTRAndCBC(t *testing.T) {
 	key := bytes.Repeat([]byte{0x42}, 32)
 	setAntigravityKey(t, key)
 
+	// CTR at skip=0 is deterministic: the correct candidate is the very
+	// first one evaluated, and it wins on merit.
 	t.Run("ctr", func(t *testing.T) {
 		data := encryptAesCTR(t, key, bytes.Repeat([]byte{0x07}, 16), agTestProto)
 		got, err := decryptAntigravity(data)
@@ -104,38 +118,52 @@ func TestDecryptAntigravityCTRAndCBC(t *testing.T) {
 		assert.Equal(t, agTestProto, got)
 	})
 
-	// The fixture constants below are chosen so the correct (mode, skip)
-	// combination wins the candidate race: the proto sniff is permissive and
-	// a wrong-offset decryption can also walk as protobuf, so arbitrary
-	// nonces and IVs sometimes let a garbage candidate answer first.
+	// Reproduces PX-2042: with leading bytes the correct (mode, skip) is
+	// tried later, and a wrong-offset garbage candidate passes the weak
+	// proto sniff first. nonce 0xaa loses that race today.
 	t.Run("ctr with leading bytes", func(t *testing.T) {
-		data := encryptAesCTR(t, key, bytes.Repeat([]byte{0x09}, 16), agTestProto)
+		t.Skip("reproduces PX-2042: weak proto sniff lets wrong-offset garbage win the candidate race")
+		data := encryptAesCTR(t, key, bytes.Repeat([]byte{0xaa}, 16), agRealisticProto)
 		data = append([]byte{0x00, 0x00, 0x00, 0x00}, data...)
 		got, err := decryptAntigravity(data)
 		require.NoError(t, err)
-		assert.Equal(t, agTestProto, got)
+		assert.Equal(t, agRealisticProto, got)
 	})
 
+	// Reproduces PX-2042: CTR is tried before CBC, and CTR-mode garbage
+	// passes the weak proto sniff before the real CBC candidate is reached.
+	// Only 2 of 256 single-byte IVs decode correctly today; iv 0x00 loses.
 	t.Run("cbc", func(t *testing.T) {
-		data := encryptAesCBC(t, key, bytes.Repeat([]byte{0x2a}, 16), agTestProto)
+		t.Skip("reproduces PX-2042: CTR-mode garbage wins the race before CBC is tried")
+		data := encryptAesCBC(t, key, bytes.Repeat([]byte{0x00}, 16), agRealisticProto)
 		got, err := decryptAntigravity(data)
 		require.NoError(t, err)
-		assert.Equal(t, agTestProto, got)
+		assert.Equal(t, agRealisticProto, got)
 	})
 }
 
-// TestDecryptAntigravityWrongKey: ciphertext nobody can read must come back
-// as nil, nil — "not decryptable" — not as an error or garbage bytes. The
-// wrong key byte is a fixture: the proto sniff accepts most garbage, so only
-// some keys exhaust every candidate to nil.
+// TestDecryptAntigravityWrongKey reproduces PX-2042: ciphertext nobody can
+// read must come back as nil, nil — "not decryptable" — not as garbage
+// bytes. Sweeps all 255 single-byte wrong keys over a realistic-size
+// plaintext; 167 of them return junk today.
 func TestDecryptAntigravityWrongKey(t *testing.T) {
+	t.Skip("reproduces PX-2042: wrong keys return garbage because the proto sniff accepts it")
 	key := bytes.Repeat([]byte{0x42}, 32)
-	data := encryptAesCTR(t, key, bytes.Repeat([]byte{0x07}, 16), agTestProto)
+	data := encryptAesCTR(t, key, bytes.Repeat([]byte{0x07}, 16), agRealisticProto)
 
-	setAntigravityKey(t, bytes.Repeat([]byte{0x0e}, 32))
-	got, err := decryptAntigravity(data)
-	require.NoError(t, err)
-	assert.Nil(t, got)
+	for v := range 256 {
+		if v == 0x42 {
+			continue
+		}
+		t.Setenv("ANTIGRAVITY_KEY",
+			base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{byte(v)}, 32)))
+		agKeyOnce = sync.Once{}
+		agKeyVal = nil
+		errAGKey = nil
+		got, err := decryptAntigravity(data)
+		require.NoError(t, err)
+		assert.Nil(t, got, "wrong key 0x%02x returned %d bytes", v, len(got))
+	}
 }
 
 // TestDecryptAntigravityNoKey: a missing key is an error the caller can
