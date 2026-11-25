@@ -1042,6 +1042,7 @@ func (s *Sync) sessionFingerprints(
 		if err != nil {
 			return nil, fmt.Errorf("tool call fingerprint %s: %w", sess.ID, err)
 		}
+		messages, dialogue := db.MirrorMessageFingerprintValues(msgs)
 		payload := struct {
 			SessionFields  []any
 			Messages       []db.Message
@@ -1058,8 +1059,8 @@ func (s *Sync) sessionFingerprints(
 			SessionFields: duckSessionFingerprintFields(
 				sess, db.MirroredSessionMachine(sess, s.machine),
 			),
-			Messages:       msgs,
-			Dialogue:       db.DialogueFingerprintValues(msgs),
+			Messages:       messages,
+			Dialogue:       dialogue,
 			Usage:          usage[sess.ID],
 			ToolCalls:      toolCalls,
 			SecretFindings: findings,

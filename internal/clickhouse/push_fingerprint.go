@@ -79,9 +79,10 @@ func (s *Sync) snapshotFingerprint(
 	snapshot *db.SessionMirrorSnapshot, total *db.SessionUsageTotal,
 ) (sessionFingerprint, error) {
 	sess := snapshot.Session
+	messages, dialogue := db.MirrorMessageFingerprintValues(snapshot.Messages)
 	content := SessionContent{
-		Messages:       snapshot.Messages,
-		Dialogue:       db.DialogueFingerprintValues(snapshot.Messages),
+		Messages:       messages,
+		Dialogue:       dialogue,
 		Usage:          snapshot.UsageFingerprint,
 		ToolCalls:      snapshot.ToolCallFingerprint,
 		SecretFindings: snapshot.Findings,
