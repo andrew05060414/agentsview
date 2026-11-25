@@ -43,6 +43,7 @@ type contentSearchInput struct {
 	KeywordFallback    bool               `query:"allow_keyword_fallback" doc:"Return hybrid keyword matches when semantic search is unavailable"`
 	Scope              contentSearchScope `query:"scope" enum:"top,all,subordinate" doc:"Result scope: top, all, or subordinate (blank lexical scope keeps sidebar child filtering)"`
 	SearchIntent       string             `header:"X-AgentsView-Search-Intent" doc:"Required for semantic/hybrid GET searches"`
+	DialogueOnly       bool               `header:"X-AgentsView-Dialogue-Only" hidden:"true"`
 	In                 string             `query:"in" doc:"Comma-separated content sources"`
 	ExcludeSystem      bool               `query:"exclude_system" doc:"Exclude system messages"`
 	Reveal             bool               `query:"reveal" doc:"Return unredacted secret matches for localhost callers"`
@@ -149,6 +150,7 @@ func (s *Server) humaSearchContent(
 		KeywordFallback:    in.KeywordFallback,
 		Sources:            sources,
 		ExcludeSystem:      in.ExcludeSystem,
+		DialogueOnly:       in.DialogueOnly,
 		Reveal:             in.Reveal,
 		Project:            in.Project,
 		ExcludeProject:     in.ExcludeProject,

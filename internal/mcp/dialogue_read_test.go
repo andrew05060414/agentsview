@@ -247,6 +247,26 @@ func TestDialogueProjection_HTTPReadAndSearchContext(t *testing.T) {
 	}
 }
 
+func TestSearchContent_DefaultDialogueFiltersBeforePaging(t *testing.T) {
+	ts, d := newTestToolset(t)
+	dbtest.SeedDialogueSearchPaging(t, d)
+	in := searchContentIn{Pattern: "pagingneedle", Limit: 1, IncludeActive: true}
+	_, found, err := ts.searchContent(t.Context(), nil, in)
+	require.NoError(t, err)
+	require.Len(t, found.Matches, 1)
+	assert.Equal(t, "dialogue-page-older", found.Matches[0].SessionID)
+	assert.Equal(t, "older pagingneedle", found.Matches[0].Snippet)
+	assert.Nil(t, found.NextCursor)
+
+	in.Sources = []string{"messages"}
+	_, found, err = ts.searchContent(t.Context(), nil, in)
+	require.NoError(t, err)
+	require.Len(t, found.Matches, 1)
+	assert.Equal(t, "dialogue-page-newer", found.Matches[0].SessionID)
+	assert.Equal(t, "observation pagingneedle", found.Matches[0].Snippet)
+	assert.Equal(t, new(1), found.NextCursor)
+}
+
 func TestSearchContent_WithholdsLegacySnippets(t *testing.T) {
 	ts, d := newTestToolset(t)
 	dbtest.SeedSessionWithMessages(t, d, "legacy-search", "proj", []db.Message{

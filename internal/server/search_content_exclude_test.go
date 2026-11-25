@@ -2,14 +2,42 @@ package server_test
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 )
+
+func TestSearchContentDialogueOnlyThroughHTTP(t *testing.T) {
+	srv := httptest.NewUnstartedServer(nil)
+	t.Cleanup(srv.Close)
+	te := setup(t, withPublicOrigins("http://"+srv.Listener.Addr().String()))
+	dbtest.SeedDialogueSearchPaging(t, te.db)
+	srv.Config.Handler = te.handler
+	srv.Start()
+	backend := servicehttp.NewHTTPBackend(srv.URL, "", false, "")
+	req := service.ContentSearchRequest{
+		Pattern: "pagingneedle", Limit: 1, Sources: []string{"messages"}, DialogueOnly: true,
+	}
+	res, err := backend.SearchContent(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, res.Matches, 1)
+	assert.Equal(t, "dialogue-page-older", res.Matches[0].SessionID)
+	assert.Zero(t, res.NextCursor)
+
+	req.DialogueOnly = false
+	res, err = backend.SearchContent(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, res.Matches, 1)
+	assert.Equal(t, "dialogue-page-newer", res.Matches[0].SessionID)
+	assert.Equal(t, 1, res.NextCursor)
+}
 
 // TestSearchContentExcludeSessionDropsEveryRepeatedID pins that every
 // repeated exclude_session value is honoured, not just the first. Huma

@@ -104,6 +104,22 @@ func SeedDialogueSearch(t *testing.T, d *db.DB) {
 	}))
 }
 
+func SeedDialogueSearchPaging(t *testing.T, d *db.DB) {
+	t.Helper()
+	const older, newer, project = "dialogue-page-older", "dialogue-page-newer", "dialogue-page"
+	SeedSessionWithMessages(t, d, older, project, []db.Message{
+		{SessionID: older, Ordinal: 0, Role: "user", Content: "question", DialogueText: new("question")},
+		{SessionID: older, Ordinal: 1, Role: "assistant", Content: "older pagingneedle", DialogueText: new("older pagingneedle")},
+		{SessionID: older, Ordinal: 2, Role: "user", Content: "follow-up", DialogueText: new("follow-up")},
+	}, WithMessageCounts(3, 2), func(s *db.Session) { s.StartedAt = new("2026-05-20T12:00:00Z") })
+	SeedSessionWithMessages(t, d, newer, project, []db.Message{
+		{SessionID: newer, Ordinal: 0, Role: "user", Content: "question", DialogueText: new("question")},
+		{SessionID: newer, Ordinal: 1, Role: "user", SourceSubtype: "tool_result", Content: "observation pagingneedle"},
+		{SessionID: newer, Ordinal: 2, Role: "tool", Content: "tool pagingneedle"},
+		{SessionID: newer, Ordinal: 3, Role: "user", Content: "follow-up", DialogueText: new("follow-up")},
+	}, WithMessageCounts(4, 2), func(s *db.Session) { s.StartedAt = new("2026-05-21T12:00:00Z") })
+}
+
 // AssertDialogueSearchParity checks mirror hits and snippets against expected
 // values and compares lexical pagination with SQLite.
 // Callers supply their supported modes. Substring and regex cover every source;
@@ -124,6 +140,25 @@ func AssertDialogueSearchParity(t *testing.T, archive, mirror db.Store, modes ..
 	}
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
+			t.Run("dialogue-paging", func(t *testing.T) {
+				f := db.ContentSearchFilter{
+					Pattern: "pagingneedle", Mode: mode, Project: "dialogue-page",
+					Sources: []string{"messages"}, Limit: 1, DialogueOnly: true,
+				}
+				page, err := mirror.SearchContent(t.Context(), f)
+				require.NoError(t, err)
+				require.Len(t, page.Matches, 1)
+				assert.Equal(t, "dialogue-page-older", page.Matches[0].SessionID)
+				assert.Zero(t, page.NextCursor)
+
+				f.DialogueOnly = false
+				page, err = mirror.SearchContent(t.Context(), f)
+				require.NoError(t, err)
+				require.Len(t, page.Matches, 1)
+				assert.Equal(t, "dialogue-page-newer", page.Matches[0].SessionID)
+				assert.Equal(t, 1, page.Matches[0].Ordinal)
+				assert.Equal(t, 1, page.NextCursor)
+			})
 			lexical := mode == "" || mode == "substring" || mode == "regex"
 			sources := []string{"messages"}
 			if lexical {

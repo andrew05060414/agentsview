@@ -1168,6 +1168,7 @@ func (t *toolset) searchContent(
 		IncludeOneShot:     in.IncludeOneShot,
 		IncludeAutomated:   in.IncludeAutomated,
 		ExcludeSystem:      len(in.Sources) == 0,
+		DialogueOnly:       len(in.Sources) == 0,
 		ExcludeSessionIDs:  excludeSessions,
 		ExcludeActiveSince: cutoff,
 	}

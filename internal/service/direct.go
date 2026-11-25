@@ -1227,6 +1227,7 @@ func (b *directBackend) SearchContent(
 		Mode:               req.Mode,
 		Sources:            req.Sources,
 		ExcludeSystem:      req.ExcludeSystem,
+		DialogueOnly:       req.DialogueOnly,
 		Project:            req.Project,
 		ExcludeProject:     req.ExcludeProject,
 		Machine:            req.Machine,

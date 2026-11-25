@@ -955,6 +955,13 @@ func (b *httpBackend) SearchContent(
 		})
 	}
 
+	if req.DialogueOnly {
+		editors = append(editors, func(_ context.Context, r *http.Request) error {
+			r.Header.Set(service.DialogueOnlySearchHeader, "true")
+			return nil
+		})
+	}
+
 	api, err := b.apiClient(b.longRunningClient)
 	if err != nil {
 		return nil, err

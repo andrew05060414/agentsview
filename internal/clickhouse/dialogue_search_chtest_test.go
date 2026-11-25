@@ -19,6 +19,7 @@ func TestClickHouseDialogueSearchParity(t *testing.T) {
 	t.Parallel()
 	local, target := seedFixture(t)
 	dbtest.SeedDialogueSearch(t, local)
+	dbtest.SeedDialogueSearchPaging(t, local)
 	syncer := newTestSync(t, local, target, storage.PusherOptions{})
 	_, err := syncer.Push(t.Context(), false, nil)
 	require.NoError(t, err)

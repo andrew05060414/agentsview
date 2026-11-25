@@ -225,7 +225,7 @@ func selectContentWordPage(ctx context.Context, tx *sql.Tx, f ContentSearchFilte
 func lexicalMessageWhere(f ContentSearchFilter) (string, []any) {
 	scope, args := sessionScopeSubquery(f)
 	where := "m." + scope + " AND " + LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())
-	where += " AND " + lexicalMessagePredicate(contentSystemPredicate(f))
+	where += " AND " + lexicalMessagePredicate(f)
 	return where, args
 }
 

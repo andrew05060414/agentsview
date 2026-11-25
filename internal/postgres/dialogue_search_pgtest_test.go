@@ -15,6 +15,7 @@ func TestPGDialogueSearchParity(t *testing.T) {
 	t.Parallel()
 	syncer, local, _, ctx := newSessionProvenancePushSync(t, "agentsview")
 	dbtest.SeedDialogueSearch(t, local)
+	dbtest.SeedDialogueSearchPaging(t, local)
 	_, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store, err := NewStore(t.Context(), testPGURL(t), syncer.schema, true)

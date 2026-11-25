@@ -33,6 +33,7 @@ type ContentSearchFilter struct {
 	KeywordOnly   bool     // internal hybrid keyword leg; skips the semantic index
 	Sources       []string // subset of {"messages","thinking","tool_input","tool_result"}
 	ExcludeSystem bool
+	DialogueOnly  bool
 
 	Project, ExcludeProject, Machine, Agent           string
 	SessionID, GitBranchExact                         string
@@ -353,8 +354,17 @@ func contentSystemPredicate(f ContentSearchFilter) string {
 	return "m.role <> 'system' AND m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
 }
 
-func lexicalMessagePredicate(systemPredicate string) string {
-	return "(m.dialogue_text IS NULL OR TRIM(m.dialogue_text) <> '') AND " + systemPredicate
+// DialogueSearchSQL restricts message hits for the default MCP dialogue search.
+// Unclassified user and assistant rows remain eligible as coverage gaps.
+func (f ContentSearchFilter) DialogueSearchSQL() string {
+	if !f.DialogueOnly {
+		return ""
+	}
+	return " AND m.role IN ('user', 'assistant') AND m.source_subtype <> 'tool_result'"
+}
+
+func lexicalMessagePredicate(f ContentSearchFilter) string {
+	return "(m.dialogue_text IS NULL OR TRIM(m.dialogue_text) <> '') AND " + contentSystemPredicate(f) + f.DialogueSearchSQL()
 }
 
 // searchContentSubstring builds a UNION ALL across the selected sources
@@ -453,7 +463,7 @@ func substringUnion(f ContentSearchFilter, candidates substringCandidateFilters)
 			JOIN sessions s ON s.id = m.session_id
 			WHERE %s LIKE ? ESCAPE '\'%s AND %s AND m.%s`,
 			snippetExpr("COALESCE(m.dialogue_text, m.content)"), "COALESCE(m.dialogue_text, m.content)",
-			candidates.message.sql, lexicalMessagePredicate(sysPred), scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
+			candidates.message.sql, lexicalMessagePredicate(f), scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
 		args = append(args, like)
 		args = append(args, candidates.message.args...)
 		args = append(args, scopeArgs...)
@@ -841,7 +851,7 @@ func (db *DB) regexCandidateRows(
 			FROM messages m
 			JOIN sessions s ON s.id = m.session_id
 			WHERE %s AND %s AND m.%s`,
-			"COALESCE(m.dialogue_text, m.content)", w, lexicalMessagePredicate(sysPred), scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
+			"COALESCE(m.dialogue_text, m.content)", w, lexicalMessagePredicate(f), scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
 		args = append(args, scopeArgs...)
 	}
 	if hasSource(f, "thinking") {
@@ -1091,7 +1101,7 @@ func (db *DB) searchContentFTS(
 		return ContentSearchPage{}, err
 	}
 	scope, scopeArgs := sessionScopeSubquery(f)
-	msgPred := lexicalMessagePredicate(contentSystemPredicate(f))
+	msgPred := lexicalMessagePredicate(f)
 	// A row can match OR and NOT queries without every operand, so ask SQLite
 	// which operands this row matched. Snippets then follow a branch the row
 	// actually satisfied. Unquoted input never carries these operators. Syntax
@@ -1823,7 +1833,7 @@ func (db *DB) hybridWordHits(
 	defer func() { _ = snapshot.Close() }()
 	scope, args := semanticSessionScopeSubquery(f)
 	where := "m.role IN ('user','assistant') AND m.is_system = 0 AND " +
-		SystemPrefixSQL("m.content", "m.role") + " AND m." + scope
+		SystemPrefixSQL("m.content", "m.role") + " AND m." + scope + f.DialogueSearchSQL()
 	// Keep the fragment unredacted until enrichment locates it in the full
 	// message. The final snippet is redacted against that full message.
 	f.RevealSecrets = true
@@ -1856,9 +1866,9 @@ func (db *DB) fetchHybridFTSBatch(
 		FROM messages_fts f JOIN messages m ON m.id = f.rowid
 		WHERE f.content MATCH ? AND m.role IN ('user','assistant')
 		  AND m.is_system = 0 AND %s
-		  AND m.%s
+		  AND m.%s%s
 		ORDER BY f.rank, m.id LIMIT ? OFFSET ?`,
-		SystemPrefixSQL("m.content", "m.role"), scope)
+		SystemPrefixSQL("m.content", "m.role"), scope, f.DialogueSearchSQL())
 	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
 
 	args := []any{ftsQuery.match}

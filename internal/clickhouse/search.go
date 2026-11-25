@@ -431,6 +431,7 @@ func (s *Store) collectContentSubstringMatches(
 			if f.ExcludeSystem {
 				sysPred = embeddableMessagePredicate("m")
 			}
+			sysPred += f.DialogueSearchSQL()
 			contentPred := addSearchArgs("COALESCE(m.dialogue_text, m.content)")
 			branches = append(branches, `
 				SELECT m.session_id AS session_id, s.project AS project, s.agent AS agent,
@@ -632,7 +633,7 @@ func (s *Store) collectContentSource(
 		if f.ExcludeSystem {
 			query += " AND " + embeddableMessagePredicate("m")
 		}
-		query += prefixFilter("COALESCE(m.dialogue_text, m.content)")
+		query += prefixFilter("COALESCE(m.dialogue_text, m.content)") + f.DialogueSearchSQL()
 		query += " ORDER BY m.session_id, m.ordinal, m.id"
 	case "thinking":
 		query = `SELECT m.session_id, s.project, s.agent, 'thinking',
