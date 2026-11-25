@@ -264,7 +264,7 @@ func TestSelectSurvivingVectorHitsErrors(t *testing.T) {
 						cancel()
 					}
 					return nil, tc.lookupErr
-				})
+				}, nil)
 			if tc.cancelAfterLookup {
 				require.ErrorIs(t, err, context.Canceled)
 			} else {

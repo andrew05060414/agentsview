@@ -117,7 +117,61 @@ func SeedDialogueSearchPaging(t *testing.T, d *db.DB) {
 		{SessionID: newer, Ordinal: 1, Role: "user", SourceSubtype: "tool_result", Content: "observation pagingneedle"},
 		{SessionID: newer, Ordinal: 2, Role: "tool", Content: "tool pagingneedle"},
 		{SessionID: newer, Ordinal: 3, Role: "user", Content: "follow-up", DialogueText: new("follow-up")},
-	}, WithMessageCounts(4, 2), func(s *db.Session) { s.StartedAt = new("2026-05-21T12:00:00Z") })
+		{SessionID: newer, Ordinal: 4, Role: "assistant", SourceSubtype: "tool_result", Content: "assistant tool output"},
+	}, WithMessageCounts(5, 2), func(s *db.Session) { s.StartedAt = new("2026-05-21T12:00:00Z") })
+}
+
+type dialogueVectorSearcher struct {
+	limits []int
+}
+
+func (s *dialogueVectorSearcher) PrepareSemanticSearch(context.Context, string) (db.VectorSearchPage, int, error) {
+	return func(_ context.Context, limit int) ([]db.VectorHit, bool, error) {
+		s.limits = append(s.limits, limit)
+		hits := []db.VectorHit{
+			{SessionID: "dialogue-page-newer", Ordinal: 4, OrdinalStart: 4, OrdinalEnd: 4, Score: 0.95, Snippet: "assistant tool output"},
+			{SessionID: "dialogue-page-newer", Ordinal: 2, OrdinalStart: 2, OrdinalEnd: 2, Score: 0.9, Snippet: "tool pagingneedle"},
+		}
+		if limit <= db.SemanticOverfetchMin {
+			return hits, false, nil
+		}
+		return append(hits, db.VectorHit{
+			SessionID: "dialogue-page-older", Ordinal: 1, OrdinalStart: 1, OrdinalEnd: 1, Score: 0.8, Snippet: "older pagingneedle",
+		}), true, nil
+	}, 0, nil
+}
+
+func (*dialogueVectorSearcher) ResolveMessageUnits(_ context.Context, refs []db.MessageRef) ([]db.UnitRef, error) {
+	return make([]db.UnitRef, len(refs)), nil
+}
+
+type dialogueVectorStore interface {
+	SetVectorSearcher(db.VectorSearcher)
+	SearchContent(context.Context, db.ContentSearchFilter) (db.ContentSearchPage, error)
+}
+
+func AssertDialogueVectorSearch(t *testing.T, store dialogueVectorStore) {
+	t.Helper()
+	for _, mode := range []string{"hybrid", "semantic"} {
+		searcher := &dialogueVectorSearcher{}
+		store.SetVectorSearcher(searcher)
+		f := db.ContentSearchFilter{
+			Pattern: "vectoronlyneedle", Mode: mode, Project: "dialogue-page", Limit: 1, DialogueOnly: true,
+		}
+		page, err := store.SearchContent(t.Context(), f)
+		require.NoError(t, err, mode)
+		require.Len(t, page.Matches, 1, mode)
+		assert.Equal(t, "dialogue-page-older", page.Matches[0].SessionID, mode)
+		assert.Equal(t, 1, page.Matches[0].Ordinal, mode)
+		assert.Equal(t, []int{db.SemanticOverfetchMin, 2 * db.SemanticOverfetchMin}, searcher.limits, mode)
+
+		f.DialogueOnly, f.Sources = false, []string{"messages"}
+		page, err = store.SearchContent(t.Context(), f)
+		require.NoError(t, err, mode)
+		require.Len(t, page.Matches, 1, mode)
+		assert.Equal(t, "dialogue-page-newer", page.Matches[0].SessionID, mode)
+		assert.Equal(t, 4, page.Matches[0].Ordinal, mode)
+	}
 }
 
 // AssertDialogueSearchParity checks mirror hits and snippets against expected

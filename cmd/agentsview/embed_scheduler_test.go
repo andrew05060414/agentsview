@@ -834,7 +834,7 @@ func TestSearcherAdapterActivityCandidateExpansion(t *testing.T) {
 				allowed[id] = false
 			}
 			return allowed, nil
-		})
+		}, nil)
 		require.NoError(t, err)
 		assert.Empty(t, hits)
 		assert.Equal(t, 1, encodes)

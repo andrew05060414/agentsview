@@ -1332,32 +1332,32 @@ func classifyFTSError(err error) error {
 // than will ultimately be returned.
 const SemanticOverfetchMin = 200
 
-// maxActivityExpansionCandidates caps the candidate count when an activity
-// cutoff or ContentSearchFilter.Candidates makes SelectSurvivingVectorHits
-// double its fetch. Starting from
+// maxVectorExpansionCandidates caps the candidate count when filtering
+// makes SelectSurvivingVectorHits double its fetch. Starting from
 // SemanticOverfetchMin, the cap allows at most six fetches. It equals
 // sqlite-vec's KNN ceiling, and it also bounds the KNN and hydration work
 // that PostgreSQL and ClickHouse would otherwise do for large limits.
-const maxActivityExpansionCandidates = 4096
+const maxVectorExpansionCandidates = 4096
 
 // SelectSurvivingVectorHits returns the ranked vector hits that pass the
-// filter's session scope. When an activity cutoff rejects hits and leaves
-// fewer than f.Limit units, it fetches again with twice the candidates, until
-// the engine is exhausted or the candidate cap is reached. When
-// f.Candidates is set it expands the same way whenever fewer than f.Limit
-// units survive, and records whether the engine was exhausted. allowedSessions
-// returns an entry for each otherwise eligible session; false marks a
-// session that the activity cutoff rejects.
+// filter's session scope and, for dialogue search, anchor eligibility.
+// When activity or anchor filtering leaves fewer than f.Limit units, it
+// doubles the fetch until the engine is exhausted or the candidate cap is
+// reached. When f.Candidates is set it expands the same way whenever fewer
+// than f.Limit units survive, and records whether the engine was exhausted.
+// allowedSessions returns an entry for each otherwise eligible session;
+// false marks a session that the activity cutoff rejects.
 func SelectSurvivingVectorHits(
 	ctx context.Context, f ContentSearchFilter, searcher VectorSearcher, k int,
 	allowedSessions func(context.Context, ContentSearchFilter, []string) (map[string]bool, error),
+	dialogueAnchors func(context.Context, ContentSearchFilter, []VectorHit) (map[MessageRef]bool, error),
 ) ([]VectorHit, error) {
 	search, ceiling, err := searcher.PrepareSemanticSearch(ctx, f.Pattern)
 	if err != nil {
 		return nil, err
 	}
-	if ceiling <= 0 || ceiling > maxActivityExpansionCandidates {
-		ceiling = maxActivityExpansionCandidates
+	if ceiling <= 0 || ceiling > maxVectorExpansionCandidates {
+		ceiling = maxVectorExpansionCandidates
 	}
 	k = clampRecallVectorCandidates(k, ceiling)
 	for {
@@ -1369,7 +1369,14 @@ func SelectSurvivingVectorHits(
 		if err != nil {
 			return nil, err
 		}
-		surviving, units, activityRejected := filterVectorHits(hits, allowed, f.Scope)
+		var anchors map[MessageRef]bool
+		if f.DialogueOnly {
+			anchors, err = dialogueAnchors(ctx, f, hits)
+			if err != nil {
+				return nil, err
+			}
+		}
+		surviving, units, rejected := filterVectorHits(hits, allowed, f.Scope, anchors)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -1377,7 +1384,7 @@ func SelectSurvivingVectorHits(
 			f.Candidates.Exhausted = exhausted
 		}
 		next := clampRecallVectorCandidates(k*2, ceiling)
-		expand := activityRejected || f.Candidates != nil
+		expand := rejected || f.Candidates != nil
 		if !expand || units >= f.Limit || exhausted || next <= k {
 			return surviving, nil
 		}
@@ -1385,28 +1392,75 @@ func SelectSurvivingVectorHits(
 	}
 }
 
-// filterVectorHits keeps hits from allowed sessions inside scope. It reports
-// the number of distinct surviving units and whether the activity cutoff
-// rejected any otherwise eligible hit.
+// filterVectorHits keeps hits from allowed sessions inside scope. A non-nil
+// anchor set restricts the hits to dialogue-eligible messages.
 func filterVectorHits(
-	hits []VectorHit, allowed map[string]bool, scope string,
+	hits []VectorHit, allowed map[string]bool, scope string, anchors map[MessageRef]bool,
 ) ([]VectorHit, int, bool) {
 	surviving := make([]VectorHit, 0, len(hits))
 	units := make(map[string]struct{})
-	activityRejected := false
+	rejected := false
 	for _, h := range hits {
 		activityAllowed, eligible := allowed[h.SessionID]
 		if !eligible || ScopeExcludes(scope, h.Subordinate) {
 			continue
 		}
-		if !activityAllowed {
-			activityRejected = true
+		if !activityAllowed || anchors != nil && !anchors[MessageRef{SessionID: h.SessionID, Ordinal: h.Ordinal}] {
+			rejected = true
 			continue
 		}
 		surviving = append(surviving, h)
 		units[UnitFusionKey(h.SessionID, h.OrdinalStart)] = struct{}{}
 	}
-	return surviving, len(units), activityRejected
+	return surviving, len(units), rejected
+}
+
+// DialogueVectorAnchors looks up the ranked anchors in bounded batches, without
+// reading message bodies. The vector index may contain non-dialogue or stale rows.
+func DialogueVectorAnchors(
+	dialect QueryDialect,
+	query func(context.Context, string, ...any) (*sql.Rows, error),
+) func(context.Context, ContentSearchFilter, []VectorHit) (map[MessageRef]bool, error) {
+	return func(ctx context.Context, f ContentSearchFilter, hits []VectorHit) (map[MessageRef]bool, error) {
+		refs := make([]MessageRef, 0, len(hits))
+		seen := make(map[MessageRef]bool, len(hits))
+		for _, h := range hits {
+			ref := MessageRef{SessionID: h.SessionID, Ordinal: h.Ordinal}
+			if !seen[ref] {
+				seen[ref] = true
+				refs = append(refs, ref)
+			}
+		}
+		allowed := make(map[MessageRef]bool, len(refs))
+		for chunk := range slices.Chunk(refs, 400) {
+			b := NewQueryBuilder(dialect, 0)
+			tuples := make([]string, 0, len(chunk))
+			for _, ref := range chunk {
+				tuples = append(tuples, "("+b.Add(ref.SessionID)+", "+b.Add(ref.Ordinal)+")")
+			}
+			rows, err := query(ctx, "SELECT m.session_id, m.ordinal FROM messages m WHERE (m.session_id, m.ordinal) IN ("+
+				strings.Join(tuples, ", ")+")"+f.DialogueSearchSQL(), b.Args()...)
+			if err != nil {
+				return nil, fmt.Errorf("look up dialogue vector anchors: %w", err)
+			}
+			if err := scanDialogueVectorAnchors(rows, allowed); err != nil {
+				return nil, fmt.Errorf("read dialogue vector anchors: %w", err)
+			}
+		}
+		return allowed, nil
+	}
+}
+
+func scanDialogueVectorAnchors(rows *sql.Rows, allowed map[MessageRef]bool) error {
+	defer rows.Close()
+	for rows.Next() {
+		var ref MessageRef
+		if err := rows.Scan(&ref.SessionID, &ref.Ordinal); err != nil {
+			return err
+		}
+		allowed[ref] = true
+	}
+	return rows.Err()
 }
 
 // validateSemanticSources returns a SearchInputError unless f.Sources is
@@ -1515,7 +1569,8 @@ func (db *DB) searchContentSemantic(
 	}
 
 	k := max(f.Limit*4, SemanticOverfetchMin)
-	surviving, err := SelectSurvivingVectorHits(ctx, f, searcher, k, db.semanticAllowedSessionIDs)
+	surviving, err := SelectSurvivingVectorHits(ctx, f, searcher, k, db.semanticAllowedSessionIDs,
+		DialogueVectorAnchors(SQLiteQueryDialect(), db.getReader().QueryContext))
 	if err != nil {
 		return ContentSearchPage{}, err
 	}
@@ -1741,7 +1796,8 @@ func (db *DB) hybridVectorLeg(
 	ctx context.Context, f ContentSearchFilter, searcher VectorSearcher, k int,
 ) (hybridLeg, error) {
 	leg := hybridLeg{display: make(map[string]hybridDisplay)}
-	hits, err := SelectSurvivingVectorHits(ctx, f, searcher, k, db.semanticAllowedSessionIDs)
+	hits, err := SelectSurvivingVectorHits(ctx, f, searcher, k, db.semanticAllowedSessionIDs,
+		DialogueVectorAnchors(SQLiteQueryDialect(), db.getReader().QueryContext))
 	if err != nil {
 		return hybridLeg{}, err
 	}

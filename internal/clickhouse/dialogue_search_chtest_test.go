@@ -28,6 +28,7 @@ func TestClickHouseDialogueSearchParity(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	dbtest.AssertDialogueMessageReads(t, store)
 	dbtest.AssertDialogueSearchParity(t, local, store, "substring", "regex", "fts")
+	dbtest.AssertDialogueVectorSearch(t, store)
 }
 
 func TestDialogueClickHouseBackfillsExistingPushCursor(t *testing.T) {
