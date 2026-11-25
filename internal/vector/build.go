@@ -2,11 +2,13 @@ package vector
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +59,8 @@ type BuildOptions struct {
 	// than the refresh watermark are picked up. It does not force a re-embed
 	// of documents that stay in scope.
 	IncludeAutomated bool
+	// Agents limits message scans to these agent IDs; an empty list includes all.
+	Agents []string
 	// BatchSize is the encode batch size (config batch_size).
 	BatchSize int
 	// ModelContextTokens is the maximum tokens accepted for one input.
@@ -128,7 +132,7 @@ func (ix *Index) Build(
 		return BuildResult{}, errors.New("repair-invalid and backstop are mutually exclusive")
 	}
 	if o.RepairInvalid {
-		return ix.buildInvalidRepair(ctx, enc, gen, o)
+		return ix.repairWithScope(ctx, enc, gen, o)
 	}
 
 	firstEver, err := ix.noWatermarkYet(ctx)
@@ -147,7 +151,13 @@ func (ix *Index) Build(
 	// in-scope automated sessions older than the watermark) get resolved,
 	// then setIncludeAutomatedScope below stamps the key so every later
 	// build compares against a real stored scope again.
-	scopeChanged := !hasScope || storedScope != o.IncludeAutomated
+	storedAgents, _, err := ix.metaGet(ctx, scopeAgentsKey)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	agents := normalizedAgents(o.Agents)
+	scopeAgents := strings.Join(agents, ",")
+	scopeChanged := !hasScope || storedScope != o.IncludeAutomated || storedAgents != scopeAgents
 	corpusFingerprint := gen.Params[CorpusFingerprintParam]
 	storedCorpusFingerprint, hasCorpusFingerprint, err := ix.metaGet(
 		ctx, corpusFingerprintMetaKey,
@@ -168,6 +178,12 @@ func (ix *Index) Build(
 		capChanged = !hasCap || storedCap != runCap
 	}
 	full := o.FullRebuild || o.Backstop || firstEver || scopeChanged || corpusChanged || capChanged
+	if scopeChanged {
+		// A failed reconciliation must be retried even if the old scope returns.
+		if err := ix.metaDelete(ctx, scopeIncludeAutomatedKey); err != nil {
+			return BuildResult{}, fmt.Errorf("clearing scope: %w", err)
+		}
+	}
 	if capChanged {
 		// A partial reshape must still reconcile fully if the old cap is restored.
 		if err := ix.metaDelete(ctx, runMaxRunesMetaKey); err != nil {
@@ -175,8 +191,28 @@ func (ix *Index) Build(
 		}
 	}
 	fp := gen.Fingerprint()
+	selected, activeMatches, err := ix.selectBuildTarget(ctx, fp, o.Space)
+	if err != nil {
+		return BuildResult{}, err
+	}
 	if full {
 		if err := ix.clearCompletedCorpusRevision(ctx, fp); err != nil {
+			return BuildResult{}, err
+		}
+	}
+	var seed *reuseGeneration
+	if ix.spec.Name == "messages" && !o.FullRebuild && selected == fp {
+		var g reuseGeneration
+		g.ordinal, g.dimension, err = ix.generationOrdinalDimension(ctx, fp)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return BuildResult{}, err
+		}
+		if err == nil {
+			seed = &g
+		}
+	}
+	if ix.spec.Name == "messages" && o.FullRebuild {
+		if err := ix.clearReuse(ctx); err != nil {
 			return BuildResult{}, err
 		}
 	}
@@ -187,7 +223,7 @@ func (ix *Index) Build(
 	if o.Progress != nil {
 		o.Progress(BuildProgress{Phase: "scanning"})
 	}
-	refreshStats, err := ix.Refresh(ctx, src, full, o.IncludeAutomated)
+	refreshStats, err := ix.refresh(ctx, src, full, o.IncludeAutomated, agents, seed)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -195,6 +231,9 @@ func (ix *Index) Build(
 		if err := ix.metaSet(ctx, runMaxRunesMetaKey, runCap); err != nil {
 			return BuildResult{}, fmt.Errorf("storing run cap: %w", err)
 		}
+	}
+	if err := ix.metaSet(ctx, scopeAgentsKey, scopeAgents); err != nil {
+		return BuildResult{}, err
 	}
 	if err := ix.setIncludeAutomatedScope(ctx, o.IncludeAutomated); err != nil {
 		return BuildResult{}, err
@@ -205,7 +244,7 @@ func (ix *Index) Build(
 		}
 	}
 
-	target, wasBuilding, err := ix.resolveBuildTarget(ctx, gen, fp, o.Space, o.FullRebuild)
+	target, wasBuilding, err := ix.resolveBuildTarget(ctx, gen, selected, activeMatches, o.FullRebuild)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -216,13 +255,16 @@ func (ix *Index) Build(
 		return result, err
 	}
 
+	if seed != nil {
+		enc = ix.reuseEncoder(enc, *seed)
+	}
 	wrapped, finish := ix.wrapProgress(enc, total, o.Progress)
 	fillStore := &repairQueueCompletingStore{
 		Store: ix.store,
 		db:    ix.db,
 		spec:  ix.spec,
 	}
-	fillStats, fillErr := kitvec.Fill[string, string](ctx, fillStore, target, wrapped,
+	fillStats, fillErr := kitvec.Fill[string, string](ctx, &reuseCompletingStore{fillStore}, target, wrapped,
 		kitvec.WithFillSplit[string](ix.split),
 		kitvec.WithFillBatch[string](o.EncodeBatchOptions()...),
 		kitvec.WithFillConcurrency[string](o.Concurrency),
@@ -258,6 +300,25 @@ func (ix *Index) Build(
 		}
 	}
 	return result, nil
+}
+
+func (ix *Index) repairWithScope(
+	ctx context.Context, enc kitvec.EncodeFunc, gen kitvec.Generation, o BuildOptions,
+) (BuildResult, error) {
+	if ix.spec.Name == "messages" {
+		storedAgents, hasAgents, err := ix.metaGet(ctx, scopeAgentsKey)
+		if err != nil {
+			return BuildResult{Fingerprint: gen.Fingerprint()}, err
+		}
+		_, hasScope, err := ix.metaGet(ctx, scopeIncludeAutomatedKey)
+		if err != nil {
+			return BuildResult{Fingerprint: gen.Fingerprint()}, err
+		}
+		if storedAgents != strings.Join(normalizedAgents(o.Agents), ",") || (hasAgents && !hasScope) {
+			return BuildResult{Fingerprint: gen.Fingerprint()}, errors.New("agent scope changed; run an embeddings build before repairing invalid vectors")
+		}
+	}
+	return ix.buildInvalidRepair(ctx, enc, gen, o)
 }
 
 // buildInvalidRepair is separate from the ordinary build path so repair cannot
@@ -421,22 +482,8 @@ func (ix *Index) noWatermarkYet(ctx context.Context) (bool, error) {
 	return watermark == "", nil
 }
 
-// resolveBuildTarget decides which generation fingerprint Build should fill
-// and whether it is a newly (or still) building generation that should be
-// auto-activated once it fully covers the mirror. See the package's build
-// brief for the exact decision table.
-//
-// FullRebuild resets the target generation whenever it already exists —
-// active, building, or retired — not only when it happens to be the active
-// one: a fingerprint that already exists as a retired (or still building)
-// generation carries stamps and vectors from its earlier life, and without
-// a reset EnsureGeneration would reuse them, letting Fill skip every
-// document and silently reactivate stale embeddings instead of performing
-// the requested full rebuild.
-func (ix *Index) resolveBuildTarget(
-	ctx context.Context, gen kitvec.Generation, fp string,
-	space embedmodel.Descriptor, fullRebuild bool,
-) (target string, wasBuilding bool, err error) {
+// selectBuildTarget picks the active matching generation or the new fingerprint.
+func (ix *Index) selectBuildTarget(ctx context.Context, fp string, space embedmodel.Descriptor) (string, bool, error) {
 	active, hasActive, err := ix.ActiveFingerprint(ctx)
 	if err != nil {
 		return "", false, err
@@ -447,9 +494,19 @@ func (ix *Index) resolveBuildTarget(
 			return "", false, fmt.Errorf("matching active generation: %w", err)
 		}
 	}
-
 	if activeMatches {
-		fp = active
+		return active, true, nil
+	}
+	return fp, false, nil
+}
+
+// resolveBuildTarget prepares the selected generation and resets it for a full
+// rebuild, including when the generation was previously retired.
+func (ix *Index) resolveBuildTarget(
+	ctx context.Context, gen kitvec.Generation, fp string,
+	activeMatches, fullRebuild bool,
+) (target string, wasBuilding bool, err error) {
+	if activeMatches {
 		if fullRebuild {
 			if err := ix.markActiveFullRebuildPending(ctx, fp); err != nil {
 				return "", false, err

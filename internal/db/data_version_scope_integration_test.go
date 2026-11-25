@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"encoding/json/jsontext"
 	"fmt"
+	"image/color"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1167,6 +1168,113 @@ func TestPiSubagentRelationshipUpgradeReparsesInPlace(t *testing.T) {
 	assert.Equal(t, 2, sessions)
 }
 
+func TestPiSkillExpansionUpgradeReparsesInPlace(t *testing.T) {
+	scope := db.ScopedDataVersionProviders(187, 188)
+	assert.ElementsMatch(t, []parser.AgentType{
+		parser.AgentPi, parser.AgentOMP, parser.AgentOMO, parser.AgentStepCode,
+		parser.AgentDirectAPI, parser.AgentPrimeAgent,
+	}, scope)
+	version := db.CurrentDataVersion()
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+	ctx := t.Context()
+	database := dbtest.OpenTestDB(t)
+	root := t.TempDir()
+	source := filepath.Join(root, "encoded-cwd", "2026-11-01T10-00-00-000Z_skill-session.jsonl")
+	dbtest.WriteTestFile(t, source, []byte(
+		`{"type":"session","version":3,"id":"skill-session","timestamp":"2026-11-01T10:00:00Z","cwd":"/work/project"}`+"\n"+
+			`{"type":"message","id":"entry-1","parentId":null,"timestamp":"2026-11-01T10:00:01Z","message":{"role":"user","content":"<skill name=\"review\" location=\"/skills/review/SKILL.md\">\nCheck the diff.\n</skill>\n\nreview the auth module"}}`+"\n"+
+			`{"type":"message","id":"entry-2","parentId":"entry-1","timestamp":"2026-11-01T10:00:02Z","message":{"role":"assistant","content":"ok"}}`+"\n"))
+	cfg := sync.EngineConfig{Machine: "local", AgentDirs: map[parser.AgentType][]string{parser.AgentPi: {root}}}
+	engine := sync.NewEngine(ctx, database, cfg)
+	require.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+	engine.Close()
+	const id = "pi:skill-session"
+
+	// Reproduce the version-187 archive: the parser stored the whole
+	// expansion as one user message and the typed prompt did not exist.
+	const expansion = `<skill name="review" location="/skills/review/SKILL.md">
+Check the diff.
+</skill>
+
+review the auth module`
+	msgs, err := database.GetAllMessages(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, msgs, 3)
+	oldUser := msgs[1]
+	oldUser.Ordinal = 0
+	oldUser.Content = expansion
+	oldUser.ContentLength = len(expansion)
+	oldUser.SourceParentUUID = ""
+	oldAssistant := msgs[2]
+	oldAssistant.Ordinal = 1
+	require.NoError(t, database.ReplaceSessionMessages(ctx, id, []db.Message{oldUser, oldAssistant}))
+
+	// Pin the archived user prompt so the upgrade has a pin to carry over.
+	oldMsgs, err := database.GetAllMessages(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, oldMsgs, 2)
+	require.Equal(t, "user", oldMsgs[0].Role)
+	note := "keep this prompt"
+	pinID, err := database.PinMessage(ctx, id, oldMsgs[0].ID, &note)
+	require.NoError(t, err)
+	require.NotZero(t, pinID)
+
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE sessions SET data_version=%d; PRAGMA user_version=%d", version-1, version-1))
+		return err
+	}))
+	path := database.Path()
+	require.NoError(t, database.Close())
+	database, err = db.OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	needsSync, fullRebuild, err := db.ArchiveResyncState(ctx, path)
+	require.NoError(t, err)
+	assert.True(t, needsSync)
+	assert.False(t, fullRebuild, "the Pi skill expansion upgrade must reparse in place")
+
+	engine = sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	require.Equal(t, 1, engine.SyncAll(ctx, nil).Synced)
+
+	var sessions int
+	require.NoError(t, database.Reader().QueryRow(ctx, "SELECT count(*) FROM sessions").Scan(&sessions))
+	assert.Equal(t, 1, sessions, "the upgrade must not duplicate the session")
+	assert.Equal(t, source, database.GetSessionFilePath(ctx, id), "source path is unchanged")
+	assert.Equal(t, version, database.GetSessionDataVersion(ctx, id))
+
+	msgs, err = database.GetAllMessages(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, msgs, 3)
+	for i, msg := range msgs {
+		assert.Equal(t, i, msg.Ordinal, "ordinals must stay contiguous")
+	}
+	skillRow := msgs[0]
+	assert.Equal(t, "user", skillRow.Role)
+	assert.True(t, skillRow.IsSystem)
+	assert.Equal(t, "system", skillRow.SourceType)
+	assert.Equal(t, "skill_invocation", skillRow.SourceSubtype)
+	assert.Equal(t, "[Skill: review]\nCheck the diff.\n[/Skill]", skillRow.Content)
+	assert.Equal(t, "entry-1:skill", skillRow.SourceUUID)
+	assert.Empty(t, skillRow.SourceParentUUID)
+	userRow := msgs[1]
+	assert.Equal(t, "user", userRow.Role)
+	assert.False(t, userRow.IsSystem)
+	assert.Equal(t, "review the auth module", userRow.Content)
+	assert.Equal(t, "entry-1", userRow.SourceUUID)
+	assert.Equal(t, "entry-1:skill", userRow.SourceParentUUID)
+	assert.Equal(t, "ok", msgs[2].Content)
+
+	// The pin on the original user message survives on the user row.
+	pins, err := database.ListPinnedMessages(ctx, "", "")
+	require.NoError(t, err)
+	require.Len(t, pins, 1)
+	assert.Equal(t, id, pins[0].SessionID)
+	assert.Equal(t, userRow.ID, pins[0].MessageID)
+	assert.Equal(t, &note, pins[0].Note)
+	assert.Equal(t, &userRow.Content, pins[0].Content)
+}
+
 func TestOMPParentLinkUpgradePreservesSessionIdentityAndCuration(t *testing.T) {
 	scope := db.ScopedDataVersionProviders(157, 158)
 	require.Equal(t, []parser.AgentType{parser.AgentOMP}, scope)
@@ -1772,4 +1880,243 @@ func TestEvenerCompactionUpgradeReparsesStoredLabels(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, messages, 2)
 	assert.Equal(t, parser.EvenerLiteralCompactionSourceType, messages[1].SourceType)
+}
+
+func TestClaudeToolResultImageUpgradeReparsesAndIndexes(t *testing.T) {
+	scope := db.ScopedDataVersionProviders(188, 189)
+	assert.Contains(t, scope, parser.AgentClaude)
+	version := db.CurrentDataVersion()
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+
+	ctx := t.Context()
+	database := dbtest.OpenTestDB(t)
+	root := t.TempDir()
+	claudeProject := filepath.Join(root, "proj")
+	require.NoError(t, os.MkdirAll(claudeProject, 0o755))
+
+	const sessionID = "c0000000-0000-4000-8000-000000000188"
+	pngB64 := testjsonl.SolidPNGBase64(1, 1, color.RGBA{R: 99, G: 11, B: 22, A: 255})
+	body := testjsonl.JoinJSONL(
+		`{"type":"user","uuid":"u0","parentUuid":null,"sessionId":"`+sessionID+`","timestamp":"2026-11-24T01:00:00Z","message":{"role":"user","content":"Check screenshot"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u0","sessionId":"`+sessionID+`","timestamp":"2026-11-24T01:00:01Z","message":{"role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_upgrade_1","name":"Bash","input":{"command":"shot"}}]}}`,
+		`{"type":"user","uuid":"u1","parentUuid":"a1","sessionId":"`+sessionID+`","timestamp":"2026-11-24T01:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_upgrade_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"`+pngB64+`"}}]}]}}`,
+	)
+	dbtest.WriteTestFile(t, filepath.Join(claudeProject, sessionID+".jsonl"), []byte(body))
+
+	cfg := sync.EngineConfig{
+		Machine:          "local",
+		AgentDirs:        map[parser.AgentType][]string{parser.AgentClaude: {root}},
+		ToolResultImages: config.ToolResultImagesKeep,
+	}
+	engine := sync.NewEngine(ctx, database, cfg)
+	stats := engine.SyncAll(ctx, nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced)
+	engine.Close()
+
+	var id string
+	require.NoError(t, database.Reader().QueryRow(ctx, "SELECT id FROM sessions WHERE agent='claude'").Scan(&id))
+
+	// Simulate the pre-fix v0.48.0 database state where tool_result images
+	// were decoded to empty strings and produced zero occurrences.
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE tool_calls SET result_content = '' WHERE session_id = ?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE tool_result_events SET content = '' WHERE session_id = ?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM image_text_occurrences WHERE session_id = ?`, id); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE sessions SET data_version=%d; PRAGMA user_version=%d", version-1, version-1))
+		return err
+	}))
+
+	path := database.Path()
+	require.NoError(t, database.Close())
+	database, err := db.OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	needsSync, fullRebuild, err := db.ArchiveResyncState(ctx, path)
+	require.NoError(t, err)
+	assert.True(t, needsSync)
+	assert.False(t, fullRebuild)
+
+	engine = sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	stats = engine.SyncAll(ctx, nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced)
+	require.NoError(t, database.BackfillImageTextOccurrences(ctx))
+
+	var eventContent string
+	var resultContentLen int
+	require.NoError(t, database.Reader().QueryRow(ctx,
+		`SELECT content FROM tool_result_events WHERE session_id = ? AND tool_use_id = ?`, id, "toolu_upgrade_1",
+	).Scan(&eventContent))
+	require.NoError(t, database.Reader().QueryRow(ctx,
+		`SELECT COALESCE(result_content_length, 0) FROM tool_calls WHERE session_id = ? AND tool_use_id = ?`, id, "toolu_upgrade_1",
+	).Scan(&resultContentLen))
+	retained := db.RetainedToolResultImages(eventContent)
+	require.Len(t, retained, 1)
+	assert.Equal(t, len(eventContent), resultContentLen)
+
+	messages, err := database.GetAllMessages(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	require.Len(t, messages[1].ToolCalls, 1)
+	assert.Len(t, db.RetainedToolResultImages(messages[1].ToolCalls[0].ResultContent), 1)
+
+	var occCount int
+	require.NoError(t, database.Reader().QueryRow(ctx,
+		`SELECT count(*) FROM image_text_occurrences WHERE session_id = ? AND image_hash = ?`, id, retained[0].SHA256,
+	).Scan(&occCount))
+	assert.Positive(t, occCount)
+}
+
+func TestZCodeToolResultImageUpgradeReparsesAndIndexes(t *testing.T) {
+	scope := db.ScopedDataVersionProviders(188, 189)
+	assert.Contains(t, scope, parser.AgentZCode)
+	version := db.CurrentDataVersion()
+	t.Cleanup(db.InstallDataVersionScopesForTest(map[int][]parser.AgentType{version: scope}))
+
+	ctx := t.Context()
+	database := dbtest.OpenTestDB(t)
+	root := t.TempDir()
+	cliRoot := filepath.Join(root, ".zcode", "cli")
+	dbDir := filepath.Join(cliRoot, "db")
+	require.NoError(t, os.MkdirAll(dbDir, 0o755))
+	zcodeDBPath := filepath.Join(dbDir, "db.sqlite")
+
+	srcDB, err := sql.Open("sqlite3", zcodeDBPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = srcDB.Close() })
+	_, err = srcDB.ExecContext(ctx, `
+		CREATE TABLE session (
+			id TEXT PRIMARY KEY NOT NULL,
+			project_id TEXT,
+			workspace_id TEXT,
+			directory TEXT,
+			title TEXT,
+			time_created INTEGER,
+			time_updated INTEGER
+		);
+		CREATE TABLE model_usage (
+			session_id TEXT NOT NULL,
+			turn_id TEXT,
+			provider_id TEXT,
+			model_id TEXT,
+			status TEXT,
+			input_tokens INTEGER,
+			output_tokens INTEGER,
+			reasoning_tokens INTEGER,
+			cache_creation_input_tokens INTEGER,
+			cache_read_input_tokens INTEGER,
+			computed_total_tokens INTEGER,
+			started_at INTEGER,
+			completed_at INTEGER,
+			duration_ms INTEGER,
+			tool_call_count INTEGER
+		);
+		CREATE TABLE message (
+			id TEXT PRIMARY KEY NOT NULL,
+			session_id TEXT NOT NULL,
+			time_created TEXT,
+			data TEXT
+		);
+		CREATE TABLE part (
+			id TEXT PRIMARY KEY NOT NULL,
+			message_id TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			time_created TEXT,
+			data TEXT
+		);
+	`)
+	require.NoError(t, err)
+
+	pngB64 := testjsonl.SolidPNGBase64(1, 1, color.RGBA{R: 44, G: 88, B: 12, A: 255})
+	_, err = srcDB.ExecContext(ctx, `
+		INSERT INTO session (id, directory, title, time_created, time_updated)
+		VALUES ('zcode-upgrade-img', '/workspace/acme', 'Screenshot check', '2026-11-24T01:00:00Z', '2026-11-24T01:00:02Z');
+		INSERT INTO message (id, session_id, time_created, data)
+		VALUES
+			('m0', 'zcode-upgrade-img', '2026-11-24T01:00:00Z', '{"role":"user"}'),
+			('m1', 'zcode-upgrade-img', '2026-11-24T01:00:01Z', '{"role":"assistant","modelID":"claude-sonnet-4-6"}'),
+			('m2', 'zcode-upgrade-img', '2026-11-24T01:00:02Z', '{"role":"user"}');
+		INSERT INTO part (id, message_id, session_id, time_created, data)
+		VALUES
+			('p0', 'm0', 'zcode-upgrade-img', '2026-11-24T01:00:00Z', '{"type":"text","text":"Check screenshot"}'),
+			('p1', 'm1', 'zcode-upgrade-img', '2026-11-24T01:00:01Z', '{"type":"tool_use","id":"zcode_upgrade_1","name":"Bash","input":{"command":"shot"}}'),
+			('p2', 'm2', 'zcode-upgrade-img', '2026-11-24T01:00:02Z', ?);
+	`, `{"type":"tool_result","tool_use_id":"zcode_upgrade_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"`+pngB64+`"}}]}`)
+	require.NoError(t, err)
+	require.NoError(t, srcDB.Close())
+
+	cfg := sync.EngineConfig{
+		Machine:                           "local",
+		AgentDirs:                         map[parser.AgentType][]string{parser.AgentZCode: {cliRoot}},
+		ToolResultImages:                  config.ToolResultImagesKeep,
+		DisableFilesystemProjectDiscovery: true,
+	}
+	engine := sync.NewEngine(ctx, database, cfg)
+	stats := engine.SyncAll(ctx, nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced)
+	engine.Close()
+
+	var id string
+	require.NoError(t, database.Reader().QueryRow(ctx, "SELECT id FROM sessions WHERE agent='zcode'").Scan(&id))
+
+	// Simulate pre-fix database state while leaving the Z Code source DB untouched.
+	require.NoError(t, database.Update(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE tool_calls SET result_content = '', result_content_length = 0 WHERE session_id = ?`, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM image_text_occurrences WHERE session_id = ?`, id); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, fmt.Sprintf("UPDATE sessions SET data_version=%d; PRAGMA user_version=%d", version-1, version-1))
+		return err
+	}))
+
+	path := database.Path()
+	require.NoError(t, database.Close())
+	database, err = db.OpenIsolated(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	needsSync, fullRebuild, err := db.ArchiveResyncState(ctx, path)
+	require.NoError(t, err)
+	assert.True(t, needsSync)
+	assert.False(t, fullRebuild)
+
+	engine = sync.NewEngine(ctx, database, cfg)
+	t.Cleanup(engine.Close)
+	stats = engine.SyncAll(ctx, nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced)
+	require.NoError(t, database.BackfillImageTextOccurrences(ctx))
+
+	var resultContent string
+	var resultContentLen int
+	require.NoError(t, database.Reader().QueryRow(ctx,
+		`SELECT result_content, COALESCE(result_content_length, 0) FROM tool_calls WHERE session_id = ? AND tool_use_id = ?`, id, "zcode_upgrade_1",
+	).Scan(&resultContent, &resultContentLen))
+	retained := db.RetainedToolResultImages(resultContent)
+	require.Len(t, retained, 1)
+	assert.Equal(t, len(resultContent), resultContentLen)
+
+	messages, err := database.GetAllMessages(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	require.Len(t, messages[1].ToolCalls, 1)
+	assert.Len(t, db.RetainedToolResultImages(messages[1].ToolCalls[0].ResultContent), 1)
+
+	var occCount int
+	require.NoError(t, database.Reader().QueryRow(ctx,
+		`SELECT count(*) FROM image_text_occurrences WHERE session_id = ? AND image_hash = ?`, id, retained[0].SHA256,
+	).Scan(&occCount))
+	assert.Positive(t, occCount)
 }

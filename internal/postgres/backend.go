@@ -128,6 +128,10 @@ func (Backend) OpenServeStore(
 	if err != nil {
 		return nil, err
 	}
+	if err := sizeServePool(ctx, store.DB(), store.cockroach); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	if err := prepareServeStore(ctx, store, target.Schema); err != nil {
 		_ = store.Close()
 		return nil, err
@@ -304,6 +308,13 @@ func (Backend) OpenVectorSearcher(
 	pool, err := pgStore.requireOwnedPool()
 	if err != nil {
 		return nil, "", err
+	}
+	hasHalfvec, version, err := vectorHalfvecAvailable(ctx, pool)
+	if err != nil {
+		return nil, "", err
+	}
+	if reason := vectorUnavailableReason(hasHalfvec, version); reason != "" {
+		return nil, reason, nil
 	}
 	genID, dim, ok, err := LookupVectorGeneration(ctx, pool, gen.Fingerprint)
 	if err != nil {

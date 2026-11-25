@@ -182,6 +182,9 @@ type VectorConfig struct {
 	// `embeddings build --include-automated` can override this for a
 	// one-off build; see that flag's help for the scheduled-build caveat.
 	IncludeAutomated bool `toml:"include_automated" json:"include_automated"`
+	// Agents limits local message embeddings to these session agent IDs.
+	// An empty list includes all agents.
+	Agents []string `toml:"agents" json:"agents,omitempty"`
 	// RecallMaxRevisionLag is how many Recall corpus revisions the Recall
 	// vector index may trail the corpus and still answer vector and hybrid
 	// queries. Every insert, delete, or text edit of an accepted Recall entry
@@ -467,6 +470,13 @@ const DefaultRecallMaxRevisionLag = 256
 func (c VectorConfig) Validate() error {
 	if !c.Enabled {
 		return nil
+	}
+	for _, agent := range c.Agents {
+		if !slices.ContainsFunc(parser.Registry, func(def parser.AgentDef) bool {
+			return slices.Contains(parser.ProviderStoredAgents(def.Type), parser.AgentType(agent))
+		}) {
+			return fmt.Errorf("[vector] agents: unknown agent %q", agent)
+		}
 	}
 	if c.RecallMaxRevisionLag < 0 {
 		return fmt.Errorf(
@@ -1559,6 +1569,9 @@ func Default() (Config, error) {
 				filepath.Join(home, ".hermes", "profiles"),
 			)
 		}
+		if root == "" {
+			dirs = append(dirs, resolveMetaHarnessDefaultDirs(def.Type, home)...)
+		}
 		agentDirs[def.Type] = dirs
 		agentDirSource[def.Type] = dirDefault
 	}
@@ -2291,6 +2304,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	// section fields' treatment even though both currently agree.
 	if meta.IsDefined("vector", "include_automated") {
 		c.Vector.IncludeAutomated = file.Vector.IncludeAutomated
+	}
+	if meta.IsDefined("vector", "agents") {
+		c.Vector.Agents = file.Vector.Agents
 	}
 	if meta.IsDefined("vector", "recall_max_revision_lag") {
 		c.Vector.RecallMaxRevisionLag = file.Vector.RecallMaxRevisionLag

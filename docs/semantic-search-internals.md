@@ -321,13 +321,19 @@ or periodic retry. The document is attempted again only when its content changes
 (a new `content_hash`), a full rebuild clears the generation's stamps, or a
 config change creates a generation with a new fingerprint.
 
-### Scope (`include_automated`)
+### Scope (`include_automated`, `agents`)
 
 Whether automated sessions are in the embeddable universe is stored in
-`vector_meta` (`scope_include_automated`). Changing it — in config or via the
-one-off `--include-automated` flag — forces a full mirror *reconciliation*, not
-a re-embed: it inserts or removes rows to match the new scope, but documents
-that stay in scope and are unchanged keep their existing stamps.
+`vector_meta` (`scope_include_automated`). The `[vector] agents` list is stored
+as `scope_agents`, sorted, deduplicated, and comma-joined. A missing key reads as
+an empty list, so an upgrade forces no rescan. Only the local message store
+applies the list; Recall and hosted PostgreSQL embeddings ignore it.
+
+Changing either value forces a full mirror *reconciliation*, not a re-embed:
+it inserts or removes rows to match the new scope, but documents that stay in
+scope and are unchanged keep their existing stamps. `include_automated` can
+change in config or via the one-off `--include-automated` flag; `agents` comes
+only from config.
 
 The run cap is stored as `run_max_runes` in the store's metadata. A missing or
 changed cap forces one full reconciliation, including idle sessions older than
@@ -456,9 +462,9 @@ uniform. The HTTP response serializes `db.ContentMatch` directly; the MCP
   lexical output must not flicker with index state.
 
 Derived and embedded spans differ for capped assistant runs, sessions excluded
-from the build (`include_automated = false`), and messages newer than the last
-mirror refresh. There is deliberately no provenance discriminator field on the
-wire — the mode implies it.
+from the build (`include_automated = false` or omitted from `agents`), and
+messages newer than the last mirror refresh. There is deliberately no
+provenance discriminator field on the wire — the mode implies it.
 
 Hybrid unit-less rows (FTS hits whose message resolves to no mirror unit) are
 classified **before** scope filtering and the RRF merge, so `scope` exclusion,
@@ -577,6 +583,7 @@ covers the invariants.
   content duplicated into PG so snippets and anchoring reuse the exact local
   mirror semantics (rebuilding content from `messages` at query time would
   need duplicate extraction logic that can drift).
+- Kit attaches to each application-owned chunk table for replacement and raw nearest-chunk search. AgentsView owns generations, document metadata, and result hydration.
 - `vector_chunks_g<id>` is one table per generation with a `halfvec(N)` column
   and an HNSW cosine index. Per-generation tables are required because a
   pgvector column has a fixed typed dimension; `halfvec` stays under HNSW's
@@ -679,9 +686,7 @@ covers the invariants.
   below k for large fetches, so each search runs
   `SET LOCAL hnsw.ef_search = clamp(k, 40, 1000)` in the query transaction.
   For k past pgvector's 1000 ceiling, `hnsw.iterative_scan = 'relaxed_order'`
-  (pgvector >= 0.8) lets the scan continue; the GUC is probed with
-  `current_setting(..., missing_ok)` first so older pgvector skips it instead
-  of aborting the transaction.
+  lets the scan continue. Semantic search requires pgvector 0.8.0 or newer.
 - The hybrid keyword leg selects ILIKE candidates in recency order over the
   embedded-universe predicates, resolves them to units through
   `ResolveMessageUnits` point lookups against `vector_documents`, and feeds

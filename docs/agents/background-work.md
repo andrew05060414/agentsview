@@ -13,7 +13,9 @@ only; `TriggerNow` bypasses cooldown.
 
 Pricing refresh and conversation tombstone pruning use the scheduler. Periodic
 session sync, vector embedding, and recall extraction still own their timing;
-migrating them is separate work.
+migrating them is separate work. PostgreSQL serve fills stale Dashboard
+frustration counts at launch after Usage warm-up when the store can write
+the count table.
 
 ## Memory and Work Bounds
 
@@ -97,7 +99,9 @@ Codex data-loss bug or a merge blocker.
   timezones. On completion, it claims each timezone through its captured
   archive revision, capped by older installs written during the pass. Installs
   from another catalog prevent the claim. A changed claim revision or install
-  boundary prevents replacement.
+  boundary prevents replacement. Once every zone has a trusted claim, a pass
+  skips the full capture when no session has changed since the oldest claim and
+  no rollup is invalidated.
 - Served usage requests own timezone recency in
   `usage_rollup_timezones.last_requested_at`, rewriting it at most once a
   minute per zone. Rollup installs stamp only a zone's first row, so

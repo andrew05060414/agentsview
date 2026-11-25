@@ -47,6 +47,28 @@ func (db *DB) GetSessionExternalParent(
 	return loadSessionExternalParent(ctx, db.getReader(), sessionID)
 }
 
+// SessionExternalParentsBySession returns stored parent IDs for the requested sessions.
+func (db *DB) SessionExternalParentsBySession(ctx context.Context, sessionIDs []string) (map[string]string, error) {
+	out := make(map[string]string)
+	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
+		ph, args := sessionIDArgs(chunk)
+		rows, err := db.getReader().QueryContext(ctx, `SELECT session_id, parent_session_id FROM session_external_parents WHERE session_id IN (`+ph+`)`, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, parent string
+			if err := rows.Scan(&id, &parent); err != nil {
+				return err
+			}
+			out[id] = parent
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // SetSessionExternalParent records a launcher-supplied parent and applies
 // it when the session has no transcript parent or spawn edge.
 func (db *DB) SetSessionExternalParent(
@@ -184,10 +206,14 @@ func (db *DB) ClearSessionExternalParent(
 // named by alias as a spawned subagent. Linking derives that session's
 // parent from the edge, so a launcher-supplied link never owns it.
 func spawnEdgeExistsSQL(alias string) string {
+	return spawnEdgeExistsDialectSQL(alias, "IS NOT")
+}
+
+func spawnEdgeExistsDialectSQL(alias, comparison string) string {
 	return `EXISTS (
 			SELECT 1 FROM tool_calls tc
 			WHERE tc.subagent_session_id = ` + alias + `.id
-			AND tc.session_id IS NOT tc.subagent_session_id
+			AND tc.session_id ` + comparison + ` tc.subagent_session_id
 		)`
 }
 

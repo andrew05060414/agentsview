@@ -908,13 +908,15 @@ and pull request description.
 
 Search keeps exact pages on disk for SQLite archives and native PostgreSQL and
 ClickHouse mirrors. It reuses a page when its filters, paging, search rules,
-and searchable data match. PostgreSQL retains each session's best match in a
-bounded in-memory set. After a write, it refreshes changed matches when a
-checkpoint confirms that they belong to the current history. It rebuilds all
-matches when the checkpoint is missing or 128 or more revisions old. ClickHouse
-merges that leave rows unchanged keep pages valid. Deleted snippets can remain
-in old cache files until the same search overwrites them or the cache is
-trimmed. Read-only SQLite and hosted or borrowed PostgreSQL views read directly.
+and searchable data match. Searchable writes invalidate old pages. PostgreSQL
+keeps each session's best match in memory and a companion file; page visits keep
+that file active for cache cleanup. The file is capped at 128 MiB within a
+shared 256 MiB cache budget. PostgreSQL refreshes changed matches when the
+journal proves the retained history. A missing, oversized, or evicted file, or
+a missing checkpoint or one 128 or more revisions old, requires a full search.
+ClickHouse merges that leave rows unchanged keep pages valid. Deleted snippets
+can remain in old cache files until the same search overwrites them or the cache
+is trimmed. Read-only SQLite and hosted or borrowed PostgreSQL views read directly.
 
 ### Usage cache divergence
 
@@ -1221,6 +1223,24 @@ missing indexes automatically. Each first build scans `sessions` and blocks
 writes until installation commits. Restricted publishers keep writing before
 owner installation, using the existing queries until the indexes are available.
 
+### PostgreSQL schema step reuse
+
+A push starts with a schema step that checks every table, column, and index the
+push needs and runs data repairs. One `Sync` runs it once and remembers that in
+`schemaDone`. The daemon builds a new `Sync` for every push request, so
+`ensuredSchemas` also records, per push target, a summary of the target schema
+after the step: relations with their columns or index definitions, constraints,
+triggers, functions, extensions, and their object IDs. A later `Sync` in the
+same process reads the summary, and while it matches, skips the schema probes
+and DDL. It still runs the data version check (`CheckDataVersionCompat`),
+because another machine can push rows in a newer format without changing the
+schema. It also still runs the data repairs (`runSchemaDataRepairsPG`), because
+pushes since the step can leave rows they fix, such as sessions awaiting the
+automation audit. A full push, a missing push marker, or a failed push forgets
+the record, so the next push runs the whole step. A step whose optional setup
+fails, such as an index the role lacks privilege to create, records nothing,
+so the next push retries it.
+
 ### Raw session ID lookups
 
 `FindSessionIDsByRawSuffix` resolves a raw ID such as a bare Codex thread UUID
@@ -1468,10 +1488,13 @@ pairs the session's committed row version and UTC `updated_at` with an
 independent rules version. A saved count must match both the version selected
 for Signals and the current session version at lookup. A mismatch triggers a
 fresh count. Bump `frustrationMarkerRulesVersion` whenever the Go or PostgreSQL
-frustration classifier changes a verdict. Counts fill lazily after a complete
-scan, including zero counts. A save skips sessions changed before the write
-starts. A sync overlapping the save can leave a stale row; later reads reject
-that row and recount the session.
+frustration classifier changes a verdict. On startup, writable PostgreSQL
+stores fill missing or stale counts after the Usage cache warms. A Signals
+request waits up to five seconds when the active fill covers all its missing
+counts, then scans any remaining misses. Requests also scan and save missing
+or stale counts, including zero counts. A save skips sessions changed before
+the write starts. A sync overlapping the save can leave a stale row; later
+reads reject that row and recount the session.
 
 A read-only role reuses rows it can read and scans misses without saving them.
 The table is optional for push. A missing table falls back to scanning. Hosted
@@ -1562,6 +1585,13 @@ own metadata, which is why the docs below call the database a mirror.
   [appends](../internal/clickhouse-mirror.md#pushes-rewrite-only-what-differs).
   Store every ClickHouse push cursor and version in the mirror's
   `sync_metadata`. Never store ClickHouse sync state in SQLite.
+- A watch push for changed files (`PushOptions.SkipIfUnchanged`) writes nothing
+  when the archive holds no change for the mirror, and `Sync.EnsureSchema`
+  skips the schema step while the mirror's tables, server, and stored exchange
+  probe match what this process last prepared. When a push starts writing
+  something new, add the local change it writes to `unchangedSinceLastPush`,
+  or a watch never pushes it before the interval push. See
+  [ClickHouse push and serve](../internal/clickhouse-mirror.md#decisions).
 - A push that rewrote at least `compactionShare` of the live messages runs
   `OPTIMIZE TABLE ... FINAL` on `compactionTables` (`compactAfterRewrite`).
   Add every new table a session push rewrites to that list. Compaction
@@ -1649,8 +1679,15 @@ own metadata, which is why the docs below call the database a mirror.
 
 ### ClickHouse test fixtures
 
-Run `make test-clickhouse` to use the compose service. When running tagged Go
-tests directly, set `TEST_CLICKHOUSE_URL` to reuse a dedicated test server.
+Run `make test-clickhouse` to start a disposable compose service. Its container
+carries a `test-service.lease` label, and the tests hold an exclusive lock on
+`~/.local/state/test-service-leases/<id>` until the last descendant exits. The
+test command then removes its Compose project. A scheduled cleaner can remove
+projects left by killed runs after their lock is released. Manual services have
+no lease label. Use
+`make clickhouse-up` and `make clickhouse-down` to manage a separate standing
+service. When running tagged Go tests directly, set `TEST_CLICKHOUSE_URL` to
+reuse a dedicated test server.
 These tests use the `chtest` build tag. Never point them at a live mirror.
 
 - For reads against the standard populated mirror, use `newClonedReadStore(t)`.
@@ -1739,9 +1776,13 @@ Because each test owns a database, the tests run in parallel:
   (`start-single-node --store=type=mem,size=4GiB`). Schema setup takes about
   10 s per test there, against 86 s on a disk store.
 
-Use `make test-postgres` to start the test container and run the suite. It
-leaves the container running. If you started that container, use
-`make postgres-down` when it is no longer needed.
+Use `make test-postgres` to start a disposable container and run the suite.
+The same lease applies to PostgreSQL.
+Use `make postgres-up` and `make postgres-down` to manage a separate standing
+test container.
+The leased PostgreSQL, ClickHouse, and usage benchmark targets use Unix file
+locks and process groups. On native Windows, run them from WSL with the checkout
+in WSL's Linux filesystem.
 
 To use an existing dedicated instance, run:
 

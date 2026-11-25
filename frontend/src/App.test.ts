@@ -14,6 +14,7 @@ import { createSessionsStore, sessions } from "./lib/stores/sessions.svelte.js";
 import { settings } from "./lib/stores/settings.svelte.js";
 import { starred } from "./lib/stores/starred.svelte.js";
 import { sync } from "./lib/stores/sync.svelte.js";
+import { events } from "./lib/stores/events.svelte.js";
 import { codexCloudStatus } from "./lib/stores/codexCloud.svelte.js";
 import { ui } from "./lib/stores/ui.svelte.js";
 import { usage } from "./lib/stores/usage.svelte.js";
@@ -87,6 +88,9 @@ afterEach(() => {
     unmount(component);
     component = undefined;
   }
+  sync.serverVersion = null;
+  sessions.sessions = [];
+  events.setAvailable(false);
   vi.restoreAllMocks();
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -230,6 +234,88 @@ describe("App Recall availability", () => {
   });
 });
 
+describe("saved remote API version", () => {
+  function mountRemoteSession(apiVersion: number) {
+    stubAppDependencies();
+    vi.mocked(sync.watchSession).mockRestore();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    vi.spyOn(sessions, "refreshActiveSession").mockResolvedValue();
+    sessions.sessions = [
+      {
+        id: "session-1",
+        project: "proj-a",
+        machine: "local",
+        agent: "claude",
+        first_message: "hello",
+        started_at: "2026-02-20T12:30:00Z",
+        ended_at: "2026-02-20T12:31:00Z",
+        message_count: 2,
+        user_message_count: 1,
+        created_at: "2026-02-20T12:30:00Z",
+      } as unknown as (typeof sessions.sessions)[number],
+    ];
+    const requests: unknown[] = [];
+    vi.stubGlobal(
+      "SharedWorker",
+      class {
+        port = {
+          onmessage: null,
+          postMessage: (value: unknown) => requests.push(value),
+          start() {},
+        };
+      },
+    );
+    const fetchSpy = vi.fn(
+      async (_input: RequestInfo | URL) =>
+        new Response("[]", { headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    localStorage.setItem("agentsview-server-url", "https://remote.example.test");
+    sync.serverVersion = {
+      api_version: apiVersion,
+      build_date: "",
+      version: "test",
+      commit: "test",
+      data_version: 1,
+      friction_available: false,
+      friction_build_allowed: false,
+      insight_generation_available: false,
+      kata_available: false,
+      session_stats_available: false,
+    };
+    events.setAvailable(true);
+    router.route = "sessions";
+    router.sessionId = "session-1";
+    sessions.activeSessionId = "session-1";
+    component = mount(App, { target: document.body });
+    return { requests, fetchSpy };
+  }
+
+  const notice =
+    "Sessions won't update live: this server runs API 27. Upgrade it to API 28, or reload to see new messages.";
+
+  it("keeps the archive live on API 27 and warns that the session won't update", async () => {
+    const { requests } = mountRemoteSession(27);
+    await vi.waitFor(() =>
+      expect(document.querySelector(".session-live-notice")?.textContent?.trim()).toBe(notice),
+    );
+    expect(requests).toContainEqual(expect.objectContaining({ session: undefined }));
+    expect(requests).not.toContainEqual(expect.objectContaining({ session: "session-1" }));
+  });
+
+  it("watches the selected session on API 28 without the notice", async () => {
+    const { requests } = mountRemoteSession(28);
+    try {
+      await vi.waitFor(() =>
+        expect(requests).toContainEqual(expect.objectContaining({ session: "session-1" })),
+      );
+      expect(document.querySelector(".session-live-notice")).toBeNull();
+    } finally {
+      sync.unwatchSession();
+    }
+  });
+});
+
 describe("App session URL date state", () => {
   it.each(["selection change", "selection cleared", "route exit", "unmount"])(
     "ignores an old watch's children fallback after %s",
@@ -280,32 +366,36 @@ describe("App session URL date state", () => {
     vi.spyOn(sessions, "navigateToSession").mockResolvedValue();
     vi.spyOn(sessions, "refreshActiveSession").mockResolvedValue();
     vi.spyOn(messages, "reload").mockResolvedValue();
-    let stream!: ReadableStreamDefaultController<Uint8Array>;
-    const watch = vi.spyOn(SessionsService, "getApiV1SessionsByIdWatch").mockResolvedValue(
-      new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            stream = controller;
-          },
-        }),
-        { headers: { "Content-Type": "text/event-stream" } },
-      ),
-    );
+    let port!: {
+      onmessage: ((event: MessageEvent) => void) | null;
+      postMessage: ReturnType<typeof vi.fn>;
+      start: () => void;
+    };
+    class Worker {
+      port = { onmessage: null, postMessage: vi.fn(), start() {} };
+      constructor() {
+        port = this.port;
+      }
+    }
+    vi.stubGlobal("SharedWorker", Worker);
     const fetchSpy = vi.fn(
       async (_input: RequestInfo | URL) =>
-        new Response("[]", {
-          headers: { "Content-Type": "application/json" },
-        }),
+        new Response("[]", { headers: { "Content-Type": "application/json" } }),
     );
     vi.stubGlobal("fetch", fetchSpy);
     router.route = "sessions";
+    router.isRootPath = false;
     router.sessionId = "session-1";
     sessions.activeSessionId = "session-1";
     try {
       component = mount(App, { target: document.body });
       await flushEffects();
-      expect(watch).toHaveBeenCalledWith({ id: "session-1" }, expect.anything());
-      stream.enqueue(new TextEncoder().encode("event: session_ready\ndata: {}\n\n"));
+      expect(port.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ session: "session-1" }),
+      );
+      port.onmessage?.(
+        new MessageEvent("message", { data: { type: "session_ready", data: "session-1" } }),
+      );
       await vi.waitFor(() =>
         expect(
           fetchSpy.mock.calls.some(([input]) =>
@@ -320,7 +410,6 @@ describe("App session URL date state", () => {
       expect(childrenRequests).toHaveLength(1);
     } finally {
       sync.unwatchSession();
-      stream.close();
     }
   });
 
@@ -1404,7 +1493,7 @@ function message(ordinal: number, role: Message["role"], isSystem = false) {
   return {
     kind: "message" as const,
     ordinals: [ordinal],
-    message: { role, is_system: isSystem } as Message,
+    message: { ordinal, role, is_system: isSystem } as Message,
   };
 }
 
@@ -1425,6 +1514,19 @@ describe("findUserPromptOrdinal", () => {
     expect(findUserPromptOrdinal(items, 99, 1, true)).toBe(1);
     expect(findUserPromptOrdinal(items, 99, -1, true)).toBe(4);
     expect(findUserPromptOrdinal(items.slice(1, 3), 2, 1, true)).toBeUndefined();
+  });
+
+  it("treats a merged skill card as one stop at its prompt ordinal", () => {
+    const merged = {
+      kind: "message" as const,
+      ordinals: [5, 6],
+      skill: { id: 5, ordinal: 5, role: "user", is_system: true } as Message,
+      message: { id: 6, ordinal: 6, role: "user", is_system: false } as Message,
+    };
+    const withSkill = [message(1, "user"), merged, message(9, "user")];
+    expect(findUserPromptOrdinal(withSkill, 6, 1, true)).toBe(9);
+    expect(findUserPromptOrdinal(withSkill, 6, -1, true)).toBe(1);
+    expect(findUserPromptOrdinal(withSkill, 9, -1, true)).toBe(6);
   });
 
   it("keeps chronological directions when newest-first reorders rows", () => {
@@ -1932,6 +2034,55 @@ describe("App telemetry", () => {
       }),
     );
   }
+
+  it("updates the tab title as the screen changes", async () => {
+    setup();
+    router.route = "activity";
+    component = mount(App, { target: document.body });
+    await flushEffects();
+    expect(document.title).toBe("Activity · AgentsView");
+    router.navigate("usage");
+    await flushEffects();
+    expect(document.title).toBe("Usage · AgentsView");
+    router.navigateToSession("hostA~abc");
+    await flushEffects();
+    expect(document.title).toContain("Session (");
+  });
+
+  it("keeps the session tab title while loading, loaded, and missing", async () => {
+    setup();
+    const originalSessions = sessions.sessions;
+    const originalNotFound = sessions.activeSessionNotFound;
+    try {
+      sessions.sessions = [];
+      sessions.activeSessionNotFound = false;
+      component = mount(App, { target: document.body });
+      await flushEffects();
+      router.navigateToSession("hostA~abc");
+      await flushEffects();
+      expect(sessions.activeSession).toBeUndefined();
+      expect(document.title).toBe("Session (8e9ac634) · AgentsView");
+
+      sessions.sessions = [
+        hydratedSession("hostA~abc", "codex", {
+          display_name: "Private title",
+          first_message: "Private prompt",
+        }),
+      ];
+      await flushEffects();
+      expect(sessions.activeSession?.display_name).toBe("Private title");
+      expect(document.title).toBe("Session (8e9ac634) · AgentsView");
+
+      sessions.sessions = [];
+      sessions.activeSessionNotFound = true;
+      await flushEffects();
+      expect(sessions.activeSessionNotFound).toBe(true);
+      expect(document.title).toBe("Session (8e9ac634) · AgentsView");
+    } finally {
+      sessions.sessions = originalSessions;
+      sessions.activeSessionNotFound = originalNotFound;
+    }
+  });
 
   function postedFor(event: string) {
     return posted.filter((p) => p.event === event).map((p) => p.properties);

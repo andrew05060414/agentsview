@@ -51,6 +51,11 @@ func (s *Sync) PushWithOptions(
 	s.fullRunRecorded = false
 	s.usageWritten = false
 	result, err := s.pushWithOptions(ctx, opts, onProgress)
+	if err != nil {
+		// The failure may come from a schema changed under this process,
+		// so the next push checks the tables again.
+		s.forgetEnsuredSchema()
+	}
 	if err != nil && opts.Full && !s.fullRunRecorded {
 		// The push failed before it recorded the requested full push, so
 		// nothing can resume it.
@@ -68,9 +73,6 @@ func (s *Sync) pushWithOptions(
 		return result, err
 	}
 	conn := s.conn
-	if err := CheckDataVersionCompat(ctx, conn); err != nil {
-		return result, err
-	}
 	if onProgress != nil {
 		onProgress(storage.PushProgress{Phase: "preparing"})
 	}
@@ -90,8 +92,11 @@ func (s *Sync) pushWithOptions(
 		s.archiveKey(messageDialogueReadyKeyBase),
 		s.archiveKey(commitLinksReadyKeyBase),
 		s.archiveKey(storedCountRepairKeyBase),
+		s.archiveKey(launcherRowsReadyKeyBase),
 		s.archiveKey(databaseIDKeyBase),
 		s.archiveKey(fullPushRunKeyBase),
+		s.archiveKey(curationFingerprintKeyBase),
+		s.archiveKey(cursorUsageMaxIDKeyBase),
 	)
 	if err != nil {
 		return result, err
@@ -109,6 +114,46 @@ func (s *Sync) pushWithOptions(
 	if err != nil {
 		return result, fmt.Errorf("loading source database generation: %w", err)
 	}
+	localDeletion, err := s.local.SessionDeletionPublicationRevision(ctx)
+	if err != nil {
+		return result, fmt.Errorf("reading local deletion revision: %w", err)
+	}
+	unchanged, err := s.unchangedSinceLastPush(ctx, opts, meta, storedCutoff, storedScope, databaseID, localDeletion)
+	if err != nil {
+		return result, err
+	}
+	if unchanged {
+		log.Printf("clickhouse push: no local changes since the last push; skipping sessions")
+		if s.local.ArchiveContent().UsageOnly() {
+			// Clearing a usage-only archive's vectors is upkeep, like
+			// repricing, that the next push without SkipIfUnchanged does.
+			result.Vectors.Skipped, result.Vectors.SkippedReason = true, usageOnlyVectorsReason
+			result.Duration = time.Since(start)
+			return result, nil
+		}
+		// The vector phase decides for itself whether it has work: a scoped
+		// one has none, and a generation-wide one may find vector-only
+		// changes.
+		var vectorScope []string
+		if opts.ScopeVectorsToChangedSessions {
+			vectorScope = []string{}
+		} else if s.vectorSource != nil {
+			// A generation-wide vector phase with a source can write, so it
+			// must not write to a mirror a newer AgentsView wrote.
+			if err := CheckDataVersionCompat(ctx, conn); err != nil {
+				return result, err
+			}
+		}
+		result.Vectors, err = s.pushVectors(ctx, 0, nil, vectorScope, nil, onProgress)
+		if err != nil {
+			return result, fmt.Errorf("vector push: %w", err)
+		}
+		result.Duration = time.Since(start)
+		return result, nil
+	}
+	if err := CheckDataVersionCompat(ctx, conn); err != nil {
+		return result, err
+	}
 	full, reason := s.decideFull(opts, storedCutoff, storedScope)
 	if !full && meta[s.archiveKey(databaseIDKeyBase)] != databaseID {
 		full, reason = true, "archive was rebuilt"
@@ -121,6 +166,9 @@ func (s *Sync) pushWithOptions(
 	}
 	if !full && meta[s.archiveKey(messageDialogueReadyKeyBase)] == "" {
 		full, reason = true, "preparing message dialogue"
+	}
+	if !full && meta[s.archiveKey(launcherRowsReadyKeyBase)] == "" {
+		full, reason = true, "republishing launcher provenance"
 	}
 	// Rows from before stored_message_count, the current dashboard facts, or
 	// content fingerprints, or from an older writer, stay in the old format
@@ -144,10 +192,6 @@ func (s *Sync) pushWithOptions(
 	}
 	if !full && repairing {
 		full, reason = true, "republishing session rows from an older format"
-	}
-	localDeletion, err := s.local.SessionDeletionPublicationRevision(ctx)
-	if err != nil {
-		return result, fmt.Errorf("reading local deletion revision: %w", err)
 	}
 	if !full && storedDeletion > localDeletion {
 		full, reason = true, "local deletion journal was reset"
@@ -391,6 +435,7 @@ func (s *Sync) pushWithOptions(
 			pushed[s.archiveKey(storedCountRepairKeyBase)] = ""
 		}
 		if full {
+			pushed[s.archiveKey(launcherRowsReadyKeyBase)] = cutoff
 			pushed[s.archiveKey(messageDialogueReadyKeyBase)] = cutoff
 			pushed[s.archiveKey(commitLinksReadyKeyBase)] = cutoff
 			pushed[s.archiveKey(fullPushRunKeyBase)] = ""
@@ -431,8 +476,93 @@ func (s *Sync) pushWithOptions(
 			return result, err
 		}
 	}
+	// A push replaces the tables it maintains, such as prepared usage and
+	// the usage rollup, with identical ones, so a clean push leaves the
+	// state the schema step recorded. A different state, such as a table
+	// dropped during the push, or session errors, which may come from one,
+	// leave the next push to check the tables again.
+	if result.Errors > 0 || !schemaUnchangedSinceEnsured(ctx, conn, s.schemaKey) {
+		s.forgetEnsuredSchema()
+	}
 	result.Duration = time.Since(start)
 	return result, nil
+}
+
+// unchangedSinceLastPush reports whether a change-triggered push has
+// nothing to write: no option asks for more, nothing requires a full push,
+// and the archive holds no session, deletion, project identity, worktree
+// mapping, star, pin, or Cursor usage change since the last push finished
+// cleanly. meta holds the metadata the push read, and storedCutoff and
+// storedScope the cutoff and scope stored in it. The checks read only the
+// local archive.
+//
+// The push it skips would also refresh machine labels, model prices, usage
+// prices, retained commit links, prepared usage, and the usage rollup, clear
+// a usage-only archive's vectors, and prune rows the archive no longer owns.
+// None of them depends on this archive's sessions changing, so the next push
+// without SkipIfUnchanged, such as a watcher's interval push, does them.
+func (s *Sync) unchangedSinceLastPush(
+	ctx context.Context, opts storage.PushOptions, meta map[string]string,
+	storedCutoff, storedScope, databaseID string, localDeletion int64,
+) (bool, error) {
+	if !opts.SkipIfUnchanged || opts.RewriteUnchanged ||
+		opts.FullVectors || len(opts.FullVectorSessions) > 0 {
+		return false, nil
+	}
+	if full, _ := s.decideFull(opts, storedCutoff, storedScope); full {
+		return false, nil
+	}
+	// Each of these starts a full push or finishes one.
+	for _, base := range []string{
+		usageSnapshotReadyKeyBase, messageDialogueReadyKeyBase, commitLinksReadyKeyBase, launcherRowsReadyKeyBase,
+	} {
+		if meta[s.archiveKey(base)] == "" {
+			return false, nil
+		}
+	}
+	if meta[s.archiveKey(databaseIDKeyBase)] != databaseID ||
+		meta[s.archiveKey(storedCountRepairKeyBase)] != "" ||
+		meta[s.archiveKey(fullPushRunKeyBase)] != "" ||
+		meta[s.archiveKey(deletionRevisionKeyBase)] != strconv.FormatInt(localDeletion, 10) {
+		return false, nil
+	}
+	identity, err := s.local.ProjectIdentityPublicationRevision(ctx)
+	if err != nil {
+		return false, err
+	}
+	mapping, err := s.local.WorktreeMappingPublicationRevision(ctx)
+	if err != nil {
+		return false, err
+	}
+	if meta[s.archiveKey(identityRevisionKeyBase)] != strconv.FormatInt(identity, 10) ||
+		meta[s.archiveKey(mappingRevisionKeyBase)] != strconv.FormatInt(mapping, 10) {
+		return false, nil
+	}
+	candidates, err := s.local.ListSessionsForMirrorWindow(ctx, storedCutoff, nil, nil)
+	if err != nil {
+		return false, fmt.Errorf("listing sessions for clickhouse push: %w", err)
+	}
+	if len(candidates) > 0 {
+		return false, nil
+	}
+	if !s.isFiltered() {
+		events, _, err := s.pendingCursorUsageEvents(ctx, meta[s.archiveKey(cursorUsageMaxIDKeyBase)])
+		if err != nil {
+			return false, err
+		}
+		if len(events) > 0 {
+			return false, nil
+		}
+	}
+	snap, err := s.loadCurationSnapshot(ctx)
+	if err != nil {
+		return false, err
+	}
+	curation, err := snap.fingerprint()
+	if err != nil {
+		return false, err
+	}
+	return curation == meta[s.archiveKey(curationFingerprintKeyBase)], nil
 }
 
 func (s *Sync) archiveKey(base string) string {
@@ -514,7 +644,7 @@ var rewriteSession = sessionWrite{row: true, content: true}
 // makes any later change to its session fields rewrite every table, so
 // the repair push republishes the row to record it.
 const currentSessionRowSQL = `stored_message_count IS NOT NULL AND dashboard_facts_version = ?
-	AND agentsview_content_fingerprint != ''`
+	AND agentsview_content_fingerprint != '' AND is_launched IS NOT NULL`
 
 // mirrorSession is what the mirror's session row records about the rows a
 // push wrote for the session.
@@ -998,6 +1128,7 @@ func reportProgress(done, total int, result *storage.PushResult, onProgress func
 // sessionPayload is everything one session contributes to the mirror.
 type sessionPayload struct {
 	session     db.Session
+	isLaunched  bool
 	messages    []db.Message
 	usage       []db.UsageEvent
 	planUsage   *db.SessionPlanUsage
@@ -1033,7 +1164,7 @@ func (s *Sync) loadPayload(ctx context.Context, sess db.Session) (sessionPayload
 		return sessionPayload{}, err
 	}
 	return sessionPayload{
-		session: snapshot.Session, messages: snapshot.Messages, usage: snapshot.Usage,
+		session: snapshot.Session, isLaunched: snapshot.IsLaunched, messages: snapshot.Messages, usage: snapshot.Usage,
 		planUsage: snapshot.PlanUsage, total: total,
 		findings: snapshot.Findings, commitLinks: snapshot.CommitLinks, imageText: snapshot.ImageText,
 		pins: snapshot.Pins, fingerprint: fingerprint,
@@ -1447,7 +1578,7 @@ func (s *Sync) sessionRow(p sessionPayload, publication sessionPublication, vers
 		nullString(sess.FilePath), nullInt64(sess.FileSize), nullInt64(sess.FileMtime),
 		nullInt64(sess.FileInode), nullInt64(sess.FileDevice), nullString(sess.FileHash),
 		nullTime(sess.LocalModifiedAt), db.TranscriptRevisionValue(sess.TranscriptRevision),
-		nullString(sess.ParentSessionID), sess.RelationshipType,
+		nullString(sess.ParentSessionID), sess.RelationshipType, p.isLaunched,
 		int64(sess.TotalOutputTokens), int64(sess.PeakContextTokens),
 		sess.HasTotalOutputTokens, sess.HasPeakContextTokens, sess.IsAutomated,
 		int64(sess.ToolFailureSignalCount), int64(sess.ToolRetryCount),
