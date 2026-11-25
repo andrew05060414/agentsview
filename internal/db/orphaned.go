@@ -252,10 +252,22 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 		); err != nil {
 			return nil, fmt.Errorf("sanitizing orphaned data: %w", err)
 		}
+		if !oldDBHasColumn(ctx, tx, "sessions", "structured_pr_links") {
+			if _, err := tx.ExecContext(ctx, `UPDATE sessions SET structured_pr_links=pr_links WHERE id IN (SELECT id FROM _orphaned_ids)`); err != nil {
+				return nil, err
+			}
+		}
 		if err := applyArchiveContentToCopiedSessionsTx(
 			ctx, tx, "_orphaned_ids", d.ArchiveContent(), sourceVersion,
 		); err != nil {
 			return nil, fmt.Errorf("projecting orphaned data: %w", err)
+		}
+		if !d.usageOnlyStorage() {
+			for _, id := range ids {
+				if err := refreshSessionPromptPRLinksTx(tx, id); err != nil {
+					return nil, fmt.Errorf("refreshing orphaned prompt PR links: %w", err)
+				}
+			}
 		}
 		if err := clearCopiedSelfParents(ctx, tx, "_orphaned_ids"); err != nil {
 			return nil, err
@@ -412,10 +424,22 @@ func (d *DB) CopyTrashedDataFrom(ctx context.Context, sourcePath string) ([]stri
 	); err != nil {
 		return nil, fmt.Errorf("sanitizing trashed data: %w", err)
 	}
+	if !oldDBHasColumn(ctx, tx, "sessions", "structured_pr_links") {
+		if _, err := tx.ExecContext(ctx, `UPDATE sessions SET structured_pr_links=pr_links WHERE id IN (SELECT id FROM _trashed_ids)`); err != nil {
+			return nil, err
+		}
+	}
 	if err := applyArchiveContentToCopiedSessionsTx(
 		ctx, tx, "_trashed_ids", d.ArchiveContent(), sourceVersion,
 	); err != nil {
 		return nil, fmt.Errorf("projecting trashed data: %w", err)
+	}
+	if !d.usageOnlyStorage() {
+		for _, id := range ids {
+			if err := refreshSessionPromptPRLinksTx(tx, id); err != nil {
+				return nil, fmt.Errorf("refreshing trashed prompt PR links: %w", err)
+			}
+		}
 	}
 	// Keep the archived transcript under its page ID before the upgrade loses
 	// the filename mapping. Retain an empty thread row for legacy trash scope;
@@ -1724,6 +1748,10 @@ func (d *DB) CopySessionMetadataFrom(
 		if oldDBHasColumn(ctx, tx, "cursor_usage_events", "agent") {
 			agentColumn = "agent"
 		}
+		accountID, polledAt := "''", "''"
+		if oldDBHasColumn(ctx, tx, "cursor_usage_events", "account_user_id") {
+			accountID, polledAt = "account_user_id", "account_polled_at"
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO main.cursor_usage_events (
 				agent,
@@ -1731,17 +1759,22 @@ func (d *DB) CopySessionMetadataFrom(
 				input_tokens, output_tokens,
 				cache_write_tokens, cache_read_tokens,
 				charged_microdollars, cursor_token_fee_microdollars,
-				user_id, user_email, is_headless, dedup_key
+				user_id, user_email, is_headless, dedup_key, account_user_id, account_polled_at
 			)
 			SELECT `+agentColumn+`,
 				occurred_at, model, kind,
 				input_tokens, output_tokens,
 				cache_write_tokens, cache_read_tokens,
 				charged_microdollars, cursor_token_fee_microdollars,
-				user_id, user_email, is_headless, dedup_key
+				user_id, user_email, is_headless, dedup_key, `+accountID+`, `+polledAt+`
 			FROM old_db.cursor_usage_events
 			ORDER BY occurred_at, id`); err != nil {
 			return fmt.Errorf("copying cursor usage events: %w", err)
+		}
+	}
+	if oldDBHasTable(ctx, tx, "cursor_account_polls") {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM main.cursor_account_polls; INSERT INTO main.cursor_account_polls SELECT account_user_id, hour_start, polled_at FROM old_db.cursor_account_polls`); err != nil {
+			return fmt.Errorf("copying Cursor account polls: %w", err)
 		}
 	}
 
@@ -2247,7 +2280,7 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 		"missing_verification_count",
 		"duplicate_prompt_count", "no_code_context_count",
 		"runaway_tool_loop_count",
-		"cwd", "git_branch", "pr_links", "source_session_id",
+		"cwd", "git_branch", "pr_links", "structured_pr_links", "source_session_id",
 		"source_version", "group_key", "transcript_fidelity", "parser_malformed_lines",
 		"is_truncated", "last_write_incremental",
 		"termination_status", "transcript_revision",

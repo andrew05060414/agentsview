@@ -791,6 +791,9 @@ components:
           type: integer
         migrate_legacy_sync_state:
           type: boolean
+        no_source_sync:
+          description: Copy committed archive changes without scanning source files. Full pushes and stale archives still synchronise sources.
+          type: boolean
         no_vectors:
           type: boolean
         projects:
@@ -14732,6 +14735,16 @@ paths:
   /api/v1/events:
     get:
       operationId: get-api-v1-events
+      parameters:
+        - description: Session IDs to watch; repeat for each session
+          explode: true
+          in: query
+          name: session
+          schema:
+            description: Session IDs to watch; repeat for each session
+            items:
+              type: string
+            type: array
       responses:
         "200":
           content:
@@ -14769,6 +14782,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/ApiErrorResponse"
           description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
         "500":
           content:
             application/json:
@@ -20754,12 +20773,12 @@ paths:
             items:
               type: string
             type: array
-        - description: "Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123"
+        - description: "Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123. Includes URLs in user prompts; a mention does not mean work was done on the PR"
           explode: false
           in: query
           name: pr
           schema:
-            description: "Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123"
+            description: "Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123. Includes URLs in user prompts; a mention does not mean work was done on the PR"
             type: string
         - description: "Sort order: a comma-separated list of keys, each optionally suffixed :asc or :desc (e.g. messages:desc,started:asc). A key with no suffix uses the descending param, then its natural direction. Valid keys: recent, started, messages, user-messages, output-tokens, peak-context, failures, retries, edit-churn, compactions, context-pressure, health, secrets, id."
           explode: false
@@ -21142,12 +21161,12 @@ paths:
             items:
               type: string
             type: array
-        - description: "Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123"
+        - description: "Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123. Includes URLs in user prompts; a mention does not mean work was done on the PR"
           explode: false
           in: query
           name: pr
           schema:
-            description: "Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123"
+            description: "Keep sessions linked to a pull request: owner/repo, owner/repo#123, or github.com::owner/repo#123. Includes URLs in user prompts; a mention does not mean work was done on the PR"
             type: string
         - description: "Sort order: a comma-separated list of keys, each optionally suffixed :asc or :desc (e.g. messages:desc,started:asc). A key with no suffix uses the descending param, then its natural direction. Valid keys: recent, started, messages, user-messages, output-tokens, peak-context, failures, retries, edit-churn, compactions, context-pressure, health, secrets, id."
           explode: false
