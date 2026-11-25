@@ -301,6 +301,7 @@ func New(
 	modelGroups := service.NewModelGroups(cfg.ModelAliases)
 	backendOptions := []service.DirectBackendOption{
 		service.WithModelGroups(modelGroups), service.WithConfiguredDocbank(cfg),
+		service.WithAccountAliases(cfg.AccountAliases),
 	}
 	var sessions service.SessionService
 	if local, ok := database.(*db.DB); ok {

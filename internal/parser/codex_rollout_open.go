@@ -59,6 +59,28 @@ func codexRolloutStem(name string) string {
 	return strings.TrimSuffix(name, codexRolloutSuffix)
 }
 
+// codexRolloverSibling redirects a recorded or reported rollout path to the
+// sibling form that exists on disk. Codex compresses completed rollouts in
+// place, replacing name.jsonl with name.jsonl.zst; a source recorded or a
+// watcher event raised just before that rollover still names the plain file,
+// and the reverse applies to extraction or older builds. Returns path
+// unchanged when it already exists or is not a rollout path, so callers rank
+// and stat as usual.
+func codexRolloverSibling(path string) string {
+	if isCompressedCodexRolloutPath(path) {
+		if plain := codexPlainRolloutPath(path); IsRegularFile(plain) {
+			return plain
+		}
+		return path
+	}
+	if strings.HasSuffix(path, codexRolloutSuffix) &&
+		!IsRegularFile(path) &&
+		IsRegularFile(path+".zst") {
+		return path + ".zst"
+	}
+	return path
+}
+
 // codexRolloutSnapshot owns the source file and yields decoded bytes.
 type codexRolloutSnapshot struct {
 	File       *os.File

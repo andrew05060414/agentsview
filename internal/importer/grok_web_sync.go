@@ -22,6 +22,7 @@ const (
 	grokListRequest = iota
 	grokListPageRequest
 	grokResponsesRequest
+	grokAccountRequest
 )
 
 // grokDetailGap delays each conversation request by 3 s with jitter, the
@@ -77,6 +78,9 @@ func grokListChat(item jsontext.Value) (grokChat, bool) {
 // syncGrokWeb imports new and changed Grok web conversations.
 func syncGrokWeb(ctx context.Context, store BrowserSyncStore, fetch BrowserFetch, opts BrowserSyncOptions, cb *ImportCallbacks) (stats ImportStats, retErr error) {
 	platform := grokWebPlatform()
+	accountPath := browserRequest(grokWebRequests, grokAccountRequest)
+	account, _ := browserAccount(ctx, fetch, accountPath)
+	var accountIDs []string
 	seen := make(map[string]struct{})
 	runner := newBrowserSync(store, platform, &stats, opts, cb)
 	// A page token seen before would loop forever. Paging has no count
@@ -113,7 +117,9 @@ func syncGrokWeb(ctx context.Context, store BrowserSyncStore, fetch BrowserFetch
 				continue
 			}
 			seen[chat.ConversationID] = struct{}{}
-			err := runner.conversation(ctx, "grok-web:"+chat.ConversationID, browserConversation{
+			id := "grok-web:" + chat.ConversationID
+			accountIDs = append(accountIDs, id)
+			err := runner.conversation(ctx, id, browserConversation{
 				freshness: func(session *db.Session) uint64 {
 					marker := ""
 					if !updatedAt.IsZero() {
@@ -156,7 +162,7 @@ func syncGrokWeb(ctx context.Context, store BrowserSyncStore, fetch BrowserFetch
 		}
 		token, tokens[next] = next, struct{}{}
 	}
-	return stats, runner.formatErr
+	return stats, errors.Join(runner.formatErr, runner.confirmAccount(ctx, fetch, accountPath, account, accountIDs))
 }
 
 // fetchGrokConversation reads one chat's responses and wraps them with the

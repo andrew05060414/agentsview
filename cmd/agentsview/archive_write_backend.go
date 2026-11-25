@@ -676,7 +676,7 @@ func (b *localArchiveWriteBackend) ReplicaPush(
 			applyClassifierConfig(b.appCfg)
 			return backend.NewPusher(
 				c, target.Target, b.database,
-				replicaPusherOptions(target, projects, excludeProjects, vectorSource),
+				replicaPusherOptions(target, projects, excludeProjects, vectorSource, b.appCfg.AccountAliases),
 			)
 		},
 		EnsurePricing: b.ensureCurrentPricing,
@@ -775,7 +775,7 @@ func (b *localArchiveWriteBackend) ReplicaPushWatch(
 				applyClassifierConfig(b.appCfg)
 				return backend.NewPusher(
 					c, target.Target, b.database,
-					replicaPusherOptions(target, projects, exclude, vectorSource),
+					replicaPusherOptions(target, projects, exclude, vectorSource, b.appCfg.AccountAliases),
 				)
 			},
 		)
@@ -881,8 +881,10 @@ func replicaPusherOptions(
 	target storage.ConfiguredReplica,
 	projects, excludeProjects []string,
 	vectorSource storage.VectorPushSource,
+	accountAliases map[string]string,
 ) storage.PusherOptions {
 	return storage.PusherOptions{
+		AccountAliases:         accountAliases,
 		Projects:               projects,
 		ExcludeProjects:        excludeProjects,
 		SyncStateTarget:        target.SyncStateTarget(),

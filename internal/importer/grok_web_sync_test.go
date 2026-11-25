@@ -69,7 +69,7 @@ func TestSyncGrokCapturedPages(t *testing.T) {
 		details++
 		return BrowserResponse{Status: 200, Body: grokFixture(t, "responses-linear.json")}, nil
 	}
-	stats, err := syncGrokWeb(t.Context(), d, fetch, opts, nil)
+	stats, err := syncGrokTest(t.Context(), d, fetch, opts, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 10, stats.Imported)
 	assert.Zero(t, stats.Errors)
@@ -100,7 +100,7 @@ func TestSyncGrokCapturedPages(t *testing.T) {
 
 	// The cut-off reply sits on a branch the web app no longer shows, so the
 	// chat is not pending and the next Sync fetches nothing.
-	stats, err = syncGrokWeb(t.Context(), d, fetch, opts, nil)
+	stats, err = syncGrokTest(t.Context(), d, fetch, opts, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 10, stats.Skipped)
 	assert.Equal(t, 10, details)
@@ -156,7 +156,7 @@ func TestSyncGrokIncrementalAndHistory(t *testing.T) {
 	sync := func(modified string, responses ...map[string]any) ImportStats {
 		t.Helper()
 		fake.modified, fake.responses = modified, responses
-		stats, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+		stats, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 		require.NoError(t, err)
 		assert.Zero(t, stats.Errors)
 		return stats
@@ -249,20 +249,20 @@ func TestSyncGrokRefetchesReplyInProgress(t *testing.T) {
 				tc.pending(fake)
 			}
 			for range 2 {
-				_, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+				_, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 				require.NoError(t, err)
 			}
 			assert.Equal(t, 2, fake.details, "a reply in progress is not cached as fresh")
 
 			fake.inflight = nil
 			fake.responses = []map[string]any{q, grokSyncResponse("r2", "r1", "assistant", "Answer", at)}
-			_, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+			_, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 			require.NoError(t, err)
 			messages, err := d.GetAllMessages(t.Context(), "grok-web:"+grokTestChat)
 			require.NoError(t, err)
 			assert.Equal(t, []string{"Question", "Answer"}, messageContents(messages))
 
-			stats, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+			stats, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 			require.NoError(t, err)
 			assert.Equal(t, 1, stats.Skipped)
 			assert.Equal(t, 3, fake.details)
@@ -282,13 +282,13 @@ func TestSyncGrokRefetchesRegeneration(t *testing.T) {
 	regenerating["partial"] = true
 	fake := &grokFake{t: t, modified: "2026-10-21T08:01:00Z", responses: []map[string]any{q, first, regenerating}}
 	for range 2 {
-		_, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+		_, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 		require.NoError(t, err)
 	}
 	assert.Equal(t, 2, fake.details, "a regeneration in progress is not cached as fresh")
 
 	fake.responses = []map[string]any{q, first, grokSyncResponse("r3", "r1", "assistant", "Better answer", "2026-10-21T08:01:00Z")}
-	stats, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+	stats, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Updated)
 	messages, err := d.GetAllMessages(t.Context(), id)
@@ -300,7 +300,7 @@ func TestSyncGrokRefetchesRegeneration(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"Question", "First answer"}, messageContents(saved))
 
-	stats, err = syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+	stats, err = syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Skipped)
 	assert.Equal(t, 3, fake.details)
@@ -329,7 +329,7 @@ func TestSyncGrokPendingWindow(t *testing.T) {
 			}}
 			opts := BrowserSyncOptions{Now: func() time.Time { return now }}
 			for range 2 {
-				stats, err := syncGrokWeb(t.Context(), d, fake.fetch, opts, nil)
+				stats, err := syncGrokTest(t.Context(), d, fake.fetch, opts, nil)
 				require.NoError(t, err)
 				assert.Zero(t, stats.Errors)
 			}
@@ -376,7 +376,7 @@ func TestSyncGrokStops(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := &grokFake{t: t, modified: "2026-10-21T08:00:00Z", status: tc.status, pages: tc.pages}
 			fake.responses = []map[string]any{grokSyncResponse("r1", "", "human", "Question", "2026-10-21T08:00:00Z")}
-			stats, err := syncGrokWeb(t.Context(), testDB(t), fake.fetch, grokTestOptions, nil)
+			stats, err := syncGrokTest(t.Context(), testDB(t), fake.fetch, grokTestOptions, nil)
 			require.Error(t, err)
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
@@ -404,7 +404,7 @@ func TestSyncGrokSkipsUnreadableListEntries(t *testing.T) {
 		grokSyncResponse("r1", "", "human", "Question", "2026-10-21T08:00:00Z"),
 		grokSyncResponse("r2", "r1", "assistant", "Answer", "2026-10-21T08:00:05Z"),
 	}
-	stats, err := syncGrokWeb(t.Context(), testDB(t), fake.fetch, grokTestOptions, nil)
+	stats, err := syncGrokTest(t.Context(), testDB(t), fake.fetch, grokTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Imported)
 	assert.Equal(t, 2, stats.Errors)
@@ -443,12 +443,12 @@ func TestSyncGrokUnreadableListTime(t *testing.T) {
 						`{"conversationId":"` + grokTestChat + `","title":"Trip plan"` + modified.field + `}]}`),
 				}}
 				fake.responses = []map[string]any{question, tc.reply}
-				stats, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+				stats, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 				require.NoError(t, err)
 				assert.Equal(t, 1, stats.Imported)
 				assert.Zero(t, stats.Errors)
 
-				stats, err = syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+				stats, err = syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 				require.NoError(t, err)
 				assert.Zero(t, stats.Errors)
 				assert.Equal(t, tc.wantDetails, fake.details)
@@ -477,7 +477,7 @@ func TestSyncGrokLongChatList(t *testing.T) {
 	}
 	fake.pages[grokRequest(grokListPageRequest, "", token(pages-1))] = []byte(`{"conversations":[` +
 		`{"conversationId":"` + grokTestChat + `","modifyTime":"2026-10-21T08:00:00Z"}]}`)
-	stats, err := syncGrokWeb(t.Context(), testDB(t), fake.fetch, grokTestOptions, nil)
+	stats, err := syncGrokTest(t.Context(), testDB(t), fake.fetch, grokTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Imported)
 	assert.Equal(t, pages-1, stats.Errors, "each earlier page lists one unreadable entry")
@@ -497,7 +497,7 @@ func TestSyncGrokUsageOnlyAppendBackfillsModel(t *testing.T) {
 	q2 := grokSyncResponse("r3", "r2", "human", "Follow up", "2026-10-21T08:01:00Z")
 	a2 := grokSyncResponse("r4", "r3", "assistant", "Second answer", "2026-10-21T08:01:05Z")
 	fake.modified, fake.responses = "2026-10-21T08:01:05Z", []map[string]any{q1, a1, q2, a2}
-	_, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+	_, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 	require.NoError(t, err)
 	before, err := d.GetAllMessages(t.Context(), id)
 	require.NoError(t, err)
@@ -509,7 +509,7 @@ func TestSyncGrokUsageOnlyAppendBackfillsModel(t *testing.T) {
 	q3 := grokSyncResponse("r5", "r4", "human", "Third question", "2026-10-21T08:02:00Z")
 	a3 := grokSyncResponse("r6", "r5", "assistant", "Third answer", "2026-10-21T08:02:05Z")
 	fake.modified, fake.responses = "2026-10-21T08:02:05Z", []map[string]any{q1, modeled, q2, a2, q3, a3}
-	_, err = syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+	_, err = syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 	require.NoError(t, err)
 	after, err := d.GetAllMessages(t.Context(), id)
 	require.NoError(t, err)
@@ -534,7 +534,7 @@ func TestSyncGrokCompletionFillsModel(t *testing.T) {
 			partial := grokSyncResponse("r2", "r1", "assistant", "Answer", at)
 			partial["model"], partial["partial"] = "", true
 			fake := &grokFake{t: t, modified: at, responses: []map[string]any{q, partial}}
-			_, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+			_, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 			require.NoError(t, err)
 			before, err := d.GetAllMessages(t.Context(), id)
 			require.NoError(t, err)
@@ -545,7 +545,7 @@ func TestSyncGrokCompletionFillsModel(t *testing.T) {
 			preventChatGPTMessageIDReuse(t, d)
 
 			fake.responses = []map[string]any{q, grokSyncResponse("r2", "r1", "assistant", "Answer", at)}
-			_, err = syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+			_, err = syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 			require.NoError(t, err)
 			after, err := d.GetAllMessages(t.Context(), id)
 			require.NoError(t, err)
@@ -553,7 +553,7 @@ func TestSyncGrokCompletionFillsModel(t *testing.T) {
 			assert.Equal(t, reply.ID, after[len(after)-1].ID, "the reply is updated in place")
 			assert.Equal(t, "grok-4", after[len(after)-1].Model)
 
-			stats, err := syncGrokWeb(t.Context(), d, fake.fetch, grokTestOptions, nil)
+			stats, err := syncGrokTest(t.Context(), d, fake.fetch, grokTestOptions, nil)
 			require.NoError(t, err)
 			assert.Equal(t, 1, stats.Skipped)
 			assert.Equal(t, 2, fake.details)

@@ -415,6 +415,9 @@ func filterToQuery(f service.ListFilter) (*apiclient.GetAPIV1SessionsQuery, erro
 	if f.Machine != "" {
 		q.Machine = new(f.Machine)
 	}
+	if f.Account != "" {
+		q.Account = new(f.Account)
+	}
 	if f.GitBranch != "" {
 		q.GitBranch = new(f.GitBranch)
 	}
@@ -902,6 +905,9 @@ func (b *httpBackend) SearchContent(
 	}
 	if req.Machine != "" {
 		q.Machine = new(req.Machine)
+	}
+	if req.Account != "" {
+		q.Account = new(req.Account)
 	}
 	if req.GitBranch != "" {
 		q.GitBranch = new(req.GitBranch)

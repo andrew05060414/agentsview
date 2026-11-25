@@ -164,7 +164,7 @@ func TestSyncGeminiCapturedPages(t *testing.T) {
 		require.Failf(t, "unexpected Gemini request path", "%s", path)
 		return BrowserResponse{}, nil
 	}
-	stats, err := syncGeminiApps(t.Context(), d, fetch, geminiTestOptions, nil)
+	stats, err := syncGeminiTest(t.Context(), d, fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Imported)
 	assert.Zero(t, stats.Errors)
@@ -209,7 +209,7 @@ func TestSyncGeminiIncrementalAndHistory(t *testing.T) {
 		for _, turn := range slices.Backward(turns) { // the web app sends newest first
 			fake.turns = append(fake.turns, turn)
 		}
-		stats, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+		stats, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 		require.NoError(t, err)
 		assert.Zero(t, stats.Errors)
 		return stats
@@ -258,13 +258,13 @@ func TestSyncGeminiRefetchesReplyInProgress(t *testing.T) {
 	d := testDB(t)
 	fake := &geminiFake{t: t, listAt: 1_790_000_000}
 	fake.turns = []any{geminiSyncTurn("1", "Question", "", 1_790_000_000)}
-	stats, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+	stats, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Imported)
 
 	// Same list time: a missing reply is not trusted as fresh.
 	fake.turns = []any{geminiSyncTurn("1", "Question", "Answer", 1_790_000_000)}
-	stats, err = syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+	stats, err = syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Updated)
 	assert.Equal(t, 2, fake.details)
@@ -272,7 +272,7 @@ func TestSyncGeminiRefetchesReplyInProgress(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"Question", "Answer"}, messageContents(messages))
 
-	stats, err = syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+	stats, err = syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Skipped)
 	assert.Equal(t, 2, fake.details)
@@ -344,7 +344,7 @@ func TestSyncGeminiStops(t *testing.T) {
 			for path, body := range tc.pages {
 				fake.pages[path] = body(t)
 			}
-			stats, err := syncGeminiApps(t.Context(), testDB(t), fake.fetch, geminiTestOptions, nil)
+			stats, err := syncGeminiTest(t.Context(), testDB(t), fake.fetch, geminiTestOptions, nil)
 			require.Error(t, err)
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
@@ -376,7 +376,7 @@ func TestSyncGeminiRefusedConversationsDoNotEndRound(t *testing.T) {
 		geminiRequest(geminiDetailRequest, refusedB, ""): refused(t),
 	}}
 	fake.turns = []any{geminiSyncTurn("1", "Question", "Answer", 1_790_000_000)}
-	stats, err := syncGeminiApps(t.Context(), testDB(t), fake.fetch, geminiTestOptions, nil)
+	stats, err := syncGeminiTest(t.Context(), testDB(t), fake.fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Imported)
 	assert.Equal(t, 2, stats.Errors)
@@ -393,7 +393,7 @@ func TestSyncGeminiKeepsPinsInPlace(t *testing.T) {
 	sync := func(listAt int64, turns ...any) {
 		t.Helper()
 		fake.listAt, fake.turns = listAt, turns
-		stats, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+		stats, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 		require.NoError(t, err)
 		assert.Zero(t, stats.Errors)
 	}
@@ -465,19 +465,19 @@ func TestSyncGeminiRefetchesAttachmentOnlyTurn(t *testing.T) {
 			}
 			fake.turns = append([]any{geminiSyncTurn("2", "", "", t0+60)}, tc.older...)
 			for range 2 {
-				_, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+				_, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 				require.NoError(t, err)
 			}
 			assert.Equal(t, 2, fake.details, "a pending turn is not cached as fresh")
 
 			fake.turns[0] = geminiSyncTurn("2", "", reply, t0+60)
-			_, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+			_, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 			require.NoError(t, err)
 			messages, err := d.GetAllMessages(t.Context(), "gemini-apps:"+geminiTestChat)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, messageContents(messages))
 
-			stats, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+			stats, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 			require.NoError(t, err)
 			assert.Equal(t, 1, stats.Skipped)
 			assert.Equal(t, 3, fake.details)
@@ -502,7 +502,7 @@ func TestSyncGeminiDraftSwitchKeepsHistory(t *testing.T) {
 		return turn
 	}
 	fake := &geminiFake{t: t, listAt: t0, turns: []any{turn("rc_a")}}
-	_, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+	_, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	stored, err := d.GetAllMessages(t.Context(), id)
 	require.NoError(t, err)
@@ -510,7 +510,7 @@ func TestSyncGeminiDraftSwitchKeepsHistory(t *testing.T) {
 	assert.Equal(t, []string{"r_1", "rc_a"}, []string{stored[0].SourceUUID, stored[1].SourceUUID})
 
 	fake.listAt, fake.turns = t0+60, []any{turn("rc_b")}
-	_, err = syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+	_, err = syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	after, err := d.GetAllMessages(t.Context(), id)
 	require.NoError(t, err)
@@ -552,7 +552,7 @@ func TestSyncGeminiSameTextDraftSwitchKeepsPins(t *testing.T) {
 				return turn
 			}
 			fake := &geminiFake{t: t, listAt: t0, turns: []any{turn("rc_a")}}
-			_, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+			_, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 			require.NoError(t, err)
 			stored, err := d.GetAllMessages(t.Context(), id)
 			require.NoError(t, err)
@@ -561,7 +561,7 @@ func TestSyncGeminiSameTextDraftSwitchKeepsPins(t *testing.T) {
 			require.NoError(t, err)
 
 			fake.listAt, fake.turns = t0+60, []any{turn("rc_b")}
-			_, err = syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+			_, err = syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 			require.NoError(t, err)
 			after, err := d.GetAllMessages(t.Context(), id)
 			require.NoError(t, err)
@@ -613,7 +613,7 @@ func TestSyncGeminiPendingWindow(t *testing.T) {
 				fake := &geminiFake{t: t, listAt: tc.listAt, turns: turn}
 				opts := BrowserSyncOptions{Now: func() time.Time { return time.Unix(now, 0) }}
 				for range 2 {
-					stats, err := syncGeminiApps(t.Context(), d, fake.fetch, opts, nil)
+					stats, err := syncGeminiTest(t.Context(), d, fake.fetch, opts, nil)
 					require.NoError(t, err)
 					assert.Zero(t, stats.Errors)
 				}
@@ -639,14 +639,14 @@ func TestSyncGeminiUsageArchiveShorterChatKeepsTrashedCopy(t *testing.T) {
 		geminiSyncTurn("2", "Another", "", t0+60),
 		first,
 	}}
-	_, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+	_, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	before, err := d.GetAllMessages(t.Context(), id)
 	require.NoError(t, err)
 	require.Len(t, before, 1, "usage-only storage keeps only the reply row")
 
 	fake.listAt, fake.turns = t0, []any{geminiSyncTurn("2", "Follow up", "Second answer", t0+60), first}
-	stats, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+	stats, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, ImportStats{Updated: 1}, stats)
 	session, err := d.GetSessionFull(t.Context(), id)
@@ -681,7 +681,7 @@ func TestSyncGeminiLongChatList(t *testing.T) {
 	lastTurn[0] = []any{lastChat, "r_2"}
 	fake.pages[geminiRequest(geminiDetailRequest, lastChat, "")] = geminiRPCBody(t, geminiDetailRPC, []any{[]any{lastTurn}, nil, nil, []any{}})
 	d := testDB(t)
-	stats, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+	stats, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, 2, stats.Imported)
 	assert.Zero(t, stats.Errors)
@@ -709,7 +709,7 @@ func TestSyncGeminiListStopsOnEmptyPage(t *testing.T) {
 		next := "page" + strconv.Itoa(len(cursors))
 		return BrowserResponse{Status: 200, Body: geminiRPCBody(t, geminiListRPC, []any{nil, next, []any{}})}, nil
 	}
-	stats, err := syncGeminiApps(t.Context(), testDB(t), fetch, geminiTestOptions, nil)
+	stats, err := syncGeminiTest(t.Context(), testDB(t), fetch, geminiTestOptions, nil)
 	require.NoError(t, err)
 	assert.Equal(t, ImportStats{}, stats)
 	assert.Equal(t, []string{""}, cursors)
@@ -767,12 +767,12 @@ func TestSyncGeminiUnreadableListTime(t *testing.T) {
 					}}),
 				}}
 				fake.turns = []any{geminiSyncTurn("1", "Question", tc.reply, 1_790_000_000)}
-				stats, err := syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+				stats, err := syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 				require.NoError(t, err)
 				assert.Equal(t, 1, stats.Imported)
 				assert.Zero(t, stats.Errors)
 
-				stats, err = syncGeminiApps(t.Context(), d, fake.fetch, geminiTestOptions, nil)
+				stats, err = syncGeminiTest(t.Context(), d, fake.fetch, geminiTestOptions, nil)
 				require.NoError(t, err)
 				assert.Zero(t, stats.Errors)
 				assert.Equal(t, tc.wantDetails, fake.details)
