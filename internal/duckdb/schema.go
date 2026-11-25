@@ -42,7 +42,8 @@ import (
 // v30 moves the OpenRouter ownership list from a model_pricing row into
 // pricing_meta and stores pricing times as TIMESTAMP.
 // v31 stores system-prefix verdicts.
-const SchemaVersion = 31
+// v32 stores the classification marker for dialogue equal to content.
+const SchemaVersion = 32
 
 func trendsPartsIdentity() string {
 	return "duckdb|" + db.SystemPrefixRulesVersion()
@@ -358,6 +359,7 @@ var mirrorTables = append([]tableSpec{
 			content TEXT NOT NULL,
 			thinking_text TEXT NOT NULL DEFAULT '',
 			dialogue_text TEXT,
+			dialogue_is_content BOOLEAN NOT NULL DEFAULT FALSE,
 			timestamp TIMESTAMP,
 			has_thinking BOOLEAN NOT NULL DEFAULT FALSE,
 			has_tool_use BOOLEAN NOT NULL DEFAULT FALSE,
@@ -398,6 +400,7 @@ var mirrorTables = append([]tableSpec{
 			{"content", "content TEXT NOT NULL DEFAULT ''"},
 			{"thinking_text", "thinking_text TEXT NOT NULL DEFAULT ''"},
 			{"dialogue_text", "dialogue_text TEXT"},
+			{"dialogue_is_content", "dialogue_is_content BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"timestamp", "timestamp TIMESTAMP"},
 			{"has_thinking", "has_thinking BOOLEAN NOT NULL DEFAULT FALSE"},
 			{"has_tool_use", "has_tool_use BOOLEAN NOT NULL DEFAULT FALSE"},

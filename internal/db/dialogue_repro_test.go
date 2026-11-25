@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/stretchr/testify/require"
 )
 
 // TestDialogueReproRealArchive reads a local archive read-only and reports,
@@ -20,17 +21,16 @@ func TestDialogueReproRealArchive(t *testing.T) {
 		t.Skip("AGENTS_VIEW_REPRO_DB not set")
 	}
 	conn, err := sql.Open("sqlite3", "file:"+path+"?mode=ro&_query_only=1")
-	if err != nil {
-		t.Fatalf("opening %s: %v", path, err)
-	}
+	require.NoError(t, err, "opening archive")
 	t.Cleanup(func() { conn.Close() })
 
-	const target = "codex:01a17024-4164-73e0-8135-4cf7911a0391"
-	reportSession(t, conn, target, 35, 43)
+	if target := os.Getenv("AGENTS_VIEW_REPRO_SESSION_ID"); target != "" {
+		reportSession(t, conn, target, 35, 43)
+	}
 
 	for _, agent := range []string{"claude", "chatgpt", "cursor", "cursor-ide", "antigravity", "antigravity-cli"} {
 		var sid string
-		err := conn.QueryRowContext(context.Background(),
+		err := conn.QueryRowContext(t.Context(),
 			`SELECT id FROM sessions WHERE agent = ? AND message_count BETWEEN 8 AND 40 ORDER BY ended_at DESC LIMIT 1`,
 			agent).Scan(&sid)
 		if err != nil {
@@ -43,10 +43,8 @@ func TestDialogueReproRealArchive(t *testing.T) {
 
 func reportSession(t *testing.T, conn *sql.DB, sid string, from, to int) {
 	t.Helper()
-	msgs, err := readReproMessages(conn, sid, from, to)
-	if err != nil {
-		t.Fatalf("%s: %v", sid, err)
-	}
+	msgs, err := readReproMessages(t.Context(), conn, sid, from, to)
+	require.NoError(t, err, "reading sample session")
 	var visible, dropped, uncertain int
 	fmt.Printf("SESSION %s rows=%d\n", sid, len(msgs))
 	for _, m := range msgs {
@@ -76,8 +74,8 @@ func reportSession(t *testing.T, conn *sql.DB, sid string, from, to int) {
 // readReproMessages loads one ordinal range with its tool calls straight from
 // the archive, without the package's schema gate, so an older archive still
 // answers. Only the columns the dialogue verdict reads are filled in.
-func readReproMessages(conn *sql.DB, sid string, from, to int) ([]Message, error) {
-	rows, err := conn.QueryContext(context.Background(), `
+func readReproMessages(ctx context.Context, conn *sql.DB, sid string, from, to int) ([]Message, error) {
+	rows, err := conn.QueryContext(ctx, `
 		SELECT id, ordinal, role, content, COALESCE(source_subtype,''), has_tool_use
 		FROM messages
 		WHERE session_id = ? AND ordinal BETWEEN ? AND ?
@@ -99,25 +97,30 @@ func readReproMessages(conn *sql.DB, sid string, from, to int) ([]Message, error
 		return nil, err
 	}
 	for i := range msgs {
-		calls, err := conn.QueryContext(context.Background(), `
-			SELECT tool_name, category, COALESCE(input_json,'')
-			FROM tool_calls WHERE message_id = ? ORDER BY call_index`, msgs[i].ID)
+		calls, err := readReproCalls(ctx, conn, msgs[i].ID)
 		if err != nil {
 			return nil, err
 		}
-		for calls.Next() {
-			var c ToolCall
-			if err := calls.Scan(&c.ToolName, &c.Category, &c.InputJSON); err != nil {
-				calls.Close()
-				return nil, err
-			}
-			msgs[i].ToolCalls = append(msgs[i].ToolCalls, c)
-		}
-		if err := calls.Err(); err != nil {
-			calls.Close()
-			return nil, err
-		}
-		calls.Close()
+		msgs[i].ToolCalls = calls
 	}
 	return msgs, nil
+}
+
+func readReproCalls(ctx context.Context, conn *sql.DB, messageID int64) ([]ToolCall, error) {
+	rows, err := conn.QueryContext(ctx, `
+		SELECT tool_name, category, COALESCE(input_json,'')
+		FROM tool_calls WHERE message_id = ? ORDER BY call_index`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var calls []ToolCall
+	for rows.Next() {
+		var c ToolCall
+		if err := rows.Scan(&c.ToolName, &c.Category, &c.InputJSON); err != nil {
+			return nil, err
+		}
+		calls = append(calls, c)
+	}
+	return calls, rows.Err()
 }

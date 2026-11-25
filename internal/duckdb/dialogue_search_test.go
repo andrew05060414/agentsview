@@ -23,6 +23,7 @@ func TestDuckDBDialogueSearchParity(t *testing.T) {
 	require.NoError(t, err)
 	store := openPushedStore(t, path)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	dbtest.AssertDialogueMessageReads(t, store)
 	dbtest.AssertDialogueSearchParity(t, local, store, "substring", "regex", "fts")
 }
 

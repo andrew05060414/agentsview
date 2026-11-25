@@ -922,8 +922,9 @@ func pgUsageEventTimestampFingerprintText(value string) string {
 }
 
 func loadPushMessageDialogueFingerprints(ctx context.Context, tx *sql.Tx, sessionIDs []string, out map[string]string) error {
-	rows, err := tx.QueryContext(ctx, `SELECT session_id, ordinal, sha256(convert_to(dialogue_text, 'UTF8'))
-        FROM messages WHERE session_id = ANY($1) AND dialogue_text IS NOT NULL
+	rows, err := tx.QueryContext(ctx, `SELECT session_id, ordinal,
+        sha256(convert_to(CASE WHEN dialogue_is_content THEN content ELSE dialogue_text END, 'UTF8'))
+        FROM messages WHERE session_id = ANY($1) AND (dialogue_is_content OR dialogue_text IS NOT NULL)
         ORDER BY session_id, ordinal`, sessionIDs)
 	if err != nil {
 		return err

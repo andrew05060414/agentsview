@@ -198,6 +198,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content        TEXT NOT NULL,
     thinking_text  TEXT NOT NULL DEFAULT '',
     dialogue_text  TEXT,
+    dialogue_is_content BOOLEAN NOT NULL DEFAULT FALSE,
     timestamp      TIMESTAMPTZ,
     has_thinking   BOOLEAN NOT NULL DEFAULT FALSE,
     has_tool_use   BOOLEAN NOT NULL DEFAULT FALSE,
@@ -1528,7 +1529,7 @@ func dedupeStoredDialoguePG(ctx context.Context, pg pgSessionExecer) error {
 			INSERT INTO sync_metadata (key, value) VALUES ($1, '1')
 			ON CONFLICT (key) DO NOTHING RETURNING key
 		)
-		UPDATE messages SET dialogue_text = NULL
+		UPDATE messages SET dialogue_text = NULL, dialogue_is_content = TRUE
 		WHERE dialogue_text = content AND thinking_text = ''
 		  AND EXISTS (SELECT 1 FROM migration)`, dialogueDedupeMetadataKey)
 	if err != nil {
@@ -2368,7 +2369,7 @@ func CheckSchemaCompat(
 	}
 
 	_, err = db.ExecContext(ctx,
-		`SELECT session_id, ordinal, role, content, thinking_text, dialogue_text,
+		`SELECT session_id, ordinal, role, content, thinking_text, dialogue_text, dialogue_is_content,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, reasoning_effort, token_usage,
 			context_tokens, output_tokens, provider_id,

@@ -3,6 +3,8 @@ package db
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestDialogueVisible(t *testing.T) {
@@ -105,11 +107,7 @@ func TestDialogueVisible(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := DialogueVisible(tt.message)
-			if got.Visible != tt.visible || got.Uncertain != tt.uncertain {
-				t.Fatalf("DialogueVisible() = %+v, want visible=%v uncertain=%v",
-					got, tt.visible, tt.uncertain)
-			}
+			assert.Equal(t, DialogueVerdict{Visible: tt.visible, Uncertain: tt.uncertain}, DialogueVisible(tt.message))
 		})
 	}
 }
@@ -126,9 +124,7 @@ func TestDialogueVisibleDropsTruncatedArgumentPreview(t *testing.T) {
 		Role: "assistant", Content: body, HasToolUse: true,
 		ToolCalls: []ToolCall{{ToolName: "exec", Category: "Bash", InputJSON: args}},
 	}
-	if got := DialogueVisible(message); got.Visible || got.Uncertain {
-		t.Fatalf("DialogueVisible() = %+v, want the truncated preview dropped", got)
-	}
+	assert.Equal(t, DialogueVerdict{}, DialogueVisible(message))
 }
 
 func TestDialogueVisibleKeepsOriginalContent(t *testing.T) {
@@ -141,10 +137,6 @@ func TestDialogueVisibleKeepsOriginalContent(t *testing.T) {
 			Rendering: "[Bash]\n$ ls",
 		}},
 	}
-	if got := DialogueVisible(message); !got.Visible || got.Uncertain {
-		t.Fatalf("DialogueVisible() = %+v, want the whole message kept", got)
-	}
-	if message.Content != content {
-		t.Fatalf("content rewritten to %q", message.Content)
-	}
+	assert.Equal(t, DialogueVerdict{Visible: true}, DialogueVisible(message))
+	assert.Equal(t, content, message.Content)
 }

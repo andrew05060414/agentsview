@@ -14,10 +14,8 @@ import (
 // treats a NULL dialogue beside thinking text as a legacy row whose content
 // still contains the thinking.
 //
-// The SQLite archive records isContent in messages.dialogue_is_content and
-// the hosted raw dialogue table in raw_message_dialogue.is_content, so their
-// readers restore the projection. The mirrors only search the column and keep
-// no marker.
+// Archives and mirrors record isContent in messages.dialogue_is_content.
+// Hosted PostgreSQL uses raw_message_dialogue.is_content instead.
 func StoredDialogue(content, thinking string, dialogue *string) (stored *string, isContent bool) {
 	if dialogue != nil && thinking == "" && *dialogue == content {
 		return nil, true

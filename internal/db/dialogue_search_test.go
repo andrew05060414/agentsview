@@ -80,3 +80,56 @@ func TestSearchContentFTSSkipsToolOnlyRows(t *testing.T) {
 	require.Len(t, page.Matches, 1)
 	assert.Equal(t, 1, page.Matches[0].Ordinal)
 }
+
+func TestSearchContentThinkingWithEmptyDialogue(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "thinking", "proj", func(s *Session) { s.UserMessageCount = 2 })
+	insertMessages(t, d,
+		Message{SessionID: "thinking", Ordinal: 0, Role: "assistant", Content: "[Thinking] reasoningneedle", ThinkingText: "reasoningneedle", DialogueText: new("")},
+		Message{SessionID: "thinking", Ordinal: 1, Role: "assistant", Content: "[Thinking] reasoningneedle [Bash]", ThinkingText: "reasoningneedle", DialogueText: new(""), HasToolUse: true},
+	)
+	for _, mode := range []string{"substring", "regex"} {
+		t.Run(mode, func(t *testing.T) {
+			page, err := d.SearchContent(t.Context(), ContentSearchFilter{
+				Pattern: "reasoningneedle", Mode: mode, Sources: []string{"thinking"}, ExcludeSystem: true,
+			})
+			require.NoError(t, err)
+			require.Len(t, page.Matches, 2)
+			for _, match := range page.Matches {
+				assert.Equal(t, "thinking", match.Location)
+			}
+		})
+	}
+}
+
+func TestSearchContentSystemRoleAcrossLexicalPaths(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "system-role", "proj", func(s *Session) { s.UserMessageCount = 2 })
+	insertMessages(t, d,
+		Message{SessionID: "system-role", Ordinal: 0, Role: "system", Content: "deploymentneedle additional testword"},
+		Message{SessionID: "system-role", Ordinal: 1, Role: "assistant", Content: "deploymentneedle additional testword"},
+	)
+	for _, tc := range []struct{ name, mode, pattern string }{
+		{"substring", "substring", "deploymentneedle"},
+		{"regex", "regex", "deploymentneedle"},
+		{"explicit FTS", "fts", "deploymentneedle OR absentneedle"},
+		{"ranked substring", "substring", "deploymentneedle testword"},
+		{"ranked FTS", "fts", "deploymentneedle testword"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if (tc.mode == "fts" || tc.name == "ranked substring") && !d.HasFTS(t.Context()) {
+				t.Skip("FTS not available")
+			}
+			filter := ContentSearchFilter{Pattern: tc.pattern, Mode: tc.mode, Sources: []string{"messages"}}
+			page, err := d.SearchContent(t.Context(), filter)
+			require.NoError(t, err)
+			require.Len(t, page.Matches, 2)
+			assert.ElementsMatch(t, []string{"system", "assistant"}, []string{page.Matches[0].Role, page.Matches[1].Role})
+			filter.ExcludeSystem = true
+			page, err = d.SearchContent(t.Context(), filter)
+			require.NoError(t, err)
+			require.Len(t, page.Matches, 1)
+			assert.Equal(t, "assistant", page.Matches[0].Role)
+		})
+	}
+}

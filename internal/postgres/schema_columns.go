@@ -382,6 +382,11 @@ func schemaColumnMigrations() []columnMigration {
 			"adding messages.dialogue_text",
 		},
 		{
+			"messages", "dialogue_is_content",
+			`dialogue_is_content BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding messages.dialogue_is_content",
+		},
+		{
 			"sessions", "termination_status",
 			`termination_status TEXT`,
 			"adding sessions.termination_status",

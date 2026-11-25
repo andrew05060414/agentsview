@@ -346,19 +346,15 @@ func hasSource(f ContentSearchFilter, name string) bool {
 	return slices.Contains(f.Sources, name)
 }
 
-// dialogueMessagePredicate keeps a lexical message search on dialogue rows:
-// user or assistant, not a tool result, and not a row whose stored dialogue
-// projection is empty. A NULL projection is an unclassified legacy row and is
-// kept. The system exclusion is added only when the caller asks for it, so
-// the CLI and HTTP default of including system rows is unchanged.
-func dialogueMessagePredicate(f ContentSearchFilter) string {
-	pred := "m.role IN ('user','assistant')" +
-		" AND COALESCE(m.source_subtype,'') <> 'tool_result'" +
-		" AND (m.dialogue_text IS NULL OR TRIM(m.dialogue_text) <> '')"
-	if f.ExcludeSystem {
-		pred += " AND m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
+func contentSystemPredicate(f ContentSearchFilter) string {
+	if !f.ExcludeSystem {
+		return "1=1"
 	}
-	return pred
+	return "m.role <> 'system' AND m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
+}
+
+func lexicalMessagePredicate(systemPredicate string) string {
+	return "(m.dialogue_text IS NULL OR TRIM(m.dialogue_text) <> '') AND " + systemPredicate
 }
 
 // searchContentSubstring builds a UNION ALL across the selected sources
@@ -443,7 +439,7 @@ func substringUnion(f ContentSearchFilter, candidates substringCandidateFilters)
 	// the Limit+1 returned rows ship a full body.
 	snippetExpr := func(col string) string { return col }
 
-	sysPred := dialogueMessagePredicate(f)
+	sysPred := contentSystemPredicate(f)
 	if hasSource(f, "messages") {
 		branches = append(branches, fmt.Sprintf(`
 			SELECT m.session_id, s.project, s.agent,
@@ -457,7 +453,7 @@ func substringUnion(f ContentSearchFilter, candidates substringCandidateFilters)
 			JOIN sessions s ON s.id = m.session_id
 			WHERE %s LIKE ? ESCAPE '\'%s AND %s AND m.%s`,
 			snippetExpr("COALESCE(m.dialogue_text, m.content)"), "COALESCE(m.dialogue_text, m.content)",
-			candidates.message.sql, sysPred, scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
+			candidates.message.sql, lexicalMessagePredicate(sysPred), scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
 		args = append(args, like)
 		args = append(args, candidates.message.args...)
 		args = append(args, scopeArgs...)
@@ -828,7 +824,7 @@ func (db *DB) regexCandidateRows(
 		return col + " LIKE ? ESCAPE '\\'"
 	}
 
-	sysPred := dialogueMessagePredicate(f)
+	sysPred := contentSystemPredicate(f)
 	if hasSource(f, "messages") {
 		w := prefilterClause("COALESCE(m.dialogue_text, m.content)") + candidates.message.sql
 		args = append(args, candidates.message.args...)
@@ -845,7 +841,7 @@ func (db *DB) regexCandidateRows(
 			FROM messages m
 			JOIN sessions s ON s.id = m.session_id
 			WHERE %s AND %s AND m.%s`,
-			"COALESCE(m.dialogue_text, m.content)", w, sysPred, scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
+			"COALESCE(m.dialogue_text, m.content)", w, lexicalMessagePredicate(sysPred), scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
 		args = append(args, scopeArgs...)
 	}
 	if hasSource(f, "thinking") {
@@ -1095,7 +1091,7 @@ func (db *DB) searchContentFTS(
 		return ContentSearchPage{}, err
 	}
 	scope, scopeArgs := sessionScopeSubquery(f)
-	sysPred := dialogueMessagePredicate(f)
+	msgPred := lexicalMessagePredicate(contentSystemPredicate(f))
 	// A row can match OR and NOT queries without every operand, so ask SQLite
 	// which operands this row matched. Snippets then follow a branch the row
 	// actually satisfied. Unquoted input never carries these operators. Syntax
@@ -1119,7 +1115,7 @@ func (db *DB) searchContentFTS(
 		JOIN sessions s ON s.id = m.session_id
 		WHERE messages_fts.content MATCH ? AND %s AND m.%s
 		ORDER BY rank ASC, m.ordinal ASC, m.id ASC
-		LIMIT ? OFFSET ?`, termHits, sysPred, scope)
+		LIMIT ? OFFSET ?`, termHits, msgPred, scope)
 	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
 	args = append(args, ftsQuery.match)
 	args = append(args, scopeArgs...)

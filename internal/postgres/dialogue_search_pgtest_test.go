@@ -20,6 +20,7 @@ func TestPGDialogueSearchParity(t *testing.T) {
 	store, err := NewStore(t.Context(), testPGURL(t), syncer.schema, true)
 	require.NoError(t, err)
 	defer store.Close()
+	dbtest.AssertDialogueMessageReads(t, store)
 	dbtest.AssertDialogueSearchParity(t, local, store, "substring", "regex", "fts")
 	t.Run("fts ignores sources", func(t *testing.T) {
 		for _, pattern := range []string{"answerneedle", "reasoningneedle"} {

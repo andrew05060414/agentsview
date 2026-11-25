@@ -727,14 +727,8 @@ func (t *toolset) getMessagesAroundDialogue(
 	if in.After != nil {
 		after = *in.After
 	}
-	fetchBefore := before
-	if fetchBefore < dialogueAroundFetchCap {
-		fetchBefore = dialogueAroundFetchCap
-	}
-	fetchAfter := after
-	if fetchAfter < dialogueAroundFetchCap {
-		fetchAfter = dialogueAroundFetchCap
-	}
+	fetchBefore := max(before, dialogueAroundFetchCap)
+	fetchAfter := max(after, dialogueAroundFetchCap)
 	// The store counts the window by role, so tool-role rows never enter it
 	// and never reach Filtered. Dialogue filtering then runs inside that
 	// window and refills a side from the extra rows fetched here when a
@@ -1173,6 +1167,7 @@ func (t *toolset) searchContent(
 		Context:            in.Context,
 		IncludeOneShot:     in.IncludeOneShot,
 		IncludeAutomated:   in.IncludeAutomated,
+		ExcludeSystem:      len(in.Sources) == 0,
 		ExcludeSessionIDs:  excludeSessions,
 		ExcludeActiveSince: cutoff,
 	}

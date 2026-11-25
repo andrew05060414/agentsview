@@ -30,8 +30,6 @@ func toolRow(sid string, ordinal int, rendering, inputJSON string) db.Message {
 	}
 }
 
-func dialogueText(content string) *string { return &content }
-
 // These fixtures represent classified dialogue. Legacy coverage-gap fixtures
 // deliberately use db.Message or dbtest helpers without these wrappers.
 func dialogueUserMsg(sid string, ordinal int, content string) db.Message {
@@ -214,13 +212,19 @@ func TestDialogueProjection_HTTPReadAndSearchContext(t *testing.T) {
 				filter.Around, filter.Before, filter.After = new(1), new(0), new(0)
 			}
 			out, err := direct.svc.Messages(r.Context(), "context", filter)
-			require.NoError(t, err)
-			require.NoError(t, json.MarshalWrite(w, out))
+			if !assert.NoError(t, err) {
+				http.Error(w, "messages failed", http.StatusInternalServerError)
+				return
+			}
+			assert.NoError(t, json.MarshalWrite(w, out))
 			return
 		}
 		out, err := direct.svc.SearchContent(r.Context(), service.ContentSearchRequest{Pattern: "needle", Mode: "substring", Sources: []string{"messages"}, Context: 3, IncludeOneShot: true, IncludeAutomated: true})
-		require.NoError(t, err)
-		require.NoError(t, json.MarshalWrite(w, out))
+		if !assert.NoError(t, err) {
+			http.Error(w, "search failed", http.StatusInternalServerError)
+			return
+		}
+		assert.NoError(t, json.MarshalWrite(w, out))
 	}))
 	t.Cleanup(server.Close)
 	remote := &toolset{svc: servicehttp.NewHTTPBackend(server.URL, "", false, "")}
@@ -285,7 +289,7 @@ func TestGetMessages_OmitsToolOnlyRows(t *testing.T) {
 		{
 			SessionID: "s1", Ordinal: 2, Role: "assistant",
 			Content: prose, ContentLength: len(prose), HasToolUse: true,
-			DialogueText: dialogueText("running it"),
+			DialogueText: new("running it"),
 			ToolCalls: []db.ToolCall{{
 				ToolName: "shell", Category: "Bash", InputJSON: `{"command":"ls"}`,
 			}},
@@ -349,9 +353,11 @@ func TestGetMessages_WithholdsUnclassifiedMixedRow(t *testing.T) {
 	})
 	raw := "starting\\n[Bash]\\n$ cat token"
 	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{
-		{SessionID: "mixed", Ordinal: 0, Role: "assistant", Content: raw,
+		{
+			SessionID: "mixed", Ordinal: 0, Role: "assistant", Content: raw,
 			ContentLength: len(raw), HasToolUse: true,
-			ToolCalls: []db.ToolCall{{ToolName: "shell", Category: "Bash", InputJSON: `{"command":"cat token"}`}}},
+			ToolCalls: []db.ToolCall{{ToolName: "shell", Category: "Bash", InputJSON: `{"command":"cat token"}`}},
+		},
 		dialogueAsstMsg("mixed", 1, "finished"),
 	}))
 	_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{SessionID: "mixed"})

@@ -1,6 +1,7 @@
 package dbtest
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -8,6 +9,39 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 )
+
+func AssertDialogueMessageReads(t *testing.T, mirror db.Store) {
+	t.Helper()
+	const id = "dialogue-search"
+	assertDialogue := func(t *testing.T, messages []db.Message, err error) {
+		t.Helper()
+		require.NoError(t, err)
+		require.Len(t, messages, 11)
+		assert.Nil(t, messages[0].DialogueText, "legacy NULL remains unclassified")
+		assert.Equal(t, new("answerneedle"), messages[1].DialogueText)
+		assert.Equal(t, new(""), messages[3].DialogueText, "empty projection remains classified")
+		assert.Equal(t, new("copiedneedle"), messages[10].DialogueText)
+	}
+	for _, tc := range []struct {
+		name string
+		read func(context.Context) ([]db.Message, error)
+	}{
+		{"page", func(ctx context.Context) ([]db.Message, error) {
+			return mirror.GetMessages(ctx, id, 0, 11, true)
+		}},
+		{"all", func(ctx context.Context) ([]db.Message, error) {
+			return mirror.GetAllMessages(ctx, id)
+		}},
+		{"window", func(ctx context.Context) ([]db.Message, error) {
+			return mirror.GetMessagesWindow(ctx, id, db.MessageWindow{Around: new(5), Before: 5, After: 5})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			messages, err := tc.read(t.Context())
+			assertDialogue(t, messages, err)
+		})
+	}
+}
 
 // SeedDialogueSearch writes projected, legacy, empty, and content-copy
 // dialogue with a structured tool result. Backends store the content copy as

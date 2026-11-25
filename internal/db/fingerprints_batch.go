@@ -296,15 +296,14 @@ func (db *DB) MessageFlagsFingerprints(ctx context.Context,
 	return out, nil
 }
 
-// MessageDialogueFingerprints hashes stored dialogue in ordinal order: the
-// non-NULL dialogue_text values that StoredDialogue writes to every backend.
-// Sessions with no stored dialogue have an empty fingerprint.
+// MessageDialogueFingerprints hashes complete classified projections in
+// ordinal order, including those stored as a copy marker.
 func (db *DB) MessageDialogueFingerprints(ctx context.Context, sessionIDs []string) (map[string]string, error) {
 	out := make(map[string]string, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(ctx, `SELECT session_id, ordinal, dialogue_text
-            FROM messages WHERE session_id IN (`+ph+`) AND dialogue_text IS NOT NULL
+		rows, err := db.getReader().Query(ctx, `SELECT session_id, ordinal, `+sqliteDialogueExprBare+`
+            FROM messages WHERE session_id IN (`+ph+`) AND (dialogue_is_content OR dialogue_text IS NOT NULL)
             ORDER BY session_id, ordinal`, args...)
 		if err != nil {
 			return err
@@ -879,8 +878,8 @@ func MessageComparisonRow(m Message, normalizeTimestamp func(string) string) Mes
 	appendContentHashFingerprintRow(&contentHash, m.Ordinal, m.ContentLength, m.Content)
 	appendRoleTimeFingerprintRow(&roleTime, m.Ordinal, m.Role, m.Timestamp, normalizeTimestamp)
 	flagsFingerprintRow{ordinal: m.Ordinal, isSystem: m.IsSystem, hasThinking: m.HasThinking, hasToolUse: m.HasToolUse, thinkingText: m.ThinkingText}.appendTo(&flags)
-	if stored, _ := StoredDialogue(m.Content, m.ThinkingText, m.DialogueText); stored != nil {
-		EncodeMessageDialogueFingerprint(&dialogue, m.Ordinal, *stored)
+	if m.DialogueText != nil {
+		EncodeMessageDialogueFingerprint(&dialogue, m.Ordinal, *m.DialogueText)
 	}
 	tokenFingerprintRow{
 		ordinal: m.Ordinal, model: m.Model, reasoningEffort: m.ReasoningEffort, providerID: m.ProviderID, tokenUsage: string(m.TokenUsage),

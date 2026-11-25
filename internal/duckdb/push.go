@@ -1166,14 +1166,14 @@ func insertMessages(
 	ctx context.Context, batch *duckAppendBatch, msgs []db.Message,
 ) error {
 	for _, m := range msgs {
-		dialogue, _ := db.StoredDialogue(m.Content, m.ThinkingText, m.DialogueText)
+		dialogue, isContent := db.StoredDialogue(m.Content, m.ThinkingText, m.DialogueText)
 		// Usage reads take these counters from typed columns, parsed here
 		// by the same function SQLite reads with, so no read parses
 		// token_usage.
 		usage := usagefacts.ParseTokenUsage(string(m.TokenUsage))
 		if err := batch.add(ctx, "messages",
 			m.ID, m.SessionID, m.Ordinal, m.Role, m.Content,
-			m.ThinkingText, dialogue, timeValue(m.Timestamp),
+			m.ThinkingText, dialogue, isContent, timeValue(m.Timestamp),
 			m.HasThinking, m.HasToolUse, m.ContentLength,
 			m.IsSystem, m.Model, m.ReasoningEffort, string(m.TokenUsage),
 			m.ContextTokens, m.OutputTokens, m.ProviderID,
