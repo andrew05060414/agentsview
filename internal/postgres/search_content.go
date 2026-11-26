@@ -206,7 +206,7 @@ func pgMessagesBranch(
 			db.PostgresSystemPrefixSQL("m.content", "m.role")
 	}
 
-	sysPred += f.DialogueSearchSQL() + " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
+	sysPred += f.DialogueSearchSQL(db.PostgresQueryDialect()) + " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
 
 	// Select the full content; the snippet is windowed and redacted in Go.
 	return fmt.Sprintf(`
@@ -516,7 +516,7 @@ func pgMessagesCandidateBranch(
 			db.PostgresSystemPrefixSQL("m.content", "m.role")
 	}
 
-	sysPred += f.DialogueSearchSQL() + " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
+	sysPred += f.DialogueSearchSQL(db.PostgresQueryDialect()) + " AND " + db.LexicalAnchorScopeSQL(f, "s", "m", db.PostgresQueryDialect())
 	return fmt.Sprintf(`
 		SELECT m.session_id, s.project, s.agent,
 			s.transcript_revision,

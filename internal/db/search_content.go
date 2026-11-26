@@ -354,17 +354,32 @@ func contentSystemPredicate(f ContentSearchFilter) string {
 	return "m.role <> 'system' AND m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
 }
 
+func dialogueNonBlankSQL(col string, dialect QueryDialect) string {
+	if dialect.name == "clickhouse" {
+		return "(" + col + " IS NULL OR " + clickhouseLTrimSQL("ifNull("+col+", '')") + " <> '')"
+	}
+	return "(" + col + " IS NULL OR " + systemPrefixSQLTrimmed(col) + " <> '')"
+}
+
 // DialogueSearchSQL restricts message hits for the default MCP dialogue search.
 // Unclassified user and assistant rows remain eligible as coverage gaps.
-func (f ContentSearchFilter) DialogueSearchSQL() string {
+func (f ContentSearchFilter) DialogueSearchSQL(dialect QueryDialect) string {
+	return f.dialogueSearchSQL("m", dialect)
+}
+
+func (f ContentSearchFilter) dialogueSearchSQL(alias string, dialect QueryDialect) string {
 	if !f.DialogueOnly {
 		return ""
 	}
-	return " AND m.role IN ('user', 'assistant') AND m.source_subtype <> 'tool_result'"
+	return " AND " + alias + ".role IN ('user', 'assistant') AND " + alias + ".source_subtype <> 'tool_result' AND " +
+		dialogueNonBlankSQL(alias+".dialogue_text", dialect)
 }
 
 func lexicalMessagePredicate(f ContentSearchFilter) string {
-	return "(m.dialogue_text IS NULL OR TRIM(m.dialogue_text) <> '') AND " + contentSystemPredicate(f) + f.DialogueSearchSQL()
+	if f.DialogueOnly {
+		return contentSystemPredicate(f) + f.DialogueSearchSQL(SQLiteQueryDialect())
+	}
+	return dialogueNonBlankSQL("m.dialogue_text", SQLiteQueryDialect()) + " AND " + contentSystemPredicate(f)
 }
 
 // searchContentSubstring builds a UNION ALL across the selected sources
@@ -1415,6 +1430,20 @@ func filterVectorHits(
 	return surviving, len(units), rejected
 }
 
+func dialogueAnchorSystemSQL(dialect QueryDialect) (string, string) {
+	switch dialect.name {
+	case "postgres":
+		return " AND m.is_system = FALSE AND " + PostgresSystemPrefixSQL("m.content", "m.role"), ""
+	case "clickhouse":
+		return " AND m.is_system = false AND " + ClickHouseSystemPrefixSQL("m.content", "m.role"),
+			" SETTINGS short_circuit_function_evaluation = 'force_enable'"
+	case "duckdb":
+		return " AND m.is_system = FALSE AND m.is_system_prefixed = FALSE", ""
+	default:
+		return " AND m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role"), ""
+	}
+}
+
 // DialogueVectorAnchors looks up the ranked anchors in bounded batches, without
 // reading message bodies. The vector index may contain non-dialogue or stale rows.
 func DialogueVectorAnchors(
@@ -1432,6 +1461,8 @@ func DialogueVectorAnchors(
 			}
 		}
 		allowed := make(map[MessageRef]bool, len(refs))
+		dialoguePred := f.DialogueSearchSQL(dialect)
+		sysPred, suffix := dialogueAnchorSystemSQL(dialect)
 		for chunk := range slices.Chunk(refs, 400) {
 			b := NewQueryBuilder(dialect, 0)
 			tuples := make([]string, 0, len(chunk))
@@ -1439,7 +1470,7 @@ func DialogueVectorAnchors(
 				tuples = append(tuples, "("+b.Add(ref.SessionID)+", "+b.Add(ref.Ordinal)+")")
 			}
 			rows, err := query(ctx, "SELECT m.session_id, m.ordinal FROM messages m WHERE (m.session_id, m.ordinal) IN ("+
-				strings.Join(tuples, ", ")+")"+f.DialogueSearchSQL(), b.Args()...)
+				strings.Join(tuples, ", ")+")"+dialoguePred+sysPred+suffix, b.Args()...)
 			if err != nil {
 				return nil, fmt.Errorf("look up dialogue vector anchors: %w", err)
 			}
@@ -1889,7 +1920,7 @@ func (db *DB) hybridWordHits(
 	defer func() { _ = snapshot.Close() }()
 	scope, args := semanticSessionScopeSubquery(f)
 	where := "m.role IN ('user','assistant') AND m.is_system = 0 AND " +
-		SystemPrefixSQL("m.content", "m.role") + " AND m." + scope + f.DialogueSearchSQL()
+		SystemPrefixSQL("m.content", "m.role") + " AND m." + scope + f.DialogueSearchSQL(SQLiteQueryDialect())
 	// Keep the fragment unredacted until enrichment locates it in the full
 	// message. The final snippet is redacted against that full message.
 	f.RevealSecrets = true
@@ -1924,7 +1955,7 @@ func (db *DB) fetchHybridFTSBatch(
 		  AND m.is_system = 0 AND %s
 		  AND m.%s%s
 		ORDER BY f.rank, m.id LIMIT ? OFFSET ?`,
-		SystemPrefixSQL("m.content", "m.role"), scope, f.DialogueSearchSQL())
+		SystemPrefixSQL("m.content", "m.role"), scope, f.DialogueSearchSQL(SQLiteQueryDialect()))
 	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
 
 	args := []any{ftsQuery.match}

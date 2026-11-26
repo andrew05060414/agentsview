@@ -713,6 +713,39 @@ func (t *toolset) getMessagesAroundRaw(
 	return nil, t.shapeAround(res, in, roles, true), nil
 }
 
+func dialogueAroundFetchSpan(before, after int) (int, int) {
+	reqBefore := max(before, 0)
+	reqAfter := max(after, 0)
+	const budget = db.MaxMessageLimit - 1
+	if reqBefore >= budget || reqAfter >= budget || reqBefore > budget-reqAfter {
+		return reqBefore, reqAfter
+	}
+	if reqBefore == 0 && reqAfter == 0 {
+		return dialogueAroundFetchCap, dialogueAroundFetchCap
+	}
+	spare := budget - reqBefore - reqAfter
+	extraBefore, extraAfter := 0, 0
+	if reqBefore > 0 && reqBefore < dialogueAroundFetchCap {
+		extraBefore = dialogueAroundFetchCap - reqBefore
+	}
+	if reqAfter > 0 && reqAfter < dialogueAroundFetchCap {
+		extraAfter = dialogueAroundFetchCap - reqAfter
+	}
+	if extraBefore+extraAfter > spare {
+		half := spare / 2
+		switch {
+		case extraBefore <= half:
+			extraAfter = spare - extraBefore
+		case extraAfter <= half:
+			extraBefore = spare - extraAfter
+		default:
+			extraBefore = half
+			extraAfter = spare - half
+		}
+	}
+	return reqBefore + extraBefore, reqAfter + extraAfter
+}
+
 // getMessagesAroundDialogue counts before/after over dialogue rows. It reads
 // a raw window large enough to hold the requested visible messages plus the
 // tool-only rows between them, then filters.
@@ -727,8 +760,7 @@ func (t *toolset) getMessagesAroundDialogue(
 	if in.After != nil {
 		after = *in.After
 	}
-	fetchBefore := max(before, dialogueAroundFetchCap)
-	fetchAfter := max(after, dialogueAroundFetchCap)
+	fetchBefore, fetchAfter := dialogueAroundFetchSpan(before, after)
 	// The store counts the window by role, so tool-role rows never enter it
 	// and never reach Filtered. Dialogue filtering then runs inside that
 	// window and refills a side from the extra rows fetched here when a

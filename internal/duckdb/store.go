@@ -1155,7 +1155,7 @@ func (s *Store) collectContentSubstringMatches(
 			if f.KeywordOnly {
 				sysPred += " AND m.role IN ('user', 'assistant')"
 			}
-			sysPred += f.DialogueSearchSQL()
+			sysPred += f.DialogueSearchSQL(db.DuckDBQueryDialect())
 			contentPred := addSearchArgs("COALESCE(m.dialogue_text, m.content)")
 			branches = append(branches, `
 				SELECT m.session_id, s.project, s.agent, 'message' AS location,
@@ -1439,7 +1439,7 @@ func (s *Store) collectContentSource(
 			0 AS call_index, 0 AS event_index, false AS legacy_thinking
 			FROM messages m JOIN sessions s ON s.id = m.session_id
 			WHERE m.session_id IN (SELECT id FROM sessions WHERE ` + scopeWhere + `) AND ` + db.LexicalAnchorScopeSQL(f, "s", "m", db.DuckDBQueryDialect())
-		query += prefixFilter("COALESCE(m.dialogue_text, m.content)") + f.DialogueSearchSQL()
+		query += prefixFilter("COALESCE(m.dialogue_text, m.content)") + f.DialogueSearchSQL(db.DuckDBQueryDialect())
 		if f.ExcludeSystem {
 			query += " AND m.is_system = FALSE AND m.is_system_prefixed = FALSE"
 		}

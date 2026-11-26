@@ -226,7 +226,7 @@ func buildTermsSearchSQL(
 		LIMIT %s OFFSET %s`,
 		where, strings.Join(hitFlags, ""),
 		dialect.falseLiteral, frag.systemPrefix("m.content", "m.role"),
-		f.DialogueSearchSQL()+prefilter.String(), strings.Join(exchangeHits, ""),
+		f.DialogueSearchSQL(dialect)+prefilter.String(), strings.Join(exchangeHits, ""),
 		frag.timestamp, frag.messageText, frag.sessionSort,
 		dialect.trueLiteral, SubordinateSessionSQL("s"),
 		dialect.trueLiteral, dialect.falseLiteral,
