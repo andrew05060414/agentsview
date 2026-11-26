@@ -77,7 +77,8 @@ func (s *Store) searchContentSemantic(
 func (s *Store) survivingVectorHits(
 	ctx context.Context, f db.ContentSearchFilter, searcher db.VectorSearcher, k int,
 ) ([]db.VectorHit, error) {
-	return db.SelectSurvivingVectorHits(ctx, f, searcher, k, s.semanticAllowedSessionIDs)
+	return db.SelectSurvivingVectorHits(ctx, f, searcher, k, s.semanticAllowedSessionIDs,
+		db.DialogueVectorAnchors(db.ClickHouseQueryDialect(), s.queryContext))
 }
 
 // semanticAllowedSessionIDs returns activity eligibility for ids passing

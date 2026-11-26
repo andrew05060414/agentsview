@@ -6,6 +6,7 @@ package mcp
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json/v2"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/secrets"
 	"go.kenn.io/agentsview/internal/service"
 )
 
@@ -485,7 +487,8 @@ type getMessagesIn struct {
 	Around             *int     `json:"around,omitempty" jsonschema:"Center a symmetric window on this ordinal (e.g. match_ordinal from search_content or search_sessions), instead of linear pagination. Mutually exclusive with from and direction."`
 	Before             *int     `json:"before,omitempty" jsonschema:"Messages of context before the around anchor, default 5. Requires around; replaces limit on that path."`
 	After              *int     `json:"after,omitempty" jsonschema:"Messages of context after the around anchor, default 5. Requires around; replaces limit on that path."`
-	Roles              []string `json:"roles,omitempty" jsonschema:"Roles to include, e.g. tool. Default: user and assistant only. System messages are always excluded."`
+	Roles              []string `json:"roles,omitempty" jsonschema:"Roles to include, e.g. tool. Explicit roles retain stored content. Default: user and assistant only. System messages are always excluded."`
+	Raw                bool     `json:"raw,omitempty" jsonschema:"Return stored content, including tool-only rows. Default false returns persisted dialogue projections; unclassified rows are withheld and counted in uncertain and filtered."`
 	MaxCharsPerMessage int      `json:"max_chars_per_message,omitempty" jsonschema:"Truncate each message to this many characters, default 2000, max 20000."`
 	ExpectedRevision   string   `json:"expected_revision,omitempty" jsonschema:"Transcript revision cited by search or an earlier read. Returns source_changed when it no longer matches."`
 	BodyCursor         string   `json:"body_cursor,omitempty" jsonschema:"Opaque continuation for the remainder of one oversized message. Use before advancing next_from."`
@@ -501,11 +504,16 @@ type messageOut struct {
 	FullLength int    `json:"full_length,omitempty"`
 	Truncated  bool   `json:"truncated,omitempty"`
 	BodyCursor string `json:"body_cursor,omitempty"`
+	bodyDigest string
 }
 
 type getMessagesOut struct {
-	Messages []messageOut `json:"messages"`
-	Filtered int          `json:"filtered,omitempty" jsonschema:"How many of this page's scanned messages were excluded by the role/system filter (omitted when zero). Summed across a full pagination sweep, filtered plus the returned messages adds up to the session's message_count."`
+	Messages  []messageOut `json:"messages"`
+	Filtered  int          `json:"filtered,omitempty" jsonschema:"How many of this page's scanned messages were excluded, by the role/system filter or, unless raw is set, because they carry no dialogue (omitted when zero). Summed across a full pagination sweep, filtered plus the returned messages adds up to the session's message_count."`
+	Uncertain int          `json:"uncertain,omitempty" jsonschema:"How many scanned messages were withheld because their dialogue projection is unclassified (a coverage gap). Included in filtered."`
+	// WindowTruncated reports when an around read exhausted the per-call raw
+	// message budget before collecting the requested before/after count.
+	WindowTruncated bool `json:"window_truncated,omitempty" jsonschema:"True when an around window stopped short of the requested before or after count because the raw read budget was exhausted before reaching the session boundary. Callers can continue earlier with from/direction=desc or later with next_from."`
 	// NextFrom is set off the last scanned ordinal (not the last visible
 	// one), so paging stays reliable even though filtering can make a page
 	// return fewer than the limit.
@@ -522,6 +530,12 @@ type messageBodyCursor struct {
 	Offset         int      `json:"p"`
 	NextFrom       *int     `json:"n,omitempty"`
 	Roles          []string `json:"l,omitempty"`
+	Raw            bool     `json:"w,omitempty"`
+	ContentDigest  string   `json:"h"`
+}
+
+func messageBodyDigest(content string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(content)))
 }
 
 func encodeMessageBodyCursor(cursor messageBodyCursor) string {
@@ -535,38 +549,55 @@ func decodeMessageBodyCursor(raw string) (messageBodyCursor, error) {
 		return messageBodyCursor{}, errors.New("invalid body_cursor")
 	}
 	var cursor messageBodyCursor
-	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.Version != 2 ||
+	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.Version != 3 ||
 		cursor.EvidenceSource == "" || cursor.SessionID == "" || cursor.Revision == "" ||
+		cursor.ContentDigest == "" ||
 		cursor.Ordinal < 0 || cursor.Offset <= 0 {
 		return messageBodyCursor{}, errors.New("invalid body_cursor")
 	}
 	return cursor, nil
 }
 
-// filterAndMapMessage applies the get_messages role/system contract to one
-// message -- always drop system content (IsSystem or a legacy system
-// content prefix), then require its role to be in roles (nil/empty roles
-// falls back to user+assistant via roleAllowed) -- and shapes the survivor
-// into a messageOut truncated to maxChars. ok is false when the message was
-// filtered, so the caller can count it.
-func filterAndMapMessage(m db.Message, roles []string, maxChars int) (messageOut, bool) {
-	if isSystemMessage(m) || !roleAllowed(m.Role, roles) {
-		return messageOut{}, false
+// projectedMessageContent selects dialogue without rewriting the archived record.
+// A nil projection is a coverage gap, even when legacy flags claim no tools.
+func projectedMessageContent(m db.Message, raw bool) (string, bool, bool) {
+	if raw {
+		return m.Content, true, false
 	}
-	content, cut := truncate(m.Content, maxChars)
+	if !roleAllowed(m.Role, nil) || m.SourceSubtype == "tool_result" {
+		return "", false, false
+	}
+	if m.DialogueText == nil {
+		return "", false, true
+	}
+	if strings.TrimSpace(*m.DialogueText) == "" {
+		return "", false, false
+	}
+	return *m.DialogueText, true, false
+}
+
+// filterAndMapMessage always excludes system content, then selects either the
+// persisted dialogue or explicitly requested raw content. Unclassified dialogue
+// is withheld and counted as uncertain; no rendering heuristics recover it.
+func filterAndMapMessage(m db.Message, roles []string, maxChars int, raw bool) (messageOut, bool, bool) {
+	if isSystemMessage(m) || !roleAllowed(m.Role, roles) {
+		return messageOut{}, false, false
+	}
+	content, ok, uncertain := projectedMessageContent(m, raw)
+	if !ok {
+		return messageOut{}, false, uncertain
+	}
+	text, cut := truncate(content, maxChars)
 	mo := messageOut{
-		Ordinal:    m.Ordinal,
-		Role:       m.Role,
-		Content:    content,
-		Timestamp:  m.Timestamp,
-		Model:      m.Model,
-		HasToolUse: m.HasToolUse,
-		Truncated:  cut,
+		Ordinal: m.Ordinal, Role: m.Role, Content: text,
+		Timestamp: m.Timestamp, Model: m.Model, HasToolUse: m.HasToolUse,
+		Truncated: cut,
 	}
 	if cut {
-		mo.FullLength = utf8.RuneCountInString(m.Content)
+		mo.FullLength = utf8.RuneCountInString(content)
+		mo.bodyDigest = messageBodyDigest(content)
 	}
-	return mo, true
+	return mo, true, uncertain
 }
 
 func (t *toolset) getMessages(
@@ -603,7 +634,10 @@ func (t *toolset) getMessages(
 		TranscriptRevision: res.TranscriptRevision,
 	}
 	for _, m := range res.Messages {
-		mo, ok := filterAndMapMessage(m, in.Roles, maxChars)
+		mo, ok, uncertain := filterAndMapMessage(m, in.Roles, maxChars, in.Raw || len(in.Roles) > 0)
+		if uncertain {
+			out.Uncertain++
+		}
 		if !ok {
 			out.Filtered++
 			continue
@@ -624,24 +658,73 @@ func (t *toolset) getMessages(
 			out.NextFrom = &next
 		}
 	}
-	attachBodyCursors(&out, res.EvidenceSource, in.SessionID, in.Roles)
+	attachBodyCursors(&out, res.EvidenceSource, in.SessionID, in.Roles, in.Raw || len(in.Roles) > 0)
 	return nil, out, nil
 }
 
+const defaultAroundSpan = 5
+
+// dialogueAroundFetchCap bounds one side of the raw window a dialogue read
+// scans while collecting the requested number of visible messages. The
+// visibility rules cannot be expressed as the store's role predicate, so the
+// window is read raw and counted after filtering.
+const dialogueAroundFetchCap = 200
+
 // getMessagesAround handles the symmetric-window retrieval path (Around
-// set). Unlike the linear path, an empty Roles must be translated to the
-// MCP default (user, assistant) before it reaches the service: an empty
-// service.MessageFilter.Roles means "all roles" there, not "the MCP
-// default", and would leak tool/system-role dumps into the window. From and
-// Direction are forwarded unused so the service can reject them as mutually
-// exclusive with Around. The service's around window always includes the
-// anchor row regardless of role, so it is subject to the same
-// filterAndMapMessage post-filter as every other message; a suppressed
-// anchor is counted in Filtered like any other dropped message. next_from
-// is anchored on the last returned ordinal (there is no scan direction in a
-// symmetric window), and Limit/Before/After select the window, not the
-// linear path's Limit.
+// set). From and Direction are forwarded unused so the service can reject
+// them as mutually exclusive with Around.
+//
+// raw (or an explicit Roles) keeps the store's role-counted window: an empty
+// Roles is translated to the MCP default (user, assistant) first, because an
+// empty service.MessageFilter.Roles means "all roles" and would leak
+// tool-role dumps. The default dialogue read instead fetches a raw window and
+// counts before/after over messages that survive the dialogue filter, so a
+// run of tool-only rows does not consume the requested context. The anchor is
+// always read back and then filtered like every other message; a suppressed
+// anchor is counted in Filtered. next_from stays anchored on the last scanned
+// raw ordinal, so paging does not skip a row the window fetched but filtered.
 func (t *toolset) getMessagesAround(
+	ctx context.Context, in getMessagesIn,
+) (*mcp.CallToolResult, getMessagesOut, error) {
+	if in.Raw || len(in.Roles) > 0 {
+		return t.getMessagesAroundRaw(ctx, in)
+	}
+	return t.getMessagesAroundDialogue(ctx, in)
+}
+
+func resolveAroundBounds(in getMessagesIn) (int, int) {
+	before := defaultAroundSpan
+	if in.Before != nil {
+		before = max(*in.Before, 0)
+	}
+	after := defaultAroundSpan
+	if in.After != nil {
+		after = max(*in.After, 0)
+	}
+	return before, after
+}
+
+func waterFill(a, b, total int) (int, int) {
+	a = max(a, 0)
+	b = max(b, 0)
+	total = max(total, 0)
+	if a <= total && b <= total-a {
+		return a, b
+	}
+	half := total / 2
+	switch {
+	case a <= half:
+		return a, min(b, total-a)
+	case b <= half:
+		return min(a, total-b), b
+	default:
+		return half, total - half
+	}
+}
+
+// getMessagesAroundRaw is the role-counted window used when the caller asked
+// for the stored records or named roles explicitly.
+func (t *toolset) getMessagesAroundRaw(
 	ctx context.Context, in getMessagesIn,
 ) (*mcp.CallToolResult, getMessagesOut, error) {
 	roles := in.Roles
@@ -660,30 +743,244 @@ func (t *toolset) getMessagesAround(
 	if err != nil {
 		return nil, getMessagesOut{}, err
 	}
+	reqBefore, reqAfter := resolveAroundBounds(in)
+	clampedBefore, clampedAfter := waterFill(reqBefore, reqAfter, db.MaxMessageLimit-1)
+	scan := t.scanAround(res, in, roles, true)
+	if (reqBefore > clampedBefore && scan.rawBefore >= clampedBefore) ||
+		(reqAfter > clampedAfter && scan.rawAfter >= clampedAfter) {
+		scan.out.WindowTruncated = true
+	}
+	return nil, scan.out, nil
+}
+
+func dialogueAroundFetchSpan(before, after int) (int, int) {
+	reqBefore := max(before, 0)
+	reqAfter := max(after, 0)
+	if reqBefore == 0 && reqAfter == 0 {
+		return dialogueAroundFetchCap, dialogueAroundFetchCap
+	}
+	const budget = db.MaxMessageLimit - 1
+	baseBefore, baseAfter := waterFill(reqBefore, reqAfter, budget)
+	spare := budget - baseBefore - baseAfter
+	if spare == 0 {
+		return baseBefore, baseAfter
+	}
+	wantExtraBefore, wantExtraAfter := 0, 0
+	if reqBefore > 0 {
+		wantExtraBefore = max(reqBefore, dialogueAroundFetchCap-reqBefore)
+	}
+	if reqAfter > 0 {
+		wantExtraAfter = max(reqAfter, dialogueAroundFetchCap-reqAfter)
+	}
+	extraBefore, extraAfter := waterFill(wantExtraBefore, wantExtraAfter, spare)
+	return baseBefore + extraBefore, baseAfter + extraAfter
+}
+
+func nextDialogueAroundSpan(
+	fetchBefore, fetchAfter int,
+	needBefore, needAfter bool,
+	usedBefore, usedAfter int,
+	budget int,
+) (int, int, bool) {
+	minBefore := fetchBefore
+	if !needBefore {
+		minBefore = usedBefore
+	}
+	minAfter := fetchAfter
+	if !needAfter {
+		minAfter = usedAfter
+	}
+	spare := budget - minBefore - minAfter
+	if spare <= 0 {
+		return fetchBefore, fetchAfter, false
+	}
+	switch {
+	case needBefore && !needAfter:
+		nextBefore := minBefore + min(max(fetchBefore, 1), spare)
+		return nextBefore, minAfter, nextBefore > fetchBefore
+	case !needBefore && needAfter:
+		nextAfter := minAfter + min(max(fetchAfter, 1), spare)
+		return minBefore, nextAfter, nextAfter > fetchAfter
+	default:
+		addBefore, addAfter := waterFill(max(fetchBefore, 1), max(fetchAfter, 1), spare)
+		return minBefore + addBefore, minAfter + addAfter, addBefore > 0 || addAfter > 0
+	}
+}
+
+// getMessagesAroundDialogue counts before/after over dialogue rows. It expands
+// the raw window within db.MaxMessageLimit-1 until both sides meet their
+// requested visible counts, hit the session boundary, or exhaust the raw read
+// budget (reporting window_truncated when exhausted).
+func (t *toolset) getMessagesAroundDialogue(
+	ctx context.Context, in getMessagesIn,
+) (*mcp.CallToolResult, getMessagesOut, error) {
+	reqBefore, reqAfter := resolveAroundBounds(in)
+	roles := in.Roles
+	if len(roles) == 0 {
+		roles = []string{"user", "assistant"}
+	}
+	const budget = db.MaxMessageLimit - 1
+	fetchBefore, fetchAfter := dialogueAroundFetchSpan(reqBefore, reqAfter)
+	pinnedRevision := in.ExpectedRevision
+	beforeExhausted, afterExhausted := false, false
+	restarts := 0
+	for {
+		// The store counts the window by role, so tool-role rows never enter it
+		// and never reach Filtered. Dialogue filtering then runs inside that
+		// window, and any unsatisfied side expands into remaining budget (or
+		// reclaims unused rows from the opposite side) before returning.
+		res, err := t.svc.Messages(ctx, in.SessionID, service.MessageFilter{
+			From:             in.From,
+			Direction:        in.Direction,
+			Around:           in.Around,
+			Before:           &fetchBefore,
+			After:            &fetchAfter,
+			Roles:            roles,
+			ExpectedRevision: pinnedRevision,
+		})
+		if err != nil {
+			if errors.Is(err, service.ErrSourceChanged) && in.ExpectedRevision == "" && restarts < 2 {
+				restarts++
+				pinnedRevision = ""
+				beforeExhausted, afterExhausted = false, false
+				fetchBefore, fetchAfter = dialogueAroundFetchSpan(reqBefore, reqAfter)
+				continue
+			}
+			return nil, getMessagesOut{}, err
+		}
+		scan := t.scanAround(res, in, roles, false)
+		if scan.rawBefore < fetchBefore {
+			beforeExhausted = true
+		}
+		if scan.rawAfter < fetchAfter {
+			afterExhausted = true
+		}
+		needBefore := reqBefore > 0 && !beforeExhausted && scan.seenBefore < reqBefore
+		needAfter := reqAfter > 0 && !afterExhausted && scan.seenAfter < reqAfter
+		if !needBefore && !needAfter {
+			return nil, scan.out, nil
+		}
+		nextBefore, nextAfter, expanded := nextDialogueAroundSpan(
+			fetchBefore, fetchAfter, needBefore, needAfter, scan.usedBefore, scan.usedAfter, budget,
+		)
+		if !expanded {
+			scan.out.WindowTruncated = true
+			return nil, scan.out, nil
+		}
+		fetchBefore, fetchAfter = nextBefore, nextAfter
+		if pinnedRevision == "" && res.TranscriptRevision != "" {
+			pinnedRevision = res.TranscriptRevision
+		}
+	}
+}
+
+type aroundWindowScan struct {
+	out        getMessagesOut
+	rawBefore  int
+	rawAfter   int
+	usedBefore int
+	usedAfter  int
+	seenBefore int
+	seenAfter  int
+}
+
+// scanAround applies the visibility filter to a fetched window and counts
+// before/after over the surviving messages. Scanning stops once the requested
+// number of visible messages is reached on each side, and rows past that point
+// are neither returned nor counted. next_from anchors on the last scanned raw
+// ordinal.
+func (t *toolset) scanAround(
+	res *service.MessageList, in getMessagesIn, roles []string, raw bool,
+) aroundWindowScan {
+	before, after := resolveAroundBounds(in)
 	maxChars := clampLimit(
 		in.MaxCharsPerMessage, defaultMaxCharsPerMessage, maxMaxCharsPerMessage)
+	anchor := 0
+	if in.Around != nil {
+		anchor = *in.Around
+	}
 	out := getMessagesOut{
 		Messages:           make([]messageOut, 0, len(res.Messages)),
 		TranscriptRevision: res.TranscriptRevision,
 	}
-	for _, m := range res.Messages {
-		mo, ok := filterAndMapMessage(m, roles, maxChars)
-		if !ok {
+	mapped := make([]messageOut, len(res.Messages))
+	kept := make([]bool, len(res.Messages))
+	uncertain := make([]bool, len(res.Messages))
+	for i, m := range res.Messages {
+		mapped[i], kept[i], uncertain[i] = filterAndMapMessage(m, roles, maxChars, raw)
+	}
+
+	beforeEnd := len(res.Messages)
+	afterStart := len(res.Messages)
+	for i := range res.Messages {
+		if res.Messages[i].Ordinal >= anchor {
+			beforeEnd = i
+			afterStart = i
+			if res.Messages[i].Ordinal == anchor {
+				afterStart++
+			}
+			break
+		}
+	}
+	// beforeFrom is the first row of the page: the before-th visible message
+	// before the anchor, or the start when fewer exist. Rows fetched past it
+	// were only scanned to find that message, so they are not part of the page
+	// and not counted in Filtered.
+	beforeFrom := beforeEnd
+	seenBefore := 0
+	for i := beforeEnd - 1; before > 0 && i >= 0; i-- {
+		if kept[i] {
+			seenBefore++
+		}
+		beforeFrom = i
+		if seenBefore == before {
+			break
+		}
+	}
+	// afterTo is one past the last row of the page, found the same way.
+	afterTo := afterStart
+	seenAfter := 0
+	for i := afterStart; after > 0 && i < len(res.Messages); i++ {
+		afterTo = i + 1
+		if kept[i] {
+			seenAfter++
+		}
+		if seenAfter == after {
+			break
+		}
+	}
+
+	for i := beforeFrom; i < afterTo; i++ {
+		if uncertain[i] {
+			out.Uncertain++
+		}
+		if !kept[i] {
 			out.Filtered++
 			continue
 		}
-		out.Messages = append(out.Messages, mo)
+		out.Messages = append(out.Messages, mapped[i])
 	}
-	if len(out.Messages) > 0 {
-		next := out.Messages[len(out.Messages)-1].Ordinal + 1
+	// Anchor on the last raw ordinal the window actually scanned, not the
+	// last visible one: a row fetched and filtered must not be scanned again,
+	// and a row the window never reached must not be skipped.
+	if afterTo > beforeFrom {
+		next := res.Messages[afterTo-1].Ordinal + 1
 		out.NextFrom = &next
 	}
-	attachBodyCursors(&out, res.EvidenceSource, in.SessionID, in.Roles)
-	return nil, out, nil
+	attachBodyCursors(&out, res.EvidenceSource, in.SessionID, in.Roles, raw)
+	return aroundWindowScan{
+		out:        out,
+		rawBefore:  beforeEnd,
+		rawAfter:   len(res.Messages) - afterStart,
+		usedBefore: beforeEnd - beforeFrom,
+		usedAfter:  afterTo - afterStart,
+		seenBefore: seenBefore,
+		seenAfter:  seenAfter,
+	}
 }
 
 func attachBodyCursors(
-	out *getMessagesOut, evidenceSource, sessionID string, roles []string,
+	out *getMessagesOut, evidenceSource, sessionID string, roles []string, raw bool,
 ) {
 	nextFrom := out.NextFrom
 	hasBodyCursor := false
@@ -702,10 +999,10 @@ func attachBodyCursors(
 		}
 		hasBodyCursor = true
 		out.Messages[i].BodyCursor = encodeMessageBodyCursor(messageBodyCursor{
-			Version: 2, EvidenceSource: evidenceSource, SessionID: sessionID,
+			Version: 3, EvidenceSource: evidenceSource, SessionID: sessionID,
 			Revision: out.TranscriptRevision, Ordinal: out.Messages[i].Ordinal,
 			Offset: utf8.RuneCountInString(out.Messages[i].Content), NextFrom: nextFrom,
-			Roles: roles,
+			Roles: roles, Raw: raw, ContentDigest: out.Messages[i].bodyDigest,
 		})
 	}
 	if hasBodyCursor {
@@ -748,10 +1045,22 @@ func (t *toolset) getMessageBodyContinuation(
 	// explicit-role listing continues under exactly the roles that made
 	// the message visible. The message is still sliced from the raw
 	// content below, so the mapped output is intentionally discarded.
-	if _, ok := filterAndMapMessage(message, cursor.Roles, maxChars); !ok {
+	// A continuation only re-checks the role and system contract the cursor
+	// was issued under. The dialogue filter already ran when the cursor was
+	// minted, and the cited row is read back on its own, so re-running it
+	// here would reject a tool-role continuation whose rendering cannot be
+	// rebuilt from that one row.
+	if isSystemMessage(message) || !roleAllowed(message.Role, cursor.Roles) {
 		return nil, getMessagesOut{}, fmt.Errorf("%w: cited message is not available", service.ErrSourceChanged)
 	}
-	runes := []rune(message.Content)
+	content, visible, _ := projectedMessageContent(message, cursor.Raw || len(cursor.Roles) > 0)
+	if !visible {
+		return nil, getMessagesOut{}, fmt.Errorf("%w: cited message projection unavailable", service.ErrSourceChanged)
+	}
+	if messageBodyDigest(content) != cursor.ContentDigest {
+		return nil, getMessagesOut{}, fmt.Errorf("%w: cited message projection changed", service.ErrSourceChanged)
+	}
+	runes := []rune(content)
 	if cursor.Offset >= len(runes) {
 		return nil, getMessagesOut{}, errors.New("invalid body_cursor offset")
 	}
@@ -778,6 +1087,7 @@ type searchContentIn struct {
 	Concepts         []string `json:"concepts,omitempty" jsonschema:"Two to five semantic concepts that must all have evidence in the same session, even in different messages. Implies mode semantic, does not page, and is mutually exclusive with pattern."`
 	Mode             string   `json:"mode,omitempty" jsonschema:"substring (default), regex, terms, semantic, or hybrid. Prefer hybrid for contextual questions. Hybrid returns keyword matches with a note when search by meaning is unavailable; semantic requires a ready index."`
 	Scope            string   `json:"scope,omitempty" jsonschema:"Substring/regex/terms/semantic/hybrid result scope: top, all (default), or subordinate."`
+	Sources          []string `json:"sources,omitempty" jsonschema:"Substring/regex sources: messages, thinking, tool_input, tool_result. Default: messages only, which searches dialogue text. Name sources to include thinking or tool inputs and results."`
 	Project          string   `json:"project,omitempty" jsonschema:"Restrict to one project."`
 	Agent            string   `json:"agent,omitempty" jsonschema:"Restrict to one agent."`
 	SessionID        string   `json:"session_id,omitempty" jsonschema:"Restrict to one exact full stored session ID."`
@@ -808,31 +1118,35 @@ func toContextMessages(msgs []db.Message) []contextMessage {
 	}
 	out := make([]contextMessage, 0, len(msgs))
 	for _, m := range msgs {
-		content, _ := truncate(m.Content, contextMessageMaxChars)
+		message, ok, _ := filterAndMapMessage(m, nil, contextMessageMaxChars, false)
+		if !ok {
+			continue
+		}
 		out = append(out, contextMessage{
-			Ordinal: m.Ordinal, Role: m.Role, Content: content,
+			Ordinal: m.Ordinal, Role: m.Role, Content: message.Content,
 		})
 	}
 	return out
 }
 
 type contentMatch struct {
-	WebURL          string   `json:"web_url,omitempty" jsonschema:"Browser URL for this session; use this URL when linking to it."`
-	SessionID       string   `json:"session_id"`
-	Project         string   `json:"project,omitempty"`
-	Agent           string   `json:"agent"`
-	Location        string   `json:"location" jsonschema:"Where the match occurred: one of message, thinking, tool_input, or tool_result."`
-	Role            string   `json:"role,omitempty"`
-	Ordinal         int      `json:"ordinal"`
-	Timestamp       string   `json:"timestamp"`
-	Snippet         string   `json:"snippet"`
-	MatchedWords    int      `json:"matched_words" jsonschema:"Number of retained query words the match holds in ranked word search; unquoted stop words are dropped. Zero for other searches."`
-	Score           *float64 `json:"score,omitempty" jsonschema:"Relevance score for semantic/hybrid modes; omitted for substring/regex/fts."`
-	OrdinalRange    [2]int   `json:"ordinal_range" jsonschema:"[start, end] ordinals of the conversation unit containing this match; equal to the match ordinal for single-message units."`
-	Subordinate     bool     `json:"subordinate,omitzero" jsonschema:"True when this match belongs to a subordinate unit: a sidechain run, or a subagent/fork session."`
-	Relationship    string   `json:"relationship,omitempty" jsonschema:"The matched session's relationship to its parent (for example subagent or fork), when it has one."`
-	ParentSessionID string   `json:"parent_session_id,omitempty" jsonschema:"The parent session ID, when the matched session has one."`
-	Sidechain       bool     `json:"is_sidechain,omitzero" jsonschema:"True when the matched message itself is flagged as a sidechain message."`
+	WebURL              string   `json:"web_url,omitempty" jsonschema:"Browser URL for this session; use this URL when linking to it."`
+	SessionID           string   `json:"session_id"`
+	Project             string   `json:"project,omitempty"`
+	Agent               string   `json:"agent"`
+	Location            string   `json:"location" jsonschema:"Where the match occurred: one of message, thinking, tool_input, or tool_result."`
+	Role                string   `json:"role,omitempty"`
+	Ordinal             int      `json:"ordinal"`
+	Timestamp           string   `json:"timestamp"`
+	Snippet             string   `json:"snippet"`
+	DialogueUnavailable bool     `json:"dialogue_unavailable,omitempty" jsonschema:"The hit has no reliable dialogue projection. Its snippet is withheld; session/ordinal metadata remains available for explicit raw inspection."`
+	MatchedWords        int      `json:"matched_words" jsonschema:"Number of retained query words the match holds in ranked word search; unquoted stop words are dropped. Zero for other searches."`
+	Score               *float64 `json:"score,omitempty" jsonschema:"Relevance score for semantic/hybrid modes; omitted for substring/regex/fts."`
+	OrdinalRange        [2]int   `json:"ordinal_range" jsonschema:"[start, end] ordinals of the conversation unit containing this match; equal to the match ordinal for single-message units."`
+	Subordinate         bool     `json:"subordinate,omitzero" jsonschema:"True when this match belongs to a subordinate unit: a sidechain run, or a subagent/fork session."`
+	Relationship        string   `json:"relationship,omitempty" jsonschema:"The matched session's relationship to its parent (for example subagent or fork), when it has one."`
+	ParentSessionID     string   `json:"parent_session_id,omitempty" jsonschema:"The parent session ID, when the matched session has one."`
+	Sidechain           bool     `json:"is_sidechain,omitzero" jsonschema:"True when the matched message itself is flagged as a sidechain message."`
 	// ContextBefore/ContextAfter are populated when Context > 0: the N
 	// messages immediately before/after this match, content truncated to
 	// 500 characters.
@@ -899,6 +1213,21 @@ func validateSearchDates(from, to string) error {
 	return nil
 }
 
+// lexicalSources narrows the default substring and regex search to dialogue
+// messages. terms, semantic, and hybrid already search messages only and
+// reject other sources, so an explicit list still reaches them untouched and
+// an omitted one stays omitted. Naming sources keeps the wider search.
+func lexicalSources(mode string, sources []string) []string {
+	if len(sources) > 0 {
+		return sources
+	}
+	switch mode {
+	case "", "substring", "regex":
+		return []string{"messages"}
+	}
+	return nil
+}
+
 func (t *toolset) searchContent(
 	ctx context.Context, _ *mcp.CallToolRequest, in searchContentIn,
 ) (*mcp.CallToolResult, searchContentOut, error) {
@@ -952,6 +1281,7 @@ func (t *toolset) searchContent(
 		Mode:               in.Mode,
 		KeywordFallback:    mode == "hybrid",
 		Scope:              scope,
+		Sources:            lexicalSources(in.Mode, in.Sources),
 		Project:            in.Project,
 		Agent:              in.Agent,
 		SessionID:          in.SessionID,
@@ -963,6 +1293,8 @@ func (t *toolset) searchContent(
 		Context:            in.Context,
 		IncludeOneShot:     in.IncludeOneShot,
 		IncludeAutomated:   in.IncludeAutomated,
+		ExcludeSystem:      len(in.Sources) == 0,
+		DialogueOnly:       len(in.Sources) == 0,
 		ExcludeSessionIDs:  excludeSessions,
 		ExcludeActiveSince: cutoff,
 	}
@@ -1005,12 +1337,43 @@ func (t *toolset) searchContent(
 			out.ExcludedActive++
 			continue
 		}
+		// Storage search deliberately falls back to raw text for legacy rows.
+		// The memory surface must not advertise that fallback as dialogue. Keep
+		// hit coordinates and pagination, but withhold unclassified snippets.
+		unavailable := false
+		if len(in.Sources) == 0 && m.Location != "message" {
+			m.Snippet = ""
+			unavailable = true
+		}
+		if len(in.Sources) == 0 && m.Location == "message" {
+			page, err := t.svc.Messages(ctx, m.SessionID, service.MessageFilter{
+				Around: &m.Ordinal, Before: new(0), After: new(0),
+				ExpectedRevision: m.TranscriptRevision,
+			})
+			if err != nil {
+				return nil, searchContentOut{}, err
+			}
+			m.Snippet = ""
+			unavailable = true
+			if len(page.Messages) == 1 && page.Messages[0].Ordinal == m.Ordinal {
+				stored := page.Messages[0]
+				if stored.DialogueText != nil {
+					stored.DialogueText = new(secrets.Redact(*stored.DialogueText))
+				}
+				message, ok, _ := filterAndMapMessage(stored, nil, contextMessageMaxChars, false)
+				if ok {
+					m.Snippet = message.Content
+					unavailable = false
+				}
+			}
+		}
 		out.Matches = append(out.Matches, contentMatch{
 			WebURL: m.WebURL, SessionID: m.SessionID, Project: m.Project, Agent: m.Agent,
 			Location: m.Location, Role: m.Role, Ordinal: m.Ordinal,
 			Timestamp: m.Timestamp, Snippet: m.Snippet, Score: m.Score,
-			MatchedWords: m.MatchedWords,
-			OrdinalRange: m.OrdinalRange, Subordinate: m.Subordinate,
+			MatchedWords:        m.MatchedWords,
+			DialogueUnavailable: unavailable,
+			OrdinalRange:        m.OrdinalRange, Subordinate: m.Subordinate,
 			Relationship: m.Relationship, ParentSessionID: m.ParentSessionID,
 			Sidechain:          m.Sidechain,
 			ContextBefore:      toContextMessages(m.ContextBefore),

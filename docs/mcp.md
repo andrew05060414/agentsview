@@ -14,6 +14,32 @@ AgentsView guides without leaving the assistant.
 
 MCP tool results warn when the archive is stale during a full parser rebuild.
 
+`get_messages` returns the stored dialogue projection by default, including in
+`around` windows and `body_cursor` continuations. Inline thinking and tool
+renderings are excluded. Unclassified archived rows are withheld: `uncertain`
+counts these coverage gaps as part of `filtered`. An empty projection means no
+dialogue. Neither case modifies the archive or message identities. `raw: true`
+retains the stored content for explicit inspection; explicit `roles` also keeps
+the existing raw-content selection. System messages remain excluded.
+
+Default `search_content` snippets and inline context follow the same dialogue
+projection. A hit without a usable projection keeps its session and ordinal,
+sets `dialogue_unavailable: true`, and withholds its snippet. Snippets show up to
+500 characters of the anchor's dialogue, so a match later in a long message may
+require `get_messages` to read it. Explicit `sources` retains the storage
+snippet contract, including raw legacy content. Context stays dialogue-only.
+HTTP-backed reads require the server to transmit `dialogue_text`; older servers
+without that field report coverage gaps instead of falling back to raw content.
+Body cursors issued before this projection contract are invalid; fetch a new
+message page to obtain a continuation for the current view.
+Each cursor also pins the selected body's digest, so a dialogue-only update
+invalidates the continuation even when the raw transcript revision is unchanged.
+Continuations are also bound to one backend instance. A gateway that starts a
+new stdio process for each call should connect those processes to the same
+running HTTP backend with `agentsview mcp --server <url> --profile memory`.
+Opening the archive directly in a fresh process for each call invalidates the
+previous process's cursors with `source_changed`.
+
 ## When To Use It
 
 Machine filters accept exact IDs, aliases, comma-separated ID/alias lists, or a

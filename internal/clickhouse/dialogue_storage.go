@@ -29,7 +29,7 @@ func dedupeStoredDialogue(ctx context.Context, conn *sql.DB) error {
 		return nil
 	}
 	if _, err := conn.ExecContext(ctx, `ALTER TABLE messages
-		UPDATE dialogue_text = if(dialogue_text = content, NULL, '')
+		UPDATE dialogue_text = if(dialogue_text = content, NULL, ''), dialogue_is_content = true
 		WHERE dialogue_text = content AND thinking_text = ''`); err != nil {
 		return fmt.Errorf("scheduling clickhouse dialogue deduplication: %w", err)
 	}

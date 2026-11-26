@@ -63,6 +63,7 @@ const (
 	// spending embeddings quota through the local daemon.
 	SemanticSearchIntentHeader = "X-AgentsView-Search-Intent"
 	SemanticSearchIntentValue  = "semantic"
+	DialogueOnlySearchHeader   = "X-AgentsView-Dialogue-Only"
 )
 
 // SessionService is the canonical per-session operation interface.
@@ -192,6 +193,7 @@ type ContentSearchRequest struct {
 	KeywordFallback bool     `json:"allow_keyword_fallback,omitempty"`
 	Sources         []string `json:"sources,omitempty"`
 	ExcludeSystem   bool     `json:"exclude_system,omitempty"`
+	DialogueOnly    bool     `json:"-"`
 	Reveal          bool     `json:"reveal,omitempty"`
 	// Context requests N messages of inline context before and after each
 	// match (0 = off, max 10). See directBackend.SearchContent.

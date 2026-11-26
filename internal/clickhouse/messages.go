@@ -57,6 +57,7 @@ func scanMessages(rows db.MessageRows) ([]db.Message, error) {
 			&m.ClaudeMessageID, &m.ClaudeRequestID,
 			&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
 			&m.SourceParentUUID, &m.IsSidechain, &m.IsCompactBoundary,
+			&m.DialogueText,
 		); err != nil {
 			return nil, fmt.Errorf("scanning clickhouse message: %w", err)
 		}

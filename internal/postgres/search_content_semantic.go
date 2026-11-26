@@ -84,7 +84,8 @@ func (s *Store) searchContentSemanticPG(
 func (s *Store) survivingVectorHitsPG(
 	ctx context.Context, f db.ContentSearchFilter, searcher db.VectorSearcher, k int,
 ) ([]db.VectorHit, error) {
-	return db.SelectSurvivingVectorHits(ctx, f, searcher, k, s.semanticAllowedSessionIDsPG)
+	return db.SelectSurvivingVectorHits(ctx, f, searcher, k, s.semanticAllowedSessionIDsPG,
+		db.DialogueVectorAnchors(db.PostgresQueryDialect(), s.pg.QueryContext))
 }
 
 // semanticAllowedSessionIDsPG returns activity eligibility for ids passing

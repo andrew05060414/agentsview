@@ -32,7 +32,7 @@ const (
 	legacyProjectIdentityStateKey          = "project_identity_publication_revision_v2"
 	projectIdentityPublicationStateKey     = "project_identity_publication_revision_v3"
 	commitLinksBackfillStateKey            = "pg_commit_links_backfill_v2"
-	messageDialogueBackfillStateKey        = "pg_message_dialogue_backfill_v1"
+	messageDialogueBackfillStateKey        = "pg_message_dialogue_backfill_v2"
 	transcriptRevisionBackfillStateKey     = "pg_transcript_revision_backfill_v1"
 	sessionProvenanceBackfillStateKey      = "pg_session_provenance_backfill_v2"
 	timestampNormalizationBackfillStateKey = "pg_timestamp_normalization_backfill_v1"
@@ -3842,7 +3842,7 @@ func bulkInsertMessages(
 
 		var b strings.Builder
 		b.WriteString(`INSERT INTO messages (
-			session_id, ordinal, role, content, thinking_text, dialogue_text,
+			session_id, ordinal, role, content, thinking_text, dialogue_text, dialogue_is_content,
 			timestamp, has_thinking, has_tool_use,
 			content_length, is_system, model, reasoning_effort, token_usage,
 			context_tokens, output_tokens,
@@ -3853,20 +3853,20 @@ func bulkInsertMessages(
 			source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain,
 			is_compact_boundary) VALUES `)
-		args := make([]any, 0, len(batch)*30)
+		args := make([]any, 0, len(batch)*31)
 		for j, m := range batch {
 			if j > 0 {
 				b.WriteByte(',')
 			}
-			p := j*30 + 1
+			p := j*31 + 1
 			fmt.Fprintf(&b,
-				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
 				p, p+1, p+2, p+3, p+4,
 				p+5, p+6, p+7, p+8, p+9,
 				p+10, p+11, p+12, p+13, p+14, p+15,
 				p+16, p+17, p+18, p+19, p+20,
 				p+21, p+22, p+23, p+24, p+25, p+26, p+27,
-				p+28, p+29,
+				p+28, p+29, p+30,
 			)
 			ts, err := optionalSQLiteTimestamp(m.Timestamp)
 			if err != nil {
@@ -3881,7 +3881,8 @@ func bulkInsertMessages(
 			// bytes (e.g. raw protobuf fragments), which PG
 			// rejects with SQLSTATE 22021.
 			var dialogue any
-			if stored, _ := db.StoredDialogue(m.Content, m.ThinkingText, m.DialogueText); stored != nil {
+			stored, isContent := db.StoredDialogue(m.Content, m.ThinkingText, m.DialogueText)
+			if stored != nil {
 				dialogue = sanitizePG(*stored)
 			}
 			tokenUsage := sanitizePG(string(m.TokenUsage))
@@ -3889,7 +3890,7 @@ func bulkInsertMessages(
 			args = append(args,
 				sessionID, m.Ordinal, sanitizePG(m.Role),
 				sanitizePG(m.Content),
-				sanitizePG(m.ThinkingText), dialogue, ts,
+				sanitizePG(m.ThinkingText), dialogue, isContent, ts,
 				m.HasThinking,
 				m.HasToolUse, m.ContentLength, m.IsSystem,
 				sanitizePG(m.Model),

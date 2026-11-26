@@ -19,13 +19,16 @@ func TestClickHouseDialogueSearchParity(t *testing.T) {
 	t.Parallel()
 	local, target := seedFixture(t)
 	dbtest.SeedDialogueSearch(t, local)
+	dbtest.SeedDialogueSearchPaging(t, local)
 	syncer := newTestSync(t, local, target, storage.PusherOptions{})
 	_, err := syncer.Push(t.Context(), false, nil)
 	require.NoError(t, err)
 	store, err := NewStore(t.Context(), target)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	dbtest.AssertDialogueMessageReads(t, store)
 	dbtest.AssertDialogueSearchParity(t, local, store, "substring", "regex", "fts")
+	dbtest.AssertDialogueVectorSearch(t, store)
 }
 
 func TestDialogueClickHouseBackfillsExistingPushCursor(t *testing.T) {

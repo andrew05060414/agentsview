@@ -15,12 +15,15 @@ func TestPGDialogueSearchParity(t *testing.T) {
 	t.Parallel()
 	syncer, local, _, ctx := newSessionProvenancePushSync(t, "agentsview")
 	dbtest.SeedDialogueSearch(t, local)
+	dbtest.SeedDialogueSearchPaging(t, local)
 	_, err := syncer.Push(ctx, true, nil)
 	require.NoError(t, err)
 	store, err := NewStore(t.Context(), testPGURL(t), syncer.schema, true)
 	require.NoError(t, err)
 	defer store.Close()
+	dbtest.AssertDialogueMessageReads(t, store)
 	dbtest.AssertDialogueSearchParity(t, local, store, "substring", "regex", "fts")
+	dbtest.AssertDialogueVectorSearch(t, store)
 	t.Run("fts ignores sources", func(t *testing.T) {
 		for _, pattern := range []string{"answerneedle", "reasoningneedle"} {
 			f := db.ContentSearchFilter{Pattern: pattern, Mode: "fts", Project: "dialogue-search", Sources: []string{"thinking"}, Limit: 50}

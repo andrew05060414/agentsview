@@ -1,6 +1,7 @@
 package dbtest
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -8,6 +9,39 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 )
+
+func AssertDialogueMessageReads(t *testing.T, mirror db.Store) {
+	t.Helper()
+	const id = "dialogue-search"
+	assertDialogue := func(t *testing.T, messages []db.Message, err error) {
+		t.Helper()
+		require.NoError(t, err)
+		require.Len(t, messages, 11)
+		assert.Nil(t, messages[0].DialogueText, "legacy NULL remains unclassified")
+		assert.Equal(t, new("answerneedle"), messages[1].DialogueText)
+		assert.Equal(t, new(""), messages[3].DialogueText, "empty projection remains classified")
+		assert.Equal(t, new("copiedneedle"), messages[10].DialogueText)
+	}
+	for _, tc := range []struct {
+		name string
+		read func(context.Context) ([]db.Message, error)
+	}{
+		{"page", func(ctx context.Context) ([]db.Message, error) {
+			return mirror.GetMessages(ctx, id, 0, 11, true)
+		}},
+		{"all", func(ctx context.Context) ([]db.Message, error) {
+			return mirror.GetAllMessages(ctx, id)
+		}},
+		{"window", func(ctx context.Context) ([]db.Message, error) {
+			return mirror.GetMessagesWindow(ctx, id, db.MessageWindow{Around: new(5), Before: 5, After: 5})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			messages, err := tc.read(t.Context())
+			assertDialogue(t, messages, err)
+		})
+	}
+}
 
 // SeedDialogueSearch writes projected, legacy, empty, and content-copy
 // dialogue with a structured tool result. Backends store the content copy as
@@ -70,6 +104,84 @@ func SeedDialogueSearch(t *testing.T, d *db.DB) {
 	}))
 }
 
+func SeedDialogueSearchPaging(t *testing.T, d *db.DB) {
+	t.Helper()
+	const older, newer, project = "dialogue-page-older", "dialogue-page-newer", "dialogue-page"
+	SeedSessionWithMessages(t, d, older, project, []db.Message{
+		{SessionID: older, Ordinal: 0, Role: "user", Content: "question", DialogueText: new("question")},
+		{SessionID: older, Ordinal: 1, Role: "assistant", Content: "older pagingneedle", DialogueText: new("older pagingneedle")},
+		{SessionID: older, Ordinal: 2, Role: "user", Content: "follow-up", DialogueText: new("follow-up")},
+	}, WithMessageCounts(3, 2), func(s *db.Session) { s.StartedAt = new("2026-05-20T12:00:00Z") })
+	SeedSessionWithMessages(t, d, newer, project, []db.Message{
+		{SessionID: newer, Ordinal: 0, Role: "user", Content: "question", DialogueText: new("question")},
+		{SessionID: newer, Ordinal: 1, Role: "user", SourceSubtype: "tool_result", Content: "observation pagingneedle"},
+		{SessionID: newer, Ordinal: 2, Role: "tool", Content: "tool pagingneedle"},
+		{SessionID: newer, Ordinal: 3, Role: "user", Content: "follow-up", DialogueText: new("follow-up")},
+		{SessionID: newer, Ordinal: 4, Role: "assistant", SourceSubtype: "tool_result", Content: "assistant tool output"},
+		{SessionID: newer, Ordinal: 5, Role: "assistant", Content: "[Bash]\n$ hidden tool", DialogueText: new(""), HasToolUse: true},
+		{SessionID: newer, Ordinal: 6, Role: "assistant", Content: "[Thinking] hidden", DialogueText: new(" \n\t "), HasThinking: true},
+		{SessionID: newer, Ordinal: 7, Role: "assistant", IsSystem: true, Content: "system flagged", DialogueText: new("system flagged")},
+		{SessionID: newer, Ordinal: 8, Role: "user", Content: "<system-reminder>injected</system-reminder>", DialogueText: new("<system-reminder>injected</system-reminder>")},
+	}, WithMessageCounts(9, 2), func(s *db.Session) { s.StartedAt = new("2026-05-21T12:00:00Z") })
+}
+
+type dialogueVectorSearcher struct {
+	limits []int
+}
+
+func (s *dialogueVectorSearcher) PrepareSemanticSearch(context.Context, string) (db.VectorSearchPage, int, error) {
+	return func(_ context.Context, limit int) ([]db.VectorHit, bool, error) {
+		s.limits = append(s.limits, limit)
+		hits := []db.VectorHit{
+			{SessionID: "dialogue-page-newer", Ordinal: 4, OrdinalStart: 4, OrdinalEnd: 4, Score: 0.99, Snippet: "assistant tool output"},
+			{SessionID: "dialogue-page-newer", Ordinal: 5, OrdinalStart: 5, OrdinalEnd: 5, Score: 0.98, Snippet: "[Bash]\n$ hidden tool"},
+			{SessionID: "dialogue-page-newer", Ordinal: 6, OrdinalStart: 6, OrdinalEnd: 6, Score: 0.97, Snippet: "[Thinking] hidden"},
+			{SessionID: "dialogue-page-newer", Ordinal: 7, OrdinalStart: 7, OrdinalEnd: 7, Score: 0.96, Snippet: "system flagged"},
+			{SessionID: "dialogue-page-newer", Ordinal: 8, OrdinalStart: 8, OrdinalEnd: 8, Score: 0.95, Snippet: "<system-reminder>injected</system-reminder>"},
+			{SessionID: "dialogue-page-newer", Ordinal: 2, OrdinalStart: 2, OrdinalEnd: 2, Score: 0.9, Snippet: "tool pagingneedle"},
+		}
+		if limit <= db.SemanticOverfetchMin {
+			return hits, false, nil
+		}
+		return append(hits, db.VectorHit{
+			SessionID: "dialogue-page-older", Ordinal: 1, OrdinalStart: 1, OrdinalEnd: 1, Score: 0.8, Snippet: "older pagingneedle",
+		}), true, nil
+	}, 0, nil
+}
+
+func (*dialogueVectorSearcher) ResolveMessageUnits(_ context.Context, refs []db.MessageRef) ([]db.UnitRef, error) {
+	return make([]db.UnitRef, len(refs)), nil
+}
+
+type dialogueVectorStore interface {
+	SetVectorSearcher(db.VectorSearcher)
+	SearchContent(context.Context, db.ContentSearchFilter) (db.ContentSearchPage, error)
+}
+
+func AssertDialogueVectorSearch(t *testing.T, store dialogueVectorStore) {
+	t.Helper()
+	for _, mode := range []string{"hybrid", "semantic"} {
+		searcher := &dialogueVectorSearcher{}
+		store.SetVectorSearcher(searcher)
+		f := db.ContentSearchFilter{
+			Pattern: "vectoronlyneedle", Mode: mode, Project: "dialogue-page", Limit: 1, DialogueOnly: true,
+		}
+		page, err := store.SearchContent(t.Context(), f)
+		require.NoError(t, err, mode)
+		require.Len(t, page.Matches, 1, mode)
+		assert.Equal(t, "dialogue-page-older", page.Matches[0].SessionID, mode)
+		assert.Equal(t, 1, page.Matches[0].Ordinal, mode)
+		assert.Equal(t, []int{db.SemanticOverfetchMin, 2 * db.SemanticOverfetchMin}, searcher.limits, mode)
+
+		f.DialogueOnly, f.Sources = false, []string{"messages"}
+		page, err = store.SearchContent(t.Context(), f)
+		require.NoError(t, err, mode)
+		require.Len(t, page.Matches, 1, mode)
+		assert.Equal(t, "dialogue-page-newer", page.Matches[0].SessionID, mode)
+		assert.Equal(t, 4, page.Matches[0].Ordinal, mode)
+	}
+}
+
 // AssertDialogueSearchParity checks mirror hits and snippets against expected
 // values and compares lexical pagination with SQLite.
 // Callers supply their supported modes. Substring and regex cover every source;
@@ -90,6 +202,25 @@ func AssertDialogueSearchParity(t *testing.T, archive, mirror db.Store, modes ..
 	}
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
+			t.Run("dialogue-paging", func(t *testing.T) {
+				f := db.ContentSearchFilter{
+					Pattern: "pagingneedle", Mode: mode, Project: "dialogue-page",
+					Sources: []string{"messages"}, Limit: 1, DialogueOnly: true,
+				}
+				page, err := mirror.SearchContent(t.Context(), f)
+				require.NoError(t, err)
+				require.Len(t, page.Matches, 1)
+				assert.Equal(t, "dialogue-page-older", page.Matches[0].SessionID)
+				assert.Zero(t, page.NextCursor)
+
+				f.DialogueOnly = false
+				page, err = mirror.SearchContent(t.Context(), f)
+				require.NoError(t, err)
+				require.Len(t, page.Matches, 1)
+				assert.Equal(t, "dialogue-page-newer", page.Matches[0].SessionID)
+				assert.Equal(t, 1, page.Matches[0].Ordinal)
+				assert.Equal(t, 1, page.NextCursor)
+			})
 			lexical := mode == "" || mode == "substring" || mode == "regex"
 			sources := []string{"messages"}
 			if lexical {

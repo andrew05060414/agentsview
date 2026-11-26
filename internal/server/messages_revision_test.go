@@ -12,6 +12,24 @@ import (
 	"go.kenn.io/agentsview/internal/service"
 )
 
+func TestMessagesHTTPPreservesDialogueProjectionStates(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "dialogue", "proj", 3)
+	require.NoError(t, te.db.ReplaceSessionMessages(t.Context(), "dialogue", []db.Message{
+		{SessionID: "dialogue", Ordinal: 0, Role: "user", Content: "question", DialogueText: new("question")},
+		{SessionID: "dialogue", Ordinal: 1, Role: "assistant", Content: "[Thinking] hidden"},
+		{SessionID: "dialogue", Ordinal: 2, Role: "assistant", Content: "[Bash] hidden", DialogueText: new("")},
+	}))
+
+	response := te.get(t, "/api/v1/sessions/dialogue/messages?limit=20")
+	assertStatus(t, response, http.StatusOK)
+	list := decode[service.MessageList](t, response)
+	require.Len(t, list.Messages, 3)
+	assert.Equal(t, new("question"), list.Messages[0].DialogueText)
+	assert.Nil(t, list.Messages[1].DialogueText)
+	assert.Equal(t, new(""), list.Messages[2].DialogueText)
+}
+
 func TestMessagesExpectedRevisionReturnsSourceChanged(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "revisioned", "proj", 2)

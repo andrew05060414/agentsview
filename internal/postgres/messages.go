@@ -32,7 +32,7 @@ func (s *Store) GetMessages(
 		FROM messages
 		WHERE session_id = $1 AND ordinal %s $2
 		ORDER BY ordinal %s
-		LIMIT $3`, pgMessageCols, op, dir)
+		LIMIT $3`, s.messageColumns(), op, dir)
 
 	rows, err := s.pg.QueryContext(
 		ctx, query, sessionID, from, limit,
@@ -63,6 +63,16 @@ const pgMessageCols = `session_id, ordinal, role, content, thinking_text,
 	source_type, source_subtype, prompt_source, source_uuid,
 	source_parent_uuid, is_sidechain,
 	is_compact_boundary`
+
+func (s *Store) messageColumns() string {
+	if s.hostedRelations {
+		return pgMessageCols + `, CASE WHEN EXISTS (
+			SELECT 1 FROM raw_message_dialogue r
+			WHERE r.session_id = messages.session_id AND r.ordinal = messages.ordinal AND r.is_content
+		) THEN content ELSE dialogue_text END AS selected_dialogue`
+	}
+	return pgMessageCols + `, CASE WHEN dialogue_is_content THEN content ELSE dialogue_text END AS selected_dialogue`
+}
 
 // pgRevisionCol selects the session transcript revision as a window
 // statement's first column. It binds $1, which every window statement
@@ -117,7 +127,7 @@ func (s *Store) getMessagesLinear(
 		FROM messages
 		WHERE session_id = $1 AND ordinal %s $2%s
 		ORDER BY ordinal %s
-		LIMIT $%d`, pgRevisionCol, pgMessageCols, op, roleClause, dir, len(roleArgs)+3)
+		LIMIT $%d`, pgRevisionCol, s.messageColumns(), op, roleClause, dir, len(roleArgs)+3)
 	args := append([]any{sessionID, from}, roleArgs...)
 	args = append(args, limit)
 	msgs, err := db.QueryMessagesWithRevision(ctx, s.pg.QueryContext, scanPGMessages, w.ObservedRevision, query, args...)
@@ -151,8 +161,8 @@ func (s *Store) getMessagesAroundAnchor(
 				ORDER BY ordinal ASC LIMIT $%d) AS after_rows
 		) AS w
 		ORDER BY w.ordinal`,
-		pgRevisionCol, pgMessageCols, roleClause, pgMessageCols,
-		pgMessageCols, roleClause, len(roleArgs)+4)
+		pgRevisionCol, s.messageColumns(), roleClause, s.messageColumns(),
+		s.messageColumns(), roleClause, len(roleArgs)+4)
 	args := append([]any{sessionID, anchor, max(w.Before, 0)}, roleArgs...)
 	args = append(args, max(w.After, 0))
 	msgs, err := db.QueryMessagesWithRevision(ctx, s.pg.QueryContext, scanPGMessages, w.ObservedRevision, query, args...)
@@ -191,7 +201,7 @@ func (s *Store) GetAllMessages(
 		SELECT %s
 		FROM messages
 		WHERE session_id = $1
-		ORDER BY ordinal ASC`, pgMessageCols), sessionID)
+		ORDER BY ordinal ASC`, s.messageColumns()), sessionID)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"querying all messages: %w", err,
@@ -772,6 +782,7 @@ func scanPGMessages(rows db.MessageRows) ([]db.Message, error) {
 			&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
 			&m.SourceParentUUID, &m.IsSidechain,
 			&m.IsCompactBoundary,
+			&m.DialogueText,
 		); err != nil {
 			return nil, fmt.Errorf(
 				"scanning message: %w", err,

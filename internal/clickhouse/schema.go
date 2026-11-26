@@ -20,8 +20,9 @@ import (
 // with few distinct values to LowCardinality (see convertToLowCardinality).
 // Version 12 moves pricing metadata out of model_pricing (see
 // movePricingMeta) and stores pricing times as timestamps (see
-// typePricingTimes).
-const SchemaVersion = 12
+// typePricingTimes). Version 13 stores the classification marker for dialogue
+// equal to content.
+const SchemaVersion = 13
 
 // Metadata keys shared by every archive that pushes into the mirror.
 const (
@@ -42,7 +43,7 @@ const (
 	cursorUsageMaxIDKeyBase     = "agentsview_cursor_usage_max_id"
 	usageSnapshotReadyKeyBase   = "agentsview_usage_snapshot_ready"
 	commitLinksReadyKeyBase     = "agentsview_commit_links_ready_v2"
-	messageDialogueReadyKeyBase = "agentsview_message_dialogue_ready"
+	messageDialogueReadyKeyBase = "agentsview_message_dialogue_ready_v2"
 	storedCountRepairKeyBase    = "agentsview_stored_message_count_repair"
 	databaseIDKeyBase           = "agentsview_source_database_id"
 	fullPushRunKeyBase          = "agentsview_full_push_run"
@@ -319,6 +320,7 @@ var mirrorTables = []tableSpec{
 			col("content", tString),
 			col("thinking_text", tString),
 			col("dialogue_text", tNullString),
+			col("dialogue_is_content", tBool),
 			col("timestamp", tNullTime),
 			col("has_thinking", tBool),
 			col("has_tool_use", tBool),

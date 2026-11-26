@@ -140,7 +140,7 @@ func (s *Store) fetchHybridKeywordBatch(
 		JOIN sessions s ON s.id = m.session_id
 		WHERE `+contentPred+`
 			AND m.role IN ('user', 'assistant')
-			AND `+embeddableMessagePredicate("m")+`
+			AND `+embeddableMessagePredicate("m")+f.DialogueSearchSQL(db.ClickHouseQueryDialect())+`
 			AND m.session_id IN (SELECT id FROM sessions WHERE `+scopeWhere+`)
 		ORDER BY COALESCE(s.ended_at, s.started_at, s.created_at) DESC NULLS LAST,
 			m.session_id ASC, m.ordinal ASC

@@ -332,12 +332,13 @@ content still contains the thinking.
   because the indexed text does not change.
 - Hosted `raw_message_dialogue` stores an empty `dialogue_text` with
   `is_content` set, and payload loads restore it from the payload's content.
-- PostgreSQL, ClickHouse, and DuckDB mirrors keep no marker. PostgreSQL and
-  ClickHouse rewrite existing copies once from schema setup, guarded by the
-  `dialogue_dedupe_v1` and `agentsview_dialogue_deduplicated` metadata keys.
-  The ClickHouse mutation must write `''` beneath the NULL; an UPDATE to plain
-  NULL keeps the old string under the null mask. DuckDB schema version 24
-  rebuilds the mirror.
+- PostgreSQL, ClickHouse, and DuckDB mirrors store the same marker. Already
+  deduplicated rows without the marker stay unclassified until republished
+  from the archive. The next push backfills PostgreSQL and ClickHouse, and
+  DuckDB rebuilds its mirror on push. If the original one-time deduplication
+  has not run, PostgreSQL and ClickHouse deduplicate still-present copies
+  while storing the marker. The ClickHouse mutation writes `''` beneath the
+  NULL; an UPDATE to plain NULL retains the old string under the null mask.
 
 Data version 146 reparses providers with dialogue classification in place,
 including the shared Codex parser. Retained sources that cannot be reparsed keep

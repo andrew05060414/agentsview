@@ -1227,6 +1227,7 @@ func (b *directBackend) SearchContent(
 		Mode:               req.Mode,
 		Sources:            req.Sources,
 		ExcludeSystem:      req.ExcludeSystem,
+		DialogueOnly:       req.DialogueOnly,
 		Project:            req.Project,
 		ExcludeProject:     req.ExcludeProject,
 		Machine:            req.Machine,
@@ -1420,6 +1421,9 @@ func (b *directBackend) enrichContentContext(
 // never reaches a transport response.
 func RedactMessageSecrets(m db.Message) db.Message {
 	m.Content = secrets.Redact(m.Content)
+	if m.DialogueText != nil {
+		m.DialogueText = new(secrets.Redact(*m.DialogueText))
+	}
 	m.ThinkingText = secrets.Redact(m.ThinkingText)
 	if len(m.ToolCalls) == 0 {
 		return m

@@ -41,11 +41,11 @@ func buildTermsAnchorSQL(
 	// before SQLite reads the columns stored after the message body.
 	member := func(alias string) string {
 		return alias + ".role IN ('user','assistant') AND " + alias + ".is_system = 0 AND " +
-			frag.systemPrefix(alias+".content", alias+".role")
+			frag.systemPrefix(alias+".content", alias+".role") + f.dialogueSearchSQL(alias, dialect)
 	}
 	turn := func(alias string) string {
 		return alias + ".role = 'user' AND " + alias + ".is_system = 0 AND " +
-			frag.systemPrefix(alias+".content", alias+".role")
+			frag.systemPrefix(alias+".content", alias+".role") + f.dialogueSearchSQL(alias, dialect)
 	}
 	within := func(alias, exchange string) string {
 		return alias + ".session_id = " + exchange + ".session_id" +

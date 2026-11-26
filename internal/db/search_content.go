@@ -33,6 +33,7 @@ type ContentSearchFilter struct {
 	KeywordOnly   bool     // internal hybrid keyword leg; skips the semantic index
 	Sources       []string // subset of {"messages","thinking","tool_input","tool_result"}
 	ExcludeSystem bool
+	DialogueOnly  bool
 
 	Project, ExcludeProject, Machine, Agent           string
 	SessionID, GitBranchExact                         string
@@ -346,6 +347,41 @@ func hasSource(f ContentSearchFilter, name string) bool {
 	return slices.Contains(f.Sources, name)
 }
 
+func contentSystemPredicate(f ContentSearchFilter) string {
+	if !f.ExcludeSystem {
+		return "1=1"
+	}
+	return "m.role <> 'system' AND m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
+}
+
+func dialogueNonBlankSQL(col string, dialect QueryDialect) string {
+	if dialect.name == "clickhouse" {
+		return "(" + col + " IS NULL OR " + clickhouseLTrimSQL("ifNull("+col+", '')") + " <> '')"
+	}
+	return "(" + col + " IS NULL OR " + systemPrefixSQLTrimmed(col) + " <> '')"
+}
+
+// DialogueSearchSQL restricts message hits for the default MCP dialogue search.
+// Unclassified user and assistant rows remain eligible as coverage gaps.
+func (f ContentSearchFilter) DialogueSearchSQL(dialect QueryDialect) string {
+	return f.dialogueSearchSQL("m", dialect)
+}
+
+func (f ContentSearchFilter) dialogueSearchSQL(alias string, dialect QueryDialect) string {
+	if !f.DialogueOnly {
+		return ""
+	}
+	return " AND " + alias + ".role IN ('user', 'assistant') AND " + alias + ".source_subtype <> 'tool_result' AND " +
+		dialogueNonBlankSQL(alias+".dialogue_text", dialect)
+}
+
+func lexicalMessagePredicate(f ContentSearchFilter) string {
+	if f.DialogueOnly {
+		return contentSystemPredicate(f) + f.DialogueSearchSQL(SQLiteQueryDialect())
+	}
+	return dialogueNonBlankSQL("m.dialogue_text", SQLiteQueryDialect()) + " AND " + contentSystemPredicate(f)
+}
+
 // searchContentSubstring builds a UNION ALL across the selected sources
 // with a case-insensitive LIKE, scoped to qualifying sessions, ordered by
 // recency then ordinal, fetching Limit+1 rows for cursor detection. A query
@@ -428,11 +464,7 @@ func substringUnion(f ContentSearchFilter, candidates substringCandidateFilters)
 	// the Limit+1 returned rows ship a full body.
 	snippetExpr := func(col string) string { return col }
 
-	sysPred := "1=1"
-	if f.ExcludeSystem {
-		sysPred = "m.is_system = 0 AND " +
-			SystemPrefixSQL("m.content", "m.role")
-	}
+	sysPred := contentSystemPredicate(f)
 	if hasSource(f, "messages") {
 		branches = append(branches, fmt.Sprintf(`
 			SELECT m.session_id, s.project, s.agent,
@@ -446,7 +478,7 @@ func substringUnion(f ContentSearchFilter, candidates substringCandidateFilters)
 			JOIN sessions s ON s.id = m.session_id
 			WHERE %s LIKE ? ESCAPE '\'%s AND %s AND m.%s`,
 			snippetExpr("COALESCE(m.dialogue_text, m.content)"), "COALESCE(m.dialogue_text, m.content)",
-			candidates.message.sql, sysPred, scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
+			candidates.message.sql, lexicalMessagePredicate(f), scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
 		args = append(args, like)
 		args = append(args, candidates.message.args...)
 		args = append(args, scopeArgs...)
@@ -817,11 +849,7 @@ func (db *DB) regexCandidateRows(
 		return col + " LIKE ? ESCAPE '\\'"
 	}
 
-	sysPred := "1=1"
-	if f.ExcludeSystem {
-		sysPred = "m.is_system = 0 AND " +
-			SystemPrefixSQL("m.content", "m.role")
-	}
+	sysPred := contentSystemPredicate(f)
 	if hasSource(f, "messages") {
 		w := prefilterClause("COALESCE(m.dialogue_text, m.content)") + candidates.message.sql
 		args = append(args, candidates.message.args...)
@@ -838,7 +866,7 @@ func (db *DB) regexCandidateRows(
 			FROM messages m
 			JOIN sessions s ON s.id = m.session_id
 			WHERE %s AND %s AND m.%s`,
-			"COALESCE(m.dialogue_text, m.content)", w, sysPred, scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
+			"COALESCE(m.dialogue_text, m.content)", w, lexicalMessagePredicate(f), scope+" AND "+LexicalAnchorScopeSQL(f, "s", "m", SQLiteQueryDialect())))
 		args = append(args, scopeArgs...)
 	}
 	if hasSource(f, "thinking") {
@@ -1088,10 +1116,7 @@ func (db *DB) searchContentFTS(
 		return ContentSearchPage{}, err
 	}
 	scope, scopeArgs := sessionScopeSubquery(f)
-	sysPred := "1=1"
-	if f.ExcludeSystem {
-		sysPred = "m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role")
-	}
+	msgPred := lexicalMessagePredicate(f)
 	// A row can match OR and NOT queries without every operand, so ask SQLite
 	// which operands this row matched. Snippets then follow a branch the row
 	// actually satisfied. Unquoted input never carries these operators. Syntax
@@ -1115,7 +1140,7 @@ func (db *DB) searchContentFTS(
 		JOIN sessions s ON s.id = m.session_id
 		WHERE messages_fts.content MATCH ? AND %s AND m.%s
 		ORDER BY rank ASC, m.ordinal ASC, m.id ASC
-		LIMIT ? OFFSET ?`, termHits, sysPred, scope)
+		LIMIT ? OFFSET ?`, termHits, msgPred, scope)
 	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
 	args = append(args, ftsQuery.match)
 	args = append(args, scopeArgs...)
@@ -1322,32 +1347,32 @@ func classifyFTSError(err error) error {
 // than will ultimately be returned.
 const SemanticOverfetchMin = 200
 
-// maxActivityExpansionCandidates caps the candidate count when an activity
-// cutoff or ContentSearchFilter.Candidates makes SelectSurvivingVectorHits
-// double its fetch. Starting from
+// maxVectorExpansionCandidates caps the candidate count when filtering
+// makes SelectSurvivingVectorHits double its fetch. Starting from
 // SemanticOverfetchMin, the cap allows at most six fetches. It equals
 // sqlite-vec's KNN ceiling, and it also bounds the KNN and hydration work
 // that PostgreSQL and ClickHouse would otherwise do for large limits.
-const maxActivityExpansionCandidates = 4096
+const maxVectorExpansionCandidates = 4096
 
 // SelectSurvivingVectorHits returns the ranked vector hits that pass the
-// filter's session scope. When an activity cutoff rejects hits and leaves
-// fewer than f.Limit units, it fetches again with twice the candidates, until
-// the engine is exhausted or the candidate cap is reached. When
-// f.Candidates is set it expands the same way whenever fewer than f.Limit
-// units survive, and records whether the engine was exhausted. allowedSessions
-// returns an entry for each otherwise eligible session; false marks a
-// session that the activity cutoff rejects.
+// filter's session scope and, for dialogue search, anchor eligibility.
+// When activity or anchor filtering leaves fewer than f.Limit units, it
+// doubles the fetch until the engine is exhausted or the candidate cap is
+// reached. When f.Candidates is set it expands the same way whenever fewer
+// than f.Limit units survive, and records whether the engine was exhausted.
+// allowedSessions returns an entry for each otherwise eligible session;
+// false marks a session that the activity cutoff rejects.
 func SelectSurvivingVectorHits(
 	ctx context.Context, f ContentSearchFilter, searcher VectorSearcher, k int,
 	allowedSessions func(context.Context, ContentSearchFilter, []string) (map[string]bool, error),
+	dialogueAnchors func(context.Context, ContentSearchFilter, []VectorHit) (map[MessageRef]bool, error),
 ) ([]VectorHit, error) {
 	search, ceiling, err := searcher.PrepareSemanticSearch(ctx, f.Pattern)
 	if err != nil {
 		return nil, err
 	}
-	if ceiling <= 0 || ceiling > maxActivityExpansionCandidates {
-		ceiling = maxActivityExpansionCandidates
+	if ceiling <= 0 || ceiling > maxVectorExpansionCandidates {
+		ceiling = maxVectorExpansionCandidates
 	}
 	k = clampRecallVectorCandidates(k, ceiling)
 	for {
@@ -1359,7 +1384,14 @@ func SelectSurvivingVectorHits(
 		if err != nil {
 			return nil, err
 		}
-		surviving, units, activityRejected := filterVectorHits(hits, allowed, f.Scope)
+		var anchors map[MessageRef]bool
+		if f.DialogueOnly {
+			anchors, err = dialogueAnchors(ctx, f, hits)
+			if err != nil {
+				return nil, err
+			}
+		}
+		surviving, units, rejected := filterVectorHits(hits, allowed, f.Scope, anchors)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -1367,7 +1399,7 @@ func SelectSurvivingVectorHits(
 			f.Candidates.Exhausted = exhausted
 		}
 		next := clampRecallVectorCandidates(k*2, ceiling)
-		expand := activityRejected || f.Candidates != nil
+		expand := rejected || f.Candidates != nil
 		if !expand || units >= f.Limit || exhausted || next <= k {
 			return surviving, nil
 		}
@@ -1375,28 +1407,91 @@ func SelectSurvivingVectorHits(
 	}
 }
 
-// filterVectorHits keeps hits from allowed sessions inside scope. It reports
-// the number of distinct surviving units and whether the activity cutoff
-// rejected any otherwise eligible hit.
+// filterVectorHits keeps hits from allowed sessions inside scope. A non-nil
+// anchor set restricts the hits to dialogue-eligible messages.
 func filterVectorHits(
-	hits []VectorHit, allowed map[string]bool, scope string,
+	hits []VectorHit, allowed map[string]bool, scope string, anchors map[MessageRef]bool,
 ) ([]VectorHit, int, bool) {
 	surviving := make([]VectorHit, 0, len(hits))
 	units := make(map[string]struct{})
-	activityRejected := false
+	rejected := false
 	for _, h := range hits {
 		activityAllowed, eligible := allowed[h.SessionID]
 		if !eligible || ScopeExcludes(scope, h.Subordinate) {
 			continue
 		}
-		if !activityAllowed {
-			activityRejected = true
+		if !activityAllowed || anchors != nil && !anchors[MessageRef{SessionID: h.SessionID, Ordinal: h.Ordinal}] {
+			rejected = true
 			continue
 		}
 		surviving = append(surviving, h)
 		units[UnitFusionKey(h.SessionID, h.OrdinalStart)] = struct{}{}
 	}
-	return surviving, len(units), activityRejected
+	return surviving, len(units), rejected
+}
+
+func dialogueAnchorSystemSQL(dialect QueryDialect) (string, string) {
+	switch dialect.name {
+	case "postgres":
+		return " AND m.is_system = FALSE AND " + PostgresSystemPrefixSQL("m.content", "m.role"), ""
+	case "clickhouse":
+		return " AND m.is_system = false AND " + ClickHouseSystemPrefixSQL("m.content", "m.role"),
+			" SETTINGS short_circuit_function_evaluation = 'force_enable'"
+	case "duckdb":
+		return " AND m.is_system = FALSE AND m.is_system_prefixed = FALSE", ""
+	default:
+		return " AND m.is_system = 0 AND " + SystemPrefixSQL("m.content", "m.role"), ""
+	}
+}
+
+// DialogueVectorAnchors looks up the ranked anchors in bounded batches, without
+// reading message bodies. The vector index may contain non-dialogue or stale rows.
+func DialogueVectorAnchors(
+	dialect QueryDialect,
+	query func(context.Context, string, ...any) (*sql.Rows, error),
+) func(context.Context, ContentSearchFilter, []VectorHit) (map[MessageRef]bool, error) {
+	return func(ctx context.Context, f ContentSearchFilter, hits []VectorHit) (map[MessageRef]bool, error) {
+		refs := make([]MessageRef, 0, len(hits))
+		seen := make(map[MessageRef]bool, len(hits))
+		for _, h := range hits {
+			ref := MessageRef{SessionID: h.SessionID, Ordinal: h.Ordinal}
+			if !seen[ref] {
+				seen[ref] = true
+				refs = append(refs, ref)
+			}
+		}
+		allowed := make(map[MessageRef]bool, len(refs))
+		dialoguePred := f.DialogueSearchSQL(dialect)
+		sysPred, suffix := dialogueAnchorSystemSQL(dialect)
+		for chunk := range slices.Chunk(refs, 400) {
+			b := NewQueryBuilder(dialect, 0)
+			tuples := make([]string, 0, len(chunk))
+			for _, ref := range chunk {
+				tuples = append(tuples, "("+b.Add(ref.SessionID)+", "+b.Add(ref.Ordinal)+")")
+			}
+			rows, err := query(ctx, "SELECT m.session_id, m.ordinal FROM messages m WHERE (m.session_id, m.ordinal) IN ("+
+				strings.Join(tuples, ", ")+")"+dialoguePred+sysPred+suffix, b.Args()...)
+			if err != nil {
+				return nil, fmt.Errorf("look up dialogue vector anchors: %w", err)
+			}
+			if err := scanDialogueVectorAnchors(rows, allowed); err != nil {
+				return nil, fmt.Errorf("read dialogue vector anchors: %w", err)
+			}
+		}
+		return allowed, nil
+	}
+}
+
+func scanDialogueVectorAnchors(rows *sql.Rows, allowed map[MessageRef]bool) error {
+	defer rows.Close()
+	for rows.Next() {
+		var ref MessageRef
+		if err := rows.Scan(&ref.SessionID, &ref.Ordinal); err != nil {
+			return err
+		}
+		allowed[ref] = true
+	}
+	return rows.Err()
 }
 
 // validateSemanticSources returns a SearchInputError unless f.Sources is
@@ -1505,7 +1600,8 @@ func (db *DB) searchContentSemantic(
 	}
 
 	k := max(f.Limit*4, SemanticOverfetchMin)
-	surviving, err := SelectSurvivingVectorHits(ctx, f, searcher, k, db.semanticAllowedSessionIDs)
+	surviving, err := SelectSurvivingVectorHits(ctx, f, searcher, k, db.semanticAllowedSessionIDs,
+		DialogueVectorAnchors(SQLiteQueryDialect(), db.getReader().QueryContext))
 	if err != nil {
 		return ContentSearchPage{}, err
 	}
@@ -1731,7 +1827,8 @@ func (db *DB) hybridVectorLeg(
 	ctx context.Context, f ContentSearchFilter, searcher VectorSearcher, k int,
 ) (hybridLeg, error) {
 	leg := hybridLeg{display: make(map[string]hybridDisplay)}
-	hits, err := SelectSurvivingVectorHits(ctx, f, searcher, k, db.semanticAllowedSessionIDs)
+	hits, err := SelectSurvivingVectorHits(ctx, f, searcher, k, db.semanticAllowedSessionIDs,
+		DialogueVectorAnchors(SQLiteQueryDialect(), db.getReader().QueryContext))
 	if err != nil {
 		return hybridLeg{}, err
 	}
@@ -1823,7 +1920,7 @@ func (db *DB) hybridWordHits(
 	defer func() { _ = snapshot.Close() }()
 	scope, args := semanticSessionScopeSubquery(f)
 	where := "m.role IN ('user','assistant') AND m.is_system = 0 AND " +
-		SystemPrefixSQL("m.content", "m.role") + " AND m." + scope
+		SystemPrefixSQL("m.content", "m.role") + " AND m." + scope + f.DialogueSearchSQL(SQLiteQueryDialect())
 	// Keep the fragment unredacted until enrichment locates it in the full
 	// message. The final snippet is redacted against that full message.
 	f.RevealSecrets = true
@@ -1856,9 +1953,9 @@ func (db *DB) fetchHybridFTSBatch(
 		FROM messages_fts f JOIN messages m ON m.id = f.rowid
 		WHERE f.content MATCH ? AND m.role IN ('user','assistant')
 		  AND m.is_system = 0 AND %s
-		  AND m.%s
+		  AND m.%s%s
 		ORDER BY f.rank, m.id LIMIT ? OFFSET ?`,
-		SystemPrefixSQL("m.content", "m.role"), scope)
+		SystemPrefixSQL("m.content", "m.role"), scope, f.DialogueSearchSQL(SQLiteQueryDialect()))
 	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
 
 	args := []any{ftsQuery.match}

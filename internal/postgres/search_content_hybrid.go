@@ -171,12 +171,12 @@ func (s *Store) fetchHybridKeywordBatchPG(
 		JOIN sessions s ON s.id = m.session_id
 		WHERE %s
 		  AND m.role IN ('user', 'assistant') AND m.is_system = FALSE
-		  AND %s
+		  AND %s%s
 		  AND m.session_id IN (SELECT id FROM sessions WHERE %s)
 		ORDER BY COALESCE(s.ended_at, s.started_at, s.created_at) DESC NULLS LAST,
 		         m.session_id ASC, m.ordinal ASC
 		LIMIT %s OFFSET %s`,
-		contentPred, db.PostgresSystemPrefixSQL("m.content", "m.role"),
+		contentPred, db.PostgresSystemPrefixSQL("m.content", "m.role"), f.DialogueSearchSQL(db.PostgresQueryDialect()),
 		scopeWhere, limitP, offsetP)
 
 	rows, err := s.pg.QueryContext(ctx, query, pb.args...)

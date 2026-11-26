@@ -12,7 +12,8 @@ const MessageColumns = `id, session_id, ordinal, role, content, thinking_text,
 	provider_id,
 	has_context_tokens, has_output_tokens, claude_message_id,
 	claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
-	source_parent_uuid, is_sidechain, is_compact_boundary`
+	source_parent_uuid, is_sidechain, is_compact_boundary,
+	CASE WHEN dialogue_is_content THEN content ELSE dialogue_text END AS selected_dialogue`
 
 // SessionQueries builds SQL shared by mirror backends.
 type SessionQueries struct{}
