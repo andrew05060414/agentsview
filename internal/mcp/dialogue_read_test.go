@@ -663,6 +663,7 @@ func TestGetMessages_AroundDenseToolRowsUsesAvailableBudget(t *testing.T) {
 		assert.Equal(t, 998, out.Messages[len(out.Messages)-1].Ordinal)
 		assert.Equal(t, 250, out.Filtered)
 		assert.Zero(t, out.Uncertain)
+		assert.False(t, out.WindowTruncated)
 	})
 
 	t.Run("two sided reclaims unused budget from sparse side", func(t *testing.T) {
@@ -691,6 +692,93 @@ func TestGetMessages_AroundDenseToolRowsUsesAvailableBudget(t *testing.T) {
 		assert.Equal(t, 950, out.Messages[len(out.Messages)-1].Ordinal)
 		assert.Equal(t, 250, out.Filtered)
 		assert.Zero(t, out.Uncertain)
+		assert.False(t, out.WindowTruncated)
+	})
+
+	t.Run("expands multiple steps and reports budget truncation vs session boundary", func(t *testing.T) {
+		ts, d := newTestToolset(t)
+		const total = 1200
+		msgs := make([]db.Message, total)
+		for i := range total {
+			if i%5 == 0 || i == total-1 {
+				msgs[i] = dialogueUserMsg("dense-budget", i, fmt.Sprintf("user %d", i))
+			} else {
+				msgs[i] = toolRow("dense-budget", i, fmt.Sprintf("[Bash]\n$ cmd %d", i), fmt.Sprintf(`{"command":"cmd %d"}`, i))
+			}
+		}
+		dbtest.SeedSessionWithMessages(t, d, "dense-budget", "proj", msgs, dbtest.WithMessageCounts(total, 240))
+
+		// 1199 raw rows before anchor, 999 budget holds 200 visible (ordinals 200..1195 step 5) + anchor 1199.
+		anchor, before, after := total-1, 250, 0
+		_, truncated, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+			SessionID: "dense-budget", Around: &anchor, Before: &before, After: &after,
+		})
+		require.NoError(t, err)
+		assert.True(t, truncated.WindowTruncated)
+		require.Len(t, truncated.Messages, 201)
+		assert.Equal(t, 200, truncated.Messages[0].Ordinal)
+		assert.Equal(t, total-1, truncated.Messages[len(truncated.Messages)-1].Ordinal)
+		assert.Equal(t, 799, truncated.Filtered)
+
+		// Smaller session with fewer than budget rows hits session start, not budget.
+		const shortTotal = 600
+		shortMsgs := make([]db.Message, shortTotal)
+		for i := range shortTotal {
+			if i%5 == 0 || i == shortTotal-1 {
+				shortMsgs[i] = dialogueUserMsg("dense-short", i, fmt.Sprintf("user %d", i))
+			} else {
+				shortMsgs[i] = toolRow("dense-short", i, fmt.Sprintf("[Bash]\n$ cmd %d", i), fmt.Sprintf(`{"command":"cmd %d"}`, i))
+			}
+		}
+		dbtest.SeedSessionWithMessages(t, d, "dense-short", "proj", shortMsgs, dbtest.WithMessageCounts(shortTotal, 120))
+		shortAnchor := shortTotal - 1
+		_, boundary, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+			SessionID: "dense-short", Around: &shortAnchor, Before: &before, After: &after,
+		})
+		require.NoError(t, err)
+		assert.False(t, boundary.WindowTruncated)
+		require.Len(t, boundary.Messages, 121)
+		assert.Equal(t, 0, boundary.Messages[0].Ordinal)
+	})
+
+	t.Run("exhausted opposite side does not trigger false truncation", func(t *testing.T) {
+		ts, d := newTestToolset(t)
+		const total = 1100
+		msgs := make([]db.Message, total)
+		for i := range total {
+			msgs[i] = dialogueUserMsg("dense-end", i, fmt.Sprintf("user %d", i))
+		}
+		dbtest.SeedSessionWithMessages(t, d, "dense-end", "proj", msgs, dbtest.WithMessageCounts(total, total))
+
+		// Anchor at 999 leaves 100 rows after (short of 600, hitting session end)
+		// and 999 rows before (satisfying before=600 after reclaiming after's budget).
+		anchor, before, after := 999, 600, 600
+		_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+			SessionID: "dense-end", Around: &anchor, Before: &before, After: &after,
+		})
+		require.NoError(t, err)
+		assert.False(t, out.WindowTruncated)
+		require.Len(t, out.Messages, 701)
+		assert.Equal(t, 399, out.Messages[0].Ordinal)
+		assert.Equal(t, 1099, out.Messages[len(out.Messages)-1].Ordinal)
+	})
+
+	t.Run("raw oversized around reports truncation", func(t *testing.T) {
+		ts, d := newTestToolset(t)
+		const total = db.MaxMessageLimit + 20
+		msgs := make([]db.Message, total)
+		for i := range total {
+			msgs[i] = dialogueUserMsg("raw-trunc", i, fmt.Sprintf("user %d", i))
+		}
+		dbtest.SeedSessionWithMessages(t, d, "raw-trunc", "proj", msgs, dbtest.WithMessageCounts(total, total))
+
+		anchor, before, after := total-1, db.MaxMessageLimit+10, 0
+		_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+			SessionID: "raw-trunc", Around: &anchor, Before: &before, After: &after, Raw: true,
+		})
+		require.NoError(t, err)
+		assert.True(t, out.WindowTruncated)
+		require.Len(t, out.Messages, db.MaxMessageLimit)
 	})
 }
 

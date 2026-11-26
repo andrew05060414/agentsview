@@ -511,6 +511,9 @@ type getMessagesOut struct {
 	Messages  []messageOut `json:"messages"`
 	Filtered  int          `json:"filtered,omitempty" jsonschema:"How many of this page's scanned messages were excluded, by the role/system filter or, unless raw is set, because they carry no dialogue (omitted when zero). Summed across a full pagination sweep, filtered plus the returned messages adds up to the session's message_count."`
 	Uncertain int          `json:"uncertain,omitempty" jsonschema:"How many scanned messages were withheld because their dialogue projection is unclassified (a coverage gap). Included in filtered."`
+	// WindowTruncated reports when an around read exhausted the per-call raw
+	// message budget before collecting the requested before/after count.
+	WindowTruncated bool `json:"window_truncated,omitempty" jsonschema:"True when an around window stopped short of the requested before or after count because the raw read budget was exhausted before reaching the session boundary. Callers can continue earlier with from/direction=desc or later with next_from."`
 	// NextFrom is set off the last scanned ordinal (not the last visible
 	// one), so paging stays reliable even though filtering can make a page
 	// return fewer than the limit.
@@ -689,6 +692,36 @@ func (t *toolset) getMessagesAround(
 	return t.getMessagesAroundDialogue(ctx, in)
 }
 
+func resolveAroundBounds(in getMessagesIn) (int, int) {
+	before := defaultAroundSpan
+	if in.Before != nil {
+		before = max(*in.Before, 0)
+	}
+	after := defaultAroundSpan
+	if in.After != nil {
+		after = max(*in.After, 0)
+	}
+	return before, after
+}
+
+func waterFill(a, b, total int) (int, int) {
+	a = max(a, 0)
+	b = max(b, 0)
+	total = max(total, 0)
+	if a <= total && b <= total-a {
+		return a, b
+	}
+	half := total / 2
+	switch {
+	case a <= half:
+		return a, min(b, total-a)
+	case b <= half:
+		return min(a, total-b), b
+	default:
+		return half, total - half
+	}
+}
+
 // getMessagesAroundRaw is the role-counted window used when the caller asked
 // for the stored records or named roles explicitly.
 func (t *toolset) getMessagesAroundRaw(
@@ -710,103 +743,156 @@ func (t *toolset) getMessagesAroundRaw(
 	if err != nil {
 		return nil, getMessagesOut{}, err
 	}
-	return nil, t.shapeAround(res, in, roles, true), nil
+	reqBefore, reqAfter := resolveAroundBounds(in)
+	clampedBefore, clampedAfter := waterFill(reqBefore, reqAfter, db.MaxMessageLimit-1)
+	scan := t.scanAround(res, in, roles, true)
+	if (reqBefore > clampedBefore && scan.rawBefore >= clampedBefore) ||
+		(reqAfter > clampedAfter && scan.rawAfter >= clampedAfter) {
+		scan.out.WindowTruncated = true
+	}
+	return nil, scan.out, nil
 }
 
 func dialogueAroundFetchSpan(before, after int) (int, int) {
 	reqBefore := max(before, 0)
 	reqAfter := max(after, 0)
-	const budget = db.MaxMessageLimit - 1
-	if reqBefore >= budget || reqAfter >= budget || reqBefore > budget-reqAfter {
-		return reqBefore, reqAfter
-	}
 	if reqBefore == 0 && reqAfter == 0 {
 		return dialogueAroundFetchCap, dialogueAroundFetchCap
 	}
-	spare := budget - reqBefore - reqAfter
-	extraBefore, extraAfter := 0, 0
-	if reqBefore > 0 && reqBefore < dialogueAroundFetchCap {
-		extraBefore = dialogueAroundFetchCap - reqBefore
+	const budget = db.MaxMessageLimit - 1
+	baseBefore, baseAfter := waterFill(reqBefore, reqAfter, budget)
+	spare := budget - baseBefore - baseAfter
+	if spare == 0 {
+		return baseBefore, baseAfter
 	}
-	if reqAfter > 0 && reqAfter < dialogueAroundFetchCap {
-		extraAfter = dialogueAroundFetchCap - reqAfter
+	wantExtraBefore, wantExtraAfter := 0, 0
+	if reqBefore > 0 {
+		wantExtraBefore = max(reqBefore, dialogueAroundFetchCap-reqBefore)
 	}
-	if extraBefore+extraAfter > spare {
-		half := spare / 2
-		switch {
-		case extraBefore <= half:
-			extraAfter = spare - extraBefore
-		case extraAfter <= half:
-			extraBefore = spare - extraAfter
-		default:
-			extraBefore = half
-			extraAfter = spare - half
-		}
+	if reqAfter > 0 {
+		wantExtraAfter = max(reqAfter, dialogueAroundFetchCap-reqAfter)
 	}
-	return reqBefore + extraBefore, reqAfter + extraAfter
+	extraBefore, extraAfter := waterFill(wantExtraBefore, wantExtraAfter, spare)
+	return baseBefore + extraBefore, baseAfter + extraAfter
 }
 
-// getMessagesAroundDialogue counts before/after over dialogue rows. It reads
-// a raw window large enough to hold the requested visible messages plus the
-// tool-only rows between them, then filters.
+func nextDialogueAroundSpan(
+	fetchBefore, fetchAfter int,
+	needBefore, needAfter bool,
+	usedBefore, usedAfter int,
+	budget int,
+) (int, int, bool) {
+	minBefore := fetchBefore
+	if !needBefore {
+		minBefore = usedBefore
+	}
+	minAfter := fetchAfter
+	if !needAfter {
+		minAfter = usedAfter
+	}
+	spare := budget - minBefore - minAfter
+	if spare <= 0 {
+		return fetchBefore, fetchAfter, false
+	}
+	switch {
+	case needBefore && !needAfter:
+		nextBefore := minBefore + min(max(fetchBefore, 1), spare)
+		return nextBefore, minAfter, nextBefore > fetchBefore
+	case !needBefore && needAfter:
+		nextAfter := minAfter + min(max(fetchAfter, 1), spare)
+		return minBefore, nextAfter, nextAfter > fetchAfter
+	default:
+		addBefore, addAfter := waterFill(max(fetchBefore, 1), max(fetchAfter, 1), spare)
+		return minBefore + addBefore, minAfter + addAfter, addBefore > 0 || addAfter > 0
+	}
+}
+
+// getMessagesAroundDialogue counts before/after over dialogue rows. It expands
+// the raw window within db.MaxMessageLimit-1 until both sides meet their
+// requested visible counts, hit the session boundary, or exhaust the raw read
+// budget (reporting window_truncated when exhausted).
 func (t *toolset) getMessagesAroundDialogue(
 	ctx context.Context, in getMessagesIn,
 ) (*mcp.CallToolResult, getMessagesOut, error) {
-	before := defaultAroundSpan
-	if in.Before != nil {
-		before = *in.Before
-	}
-	after := defaultAroundSpan
-	if in.After != nil {
-		after = *in.After
-	}
-	fetchBefore, fetchAfter := dialogueAroundFetchSpan(before, after)
-	// The store counts the window by role, so tool-role rows never enter it
-	// and never reach Filtered. Dialogue filtering then runs inside that
-	// window and refills a side from the extra rows fetched here when a
-	// tool-only assistant row would otherwise have consumed a slot.
+	reqBefore, reqAfter := resolveAroundBounds(in)
 	roles := in.Roles
 	if len(roles) == 0 {
 		roles = []string{"user", "assistant"}
 	}
-	res, err := t.svc.Messages(ctx, in.SessionID, service.MessageFilter{
-		From:             in.From,
-		Direction:        in.Direction,
-		Around:           in.Around,
-		Before:           &fetchBefore,
-		After:            &fetchAfter,
-		Roles:            roles,
-		ExpectedRevision: in.ExpectedRevision,
-	})
-	if err != nil {
-		return nil, getMessagesOut{}, err
+	const budget = db.MaxMessageLimit - 1
+	fetchBefore, fetchAfter := dialogueAroundFetchSpan(reqBefore, reqAfter)
+	pinnedRevision := in.ExpectedRevision
+	beforeExhausted, afterExhausted := false, false
+	restarts := 0
+	for {
+		// The store counts the window by role, so tool-role rows never enter it
+		// and never reach Filtered. Dialogue filtering then runs inside that
+		// window, and any unsatisfied side expands into remaining budget (or
+		// reclaims unused rows from the opposite side) before returning.
+		res, err := t.svc.Messages(ctx, in.SessionID, service.MessageFilter{
+			From:             in.From,
+			Direction:        in.Direction,
+			Around:           in.Around,
+			Before:           &fetchBefore,
+			After:            &fetchAfter,
+			Roles:            roles,
+			ExpectedRevision: pinnedRevision,
+		})
+		if err != nil {
+			if errors.Is(err, service.ErrSourceChanged) && in.ExpectedRevision == "" && restarts < 2 {
+				restarts++
+				pinnedRevision = ""
+				beforeExhausted, afterExhausted = false, false
+				fetchBefore, fetchAfter = dialogueAroundFetchSpan(reqBefore, reqAfter)
+				continue
+			}
+			return nil, getMessagesOut{}, err
+		}
+		scan := t.scanAround(res, in, roles, false)
+		if scan.rawBefore < fetchBefore {
+			beforeExhausted = true
+		}
+		if scan.rawAfter < fetchAfter {
+			afterExhausted = true
+		}
+		needBefore := reqBefore > 0 && !beforeExhausted && scan.seenBefore < reqBefore
+		needAfter := reqAfter > 0 && !afterExhausted && scan.seenAfter < reqAfter
+		if !needBefore && !needAfter {
+			return nil, scan.out, nil
+		}
+		nextBefore, nextAfter, expanded := nextDialogueAroundSpan(
+			fetchBefore, fetchAfter, needBefore, needAfter, scan.usedBefore, scan.usedAfter, budget,
+		)
+		if !expanded {
+			scan.out.WindowTruncated = true
+			return nil, scan.out, nil
+		}
+		fetchBefore, fetchAfter = nextBefore, nextAfter
+		if pinnedRevision == "" && res.TranscriptRevision != "" {
+			pinnedRevision = res.TranscriptRevision
+		}
 	}
-	return nil, t.shapeAround(res, in, roles, false), nil
 }
 
-// shapeAround applies the visibility filter to a fetched window and counts
-// before/after over the surviving messages. When dialogue is false the whole
-// fetched window is scanned (the caller already bounded it); when dialogue is
-// true, scanning stops once the requested number of visible messages is
-// reached on each side, and rows past that point are neither returned nor
-// counted. next_from anchors on the last scanned raw ordinal.
-func (t *toolset) shapeAround(
+type aroundWindowScan struct {
+	out        getMessagesOut
+	rawBefore  int
+	rawAfter   int
+	usedBefore int
+	usedAfter  int
+	seenBefore int
+	seenAfter  int
+}
+
+// scanAround applies the visibility filter to a fetched window and counts
+// before/after over the surviving messages. Scanning stops once the requested
+// number of visible messages is reached on each side, and rows past that point
+// are neither returned nor counted. next_from anchors on the last scanned raw
+// ordinal.
+func (t *toolset) scanAround(
 	res *service.MessageList, in getMessagesIn, roles []string, raw bool,
-) getMessagesOut {
-	before := defaultAroundSpan
-	if in.Before != nil {
-		before = *in.Before
-	}
-	after := defaultAroundSpan
-	if in.After != nil {
-		after = *in.After
-	}
-	if before < 0 {
-		before = 0
-	}
-	if after < 0 {
-		after = 0
-	}
+) aroundWindowScan {
+	before, after := resolveAroundBounds(in)
 	maxChars := clampLimit(
 		in.MaxCharsPerMessage, defaultMaxCharsPerMessage, maxMaxCharsPerMessage)
 	anchor := 0
@@ -841,25 +927,25 @@ func (t *toolset) shapeAround(
 	// were only scanned to find that message, so they are not part of the page
 	// and not counted in Filtered.
 	beforeFrom := beforeEnd
-	seen := 0
+	seenBefore := 0
 	for i := beforeEnd - 1; before > 0 && i >= 0; i-- {
 		if kept[i] {
-			seen++
+			seenBefore++
 		}
 		beforeFrom = i
-		if seen == before {
+		if seenBefore == before {
 			break
 		}
 	}
 	// afterTo is one past the last row of the page, found the same way.
 	afterTo := afterStart
-	seen = 0
+	seenAfter := 0
 	for i := afterStart; after > 0 && i < len(res.Messages); i++ {
 		afterTo = i + 1
 		if kept[i] {
-			seen++
+			seenAfter++
 		}
-		if seen == after {
+		if seenAfter == after {
 			break
 		}
 	}
@@ -882,7 +968,15 @@ func (t *toolset) shapeAround(
 		out.NextFrom = &next
 	}
 	attachBodyCursors(&out, res.EvidenceSource, in.SessionID, in.Roles, raw)
-	return out
+	return aroundWindowScan{
+		out:        out,
+		rawBefore:  beforeEnd,
+		rawAfter:   len(res.Messages) - afterStart,
+		usedBefore: beforeEnd - beforeFrom,
+		usedAfter:  afterTo - afterStart,
+		seenBefore: seenBefore,
+		seenAfter:  seenAfter,
+	}
 }
 
 func attachBodyCursors(
