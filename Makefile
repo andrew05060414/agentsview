@@ -353,11 +353,26 @@ desktop-app: desktop-macos-app
 GO_TEST_P ?= 4
 GO_TEST_P_FLAG := $(if $(GO_TEST_P),-p $(GO_TEST_P),)
 
+.PHONY: test-frontend
+test-frontend:
+	cd frontend && npm test -- $(TEST_ARGS)
+
 # Run the cacheable unit/integration suite. The external-service lanes below
 # intentionally retain `-count=1` because they require fresh state.
 test: pricing-snapshot ensure-embed-dir
 	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -skip '^TestActiveAppendGrowth$$' -v
 	go test -tags "fts5" ./cmd/perfsim -run '^TestActiveAppendGrowth$$' -v
+
+# Keep this focused target separate: `make test` also runs perfsim's
+# unrelated TestActiveAppendGrowth case.
+.PHONY: test-scoped-upgrade-startup
+test-scoped-upgrade-startup: pricing-snapshot ensure-embed-dir
+	go test $(GO_TEST_P_FLAG) -tags "fts5" ./internal/db ./internal/server ./cmd/agentsview -run '^(TestArchiveResyncState|TestScopedUpgradePending|TestScopedUpgradeWaitsForAuthoritativeFullPass|TestScopedUpgradePendingAllowsReadCatchup|TestScopedUpgradeDiagnosticRejectsWriterHandoff|TestScopedUpgradeSessionSyncRejectsWriterHandoff|TestScopedUpgradeFreshnessStatusAndHeader|TestScopedUpgradeQueryErrorKeepsFreshnessWarning|TestLocalDailyUsageWarnsForScopedUpgrade|TestLocalSessionUsageRefreshesSubagentTranscripts|TestLocalSessionUsageStaleArchiveReturnsStoredUsage|TestServeLegacyImageTextAfterRestart|TestServeRestartServesSessionsBeforeStartupSync|TestServeSkipInitialSyncStillReparsesStaleArchive|TestSessionUsageResolvesMissingIDsBySyncStatus|TestSessionUsageWaitPendingFallback)$$' -count=1
+
+.PHONY: test-scoped-upgrade-frontend
+test-scoped-upgrade-frontend:
+	cd frontend && npm run check
+	cd frontend && npm run test -- src/lib/components/layout/StatusBar.test.ts src/lib/stores/sync.test.ts
 
 .PHONY: test-cursor-account-reporting
 test-cursor-account-reporting: pricing-snapshot ensure-embed-dir

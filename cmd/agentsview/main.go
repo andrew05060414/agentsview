@@ -246,11 +246,11 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	workerAfterListen := false
 	firstImport := false
 	if !cfg.NoSync || archiveOnly {
-		needsResync, fullRebuild, err := db.ArchiveResyncState(ctx, cfg.DBPath)
+		needsResync, fullRebuild, schemaRepair, err := db.ArchiveResyncState(ctx, cfg.DBPath)
 		if err != nil && skipInitialSync {
 			fatal("checking archive before startup: %v", err)
 		}
-		// Scoped upgrades and schema repairs finish before startup publishes readiness.
+		// Schema repairs and full rebuilds retain their existing startup order.
 		startupRebuild = err == nil && fullRebuild
 		if err == nil && !needsResync && !cfg.NoSync && !archiveOnly {
 			firstImport, err = isFirstImport(ctx, cfg)
@@ -264,7 +264,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		if skipInitialSync {
 			skipInitialSync = !needsResync
 		}
-		workerAfterListen = !skipInitialSync && !cfg.NoSync && !archiveOnly && err == nil && !needsResync
+		workerAfterListen = !skipInitialSync && !cfg.NoSync && !archiveOnly && err == nil && !schemaRepair && !fullRebuild
 	}
 	if !startupRebuild && !skipInitialSync && !cfg.NoSync && !testing.Testing() && !workerAfterListen {
 		startupProgress.SetPhase("opening database")
@@ -2432,7 +2432,18 @@ func (p *resyncProgressPrinter) Finish() {
 	p.finishCurrent()
 }
 
+// Fail ends the output for a resync that failed, so its last phase does not
+// read as completed.
+func (p *resyncProgressPrinter) Fail() {
+	p.finished = true
+	p.endCurrent("stopped after")
+}
+
 func (p *resyncProgressPrinter) finishCurrent() {
+	p.endCurrent("completed in")
+}
+
+func (p *resyncProgressPrinter) endCurrent(outcome string) {
 	if p.label == "" {
 		return
 	}
@@ -2440,7 +2451,7 @@ func (p *resyncProgressPrinter) finishCurrent() {
 		fmt.Fprint(p.w, "\n")
 	}
 	elapsed := p.now().Sub(p.started).Round(time.Millisecond)
-	fmt.Fprintf(p.w, "  %s completed in %s\n", p.label, elapsed)
+	fmt.Fprintf(p.w, "  %s %s %s\n", p.label, outcome, elapsed)
 	p.label = ""
 	p.started = time.Time{}
 	p.inPlace = false

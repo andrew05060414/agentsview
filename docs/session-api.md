@@ -115,10 +115,15 @@ After subscribing to changes, the HTTP `/api/v1/events` stream sends
 `events_ready` on every connection. If you want updates for specific sessions on
 the same stream, you can repeat the `session` query parameter. For each one, the
 stream sends `session_ready` and `session.timing`, or `session_missing` if the
-initial lookup finds that the session does not exist or cannot be resolved. When
-you reconnect, the stream sends the readiness events again. To receive the
-changed session and message records themselves with a cursor for resuming, use
-the [change stream](/docs/conversation-export/#follow-changes-live).
+initial lookup finds that the session does not exist or cannot be resolved. The
+nonempty `session_ready` and `session_updated` SSE IDs use `v1:` followed by an
+opaque hash that changes when the session state or a direct child changes. An
+empty ID means the state could not be read. A session that becomes unresolved
+also gets `session_missing` and is no longer watched until the client
+reconnects. When you reconnect, the stream sends the readiness events again. To
+receive the changed session and message records themselves with a cursor for
+resuming, use the
+[change stream](/docs/conversation-export/#follow-changes-live).
 
 The web UI and generated API clients fetch filter options from these shared
 metadata endpoints:
@@ -677,7 +682,15 @@ ______________________________________________________________________
 ### Pull request links
 
 Each session's `pr_links` field lists pull requests found in retained user
-prompts or structured transcript records:
+prompts, literal `gh pr` commands in shell tool calls, full PR URLs in
+child-agent prompts, or structured transcript records. Supported actions are
+`view`, `checkout` (including `co`), `edit`, `diff`, `checks`, `comment`,
+`review`, `ready`, `merge`, `close`, `reopen`, `update-branch`, `lock`,
+`unlock`, and `revert`. A command names its pull request by URL or number,
+with `-R` or `--repo` set to `owner/repo` or `host/owner/repo`.
+AgentsView recognizes supported command flags and literal commands wrapped by
+`command`, `env`, `timeout`, or a shell. A selector or repository from a
+variable or substitution is not indexed.
 
 ```json
 "pr_links": [
@@ -696,6 +709,12 @@ worked on it. Claude Code also includes `pr-link` entries in its transcripts.
 Because Claude Code records these links for the whole transcript, every session
 split from that transcript, such as a rewind's fork, carries them like its name
 and git branch.
+
+A number requires an explicit repository. `-R owner/repo` uses `github.com`,
+including on GitHub Enterprise installations. Use a full URL or `-R
+host/owner/repo` for another host. A command containing `GH_HOST` does not
+produce a hostless `-R` link. Transcript-only and usage-only archives do not
+retain tool inputs, so they cannot recover command or child-agent prompt links.
 
 To filter by pull request, use `session list --pr` or the `pr` query parameter.
 Pass `owner/repo` for any pull request in that repository, `owner/repo#123` for
@@ -957,6 +976,9 @@ Substring (the default) and regex modes also scan `tool_calls.input_json`,
 `--hybrid` require an embedding index and return a single ranked page (passing
 `--cursor` is rejected); see [Semantic Search](/docs/semantic-search/) for
 setup, scoring, and limitations.
+
+SQLite substring, regex, and terms searches, and hybrid multi-word keyword
+scans, stop after two minutes and release their reader connection.
 
 On SQLite, PostgreSQL, and ClickHouse, a default multi-word search that
 includes `messages` returns exact text matches first, then messages ordered by
@@ -1335,8 +1357,10 @@ subagent transcripts without waiting for startup ingestion, sending
 `POST /api/v1/sessions/sync`. If the refresh is refused or fails, the command
 returns archived totals with a warning and sets `refresh_incomplete: true` in
 JSON. While `GET /api/v1/sync/status` reports `startup_pending`,
-`archive_stale`, or `sync_pending`, a missing daemon ID returns a retry error;
-once all three are clear, it returns exit 2 without `--wait`.
+`archive_stale`, `upgrade_pending`, or `sync_pending`, a missing daemon ID
+returns a retry error; once all four are clear, it returns exit 2 without
+`--wait`. A scoped parser upgrade can keep saved usage readable while the status
+remains pending until a successful authoritative pass clears the marker.
 
 Pass `--wait` to give HTTP lookup, ingestion, and refresh a shared 30-second
 budget after daemon discovery. When startup is deferred, combined usage
@@ -1353,15 +1377,18 @@ still absent while work remains pending returns a retry error.
 Daemon API 15 adds `sync_pending`, which stays true while ingestion catches up
 after an idle period, so older local clients must upgrade to interpret it. The
 field and catch-up warning clear when the pass finishes or fails, and failures
-are logged. Archive responses include `X-Agentsview-Archive-Stale: true` when a
-catch-up of changes held back by the background sync interval or an idle pause
-does not finish within the read's wait. A read within two minutes of another
-archive read starts no catch-up; the watcher keeps syncing at `sync_interval`
-during that time, so the read can miss up to that interval of changes. If an
-earlier read's catch-up is still running, the read shares its remaining wait
-and is marked stale if that wait runs out. Otherwise, it answers at once and is
-not marked stale. A required parser rebuild sets the stale header
-independently.
+are logged. API 31 adds `upgrade_pending` for scoped parser freshness and
+`writes_paused` for an active writer handoff. An incomplete upgrade keeps the
+freshness warning after writes resume. `archive_stale` remains the full-rebuild
+signal. Archive-data API responses include `X-Agentsview-Archive-Stale: true`
+when a catch-up of changes held back by the background sync interval or an
+idle pause does not finish within the read's wait. A read within two minutes
+of another archive read starts no catch-up; the watcher keeps syncing at
+`sync_interval` during that time, so the read can miss up to that interval
+of changes. If an earlier read's catch-up is still running, the read shares
+its remaining wait and is marked stale if that wait runs out. Otherwise, it
+answers at once and is not marked stale. A required parser rebuild sets the
+stale header independently.
 
 With HTTP `--own-only`, the CLI reads usage from the archive and, if you pass
 `--wait`, can start deferred ingestion. HTTP `--no-sync` reads the archive and

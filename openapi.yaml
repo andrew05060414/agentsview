@@ -8740,9 +8740,17 @@ components:
         sync_pending:
           description: Local ingestion is catching up after an idle period
           type: boolean
+        upgrade_pending:
+          description: Some session results may be out of date after a scoped parser upgrade
+          type: boolean
+        writes_paused:
+          description: Archive changes are paused during a maintenance pass
+          type: boolean
       required:
         - sync_pending
         - archive_stale
+        - upgrade_pending
+        - writes_paused
         - startup_pending
         - last_sync
         - stats
@@ -19510,7 +19518,7 @@ paths:
         - RemoteSync
   /api/v1/resync:
     post:
-      description: Streams progress and done events. An error event preserves the error text and may include code sync_running when a sync is already running. Other errors omit code.
+      description: Streams progress and done events. An error event preserves the error text and may include code sync_running when a sync is already running, or archive_busy when another connection holds a read transaction on the archive. Other errors omit code.
       operationId: post-api-v1-resync
       responses:
         "200":
@@ -19960,6 +19968,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/ServiceContentSearchResult"
           description: OK
+          headers:
+            X-AgentsView-Content-Scan-Deadline:
+              schema:
+                type: string
         "400":
           content:
             application/json:
@@ -25470,7 +25482,7 @@ paths:
         - Metadata
   /api/v1/sync:
     post:
-      description: Streams progress and done events. An error event preserves the error text and may include code sync_running when a sync is already running. Other errors omit code.
+      description: Streams progress and done events. An error event preserves the error text and may include code sync_running when a sync is already running, or archive_busy when another connection holds a read transaction on the archive. Other errors omit code.
       operationId: post-api-v1-sync
       parameters:
         - description: Wait for an active sync or maintenance pass before starting this sync

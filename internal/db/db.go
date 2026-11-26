@@ -708,7 +708,8 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // canonical input_image blocks so image retention, offload, and image_text
 // indexing see them. Re-parse toolResultContentLength and raw tool-result array
 // providers in place; source and session identities are unchanged.)
-const dataVersion = 189
+// (190: include retained tool calls in pull request links.)
+const dataVersion = 190
 
 const archiveOnlyVersionBase = 1 << 20
 
@@ -1545,6 +1546,12 @@ func OpenFreshIsolatedContext(ctx context.Context, path string) (*DB, error) {
 	d.mu.Lock()
 	_, err = d.getWriter().ExecContext(ctx, "ALTER TABLE sessions ADD COLUMN tools_generation TEXT")
 	if err == nil {
+		_, err = d.getWriter().ExecContext(ctx, "ALTER TABLE sessions ADD COLUMN trends_generation TEXT")
+	}
+	if err == nil {
+		_, err = d.getWriter().ExecContext(ctx, trendsGenerationSchemaSQL)
+	}
+	if err == nil {
 		_, err = d.getWriter().ExecContext(ctx, usageGenerationSchemaSQL)
 	}
 	if err == nil {
@@ -1924,6 +1931,7 @@ CREATE INDEX IF NOT EXISTS idx_cursor_account_polls_hour ON cursor_account_polls
 var exportIdentityColumnMigrations = []schemaColumnMigration{
 	{"cursor_usage_events", "account_user_id", "ALTER TABLE cursor_usage_events ADD COLUMN account_user_id TEXT NOT NULL DEFAULT ''"},
 	{"cursor_usage_events", "account_polled_at", "ALTER TABLE cursor_usage_events ADD COLUMN account_polled_at TEXT NOT NULL DEFAULT ''"},
+	{"cursor_usage_events", "conversation_id", "ALTER TABLE cursor_usage_events ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''"},
 	{"project_identity_observations", "session_id", "ALTER TABLE project_identity_observations ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"},
 	{"project_identity_observations", "source_archive_id", "ALTER TABLE project_identity_observations ADD COLUMN source_archive_id TEXT NOT NULL DEFAULT ''"},
 	{"project_identity_observations", "source_archive_salt", "ALTER TABLE project_identity_observations ADD COLUMN source_archive_salt TEXT NOT NULL DEFAULT ''"},
@@ -2344,7 +2352,7 @@ func checkReadOnlySchemaCompatibility(ctx context.Context, conn *sql.DB) error {
 			}
 		}
 	}
-	for _, column := range []string{"agent", "account_user_id", "account_polled_at"} {
+	for _, column := range []string{"agent", "account_user_id", "account_polled_at", "conversation_id"} {
 		var missing bool
 		if err := conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cursor_usage_events') AND NOT EXISTS(SELECT 1 FROM pragma_table_info('cursor_usage_events') WHERE name = ?)`, column).Scan(&missing); err != nil {
 			return fmt.Errorf("checking account usage schema: %w", err)
@@ -2388,10 +2396,10 @@ func CheckDataVersion(ctx context.Context, path string) error {
 	return err
 }
 
-// ArchiveResyncState reads both startup decisions from one archive probe.
-func ArchiveResyncState(ctx context.Context, path string) (needsResync, fullRebuild bool, err error) {
+// ArchiveResyncState reads startup decisions from one archive probe.
+func ArchiveResyncState(ctx context.Context, path string) (needsResync, fullRebuild, schemaRepairNeeded bool, err error) {
 	schema, stale, full, err := probeDatabase(ctx, path, true)
-	return schema || stale, full, err
+	return schema || stale, full, schema, err
 }
 
 // probeDatabase checks schema repairs, scoped upgrades, and full rebuilds together.
@@ -2440,11 +2448,7 @@ func probeDatabaseConn(ctx context.Context,
 	// needs their preservation rebuild.
 	countScoped := includeScoped || archiveOnly
 	if countScoped {
-		var pending bool
-		if err := conn.QueryRowContext(ctx,
-			"SELECT EXISTS(SELECT 1 FROM stats WHERE key = ? AND value > 0)",
-			scopedUpgradePendingKey,
-		).Scan(&pending); err != nil || pending {
+		if pending, err := scopedUpgradePending(ctx, conn); err != nil || pending {
 			return false, pending, pending && fullRebuild, err
 		}
 	}
@@ -2584,6 +2588,7 @@ func schemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
 		{"cursor_usage_events", "account_user_id", "ALTER TABLE cursor_usage_events ADD COLUMN account_user_id TEXT NOT NULL DEFAULT ''"},
 		{"cursor_usage_events", "account_polled_at", "ALTER TABLE cursor_usage_events ADD COLUMN account_polled_at TEXT NOT NULL DEFAULT ''"},
+		{"cursor_usage_events", "conversation_id", "ALTER TABLE cursor_usage_events ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''"},
 		{"sessions", "usage_generation", "ALTER TABLE sessions ADD COLUMN usage_generation TEXT;" +
 			" UPDATE sessions SET usage_generation=lower(hex(randomblob(8)))"},
 		{"sessions", "trends_generation", "ALTER TABLE sessions ADD COLUMN trends_generation TEXT"},
@@ -3147,6 +3152,24 @@ END;
 CREATE TRIGGER IF NOT EXISTS messages_dashboard_generation_update AFTER UPDATE OF content_length ON messages
 WHEN OLD.content_length IS NOT NEW.content_length BEGIN
     UPDATE sessions SET tools_generation=NULL WHERE id=NEW.session_id AND tools_generation IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS trends_parts_messages_insert AFTER INSERT ON messages BEGIN
+    UPDATE sessions SET trends_generation=lower(hex(randomblob(16))) WHERE id=NEW.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trends_parts_messages_delete AFTER DELETE ON messages BEGIN
+    UPDATE sessions SET trends_generation=lower(hex(randomblob(16))) WHERE id=OLD.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trends_parts_messages_update AFTER UPDATE OF session_id, ordinal, role, timestamp, content_length, source_subtype, is_system, has_thinking ON messages BEGIN
+    UPDATE sessions SET trends_generation=lower(hex(randomblob(16))) WHERE id IN (OLD.session_id, NEW.session_id);
+END;
+CREATE TRIGGER IF NOT EXISTS trends_parts_tools_insert AFTER INSERT ON tool_calls BEGIN
+    UPDATE sessions SET trends_generation=lower(hex(randomblob(16))) WHERE id=NEW.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trends_parts_tools_delete AFTER DELETE ON tool_calls BEGIN
+    UPDATE sessions SET trends_generation=lower(hex(randomblob(16))) WHERE id=OLD.session_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trends_parts_tools_update AFTER UPDATE OF session_id ON tool_calls BEGIN
+    UPDATE sessions SET trends_generation=lower(hex(randomblob(16))) WHERE id IN (OLD.session_id, NEW.session_id);
 END;
 `
 
@@ -5600,7 +5623,7 @@ func (db *DB) HasCJKFTS(ctx context.Context) (available bool) {
 
 func (db *DB) setDataVersion(ctx context.Context) error {
 	return db.Update(ctx, func(tx *sql.Tx) error {
-		if err := db.upgradePromptPRLinksTx(ctx, tx); err != nil {
+		if err := db.upgradePRLinksTx(ctx, tx); err != nil {
 			return err
 		}
 		return advanceDataVersion(ctx, tx, dataVersion)

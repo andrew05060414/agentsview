@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-11-23
+last_edited: 2026-11-25
 title: Changelog
 description: Release history for AgentsView
 ---
@@ -11,12 +11,24 @@ The latest release is
 
 **Bug fixes**
 
+- Reporting schema 7 lets integrations count shared Cursor billing events once
+  across overlapping archives while retaining events unique to each archive.
+  Integrations must reconcile event keys and poll times across reports.
+
 - `agentsview source import --type gemini-apps` now imports real Google
   Takeout exports. It used to reject every export with `input does not contain
   a Gemini Apps My Activity HTML document`, because it expected a layout that
   Takeout does not write. Each prompt now becomes a session with your prompt
   and Gemini's response as separate messages. Time zone abbreviations that your
   computer's time zone uses, such as `IST`, are now recognized.
+- `agentsview source sync --full` now exits with an error when its rebuilt
+  archive could not be installed. Another program holding a read transaction
+  on `sessions.db`, such as an open `sqlite3` shell, blocks the swap. Run
+  without a daemon, the command used to print `Sync complete` and exit 0 while
+  the archive stayed unchanged. It now says that another connection blocked the
+  swap, leaves the archive unchanged, and tells you to close that connection
+  and retry. Other failures of a direct `source sync` also exit non-zero now.
+  Before, only `debug.log` recorded them.
 
 ## 0.48.0
 

@@ -1109,12 +1109,6 @@ fixtures retain this field; missing identities remain source-local.
   Its `sqlite_home` configuration chooses the database directory, falling back
   to `CODEX_SQLITE_HOME` and then `CODEX_HOME`
   ([config_toml.rs](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/config/src/config_toml.rs)).
-  To identify the current page, the launcher hook reads the state index open
-  in the launcher. If it cannot identify one, it uses the launcher's
-  environment, user config, and command-line overrides to
-  locate the index. It rejects newer state indexes and SQLx
-  migrations after version 64 before reading `state_5.sqlite`
-  ([migration files](https://github.com/openai/codex/tree/0adee0df26c7dcdaf4a19a4013b94f4058d26f33/codex-rs/state/migrations)).
   Resume and thread lookup take the thread id and open its newest file
   ([list.rs](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/rollout/src/list.rs#L1602-L1616)).
   A reported archive written by Codex `0.153.4` and `0.155.0-alpha.16.3`
@@ -3142,15 +3136,18 @@ schemas keep their existing ordering behavior.
 ## Cursor (`cursor`)
 
 - **Team usage:** The
-  [Admin API](https://cursor.com/docs/account/teams/admin-api) documents
-  numeric user IDs in paginated daily usage data and as a filter for usage
-  events; its usage-event example does not include a user ID. An unfiltered sync
-  uses member-filtered responses to match accounts and records the matched
-  account and unfiltered fetch completion time in separate columns. Events
-  absent from that unfiltered fetch wait for a later sync. A later empty poll
-  replaces an earlier covered account-hour with zero usage. Archives with
-  account stamps require data version 185 or newer. The event's original
-  `user_id`, `user_email`, and dedup key remain unchanged.
+  [Admin API](https://cursor.com/docs/account/teams/admin-api), reverified
+  2026-11-24, documents numeric user IDs in paginated daily usage data and as a
+  filter for usage events and an optional `conversationId` identifying the
+  originating conversation; its usage-event example does not include a user ID.
+  An unfiltered sync uses member-filtered responses to match accounts and
+  records the matched account and unfiltered fetch completion time in separate
+  columns. Events absent from that unfiltered fetch wait for a later sync. A
+  later empty poll replaces an earlier covered account-hour with zero usage.
+  Archives with account stamps require data version 185 or newer. The event's
+  original `user_id`, `user_email`, and dedup key remain unchanged. Reporting
+  schema 7 exports event identities and account poll times for cross-archive
+  reconciliation and includes the conversation ID when available.
 
 - **Dialogue projection:** Reverified 2026-10-17 against the JSONL parser and
   shared block fixtures. Assistant text and thinking blocks remain separate.

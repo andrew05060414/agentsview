@@ -55,6 +55,8 @@ type SyncRead = "status" | "stats" | "version";
 class SyncStore {
   archiveStale: boolean = $state(false);
   syncPending: boolean = $state(false);
+  upgradePending: boolean = $state(false);
+  writesPaused: boolean = $state(false);
 
   syncing: boolean = $state(false);
   // Message from the last sync or resync that failed, cleared when one
@@ -194,6 +196,8 @@ class SyncStore {
       this.lastSyncStats = status.stats ?? null;
       this.archiveStale = status.archive_stale === true;
       this.syncPending = status.sync_pending === true;
+      this.upgradePending = status.upgrade_pending === true;
+      this.writesPaused = status.writes_paused === true;
       const statusProgress = status.progress ?? null;
       let statusProgressCompleted = false;
       if (statusProgress) {
@@ -393,7 +397,11 @@ class SyncStore {
     return true;
   }
 
-  watchSession(sessionId: string, onUpdate: () => void, onTiming?: (t: SessionTiming) => void) {
+  watchSession(
+    sessionId: string,
+    onUpdate: () => Promise<boolean>,
+    onTiming?: (t: SessionTiming) => void,
+  ) {
     this.unwatchSession();
     let settle!: (seen: boolean) => void;
     const ready = new Promise<boolean>((resolve) => {
@@ -405,7 +413,21 @@ class SyncStore {
     });
     const open = () => {
       this.closeSessionStream();
-      this.watchEventSource = watchSession(sessionId, onUpdate, onTiming);
+      let generation = 0;
+      const refresh = (event?: Event) => {
+        const current = ++generation;
+        const receipt = (event as (Event & { receipt?: string }) | undefined)?.receipt;
+        void onUpdate().then((success) => {
+          if (
+            success &&
+            receipt !== undefined &&
+            current === generation &&
+            this.watchEventSource === es
+          )
+            es.acknowledge(receipt);
+        });
+      };
+      this.watchEventSource = watchSession(sessionId, refresh, onTiming);
       const es = this.watchEventSource;
       es.addEventListener("error", () => {
         if (this.watchEventSource !== es) return;
@@ -414,12 +436,12 @@ class SyncStore {
       es.addEventListener("session_missing", () => {
         if (this.watchEventSource !== es) return;
         settle(false);
-        onUpdate();
+        refresh();
       });
-      es.addEventListener("session_ready", () => {
+      es.addEventListener("session_ready", (event) => {
         if (this.watchEventSource !== es) return;
         settle(true);
-        onUpdate();
+        refresh(event);
       });
     };
     if (typeof document === "undefined") {
@@ -432,7 +454,7 @@ class SyncStore {
       } else if (!this.watchEventSource || this.watchEventSource.readyState === 2) {
         open();
         // A rejected reconnect, such as a deleted session's 404, never sends session_ready.
-        onUpdate();
+        void onUpdate();
       }
     };
     document.addEventListener("visibilitychange", this.watchVisibilityHandler);
