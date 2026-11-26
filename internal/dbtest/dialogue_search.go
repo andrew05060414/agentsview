@@ -118,7 +118,11 @@ func SeedDialogueSearchPaging(t *testing.T, d *db.DB) {
 		{SessionID: newer, Ordinal: 2, Role: "tool", Content: "tool pagingneedle"},
 		{SessionID: newer, Ordinal: 3, Role: "user", Content: "follow-up", DialogueText: new("follow-up")},
 		{SessionID: newer, Ordinal: 4, Role: "assistant", SourceSubtype: "tool_result", Content: "assistant tool output"},
-	}, WithMessageCounts(5, 2), func(s *db.Session) { s.StartedAt = new("2026-05-21T12:00:00Z") })
+		{SessionID: newer, Ordinal: 5, Role: "assistant", Content: "[Bash]\n$ hidden tool", DialogueText: new(""), HasToolUse: true},
+		{SessionID: newer, Ordinal: 6, Role: "assistant", Content: "[Thinking] hidden", DialogueText: new(" \n\t "), HasThinking: true},
+		{SessionID: newer, Ordinal: 7, Role: "assistant", IsSystem: true, Content: "system flagged", DialogueText: new("system flagged")},
+		{SessionID: newer, Ordinal: 8, Role: "user", Content: "<system-reminder>injected</system-reminder>", DialogueText: new("<system-reminder>injected</system-reminder>")},
+	}, WithMessageCounts(9, 2), func(s *db.Session) { s.StartedAt = new("2026-05-21T12:00:00Z") })
 }
 
 type dialogueVectorSearcher struct {
@@ -129,7 +133,11 @@ func (s *dialogueVectorSearcher) PrepareSemanticSearch(context.Context, string) 
 	return func(_ context.Context, limit int) ([]db.VectorHit, bool, error) {
 		s.limits = append(s.limits, limit)
 		hits := []db.VectorHit{
-			{SessionID: "dialogue-page-newer", Ordinal: 4, OrdinalStart: 4, OrdinalEnd: 4, Score: 0.95, Snippet: "assistant tool output"},
+			{SessionID: "dialogue-page-newer", Ordinal: 4, OrdinalStart: 4, OrdinalEnd: 4, Score: 0.99, Snippet: "assistant tool output"},
+			{SessionID: "dialogue-page-newer", Ordinal: 5, OrdinalStart: 5, OrdinalEnd: 5, Score: 0.98, Snippet: "[Bash]\n$ hidden tool"},
+			{SessionID: "dialogue-page-newer", Ordinal: 6, OrdinalStart: 6, OrdinalEnd: 6, Score: 0.97, Snippet: "[Thinking] hidden"},
+			{SessionID: "dialogue-page-newer", Ordinal: 7, OrdinalStart: 7, OrdinalEnd: 7, Score: 0.96, Snippet: "system flagged"},
+			{SessionID: "dialogue-page-newer", Ordinal: 8, OrdinalStart: 8, OrdinalEnd: 8, Score: 0.95, Snippet: "<system-reminder>injected</system-reminder>"},
 			{SessionID: "dialogue-page-newer", Ordinal: 2, OrdinalStart: 2, OrdinalEnd: 2, Score: 0.9, Snippet: "tool pagingneedle"},
 		}
 		if limit <= db.SemanticOverfetchMin {

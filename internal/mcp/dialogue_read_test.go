@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json/v2"
 	"fmt"
 	"net/http"
@@ -265,6 +266,56 @@ func TestSearchContent_DefaultDialogueFiltersBeforePaging(t *testing.T) {
 	assert.Equal(t, "dialogue-page-newer", found.Matches[0].SessionID)
 	assert.Equal(t, "observation pagingneedle", found.Matches[0].Snippet)
 	assert.Equal(t, new(1), found.NextCursor)
+}
+
+type staleDialogueVectorSearcher struct {
+	limits []int
+}
+
+func (s *staleDialogueVectorSearcher) PrepareSemanticSearch(context.Context, string) (db.VectorSearchPage, int, error) {
+	return func(_ context.Context, limit int) ([]db.VectorHit, bool, error) {
+		s.limits = append(s.limits, limit)
+		hits := []db.VectorHit{
+			{SessionID: "dialogue-page-newer", Ordinal: 5, OrdinalStart: 5, OrdinalEnd: 5, Score: 0.99, Snippet: "[Bash]\n$ hidden tool"},
+			{SessionID: "dialogue-page-newer", Ordinal: 6, OrdinalStart: 6, OrdinalEnd: 6, Score: 0.98, Snippet: "[Thinking] hidden"},
+			{SessionID: "dialogue-page-newer", Ordinal: 7, OrdinalStart: 7, OrdinalEnd: 7, Score: 0.97, Snippet: "system flagged"},
+			{SessionID: "dialogue-page-newer", Ordinal: 8, OrdinalStart: 8, OrdinalEnd: 8, Score: 0.96, Snippet: "<system-reminder>injected</system-reminder>"},
+		}
+		if limit <= db.SemanticOverfetchMin {
+			return hits, false, nil
+		}
+		return append(hits, db.VectorHit{
+			SessionID: "dialogue-page-older", Ordinal: 1, OrdinalStart: 1, OrdinalEnd: 1, Score: 0.8, Snippet: "older pagingneedle",
+		}), true, nil
+	}, 0, nil
+}
+
+func (*staleDialogueVectorSearcher) ResolveMessageUnits(_ context.Context, refs []db.MessageRef) ([]db.UnitRef, error) {
+	return make([]db.UnitRef, len(refs)), nil
+}
+
+func TestSearchContent_DefaultDialogueVectorSkipsEmptyAndSystemAnchors(t *testing.T) {
+	for _, mode := range []string{"hybrid", "semantic"} {
+		t.Run(mode, func(t *testing.T) {
+			ts, d := newTestToolset(t)
+			if mode == "hybrid" && !d.HasFTS(t.Context()) {
+				t.Skip("FTS not available")
+			}
+			dbtest.SeedDialogueSearchPaging(t, d)
+			searcher := &staleDialogueVectorSearcher{}
+			d.SetVectorSearcher(searcher)
+			_, found, err := ts.searchContent(t.Context(), nil, searchContentIn{
+				Pattern: "vectoronlyneedle", Mode: mode, Project: "dialogue-page", Limit: 1, IncludeActive: true,
+			})
+			require.NoError(t, err)
+			require.Len(t, found.Matches, 1)
+			assert.Equal(t, "dialogue-page-older", found.Matches[0].SessionID)
+			assert.Equal(t, 1, found.Matches[0].Ordinal)
+			assert.Equal(t, "older pagingneedle", found.Matches[0].Snippet)
+			assert.False(t, found.Matches[0].DialogueUnavailable)
+			assert.Equal(t, []int{db.SemanticOverfetchMin, 2 * db.SemanticOverfetchMin}, searcher.limits)
+		})
+	}
 }
 
 func TestSearchContent_WithholdsLegacySnippets(t *testing.T) {
@@ -550,6 +601,42 @@ func TestLexicalSourcesDefault(t *testing.T) {
 	assert.Nil(t, lexicalSources("terms", nil))
 	named := []string{"messages", "tool_input"}
 	assert.Equal(t, named, lexicalSources("substring", named))
+}
+
+func TestGetMessages_AroundAsymmetricLargeWindow(t *testing.T) {
+	ts, d := newTestToolset(t)
+	const total = 901
+	msgs := make([]db.Message, total)
+	for i := range total {
+		if i%2 == 0 {
+			msgs[i] = dialogueUserMsg("asym", i, fmt.Sprintf("user %d", i))
+		} else {
+			msgs[i] = dialogueAsstMsg("asym", i, fmt.Sprintf("assistant %d", i))
+		}
+	}
+	dbtest.SeedSessionWithMessages(t, d, "asym", "proj", msgs, dbtest.WithMessageCounts(total, (total+1)/2))
+
+	for _, tc := range []struct {
+		name                  string
+		anchor, before, after int
+	}{
+		{"before only 900", 900, 900, 0},
+		{"after only 900", 0, 0, 900},
+		{"asymmetric 890 and 10", 890, 890, 10},
+		{"asymmetric 10 and 890", 10, 10, 890},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+				SessionID: "asym", Around: &tc.anchor, Before: &tc.before, After: &tc.after,
+			})
+			require.NoError(t, err)
+			require.Len(t, out.Messages, total)
+			assert.Equal(t, 0, out.Messages[0].Ordinal)
+			assert.Equal(t, total-1, out.Messages[len(out.Messages)-1].Ordinal)
+			assert.Zero(t, out.Filtered)
+			assert.Zero(t, out.Uncertain)
+		})
+	}
 }
 
 func ordinals(out getMessagesOut) []int {

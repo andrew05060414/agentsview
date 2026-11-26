@@ -1,6 +1,9 @@
 package db
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -130,6 +133,88 @@ func TestSearchContentSystemRoleAcrossLexicalPaths(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, page.Matches, 1)
 			assert.Equal(t, "assistant", page.Matches[0].Role)
+		})
+	}
+}
+
+func TestSearchContentSkipsWhitespaceOnlyDialogue(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "ws", "proj", func(s *Session) { s.UserMessageCount = 2 })
+	insertMessages(t, d,
+		Message{SessionID: "ws", Ordinal: 0, Role: "assistant", Content: "wsneedle", DialogueText: new(" \n\t ")},
+		Message{SessionID: "ws", Ordinal: 1, Role: "assistant", Content: "answer", DialogueText: new("answer")},
+	)
+	for _, tc := range []struct {
+		name, mode, pattern string
+	}{
+		{"substring newline", "substring", "\n"},
+		{"regex whitespace", "regex", `\s+`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			page, err := d.SearchContent(t.Context(), ContentSearchFilter{
+				Pattern: tc.pattern, Mode: tc.mode, Sources: []string{"messages"}, DialogueOnly: true,
+			})
+			require.NoError(t, err)
+			assert.Empty(t, page.Matches)
+		})
+	}
+}
+
+func TestDialogueVectorAnchorsDialectSQL(t *testing.T) {
+	sentinel := errors.New("stop")
+	for _, tc := range []struct {
+		name     string
+		dialect  QueryDialect
+		contains []string
+	}{
+		{
+			name:    "sqlite",
+			dialect: SQLiteQueryDialect(),
+			contains: []string{
+				"m.dialogue_text IS NULL OR LTRIM(m.dialogue_text,",
+				"m.is_system = 0",
+				SystemPrefixSQL("m.content", "m.role"),
+			},
+		},
+		{
+			name:    "postgres",
+			dialect: PostgresQueryDialect(),
+			contains: []string{
+				"m.dialogue_text IS NULL OR LTRIM(m.dialogue_text,",
+				"m.is_system = FALSE",
+				PostgresSystemPrefixSQL("m.content", "m.role"),
+			},
+		},
+		{
+			name:    "clickhouse",
+			dialect: ClickHouseQueryDialect(),
+			contains: []string{
+				"m.dialogue_text IS NULL OR replaceRegexpOne(ifNull(m.dialogue_text, ''),",
+				"m.is_system = false",
+				ClickHouseSystemPrefixSQL("m.content", "m.role"),
+				"SETTINGS short_circuit_function_evaluation = 'force_enable'",
+			},
+		},
+		{
+			name:    "duckdb",
+			dialect: DuckDBQueryDialect(),
+			contains: []string{
+				"m.dialogue_text IS NULL OR LTRIM(m.dialogue_text,",
+				"m.is_system = FALSE AND m.is_system_prefixed = FALSE",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var captured string
+			lookup := DialogueVectorAnchors(tc.dialect, func(_ context.Context, query string, _ ...any) (*sql.Rows, error) {
+				captured = query
+				return nil, sentinel
+			})
+			_, err := lookup(t.Context(), ContentSearchFilter{DialogueOnly: true}, []VectorHit{{SessionID: "s1", Ordinal: 1}})
+			require.ErrorIs(t, err, sentinel)
+			for _, want := range tc.contains {
+				assert.Contains(t, captured, want)
+			}
 		})
 	}
 }
