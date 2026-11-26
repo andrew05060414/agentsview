@@ -639,6 +639,61 @@ func TestGetMessages_AroundAsymmetricLargeWindow(t *testing.T) {
 	}
 }
 
+func TestGetMessages_AroundDenseToolRowsUsesAvailableBudget(t *testing.T) {
+	t.Run("one sided dense tool rows uses remaining budget", func(t *testing.T) {
+		ts, d := newTestToolset(t)
+		const total = 1000
+		msgs := make([]db.Message, total)
+		for i := range total {
+			if i%2 == 0 {
+				msgs[i] = dialogueUserMsg("dense-one", i, fmt.Sprintf("user %d", i))
+			} else {
+				msgs[i] = toolRow("dense-one", i, fmt.Sprintf("[Bash]\n$ cmd %d", i), fmt.Sprintf(`{"command":"cmd %d"}`, i))
+			}
+		}
+		dbtest.SeedSessionWithMessages(t, d, "dense-one", "proj", msgs, dbtest.WithMessageCounts(total, total/2))
+
+		anchor, before, after := 998, 250, 0
+		_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+			SessionID: "dense-one", Around: &anchor, Before: &before, After: &after,
+		})
+		require.NoError(t, err)
+		require.Len(t, out.Messages, 251)
+		assert.Equal(t, 498, out.Messages[0].Ordinal)
+		assert.Equal(t, 998, out.Messages[len(out.Messages)-1].Ordinal)
+		assert.Equal(t, 250, out.Filtered)
+		assert.Zero(t, out.Uncertain)
+	})
+
+	t.Run("two sided reclaims unused budget from sparse side", func(t *testing.T) {
+		ts, d := newTestToolset(t)
+		const total = 1000
+		msgs := make([]db.Message, total)
+		for i := range total {
+			switch {
+			case i < 700 && i%2 == 1:
+				msgs[i] = toolRow("dense-two", i, fmt.Sprintf("[Bash]\n$ cmd %d", i), fmt.Sprintf(`{"command":"cmd %d"}`, i))
+			case i%2 == 0:
+				msgs[i] = dialogueUserMsg("dense-two", i, fmt.Sprintf("user %d", i))
+			default:
+				msgs[i] = dialogueAsstMsg("dense-two", i, fmt.Sprintf("assistant %d", i))
+			}
+		}
+		dbtest.SeedSessionWithMessages(t, d, "dense-two", "proj", msgs, dbtest.WithMessageCounts(total, total/2))
+
+		anchor, before, after := 700, 250, 250
+		_, out, err := ts.getMessages(t.Context(), nil, getMessagesIn{
+			SessionID: "dense-two", Around: &anchor, Before: &before, After: &after,
+		})
+		require.NoError(t, err)
+		require.Len(t, out.Messages, 501)
+		assert.Equal(t, 200, out.Messages[0].Ordinal)
+		assert.Equal(t, 950, out.Messages[len(out.Messages)-1].Ordinal)
+		assert.Equal(t, 250, out.Filtered)
+		assert.Zero(t, out.Uncertain)
+	})
+}
+
 func ordinals(out getMessagesOut) []int {
 	got := make([]int, len(out.Messages))
 	for i, m := range out.Messages {
