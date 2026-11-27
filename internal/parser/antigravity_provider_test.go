@@ -880,7 +880,43 @@ func TestAntigravityCLIProviderFingerprintTracksSideInputs(t *testing.T) {
 			`"workspace":"/tmp/fallback"}`))
 	afterUntaggedHistory, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
-	assert.NotEqual(t, afterUnrelatedHistory.Hash, afterUntaggedHistory.Hash)
+	assert.Equal(t, afterUnrelatedHistory.Hash, afterUntaggedHistory.Hash,
+		"mapped session must ignore untagged history rows")
+
+	unmappedID := "99999999-aaaa-bbbb-cccc-dddddddddddd"
+	unmappedPath := filepath.Join(root, "conversations", unmappedID+".pb")
+	mustWrite(t, unmappedPath, []byte("unmapped-pb"))
+	unmappedTime := time.UnixMilli(1779000000000)
+	require.NoError(t, os.Chtimes(unmappedPath, unmappedTime, unmappedTime))
+	unmappedSrc, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+		RawSessionID: unmappedID,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	mustWrite(t, filepath.Join(root, "history.jsonl"), []byte(unrelatedHistory))
+	unmappedBefore, err := provider.Fingerprint(t.Context(), unmappedSrc)
+	require.NoError(t, err)
+
+	// A newer untagged prompt outside the +/-60s fallback window must not
+	// perturb an older unmapped session's fingerprint.
+	withLaterUntagged := unrelatedHistory + "\n" +
+		`{"display":"later prompt","timestamp":1779000120000,` +
+		`"workspace":"/tmp/later"}`
+	mustWrite(t, filepath.Join(root, "history.jsonl"), []byte(withLaterUntagged))
+	unmappedAfterLater, err := provider.Fingerprint(t.Context(), unmappedSrc)
+	require.NoError(t, err)
+	assert.Equal(t, unmappedBefore.Hash, unmappedAfterLater.Hash)
+
+	// A contemporaneous untagged prompt within the +/-60s fallback window
+	// must change the unmapped session's fingerprint.
+	mustWrite(t, filepath.Join(root, "history.jsonl"),
+		[]byte(withLaterUntagged+"\n"+
+			`{"display":"untagged prompt","timestamp":1779000000000,`+
+			`"workspace":"/tmp/fallback"}`))
+	unmappedAfterFallback, err := provider.Fingerprint(t.Context(), unmappedSrc)
+	require.NoError(t, err)
+	assert.NotEqual(t, unmappedBefore.Hash, unmappedAfterFallback.Hash)
 
 	mustWrite(t, filepath.Join(root, "brain", id, "task.md"), []byte("# Changed"))
 	afterBrain, err := provider.Fingerprint(t.Context(), source)
@@ -1877,4 +1913,55 @@ func TestAntigravityCLIProviderFingerprintIgnoresUnrelatedCacheUpdates(t *testin
 	assert.Equal(t, fpABefore.MTimeNS, fpAAfter.MTimeNS)
 	assert.Equal(t, fpABefore.Hash, fpAAfter.Hash)
 	assert.NotEqual(t, fpBBefore.Hash, fpBAfter.Hash)
+}
+
+func TestAntigravityCLIProviderMultiFileStatHashTracksSideInputs(t *testing.T) {
+	root := t.TempDir()
+	idA := "11111111-2222-3333-4444-555555555555"
+	idB := "66666667-7777-8888-9999-aaaaaaaaaaaa"
+	convDir := filepath.Join(root, "conversations")
+	mustMkdir(t, convDir)
+	pbA := filepath.Join(convDir, idA+".pb")
+	pbB := filepath.Join(convDir, idB+".pb")
+	mustWrite(t, pbA, []byte("pb-a"))
+	mustWrite(t, pbB, []byte("pb-b"))
+	old := time.UnixMilli(1779000000000)
+	require.NoError(t, os.Chtimes(pbA, old, old))
+	require.NoError(t, os.Chtimes(pbB, old, old))
+
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	historyPath := filepath.Join(root, "history.jsonl")
+	mustMkdir(t, filepath.Dir(cachePath))
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/proj-a":%q,"/tmp/proj-b":%q}`, idA, idB)))
+	mustWrite(t, historyPath, []byte(fmt.Sprintf(`{"conversationId":%q,"workspace":"/tmp/proj-a","display":"a"}`+"\n", idA)))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	hasher, ok := provider.(MultiFileStatHasher)
+	require.True(t, ok)
+
+	hABefore := hasher.ComputeMultiFileStatHash(pbA)
+	require.NotZero(t, hABefore)
+	hBBefore := hasher.ComputeMultiFileStatHash(pbB)
+	require.NotZero(t, hBBefore)
+
+	// Unrelated cache change, unrelated tagged history line, and newer untagged
+	// prompt must all keep idA's stat hash identical while changing idB's.
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/proj-a":%q,"/tmp/proj-b-new":%q}`, idA, idB)))
+	mustWrite(t, historyPath, []byte(fmt.Sprintf(
+		`{"conversationId":%q,"workspace":"/tmp/proj-a","display":"a"}`+"\n"+
+			`{"conversationId":%q,"workspace":"/tmp/proj-b-new","display":"b"}`+"\n"+
+			`{"display":"new prompt","timestamp":1779000600000,"workspace":"/tmp/other"}`+"\n",
+		idA, idB,
+	)))
+	assert.Equal(t, hABefore, hasher.ComputeMultiFileStatHash(pbA))
+	assert.NotEqual(t, hBBefore, hasher.ComputeMultiFileStatHash(pbB))
+
+	// A brain artifact edit for idA must change idA's stat hash.
+	brainDir := filepath.Join(root, "brain", idA)
+	mustMkdir(t, brainDir)
+	mustWrite(t, filepath.Join(brainDir, "task.md"), []byte("# Task"))
+	assert.NotEqual(t, hABefore, hasher.ComputeMultiFileStatHash(pbA))
 }

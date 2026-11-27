@@ -2437,6 +2437,18 @@ func providerChangedPathForceParse(
 			parser.IsGeminiProjectMetadataFile(eventPath) {
 			return false
 		}
+		// Antigravity CLI history.jsonl and cache/last_conversations.json
+		// fan out to every session under the root. Each session's
+		// fingerprint hashes its own history slice, resolved workspace, and
+		// summary digest, so the freshness gates re-parse only sessions whose
+		// resolved metadata or history rows actually changed; a forced parse
+		// would rewrite every historical session and bump local_modified_at
+		// on every prompt. Remove events keep the force so removal re-emits.
+		if eventKind != "remove" &&
+			agent == parser.AgentAntigravityCLI &&
+			parser.IsAntigravityCLIHistoryOrCacheFile(eventPath) {
+			return false
+		}
 		// A Hermes/Augure Desktop state.db event's orphan-transcript
 		// fallback surfaces every transcript whose session currently has
 		// no row, including one that was never a member and so is
@@ -9947,6 +9959,11 @@ func (e *Engine) providerStatFreshnessMtime(
 		return e.codexMetadata().EffectiveMtime(
 			lookupPath, chatInfo.ModTime().UnixNano(),
 		)
+	case parser.AgentAntigravityCLI:
+		if info, err := parser.AntigravityCLISessionFileInfo(lookupPath); err == nil {
+			return info.ModTime().UnixNano()
+		}
+		return chatInfo.ModTime().UnixNano()
 	default:
 		return chatInfo.ModTime().UnixNano()
 	}
@@ -9969,7 +9986,7 @@ func (e *Engine) providerStatDigestEligible(agent parser.AgentType) bool {
 	if e.pathRewriter == nil {
 		return true
 	}
-	return agent != parser.AgentClaude && agent != parser.AgentEvener && agent != parser.AgentMusePersonal && !isCodexFormatAgent(agent)
+	return agent != parser.AgentClaude && agent != parser.AgentEvener && agent != parser.AgentMusePersonal && agent != parser.AgentAntigravityCLI && !isCodexFormatAgent(agent)
 }
 
 // providerFreshDigestSourceCurrentInDB reports whether the active stored

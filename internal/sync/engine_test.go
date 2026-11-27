@@ -12090,6 +12090,51 @@ func TestProviderChangedPathForceParseGeminiMetadata(t *testing.T) {
 	}
 }
 
+func TestProviderChangedPathForceParseAntigravityCLIHistoryAndCache(t *testing.T) {
+	root := filepath.Join("root", ".gemini", "antigravity-cli")
+	sessionPath := filepath.Join(root, "conversations", "11111111-2222-3333-4444-555555555555.pb")
+	tests := []struct {
+		name      string
+		eventPath string
+		eventKind string
+		want      bool
+	}{
+		{
+			name:      "history.jsonl write is not forced",
+			eventPath: filepath.Join(root, "history.jsonl"),
+			eventKind: "write",
+			want:      false,
+		},
+		{
+			name:      "cache/last_conversations.json write is not forced",
+			eventPath: filepath.Join(root, "cache", "last_conversations.json"),
+			eventKind: "write",
+			want:      false,
+		},
+		{
+			name:      "history.jsonl remove keeps the force",
+			eventPath: filepath.Join(root, "history.jsonl"),
+			eventKind: "remove",
+			want:      true,
+		},
+		{
+			name:      "brain sidecar write stays forced",
+			eventPath: filepath.Join(root, "brain", "11111111-2222-3333-4444-555555555555", "task.md"),
+			eventKind: "write",
+			want:      true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := providerChangedPathForceParse(
+				parser.AgentAntigravityCLI, sessionPath, tt.eventPath, tt.eventKind,
+				parser.ProviderMigrationProviderAuthoritative,
+			)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestProviderChangedPathForceParseHermesStateEvent(t *testing.T) {
 	home := filepath.Join("root", "profile#one")
 	stateDB := filepath.Join(home, "state.db")
