@@ -89,7 +89,6 @@ func TestStartupProbeEndpointProof(t *testing.T) {
 // StartupProbeChallenge errors while the probe is disabled, so the bug is
 // latent. Fix tracked in PX-1948; unskip this test with the fix.
 func TestValidStartupProbeResponseEmptyExpected(t *testing.T) {
-	t.Skip("reproduces PX-1948: empty expected proof accepts a missing proof header")
 	resp := &http.Response{Header: http.Header{}}
 	assert.False(t, ValidStartupProbeResponse(resp, ""),
 		"a missing proof must never validate")
