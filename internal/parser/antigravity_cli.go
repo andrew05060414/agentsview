@@ -390,7 +390,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 
 	var size int64
 	var mtime int64
-	effInfo, statErr := AntigravityCLIFileInfo(path)
+	effInfo, statErr := AntigravityCLISessionFileInfo(path)
 	if statErr == nil {
 		size = effInfo.Size()
 		mtime = effInfo.ModTime().UnixNano()
@@ -1091,6 +1091,21 @@ func AntigravityCLIFileInfo(path string) (os.FileInfo, error) {
 	return antigravityCLICombinedFileInfo(
 		info,
 		companions...,
+	), nil
+}
+
+// AntigravityCLISessionFileInfo returns a composite os.FileInfo covering only
+// files owned by this conversation (.db/.pb, -wal, .trajectory.json, brain/<id>),
+// excluding shared workspace/history caches so edits in other conversations do
+// not invalidate every historical session's mtime and size.
+func AntigravityCLISessionFileInfo(path string) (os.FileInfo, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	return antigravityCLICombinedFileInfo(
+		info,
+		antigravityCLIProviderCompanionPaths(path)...,
 	), nil
 }
 

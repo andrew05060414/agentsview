@@ -1819,3 +1819,62 @@ func TestAntigravityBrainTranscriptGenMetadataTargetsModelEntry(t *testing.T) {
 		})
 	}
 }
+
+
+func TestAntigravityCLIProviderFingerprintIgnoresUnrelatedCacheUpdates(t *testing.T) {
+	root := t.TempDir()
+	idA := "11111111-2222-3333-4444-555555555555"
+	idB := "66666667-7777-8888-9999-aaaaaaaaaaaa"
+	convDir := filepath.Join(root, "conversations")
+	mustMkdir(t, convDir)
+	mustWrite(t, filepath.Join(convDir, idA+".pb"), []byte("pb-a"))
+	mustWrite(t, filepath.Join(convDir, idB+".pb"), []byte("pb-b"))
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	historyPath := filepath.Join(root, "history.jsonl")
+	mustMkdir(t, filepath.Dir(cachePath))
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/proj-a":%q,"/tmp/proj-b":%q}`, idA, idB)))
+	mustWrite(t, historyPath, []byte(fmt.Sprintf(`{"conversationId":%q,"workspace":"/tmp/proj-a","display":"a"}`+"\n", idA)))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	srcA, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: idA})
+	require.NoError(t, err)
+	require.True(t, ok)
+	srcB, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: idB})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	fpABefore, err := provider.Fingerprint(t.Context(), srcA)
+	require.NoError(t, err)
+	fpBBefore, err := provider.Fingerprint(t.Context(), srcB)
+	require.NoError(t, err)
+
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/proj-a":%q,"/tmp/proj-b-new":%q}`, idA, idB)))
+	mustWrite(t, historyPath, []byte(fmt.Sprintf(
+		`{"conversationId":%q,"workspace":"/tmp/proj-a","display":"a"}`+"\n"+
+			`{"conversationId":%q,"workspace":"/tmp/proj-b-new","display":"b"}`+"\n",
+		idA, idB,
+	)))
+	late := time.Now().Add(2 * time.Minute)
+	require.NoError(t, os.Chtimes(cachePath, late, late))
+	require.NoError(t, os.Chtimes(historyPath, late, late))
+
+	srcAAfter, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: idA})
+	require.NoError(t, err)
+	require.True(t, ok)
+	srcBAfter, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: idB})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	fpAAfter, err := provider.Fingerprint(t.Context(), srcAAfter)
+	require.NoError(t, err)
+	fpBAfter, err := provider.Fingerprint(t.Context(), srcBAfter)
+	require.NoError(t, err)
+
+	assert.Equal(t, fpABefore.Size, fpAAfter.Size)
+	assert.Equal(t, fpABefore.MTimeNS, fpAAfter.MTimeNS)
+	assert.Equal(t, fpABefore.Hash, fpAAfter.Hash)
+	assert.NotEqual(t, fpBBefore.Hash, fpBAfter.Hash)
+}

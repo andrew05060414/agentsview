@@ -513,7 +513,7 @@ func (s antigravityCLISourceSet) Fingerprint(
 		return SourceFingerprint{}, errors.New("antigravity cli source path unavailable")
 	}
 	key := firstNonEmptyJSONLString(source.FingerprintKey, source.Key, src.Path)
-	info, err := AntigravityCLIFileInfo(src.Path)
+	info, err := AntigravityCLISessionFileInfo(src.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return SourceFingerprint{Key: key}, nil

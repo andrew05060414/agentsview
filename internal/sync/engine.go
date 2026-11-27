@@ -12979,7 +12979,7 @@ func (e *Engine) SourceMtime(ctx context.Context, sessionID string) int64 {
 		}
 	}
 	if def.Type == parser.AgentAntigravityCLI {
-		info, err := parser.AntigravityCLIFileInfo(path)
+		info, err := parser.AntigravityCLISessionFileInfo(path)
 		if err != nil {
 			return 0
 		}
