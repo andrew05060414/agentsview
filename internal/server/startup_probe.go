@@ -84,6 +84,9 @@ func (s *Server) startupProbeProof(challenge string) string {
 // ValidStartupProbeResponse reports whether resp contains the proof derived
 // from the temporary server-held startup key.
 func ValidStartupProbeResponse(resp *http.Response, expected string) bool {
+	if expected == "" {
+		return false
+	}
 	return hmac.Equal(
 		[]byte(resp.Header.Get(startupProbeProofHeader)),
 		[]byte(expected),

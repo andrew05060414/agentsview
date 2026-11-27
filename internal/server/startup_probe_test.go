@@ -87,7 +87,7 @@ func TestStartupProbeEndpointProof(t *testing.T) {
 // hmac.Equal sees two empty byte strings and reports a match — an "invalid"
 // response would pass. waitForBackendReady never hits this today because
 // StartupProbeChallenge errors while the probe is disabled, so the bug is
-// latent. Fix tracked in PX-1948; unskip this test with the fix.
+// latent. The empty guard keeps this exported helper safe for future callers.
 func TestValidStartupProbeResponseEmptyExpected(t *testing.T) {
 	resp := &http.Response{Header: http.Header{}}
 	assert.False(t, ValidStartupProbeResponse(resp, ""),
