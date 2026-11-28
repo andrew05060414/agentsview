@@ -1053,7 +1053,7 @@ func decryptAntigravityCLITranscript(
 	if err != nil || len(fields) == 0 {
 		return ParsedMessage{}, false
 	}
-	strs := agProtoCollectStrings(fields, 40)
+	strs := agProtoCollectStrings(fields, agTranscriptTextMinRunes)
 	if len(strs) == 0 {
 		return ParsedMessage{}, false
 	}
