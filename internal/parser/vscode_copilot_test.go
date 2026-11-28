@@ -1544,3 +1544,84 @@ func TestVSCodeCopilotRequestSourceIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestVSCodeCopilotProviderMultiFileStatHashAndMeteredFingerprint(t *testing.T) {
+	root := t.TempDir()
+	hashDir := filepath.Join(root, "workspaceStorage", "ws1")
+	chatDir := filepath.Join(hashDir, "chatSessions")
+	require.NoError(t, os.MkdirAll(chatDir, 0o755))
+
+	chatID := "11111111-2222-4333-8444-555555555555"
+	chatPath := filepath.Join(chatDir, chatID+".json")
+	require.NoError(t, os.WriteFile(chatPath, []byte(`{"version":3,"sessionId":"`+chatID+`","requests":[{"requestId":"r1","message":{"text":"hi"},"response":[{"value":"ok"}]}]}`), 0o644))
+
+	emptyDir := filepath.Join(root, "globalStorage", "emptyWindowChatSessions")
+	require.NoError(t, os.MkdirAll(emptyDir, 0o755))
+	emptyID := "22222222-3333-4444-8555-666666666666"
+	emptyPath := filepath.Join(emptyDir, emptyID+".jsonl")
+	require.NoError(t, os.WriteFile(emptyPath, []byte(`{"kind":0,"v":{"version":3,"sessionId":"`+emptyID+`","requests":[]}}`+"\n"), 0o644))
+
+	provider, ok := NewProvider(AgentVSCodeCopilot, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "local",
+	})
+	require.True(t, ok)
+	assert.Equal(t, CapabilitySupported, provider.Capabilities().Source.MultiFileStatHash)
+	hasher, ok := provider.(MultiFileStatHasher)
+	require.True(t, ok, "vscode-copilot provider must implement MultiFileStatHasher")
+
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 2)
+
+	var wsSource SourceRef
+	for _, s := range sources {
+		if s.DisplayPath == chatPath {
+			wsSource = s
+		}
+	}
+	require.NotEmpty(t, wsSource.DisplayPath)
+
+	baseHash := hasher.ComputeMultiFileStatHash(chatPath)
+	info, err := os.Stat(chatPath)
+	require.NoError(t, err)
+	if _, changeTimeOK := codexIndexChangeTime(chatPath, info); !changeTimeOK {
+		assert.Zero(t, baseHash)
+		return
+	}
+	require.NotZero(t, baseHash)
+	assert.Equal(t, baseHash, hasher.ComputeMultiFileStatHash(chatPath))
+
+	// Appearing workspace.json must change the digest.
+	wsPath := filepath.Join(hashDir, "workspace.json")
+	require.NoError(t, os.WriteFile(wsPath, []byte(`{"folder":"file:///tmp/proj-a"}`), 0o644))
+	withWS := hasher.ComputeMultiFileStatHash(chatPath)
+	assert.NotZero(t, withWS)
+	assert.NotEqual(t, baseHash, withWS)
+
+	var meter ContentReadMeter
+	fp, err := provider.Fingerprint(WithContentReadMeter(t.Context(), &meter), wsSource)
+	require.NoError(t, err)
+	assert.NotEmpty(t, fp.Hash)
+	assert.Positive(t, meter.Bytes())
+	assert.Equal(t, int64(2), meter.Reads(), "Fingerprint must meter both chat and workspace.json reads")
+	assert.Equal(t, fp.MTimeNS, VSCodeCopilotEffectiveMtime(chatPath, info))
+
+	// Modifying workspace.json must change the digest.
+	require.NoError(t, os.WriteFile(wsPath, []byte(`{"folder":"file:///tmp/proj-b-longer"}`), 0o644))
+	afterWSEdit := hasher.ComputeMultiFileStatHash(chatPath)
+	assert.NotEqual(t, withWS, afterWSEdit)
+
+	// Modifying chat file must change the digest.
+	f, err := os.OpenFile(chatPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString(" ")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	assert.NotEqual(t, afterWSEdit, hasher.ComputeMultiFileStatHash(chatPath))
+
+	// Empty-window global session without workspace.json also produces a stable non-zero digest.
+	emptyHash := hasher.ComputeMultiFileStatHash(emptyPath)
+	require.NotZero(t, emptyHash)
+	assert.Equal(t, emptyHash, hasher.ComputeMultiFileStatHash(emptyPath))
+}

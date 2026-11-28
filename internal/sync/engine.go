@@ -384,17 +384,19 @@ type Engine struct {
 	// TCC-protected locations. homeDir is empty when the home directory
 	// cannot be resolved, which disables the gate rather than guessing.
 	// goos mirrors runtime.GOOS so the gate is testable off-darwin.
-	scanProtectedPaths  bool
-	homeDir             string
-	goos                string
-	subagentLinkPending bool                 // protected by syncMu; retains failed global linking
-	trailerScanAttempts map[string]time.Time // protected by syncMu; includes failed scans
-	syncMu              engineSyncLock       // serializes all sync operations
-	mu                  gosync.RWMutex
-	lastSync            time.Time
-	lastSyncStats       SyncStats
-	currentProgress     *Progress
-	progressStallAfter  time.Duration
+	scanProtectedPaths       bool
+	homeDir                  string
+	goos                     string
+	subagentLinkPending      bool                 // protected by syncMu; retains failed global linking
+	trailerScanAttempts      map[string]time.Time // protected by syncMu; includes failed scans
+	trailerScanCooldownUntil map[string]time.Time // protected by syncMu; backs off broken repositories
+	trailerScanNow           func() time.Time     // optional test clock for trailer cooldowns
+	syncMu                   engineSyncLock       // serializes all sync operations
+	mu                       gosync.RWMutex
+	lastSync                 time.Time
+	lastSyncStats            SyncStats
+	currentProgress          *Progress
+	progressStallAfter       time.Duration
 	// skipCache tracks paths that should be skipped on
 	// subsequent syncs, keyed by path with the file mtime
 	// at time of caching. Covers parse errors and
@@ -868,7 +870,7 @@ func NewEngine(ctx context.Context,
 		SourceMachines:   cfg.SourceMachines,
 		ProviderMetadata: cfg.ProviderMetadata,
 		DisabledAgents:   cfg.DisabledAgents,
-	}))
+	}, e.providerDefaults()))
 	if !cfg.Ephemeral {
 		if err := e.failures.Load(ctx, database); err != nil {
 			log.Printf("%v", err)
@@ -1086,11 +1088,18 @@ func providerFactoryMap(
 // digest gate will under-cover them.
 func buildProviderStatHashers(
 	factories map[parser.AgentType]parser.ProviderFactory,
+	dirs map[parser.AgentType][]string,
+	sourceMachines map[parser.AgentType]map[string]string,
+	defaults engineProviderDefaults,
 ) map[parser.AgentType]parser.MultiFileStatHasher {
 	out := make(map[parser.AgentType]parser.MultiFileStatHasher, len(factories))
 	for agent, factory := range factories {
 		probe := factory.NewProvider(parser.ProviderConfig{
-			Machine: "",
+			Roots:                 append([]string(nil), dirs[agent]...),
+			Machine:               defaults.machine,
+			StableSourceSnapshots: defaults.stableSourceSnapshots,
+			SourceMachines:        maps.Clone(sourceMachines[agent]),
+			PathRewriter:          defaults.pathRewriter,
 		})
 		if probe.Capabilities().Source.MultiFileStatHash != parser.CapabilitySupported {
 			continue
@@ -10082,9 +10091,90 @@ func (e *Engine) providerStatFreshnessMtime(
 		return chatInfo.ModTime().UnixNano()
 	case parser.AgentGrok:
 		return parser.GrokEffectiveMtime(lookupPath, chatInfo)
+	case parser.AgentCursor:
+		if hasher := e.sources().providerStatHashers[parser.AgentCursor]; hasher != nil {
+			if effective, ok := hasher.(interface {
+				EffectiveMtime(string, os.FileInfo) int64
+			}); ok {
+				return effective.EffectiveMtime(lookupPath, chatInfo)
+			}
+			if provider, ok := hasher.(parser.Provider); ok {
+				return parser.CursorEffectiveMtime(provider, lookupPath, chatInfo)
+			}
+		}
+		return e.cursorEffectiveMtime(lookupPath, chatInfo)
+	case parser.AgentVSCodeCopilot:
+		return parser.VSCodeCopilotEffectiveMtime(lookupPath, chatInfo)
+	case parser.AgentDeepSeekHarness:
+		return parser.DeepSeekHarnessEffectiveMtime(lookupPath, chatInfo)
 	default:
 		return chatInfo.ModTime().UnixNano()
 	}
+}
+
+func (e *Engine) cursorEffectiveMtime(
+	lookupPath string,
+	chatInfo os.FileInfo,
+) int64 {
+	mtime := chatInfo.ModTime().UnixNano()
+	agentID := strings.TrimSuffix(filepath.Base(lookupPath), filepath.Ext(lookupPath))
+	if !parser.IsValidSessionID(agentID) {
+		return mtime
+	}
+	cleanLookup, err := pathutil.LocalComparisonKey(lookupPath)
+	if err != nil {
+		cleanLookup = filepath.Clean(lookupPath)
+	}
+	var chatsDirs []string
+	metaByRoot := e.sources().providerMetadata[parser.AgentCursor]
+	for _, root := range e.sources().agentDirs[parser.AgentCursor] {
+		cleanRoot, err := pathutil.LocalComparisonKey(root)
+		if err != nil {
+			cleanRoot = filepath.Clean(root)
+		}
+		if !pathWithinRoot(cleanLookup, cleanRoot) {
+			continue
+		}
+		if dirs := metaByRoot[filepath.Clean(root)]; len(dirs) > 0 {
+			chatsDirs = dirs
+			break
+		}
+		for cfgRoot, dirs := range metaByRoot {
+			cleanCfg, err := pathutil.LocalComparisonKey(cfgRoot)
+			if err == nil && cleanCfg == cleanRoot && len(dirs) > 0 {
+				chatsDirs = dirs
+				break
+			}
+		}
+		if len(chatsDirs) > 0 {
+			break
+		}
+	}
+	for _, chatsDir := range chatsDirs {
+		workspaces, err := os.ReadDir(chatsDir)
+		if err != nil {
+			continue
+		}
+		for _, ws := range workspaces {
+			if !ws.IsDir() {
+				continue
+			}
+			storePath := filepath.Join(chatsDir, ws.Name(), agentID, "store.db")
+			for _, candidate := range []string{storePath, storePath + "-wal"} {
+				info, err := os.Stat(candidate)
+				if err != nil {
+					continue
+				}
+				if strings.HasSuffix(candidate, "-wal") && !parser.SQLiteWALInfoHasFrames(info) {
+					continue
+				}
+				if ts := info.ModTime().UnixNano(); ts > mtime {
+					mtime = ts
+				}
+			}
+		}
+	}
+	return mtime
 }
 
 // providerStatDigestEligible reports whether this engine may stage,
@@ -10104,7 +10194,16 @@ func (e *Engine) providerStatDigestEligible(agent parser.AgentType) bool {
 	if e.pathRewriter == nil {
 		return true
 	}
-	return agent != parser.AgentClaude && agent != parser.AgentEvener && agent != parser.AgentMusePersonal && agent != parser.AgentAntigravity && agent != parser.AgentAntigravityCLI && agent != parser.AgentGrok && !isCodexFormatAgent(agent)
+	return agent != parser.AgentClaude &&
+		agent != parser.AgentEvener &&
+		agent != parser.AgentMusePersonal &&
+		agent != parser.AgentAntigravity &&
+		agent != parser.AgentAntigravityCLI &&
+		agent != parser.AgentGrok &&
+		agent != parser.AgentCursor &&
+		agent != parser.AgentVSCodeCopilot &&
+		agent != parser.AgentDeepSeekHarness &&
+		!isCodexFormatAgent(agent)
 }
 
 // providerFreshDigestSourceCurrentInDB reports whether the active stored

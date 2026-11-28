@@ -177,3 +177,21 @@ func TestCommitTrailersDetachedWorktree(t *testing.T) {
 	assert.Equal(t, []string{"codex:detached"}, commits[0].Sessions)
 	assert.Empty(t, commits[0].Branch)
 }
+
+func TestCommitTrailersExcludesCodexTreeRefs(t *testing.T) {
+	skipIfNoGit(t)
+	repo := initRepo(t)
+	gitRun(t, repo, nil, "commit", "--allow-empty", "-qm", "Tracked\n\nAgent-Session: codex:tracked")
+	cmd := exec.CommandContext(t.Context(), "git", "rev-parse", "HEAD^{tree}")
+	cmd.Dir = repo
+	out, err := cmd.Output()
+	require.NoError(t, err)
+	tree := strings.TrimSpace(string(out))
+	gitRun(t, repo, nil, "update-ref", "refs/codex/checkpoint", tree)
+	gitRun(t, repo, nil, "update-ref", "refs/codex/nested/checkpoint", tree)
+
+	commits, err := ScanCommitTrailers(t.Context(), repo)
+	require.NoError(t, err)
+	require.Len(t, commits, 1)
+	assert.Equal(t, []string{"codex:tracked"}, commits[0].Sessions)
+}

@@ -36,15 +36,17 @@ type cursorStoreMetaJSON struct {
 }
 
 type cursorStoreIndex struct {
-	mu          sync.Mutex
-	roots       map[string]map[string]string
-	transcripts map[string]map[string]string
+	mu            sync.Mutex
+	roots         map[string]map[string]string
+	resolvedRoots map[string]string
+	transcripts   map[string]map[string]string
 }
 
 func newCursorStoreIndex() *cursorStoreIndex {
 	return &cursorStoreIndex{
-		roots:       make(map[string]map[string]string),
-		transcripts: make(map[string]map[string]string),
+		roots:         make(map[string]map[string]string),
+		resolvedRoots: make(map[string]string),
+		transcripts:   make(map[string]map[string]string),
 	}
 }
 
@@ -117,17 +119,38 @@ func (i *cursorStoreIndex) refresh(chatsRoot string) {
 		return
 	}
 	key := filepath.Clean(chatsRoot)
-	paths, err := cursorStorePathsUnderChats(key)
+	paths, resolvedRoot, err := cursorStorePathsUnderChatsWithRoot(key)
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if err != nil {
 		if _, ok := i.roots[key]; !ok {
 			i.roots[key] = nil
 		}
+		delete(i.resolvedRoots, key)
 		log.Printf("warning: Cursor store index: %v; continuing with transcripts and cached stores", err)
 		return
 	}
 	i.roots[key] = paths
+	if resolvedRoot != "" {
+		i.resolvedRoots[key] = resolvedRoot
+	} else {
+		delete(i.resolvedRoots, key)
+	}
+}
+
+func (i *cursorStoreIndex) resolvedRootLocked(chatsRoot string) (string, bool, error) {
+	if resolved, ok := i.resolvedRoots[chatsRoot]; ok && resolved != "" {
+		return resolved, true, nil
+	}
+	resolved, err := filepath.EvalSymlinks(chatsRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	i.resolvedRoots[chatsRoot] = resolved
+	return resolved, true, nil
 }
 
 func (i *cursorStoreIndex) validPath(
@@ -137,7 +160,15 @@ func (i *cursorStoreIndex) validPath(
 	if path == "" {
 		return "", nil
 	}
-	valid, err := cursorStorePathIsValid(chatsRoot, path)
+	resolvedRoot, exists, err := i.resolvedRootLocked(chatsRoot)
+	if err != nil {
+		return path, fmt.Errorf("validate Cursor store %s: %w", path, err)
+	}
+	if !exists {
+		delete(paths, agentID)
+		return "", nil
+	}
+	valid, err := cursorStorePathIsValidWithResolvedRoot(chatsRoot, resolvedRoot, path)
 	if err != nil {
 		return path, fmt.Errorf("validate Cursor store %s: %w", path, err)
 	}
@@ -160,7 +191,11 @@ func (i *cursorStoreIndex) remember(chatsRoot, agentID, storePath string) {
 		paths = make(map[string]string)
 		i.roots[key] = paths
 	}
-	valid, err := cursorStorePathIsValid(key, storePath)
+	resolvedRoot, exists, err := i.resolvedRootLocked(key)
+	var valid bool
+	if err == nil && exists {
+		valid, err = cursorStorePathIsValidWithResolvedRoot(key, resolvedRoot, storePath)
+	}
 	if err != nil {
 		// Let subsequent lookups retry validation of newly observed stores.
 		if paths[agentID] == "" {
@@ -714,55 +749,107 @@ func cursorStoreTranscriptPair(
 }
 
 func cursorStorePathsUnderChats(chatsRoot string) (map[string]string, error) {
+	paths, _, err := cursorStorePathsUnderChatsWithRoot(chatsRoot)
+	return paths, err
+}
+
+func cursorStorePathsUnderChatsWithRoot(chatsRoot string) (map[string]string, string, error) {
 	paths := make(map[string]string)
 	if chatsRoot == "" {
-		return paths, nil
+		return paths, "", nil
 	}
 	entries, err := os.ReadDir(chatsRoot)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return paths, nil
+			return paths, "", nil
 		}
-		return nil, fmt.Errorf("read Cursor chats root %s: %w", chatsRoot, err)
+		return nil, "", fmt.Errorf("read Cursor chats root %s: %w", chatsRoot, err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(chatsRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return paths, "", nil
+		}
+		return nil, "", fmt.Errorf("resolve Cursor chats root %s: %w", chatsRoot, err)
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 			continue
 		}
-		agentDirs, readErr := os.ReadDir(
-			filepath.Join(chatsRoot, entry.Name()),
-		)
+		wsDir := filepath.Join(chatsRoot, entry.Name())
+		agentDirs, readErr := os.ReadDir(wsDir)
 		if readErr != nil {
 			if errors.Is(readErr, os.ErrNotExist) {
 				continue
 			}
-			return nil, fmt.Errorf(
-				"read Cursor workspace %s: %w",
-				filepath.Join(chatsRoot, entry.Name()), readErr,
-			)
+			return nil, "", fmt.Errorf("read Cursor workspace %s: %w", wsDir, readErr)
 		}
 		for _, agentEntry := range agentDirs {
-			if !agentEntry.IsDir() || !IsValidSessionID(agentEntry.Name()) {
+			if !agentEntry.IsDir() || agentEntry.Type()&os.ModeSymlink != 0 || !IsValidSessionID(agentEntry.Name()) {
 				continue
 			}
-			candidate := filepath.Join(
-				chatsRoot, entry.Name(), agentEntry.Name(), "store.db",
-			)
-			valid, err := cursorStorePathIsValid(chatsRoot, candidate)
-			if err != nil {
-				return nil, fmt.Errorf("validate Cursor store %s: %w", candidate, err)
+			candidate := filepath.Join(wsDir, agentEntry.Name(), "store.db")
+			info, statErr := os.Lstat(candidate)
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
 			}
-			if valid {
+			if statErr != nil {
+				return nil, "", fmt.Errorf("validate Cursor store %s: %w", candidate, statErr)
+			}
+			if info.Mode().IsRegular() {
+				// Neither wsDir, agentEntry, nor store.db is a symlink, so
+				// candidate stays contained inside resolvedRoot without
+				// repeating EvalSymlinks for every store.
 				paths[agentEntry.Name()] = candidate
+				continue
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				valid, valErr := cursorStorePathIsValidWithResolvedRoot(chatsRoot, resolvedRoot, candidate)
+				if valErr != nil {
+					return nil, "", fmt.Errorf("validate Cursor store %s: %w", candidate, valErr)
+				}
+				if valid {
+					paths[agentEntry.Name()] = candidate
+				}
 			}
 		}
 	}
-	return paths, nil
+	return paths, resolvedRoot, nil
 }
 
 // cursorStorePathIsValid distinguishes absent or invalid paths from access
 // failures, which must not discard a known store or mark it fresh.
 func cursorStorePathIsValid(chatsRoot, storePath string) (bool, error) {
+	resolvedRoot, err := filepath.EvalSymlinks(chatsRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return cursorStorePathIsValidWithResolvedRoot(chatsRoot, resolvedRoot, storePath)
+}
+
+func cursorStorePathIsValidWithResolvedRoot(chatsRoot, resolvedRoot, storePath string) (bool, error) {
+	linfo, lerr := os.Lstat(storePath)
+	if errors.Is(lerr, os.ErrNotExist) {
+		return false, nil
+	}
+	if lerr != nil {
+		return false, lerr
+	}
+	if linfo.Mode().IsRegular() {
+		// Fast path: when store.db and its two parent directories under
+		// chatsRoot are all non-symlinks, containment in resolvedRoot holds
+		// without walking the full filesystem path via EvalSymlinks.
+		agentDir := filepath.Dir(storePath)
+		wsDir := filepath.Dir(agentDir)
+		if samePath(filepath.Dir(wsDir), chatsRoot) &&
+			cursorNonSymlinkDir(wsDir) &&
+			cursorNonSymlinkDir(agentDir) {
+			return true, nil
+		}
+	}
 	info, err := os.Stat(storePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -773,13 +860,6 @@ func cursorStorePathIsValid(chatsRoot, storePath string) (bool, error) {
 	if !info.Mode().IsRegular() {
 		return false, nil
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(chatsRoot)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
 	resolved, err := filepath.EvalSymlinks(storePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -788,6 +868,11 @@ func cursorStorePathIsValid(chatsRoot, storePath string) (bool, error) {
 		return false, err
 	}
 	return isContainedIn(resolved, resolvedRoot), nil
+}
+
+func cursorNonSymlinkDir(dir string) bool {
+	info, err := os.Lstat(dir)
+	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
 }
 
 func cursorStoreAgentIDFromPath(path string) (string, bool) {

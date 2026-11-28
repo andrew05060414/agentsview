@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -783,6 +784,11 @@ func hasDisplayableAntigravityCLITrajectoryMessage(
 var buildAntigravityProjectMap = antigravityProjectMapFromHistory
 
 func buildAntigravityCLIProjectMap(root string) map[string]string {
+	out, _ := buildAntigravityCLIProjectMapWithSummariesErr(root)
+	return out
+}
+
+func buildAntigravityCLIProjectMapWithSummariesErr(root string) (map[string]string, error) {
 	out := buildAntigravityProjectMap(filepath.Join(root, "history.jsonl"))
 	// The current cache is newer than history and wins for matching IDs.
 	maps.Copy(out, antigravityProjectMapFromLastConversations(
@@ -791,12 +797,13 @@ func buildAntigravityCLIProjectMap(root string) map[string]string {
 	// The cache keeps only each folder's latest conversation and current
 	// history rows carry no conversation ID, so the summary store fills the
 	// conversations they leave unmapped.
-	for id, summary := range loadAntigravitySummaries(context.Background(), root).byID {
+	summaries := loadAntigravitySummaries(context.Background(), root)
+	for id, summary := range summaries.byID {
 		if _, ok := out[id]; !ok && summary.workspace != "" {
 			out[id] = summary.workspace
 		}
 	}
-	return out
+	return out, summaries.err
 }
 
 type antigravityFileStatKey struct {
@@ -821,6 +828,7 @@ type antigravityHistorySnapshot struct {
 type antigravityLastConversationsSnapshot struct {
 	stat        antigravityFileStatKey
 	projectByID map[string]string
+	valid       bool
 }
 
 var antigravityCLIMetadataCache = struct {
@@ -854,6 +862,7 @@ func antigravityVerifiedFileStatKey(path string) (antigravityFileStatKey, bool) 
 }
 
 func loadAntigravityLastConversationsMap(path string) map[string]string {
+	path = filepath.Clean(path)
 	key, cacheable := antigravityVerifiedFileStatKey(path)
 	if cacheable {
 		antigravityCLIMetadataCache.Lock()
@@ -864,14 +873,36 @@ func loadAntigravityLastConversationsMap(path string) map[string]string {
 		antigravityCLIMetadataCache.Unlock()
 	}
 
+	out, valid := parseAntigravityLastConversationsFile(path)
+	if !valid {
+		return out
+	}
+
+	if cacheable {
+		antigravityCLIMetadataCache.Lock()
+		if _, ok := antigravityCLIMetadataCache.lastConversations[path]; !ok &&
+			len(antigravityCLIMetadataCache.lastConversations) >= 32 {
+			clear(antigravityCLIMetadataCache.lastConversations)
+		}
+		antigravityCLIMetadataCache.lastConversations[path] = antigravityLastConversationsSnapshot{
+			stat:        key,
+			projectByID: out,
+			valid:       true,
+		}
+		antigravityCLIMetadataCache.Unlock()
+	}
+	return out
+}
+
+func parseAntigravityLastConversationsFile(path string) (map[string]string, bool) {
 	out := make(map[string]string)
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return out
+		return out, false
 	}
 	root := gjson.ParseBytes(raw)
 	if !root.IsObject() {
-		return out
+		return out, false
 	}
 	root.ForEach(func(workspace, conversationID gjson.Result) bool {
 		id := strings.TrimSpace(conversationID.String())
@@ -883,23 +914,55 @@ func loadAntigravityLastConversationsMap(path string) map[string]string {
 		}
 		return true
 	})
+	return out, true
+}
 
-	if cacheable {
-		antigravityCLIMetadataCache.Lock()
-		if _, ok := antigravityCLIMetadataCache.lastConversations[path]; !ok &&
-			len(antigravityCLIMetadataCache.lastConversations) >= 32 {
-			clear(antigravityCLIMetadataCache.lastConversations)
-		}
-		antigravityCLIMetadataCache.lastConversations[path] = antigravityLastConversationsSnapshot{
-			stat:        key,
-			projectByID: out,
-		}
-		antigravityCLIMetadataCache.Unlock()
+func diffAntigravityLastConversationsChange(path string) ([]string, bool) {
+	path = filepath.Clean(path)
+	antigravityCLIMetadataCache.Lock()
+	prevSnap, hasPrev := antigravityCLIMetadataCache.lastConversations[path]
+	antigravityCLIMetadataCache.Unlock()
+	if !hasPrev || !prevSnap.valid {
+		return nil, true
 	}
-	return out
+	key, cacheable := antigravityVerifiedFileStatKey(path)
+	if !cacheable || key == prevSnap.stat {
+		return nil, true
+	}
+	curr, valid := parseAntigravityLastConversationsFile(path)
+	if !valid {
+		return nil, true
+	}
+	antigravityCLIMetadataCache.Lock()
+	antigravityCLIMetadataCache.lastConversations[path] = antigravityLastConversationsSnapshot{
+		stat:        key,
+		projectByID: curr,
+		valid:       true,
+	}
+	antigravityCLIMetadataCache.Unlock()
+
+	seen := make(map[string]struct{})
+	var affected []string
+	for id, ws := range curr {
+		if prevSnap.projectByID[id] != ws {
+			seen[id] = struct{}{}
+			affected = append(affected, id)
+		}
+	}
+	for id, ws := range prevSnap.projectByID {
+		if _, done := seen[id]; done {
+			continue
+		}
+		if curr[id] != ws {
+			seen[id] = struct{}{}
+			affected = append(affected, id)
+		}
+	}
+	return affected, false
 }
 
 func loadAntigravityHistorySnapshot(path string) (antigravityHistorySnapshot, error) {
+	path = filepath.Clean(path)
 	key, cacheable := antigravityVerifiedFileStatKey(path)
 	if cacheable {
 		antigravityCLIMetadataCache.Lock()
@@ -970,6 +1033,65 @@ func loadAntigravityHistorySnapshot(path string) (antigravityHistorySnapshot, er
 		antigravityCLIMetadataCache.Unlock()
 	}
 	return snap, nil
+}
+
+func diffAntigravityHistoryChange(path string) ([]string, bool) {
+	path = filepath.Clean(path)
+	antigravityCLIMetadataCache.Lock()
+	prevSnap, hasPrev := antigravityCLIMetadataCache.history[path]
+	antigravityCLIMetadataCache.Unlock()
+	if !hasPrev {
+		return nil, true
+	}
+	key, cacheable := antigravityVerifiedFileStatKey(path)
+	if !cacheable || key == prevSnap.stat || key.size < prevSnap.stat.size {
+		return nil, true
+	}
+	currSnap, err := loadAntigravityHistorySnapshot(path)
+	if err != nil {
+		return nil, true
+	}
+	if len(currSnap.untagged) != len(prevSnap.untagged) {
+		return nil, true
+	}
+	for i := range currSnap.untagged {
+		if currSnap.untagged[i].tsMS != prevSnap.untagged[i].tsMS ||
+			!bytes.Equal(currSnap.untagged[i].raw, prevSnap.untagged[i].raw) {
+			return nil, true
+		}
+	}
+
+	seen := make(map[string]struct{})
+	var affected []string
+	for id, lines := range currSnap.taggedLinesByID {
+		if currSnap.projectByID[id] != prevSnap.projectByID[id] ||
+			!antigravityByteSlicesEqual(lines, prevSnap.taggedLinesByID[id]) {
+			seen[id] = struct{}{}
+			affected = append(affected, id)
+		}
+	}
+	for id := range prevSnap.taggedLinesByID {
+		if _, done := seen[id]; done {
+			continue
+		}
+		if _, ok := currSnap.taggedLinesByID[id]; !ok {
+			seen[id] = struct{}{}
+			affected = append(affected, id)
+		}
+	}
+	return affected, false
+}
+
+func antigravityByteSlicesEqual(a, b [][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !bytes.Equal(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // antigravityCLIWorkspaceForID resolves the workspace for one conversation ID

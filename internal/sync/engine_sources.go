@@ -27,6 +27,7 @@ type engineSources struct {
 	// discovery must leave untouched.
 	preserveAgents    []parser.AgentType
 	providerFactories map[parser.AgentType]parser.ProviderFactory
+	providerMetadata  map[parser.AgentType]map[string][]string
 	// providerStatHashers caches the optional MultiFileStatHasher
 	// implementations keyed by AgentType, built by type-asserting each
 	// constructed provider; nil entries indicate the provider does not
@@ -35,8 +36,47 @@ type engineSources struct {
 	providerStatHashers map[parser.AgentType]parser.MultiFileStatHasher
 }
 
+type engineProviderDefaults struct {
+	machine               string
+	stableSourceSnapshots bool
+	pathRewriter          func(string) string
+}
+
+func (e *Engine) providerDefaults() engineProviderDefaults {
+	if e == nil {
+		return engineProviderDefaults{}
+	}
+	return engineProviderDefaults{
+		machine:               e.machine,
+		stableSourceSnapshots: e.stableSourceSnapshots,
+		pathRewriter:          e.pathRewriter,
+	}
+}
+
+func cloneProviderMetadataMap(
+	in map[parser.AgentType]map[string][]string,
+) map[parser.AgentType]map[string][]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[parser.AgentType]map[string][]string, len(in))
+	for agent, dirs := range in {
+		if len(dirs) == 0 {
+			continue
+		}
+		copied := make(map[string][]string, len(dirs))
+		for root, list := range dirs {
+			copied[root] = append([]string(nil), list...)
+		}
+		out[agent] = copied
+	}
+	return out
+}
+
 func newEngineSources(
-	base []parser.ProviderFactory, cfg SourceConfig,
+	base []parser.ProviderFactory,
+	cfg SourceConfig,
+	defaults engineProviderDefaults,
 ) *engineSources {
 	dirs := make(map[parser.AgentType][]string, len(cfg.AgentDirs))
 	for k, v := range cfg.AgentDirs {
@@ -65,7 +105,8 @@ func newEngineSources(
 		sourceMachines:      sourceMachines,
 		preserveAgents:      disabledAgents,
 		providerFactories:   factoryMap,
-		providerStatHashers: buildProviderStatHashers(factoryMap),
+		providerMetadata:    cloneProviderMetadataMap(cfg.ProviderMetadata),
+		providerStatHashers: buildProviderStatHashers(factoryMap, dirs, sourceMachines, defaults),
 	}
 }
 
@@ -89,7 +130,7 @@ func (e *Engine) ReconfigureSources(cfg SourceConfig) {
 	if e.sourceSyncErr != nil {
 		return
 	}
-	next := newEngineSources(e.baseProviderFactories, cfg)
+	next := newEngineSources(e.baseProviderFactories, cfg, e.providerDefaults())
 	e.syncMu.Lock()
 	defer e.syncMu.Unlock()
 	e.sourceSet.Store(next)

@@ -12,7 +12,10 @@ import (
 	"strings"
 )
 
-var _ Provider = (*vscodeCopilotProvider)(nil)
+var (
+	_ Provider            = (*vscodeCopilotProvider)(nil)
+	_ MultiFileStatHasher = (*vscodeCopilotProvider)(nil)
+)
 
 type vscodeCopilotProviderFactory struct {
 	def AgentDef
@@ -77,6 +80,29 @@ func (p *vscodeCopilotProvider) Fingerprint(
 	source SourceRef,
 ) (SourceFingerprint, error) {
 	return p.sources.Fingerprint(ctx, source)
+}
+
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher over the chat
+// session file and its workspace.json manifest sibling, so warm sweeps skip
+// unchanged sessions without re-reading and hashing their contents.
+func (p *vscodeCopilotProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
+	return p.sources.computeMultiFileStatHash(chatPath)
+}
+
+// VSCodeCopilotEffectiveMtime returns the max ModTime().UnixNano() across the
+// chat session file and its sibling workspace.json manifest, matching
+// Fingerprint.MTimeNS.
+func VSCodeCopilotEffectiveMtime(chatPath string, chatInfo os.FileInfo) int64 {
+	mtime := chatInfo.ModTime().UnixNano()
+	workspacePath := vscodeCopilotWorkspaceManifestPath(filepath.Clean(chatPath))
+	if workspacePath != "" && IsRegularFile(workspacePath) {
+		if wsInfo, err := os.Stat(workspacePath); err == nil {
+			if ts := wsInfo.ModTime().UnixNano(); ts > mtime {
+				mtime = ts
+			}
+		}
+	}
+	return mtime
 }
 
 func (p *vscodeCopilotProvider) Parse(
@@ -655,6 +681,60 @@ func (s vscodeCopilotSourceSet) workspaceManifestForSource(path string) string {
 	return ""
 }
 
+func vscodeCopilotWorkspaceManifestPath(path string) string {
+	chatDir := filepath.Dir(path)
+	if filepath.Base(chatDir) != "chatSessions" || !isVSCodeCopilotSessionPath(filepath.Base(path)) {
+		return ""
+	}
+	hashDir := filepath.Dir(chatDir)
+	if filepath.Base(filepath.Dir(hashDir)) != "workspaceStorage" {
+		return ""
+	}
+	return filepath.Join(hashDir, "workspace.json")
+}
+
+func (s vscodeCopilotSourceSet) computeMultiFileStatHash(chatPath string) uint64 {
+	clean := filepath.Clean(chatPath)
+	info, err := os.Stat(clean)
+	if err != nil || info.IsDir() {
+		return 0
+	}
+	workspacePath := ""
+	if len(s.roots) > 0 {
+		for _, root := range s.roots {
+			root = filepath.Clean(root)
+			rel, ok := relUnder(root, clean)
+			if !ok {
+				continue
+			}
+			parts := strings.Split(filepath.ToSlash(rel), "/")
+			if len(parts) == 4 &&
+				parts[0] == "workspaceStorage" &&
+				parts[2] == "chatSessions" &&
+				isVSCodeCopilotSessionPath(parts[3]) {
+				workspacePath = filepath.Join(root, "workspaceStorage", parts[1], "workspace.json")
+				break
+			}
+		}
+	} else {
+		workspacePath = vscodeCopilotWorkspaceManifestPath(clean)
+	}
+	if workspacePath != "" {
+		wsInfo, wsErr := os.Lstat(workspacePath)
+		switch {
+		case errors.Is(wsErr, os.ErrNotExist):
+			workspacePath = ""
+		case wsErr != nil:
+			return 0
+		case !wsInfo.Mode().IsRegular():
+			// Match IsRegularFile in workspaceManifestForSource: non-regular
+			// manifests (e.g. symlinks or directories) are ignored.
+			workspacePath = ""
+		}
+	}
+	return fileStatTupleDigest(0xC5, clean, workspacePath)
+}
+
 func (s vscodeCopilotSourceSet) newSourceRef(root, path, project string) SourceRef {
 	return SourceRef{
 		Provider:       AgentVSCodeCopilot,
@@ -727,6 +807,7 @@ func vscodeCopilotProviderCapabilities() Capabilities {
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,
 			CompositeFingerprint: CapabilitySupported,
+			MultiFileStatHash:    CapabilitySupported,
 			IncrementalAppend:    CapabilityNotApplicable,
 			MultiSessionSource:   CapabilityNotApplicable,
 			PerSessionErrors:     CapabilityNotApplicable,

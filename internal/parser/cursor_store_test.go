@@ -1250,3 +1250,79 @@ func TestCursorStoreParseCarriesFingerprintMtime(t *testing.T) {
 	assert.Equal(t, fingerprint.MTimeNS, outcome.Results[0].Result.Session.File.Mtime)
 	assert.Equal(t, fingerprint.Size, outcome.Results[0].Result.Session.File.Size)
 }
+
+func TestCursorProviderMultiFileStatHashAndMeteredFingerprint(t *testing.T) {
+	fx := setupCursorStoreFixture(t, false)
+	assert.Equal(t, CapabilitySupported, fx.Provider.Capabilities().Source.MultiFileStatHash)
+	hasher, ok := fx.Provider.(MultiFileStatHasher)
+	require.True(t, ok, "cursor provider must implement MultiFileStatHasher")
+
+	var meter ContentReadMeter
+	fp, err := fx.Provider.Fingerprint(WithContentReadMeter(t.Context(), &meter), fx.Source)
+	require.NoError(t, err)
+	assert.NotEmpty(t, fp.Hash)
+	assert.Positive(t, meter.Bytes(), "cursor Fingerprint must meter transcript and store header reads")
+	assert.GreaterOrEqual(t, meter.Reads(), int64(2))
+
+	info, err := os.Stat(fx.Transcript)
+	require.NoError(t, err)
+	assert.Equal(t, fp.MTimeNS, CursorEffectiveMtime(fx.Provider, fx.Transcript, info))
+
+	baseHash := hasher.ComputeMultiFileStatHash(fx.Transcript)
+	if _, changeTimeOK := codexIndexChangeTime(fx.Transcript, info); !changeTimeOK {
+		assert.Zero(t, baseHash)
+		return
+	}
+	require.NotZero(t, baseHash)
+	assert.Equal(t, baseHash, hasher.ComputeMultiFileStatHash(fx.Transcript),
+		"hash must remain stable while transcript and store are unchanged")
+
+	// A reader-created empty WAL (no frames) must not invalidate the digest.
+	require.NoError(t, os.WriteFile(fx.StorePath+"-wal", make([]byte, 32), 0o644))
+	assert.Equal(t, baseHash, hasher.ComputeMultiFileStatHash(fx.Transcript),
+		"empty WAL without frames must be ignored")
+	require.NoError(t, os.Remove(fx.StorePath+"-wal"))
+
+	// Modifying the transcript itself must change the digest.
+	f, err := os.OpenFile(fx.Transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString("assistant:\nupdated\n")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	afterTranscript := hasher.ComputeMultiFileStatHash(fx.Transcript)
+	assert.NotZero(t, afterTranscript)
+	assert.NotEqual(t, baseHash, afterTranscript, "transcript mutation must change digest")
+
+	// Writing real WAL frames into an open WAL-mode store.db must change the digest.
+	walFx := setupCursorStoreFixture(t, true)
+	walHasher := walFx.Provider.(MultiFileStatHasher)
+	walBefore := walHasher.ComputeMultiFileStatHash(walFx.Transcript)
+	require.NotZero(t, walBefore)
+	_, err = walFx.Writer.ExecContext(t.Context(),
+		`INSERT INTO blobs(id, data) VALUES(?, ?)`,
+		cursorStoreHashID("stat-hash-wal-row"), []byte("wal-payload"),
+	)
+	require.NoError(t, err)
+	walAfter := walHasher.ComputeMultiFileStatHash(walFx.Transcript)
+	assert.NotZero(t, walAfter)
+	assert.NotEqual(t, walBefore, walAfter, "store WAL mutation must change digest")
+
+	var walMeter ContentReadMeter
+	walFP, err := walFx.Provider.Fingerprint(WithContentReadMeter(t.Context(), &walMeter), walFx.Source)
+	require.NoError(t, err)
+	assert.NotEmpty(t, walFP.Hash)
+	assert.Equal(t, int64(3), walMeter.Reads(), "Fingerprint must meter transcript, store.db header, and store.db-wal header")
+
+	// Transcript without any matched store.db also produces a stable non-zero digest.
+	plainRoot := t.TempDir()
+	plainPath := cursorProviderWriteJSONLTranscript(
+		t, filepath.Join(plainRoot, "Users-demo", "agent-transcripts"),
+		"11111111-2222-4333-8444-555555555555.jsonl", "plain",
+	)
+	plainProvider, ok := NewProvider(AgentCursor, ProviderConfig{Roots: []string{plainRoot}})
+	require.True(t, ok)
+	plainHasher := plainProvider.(MultiFileStatHasher)
+	hPlain := plainHasher.ComputeMultiFileStatHash(plainPath)
+	require.NotZero(t, hPlain)
+	assert.Equal(t, hPlain, plainHasher.ComputeMultiFileStatHash(plainPath))
+}

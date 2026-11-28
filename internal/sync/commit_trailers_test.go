@@ -409,3 +409,66 @@ func TestReconcileCommitTrailersSkipsPrunedWorktree(t *testing.T) {
 	assert.Zero(t, engine.reconcileCommitTrailersWithBudget(t.Context(), time.Minute))
 	assert.NotContains(t, logs.String(), "commit trailers in")
 }
+
+func TestReconcileCommitTrailersBadObjectCooldown(t *testing.T) {
+	testutil.IsolateGit(t)
+	database := openTestDB(t)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	brokenRepo := filepath.Join(root, "a-broken")
+	healthyRepo := filepath.Join(root, "z-healthy")
+	for _, repo := range []string{brokenRepo, healthyRepo} {
+		require.NoError(t, os.Mkdir(repo, 0o700))
+		runGit(t, repo, "init", "-q", "-b", "main")
+		runGit(t, repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", filepath.Base(repo)+"\n\nAgent-Session: claude:cooldown")
+		require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+			ID: filepath.Base(repo), Agent: "claude", Project: "project-a", Machine: "local", Cwd: repo,
+		}))
+	}
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID: "cooldown", Agent: "claude", Project: "project-a", Machine: "local",
+	}))
+
+	// Point an extra branch ref at a nonexistent object so git log --all fails with "fatal: bad object".
+	badRef := filepath.Join(brokenRepo, ".git", "refs", "heads", "corrupt")
+	require.NoError(t, os.WriteFile(badRef, []byte("0123456789abcdef0123456789abcdef01234567\n"), 0o600))
+
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	engine := NewEngine(t.Context(), database, EngineConfig{Machine: "local"})
+	t.Cleanup(engine.Close)
+	engine.trailerScanNow = func() time.Time { return now }
+
+	var logs strings.Builder
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	// First pass hits the broken repo, logs once, and records a 30m cooldown.
+	assert.Zero(t, engine.reconcileCommitTrailersWithBudget(t.Context(), 0))
+	assert.Equal(t, 1, strings.Count(logs.String(), "commit trailers in"))
+	assert.Contains(t, logs.String(), "fatal: bad object")
+	brokenKey := engine.cachedProjectIdentity("local", brokenRepo).repositoryPath
+	require.NotEmpty(t, brokenKey)
+	firstAttempt := engine.trailerScanAttempts[brokenKey]
+	assert.Equal(t, now, firstAttempt)
+	assert.Equal(t, now.Add(trailerBadObjectCooldown), engine.trailerScanCooldownUntil[brokenKey])
+
+	// Second pass within cooldown must skip the broken repo without logging again,
+	// and yield budget to the healthy repo instead.
+	now = now.Add(10 * time.Minute)
+	logs.Reset()
+	stored := engine.reconcileCommitTrailersWithBudget(t.Context(), 0)
+	assert.Equal(t, 1, stored)
+	assert.Empty(t, logs.String(), "broken repo in cooldown must not spam logs")
+	assert.Equal(t, firstAttempt, engine.trailerScanAttempts[brokenKey],
+		"broken repo in cooldown must not be re-scanned")
+
+	// Repair the corrupt ref and advance past the 30m cooldown.
+	require.NoError(t, os.Remove(badRef))
+	now = now.Add(trailerBadObjectCooldown)
+	stored = engine.reconcileCommitTrailersWithBudget(t.Context(), 0)
+	assert.Equal(t, 1, stored)
+	assert.Empty(t, logs.String())
+	_, stillCooling := engine.trailerScanCooldownUntil[brokenKey]
+	assert.False(t, stillCooling, "successful rescan after cooldown must clear backoff")
+}

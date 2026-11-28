@@ -2144,3 +2144,58 @@ func TestAntigravityCLIProviderPostScanWorkspaceReplaceConsistency(t *testing.T)
 	require.Len(t, outcome.Results, 1)
 	assert.Equal(t, "proj_b", outcome.Results[0].Result.Session.Project)
 }
+
+func TestAntigravityCLIProviderScopedHistoryAndCacheChanges(t *testing.T) {
+	root := t.TempDir()
+	idA := "11111111-2222-3333-4444-555555555555"
+	idB := "22222222-3333-4444-5555-666666666666"
+	idC := "33333333-4444-5555-6666-777777777777"
+	mustMkdir(t, filepath.Join(root, "conversations"))
+	dbA := filepath.Join(root, "conversations", idA+".db")
+	dbB := filepath.Join(root, "conversations", idB+".db")
+	dbC := filepath.Join(root, "conversations", idC+".db")
+	mustWrite(t, dbA, []byte("db-a"))
+	mustWrite(t, dbB, []byte("db-b"))
+	mustWrite(t, dbC, []byte("db-c"))
+
+	historyPath := filepath.Join(root, "history.jsonl")
+	lineA1 := fmt.Sprintf(`{"display":"first","timestamp":1779000000000,"workspace":"/tmp/proj-a","conversationId":%q}`+"\n", idA)
+	lineB1 := fmt.Sprintf(`{"display":"other","timestamp":1779000001000,"workspace":"/tmp/proj-b","conversationId":%q}`+"\n", idB)
+	mustWrite(t, historyPath, []byte(lineA1+lineB1))
+
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	mustMkdir(t, filepath.Dir(cachePath))
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/shared-ws":%q}`, idA)))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	// Populate discovery & metadata snapshot caches.
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, discovered, 3)
+
+	// Appending a tagged history line for idA must only invalidate idA.
+	lineA2 := fmt.Sprintf(`{"display":"second","timestamp":1779000002000,"workspace":"/tmp/proj-a","conversationId":%q}`+"\n", idA)
+	mustWrite(t, historyPath, []byte(lineA1+lineB1+lineA2))
+	changedHistory, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
+		Path:      historyPath,
+		WatchRoot: root,
+		EventKind: "write",
+	})
+	require.NoError(t, err)
+	assertAntigravityCLISourcePaths(t, changedHistory, dbA)
+
+	// Updating last_conversations.json from idA to idB must only invalidate idA and idB, not idC.
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/shared-ws":%q}`, idB)))
+	changedCache, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
+		Path:      cachePath,
+		WatchRoot: filepath.Join(root, "cache"),
+		EventKind: "write",
+	})
+	require.NoError(t, err)
+	assertAntigravityCLISourcePaths(t, changedCache, dbA, dbB)
+}
