@@ -11,8 +11,8 @@ import (
 
 // Antigravity CLI conversations are AES-encrypted on disk.
 // The Python decryptor (github.com/arashz/antigravity_decryptor)
-// tries CTR (primary) then CBC / GCM with various skip offsets.
-// We mirror that strategy with Go stdlib primitives.
+// supports CTR, CBC, and GCM with various skip offsets.
+// We use the same modes with Go stdlib primitives.
 //
 // LAST RESORT. This is the lowest-priority decode path for
 // legacy .pb sessions; agy-reader trajectory.json sidecars are
@@ -87,8 +87,8 @@ func hasAntigravityKey() bool {
 }
 
 // decryptAntigravity tries each (mode, skip, post-skip)
-// combination from the Python decryptor and returns the first
-// plaintext that walks as protobuf with at least one field.
+// combination from the Python decryptor. Authenticated GCM
+// candidates take precedence over heuristic CTR and CBC matches.
 // Returns nil, nil when none worked (caller should treat as a
 // non-decryptable session rather than an error).
 func decryptAntigravity(data []byte) ([]byte, error) {
@@ -98,9 +98,9 @@ func decryptAntigravity(data []byte) ([]byte, error) {
 	}
 	type modeFn func([]byte, []byte, int) []byte
 	modes := []modeFn{
+		decryptAesGCM,
 		decryptAesCTR,
 		decryptAesCBC,
-		decryptAesGCM,
 	}
 	skips := []int{0, 1, 2, 4, 8}
 	for _, fn := range modes {
@@ -114,7 +114,7 @@ func decryptAntigravity(data []byte) ([]byte, error) {
 					continue
 				}
 				cand := plain[post:]
-				if isLikelyAntigravityProto(cand) {
+				if isUsableAntigravityTranscript(cand) {
 					return cand, nil
 				}
 			}
@@ -196,16 +196,16 @@ func stripPKCS7(data []byte) []byte {
 	return data[:len(data)-pad]
 }
 
-// isLikelyAntigravityProto runs the wire walker over the first
-// chunk of a candidate plaintext and reports whether it looks
-// like a well-formed message. Caps work at 4KB to keep the
-// retry loop cheap. Uses the prefix-tolerant validator so that
-// large valid transcripts whose 4KB sniff falls mid-field still
-// pass.
-func isLikelyAntigravityProto(data []byte) bool {
-	head := data
-	if len(head) > 4096 {
-		head = head[:4096]
-	}
-	return agProtoLooksLikePrefix(head)
+const agTranscriptTextMinRunes = 40
+
+// isUsableAntigravityTranscript reports whether a candidate
+// plaintext decodes end-to-end as protobuf and carries the long
+// text this fallback exists to recover. The caller discards
+// plaintext without such text, so accepting weaker structural
+// matches only lets wrong keys and offsets win the candidate race.
+func isUsableAntigravityTranscript(data []byte) bool {
+	fields, err := agProtoParse(data)
+	return err == nil && len(agProtoCollectStrings(
+		fields, agTranscriptTextMinRunes,
+	)) > 0
 }
