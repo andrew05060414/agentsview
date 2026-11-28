@@ -1473,7 +1473,7 @@ func TestImportChatGPTReimportLegacyRows(t *testing.T) {
 			} else {
 				legacyDetail = chatGPTSyncDetail(1706745710, false, "Question")
 				detail = strings.ReplaceAll(legacyDetail, `"metadata":{}`, `"metadata":{"model_slug":"gpt-4o"}`)
-				stats, err = syncChatGPT(ctx, d, chatGPTSyncFetch(t, "1706745710", legacyDetail, &details), BrowserSyncOptions{}, nil)
+				stats, err = syncChatGPTTest(ctx, d, chatGPTSyncFetch(t, "1706745710", legacyDetail, &details), BrowserSyncOptions{}, nil)
 				require.NoError(t, err)
 				require.Equal(t, 1, stats.Imported)
 			}
@@ -1503,7 +1503,7 @@ func TestImportChatGPTReimportLegacyRows(t *testing.T) {
 				assert.Empty(t, unfilled[1].Model)
 				assert.Equal(t, before[1].SourceUUID, unfilled[1].SourceUUID)
 				detail = strings.Replace(detail, `"update_time":1706745710`, `"update_time":1706745720`, 1)
-				_, err = syncChatGPT(ctx, d, chatGPTSyncFetch(t, "1706745720", detail, &details), BrowserSyncOptions{}, nil)
+				_, err = syncChatGPTTest(ctx, d, chatGPTSyncFetch(t, "1706745720", detail, &details), BrowserSyncOptions{}, nil)
 				require.NoError(t, err)
 				synced, err := d.GetAllMessages(ctx, id)
 				require.NoError(t, err)

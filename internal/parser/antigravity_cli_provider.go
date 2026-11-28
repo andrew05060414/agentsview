@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
-var _ Provider = (*antigravityCLIProvider)(nil)
+var (
+	_ Provider            = (*antigravityCLIProvider)(nil)
+	_ MultiFileStatHasher = (*antigravityCLIProvider)(nil)
+)
 
 type antigravityCLIProviderFactory struct {
 	def AgentDef
@@ -104,6 +108,14 @@ func (p *antigravityCLIProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher over the
+// conversation source, its per-session companions, its slice of history.jsonl,
+// its resolved workspace, and the summary store digest, avoiding reading multi-GB
+// historical conversation payloads on unrelated history/cache updates.
+func (p *antigravityCLIProvider) ComputeMultiFileStatHash(path string) uint64 {
+	return antigravityCLISessionStatHash(path)
+}
+
 func (p *antigravityCLIProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -126,17 +138,26 @@ func (p *antigravityCLIProvider) Parse(
 		return ParseOutcome{}, fmt.Errorf("stat %s: %w", src.Path, err)
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
+	projectHint := req.Source.ProjectHint
 	cwd := ""
 	if req.Source.CwdResolution.State == SourceCwdResolved {
 		cwd = req.Source.CwdResolution.Path
 	}
 	if req.Source.CwdResolution.State == SourceCwdRemote {
 		ctx = WithoutFilesystemProjectDiscovery(ctx)
+	} else if src.Root != "" {
+		// Align post-scan workspace replacements with ComputeMultiFileStatHash
+		// and Fingerprint so a mapping update between discovery and parse
+		// cannot leave stale workspace/project data pinned behind a new digest.
+		if workspace := antigravityCLIWorkspaceForID(ctx, src.Root, src.ID); workspace != src.Workspace {
+			projectHint = workspace
+			cwd = normalizeAntigravityCLIWorkspace(workspace)
+		}
 	}
 	sess, msgs, usageEvents, status, err := p.parseSessionWithStatus(
 		ctx,
 		src.Path,
-		req.Source.ProjectHint,
+		projectHint,
 		cwd,
 		machine,
 	)
@@ -701,14 +722,18 @@ func (s antigravityCLISourceSet) Fingerprint(
 		return SourceFingerprint{}, errors.New("antigravity cli source path unavailable")
 	}
 	key := firstNonEmptyJSONLString(source.FingerprintKey, source.Key, src.Path)
-	info, err := AntigravityCLIFileInfo(src.Path)
+	info, err := AntigravityCLISessionFileInfo(src.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return SourceFingerprint{Key: key}, nil
 		}
 		return SourceFingerprint{}, err
 	}
-	hash, err := antigravityCLICompositeHash(ctx, src.Path, src.ID, src.Workspace)
+	workspace := src.Workspace
+	if src.Root != "" {
+		workspace = antigravityCLIWorkspaceForID(ctx, src.Root, src.ID)
+	}
+	hash, err := antigravityCLICompositeHash(ctx, src.Path, src.ID, workspace)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -1015,11 +1040,45 @@ func antigravityCLIWatchRootMatches(root, watchRoot string) bool {
 	return samePath(watchRoot, filepath.Clean(root))
 }
 
+// IsAntigravityCLIHistoryOrCacheFile reports whether path names one of the
+// root-level Antigravity CLI history or workspace-cache files whose edits
+// fan out to sessions under the root.
+func IsAntigravityCLIHistoryOrCacheFile(path string) bool {
+	clean := filepath.Clean(path)
+	base := filepath.Base(clean)
+	return base == "history.jsonl" ||
+		(base == "last_conversations.json" &&
+			filepath.Base(filepath.Dir(clean)) == "cache")
+}
+
+func antigravityCLISessionStatHash(path string) uint64 {
+	id, _, ok := antigravityCLIPathID(filepath.Base(path))
+	if !ok {
+		return 0
+	}
+	root := filepath.Dir(filepath.Dir(path))
+	ctx := context.Background()
+	return antigravityStatHashFromCompanions(
+		ctx,
+		path,
+		antigravityCLIProviderCompanionPaths(path),
+		root,
+		id,
+		func(h hash.Hash64, maxMtimeNS int64) bool {
+			workspace := antigravityCLIWorkspaceForID(ctx, root, id)
+			return writeAntigravityCLIHistoryAndWorkspaceDigest(
+				h, root, id, workspace, maxMtimeNS,
+			) == nil
+		},
+	)
+}
+
 func antigravityCLIProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
 	source.StreamingDiscovery = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
 	source.ChangedPathRelevance = CapabilitySupported
+	source.MultiFileStatHash = CapabilitySupported
 	return Capabilities{
 		Source: source,
 		Content: ContentCapabilities{

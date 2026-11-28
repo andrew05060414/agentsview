@@ -28,4 +28,7 @@ func TestCodexCloudStatusRoute(t *testing.T) {
 			`[{"key":"codex-cloud","homes":[],"state":"off_disabled","message":"Off: enabled is false."}]`,
 			w.Body.String())
 	})
+	t.Run("codex-cloud status is an archive freshness probe", func(t *testing.T) {
+		assert.True(t, archiveFreshnessProbe("/api/v1/codex-cloud/status"))
+	})
 }

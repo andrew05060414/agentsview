@@ -11,17 +11,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const expectedSQLiteCacheSizeKiB = -8192
+const (
+	expectedSQLiteCacheSizeKiB       = -8192
+	expectedSQLiteWriterCacheSizeKiB = -65536
+)
 
 func assertSQLiteMemoryPragmas(
 	t *testing.T,
 	conn *sql.DB,
+	wantCacheSizeKiB int,
 ) {
 	t.Helper()
 
 	var got int
 	require.NoError(t, conn.QueryRowContext(t.Context(), "PRAGMA cache_size").Scan(&got))
-	assert.Equal(t, expectedSQLiteCacheSizeKiB, got)
+	assert.Equal(t, wantCacheSizeKiB, got)
 
 	var mmapSize int64
 	require.NoError(t, conn.QueryRowContext(t.Context(), "PRAGMA mmap_size").Scan(&mmapSize))
@@ -29,11 +33,13 @@ func assertSQLiteMemoryPragmas(
 
 func TestSQLiteConnectionMemoryPragmas(t *testing.T) {
 	tests := []struct {
-		name string
-		open func(*testing.T, string) *sql.DB
+		name             string
+		wantCacheSizeKiB int
+		open             func(*testing.T, string) *sql.DB
 	}{
 		{
-			name: "Open writer",
+			name:             "Open writer",
+			wantCacheSizeKiB: expectedSQLiteWriterCacheSizeKiB,
 			open: func(t *testing.T, path string) *sql.DB {
 				t.Helper()
 				database, err := Open(t.Context(), path)
@@ -45,7 +51,8 @@ func TestSQLiteConnectionMemoryPragmas(t *testing.T) {
 			},
 		},
 		{
-			name: "Open reader",
+			name:             "Open reader",
+			wantCacheSizeKiB: expectedSQLiteCacheSizeKiB,
 			open: func(t *testing.T, path string) *sql.DB {
 				t.Helper()
 				database, err := Open(t.Context(), path)
@@ -57,7 +64,8 @@ func TestSQLiteConnectionMemoryPragmas(t *testing.T) {
 			},
 		},
 		{
-			name: "OpenReadOnly reader",
+			name:             "OpenReadOnly reader",
+			wantCacheSizeKiB: expectedSQLiteCacheSizeKiB,
 			open: func(t *testing.T, path string) *sql.DB {
 				t.Helper()
 
@@ -78,7 +86,7 @@ func TestSQLiteConnectionMemoryPragmas(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "sessions.db")
-			assertSQLiteMemoryPragmas(t, tt.open(t, path))
+			assertSQLiteMemoryPragmas(t, tt.open(t, path), tt.wantCacheSizeKiB)
 		})
 	}
 }

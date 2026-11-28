@@ -884,7 +884,43 @@ func TestAntigravityCLIProviderFingerprintTracksSideInputs(t *testing.T) {
 			`"workspace":"/tmp/fallback"}`))
 	afterUntaggedHistory, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
-	assert.NotEqual(t, afterUnrelatedHistory.Hash, afterUntaggedHistory.Hash)
+	assert.Equal(t, afterUnrelatedHistory.Hash, afterUntaggedHistory.Hash,
+		"mapped session must ignore untagged history rows")
+
+	unmappedID := "99999999-aaaa-bbbb-cccc-dddddddddddd"
+	unmappedPath := filepath.Join(root, "conversations", unmappedID+".pb")
+	mustWrite(t, unmappedPath, []byte("unmapped-pb"))
+	unmappedTime := time.UnixMilli(1779000000000)
+	require.NoError(t, os.Chtimes(unmappedPath, unmappedTime, unmappedTime))
+	unmappedSrc, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+		RawSessionID: unmappedID,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	mustWrite(t, filepath.Join(root, "history.jsonl"), []byte(unrelatedHistory))
+	unmappedBefore, err := provider.Fingerprint(t.Context(), unmappedSrc)
+	require.NoError(t, err)
+
+	// A newer untagged prompt outside the +/-60s fallback window must not
+	// perturb an older unmapped session's fingerprint.
+	withLaterUntagged := unrelatedHistory + "\n" +
+		`{"display":"later prompt","timestamp":1779000120000,` +
+		`"workspace":"/tmp/later"}`
+	mustWrite(t, filepath.Join(root, "history.jsonl"), []byte(withLaterUntagged))
+	unmappedAfterLater, err := provider.Fingerprint(t.Context(), unmappedSrc)
+	require.NoError(t, err)
+	assert.Equal(t, unmappedBefore.Hash, unmappedAfterLater.Hash)
+
+	// A contemporaneous untagged prompt within the +/-60s fallback window
+	// must change the unmapped session's fingerprint.
+	mustWrite(t, filepath.Join(root, "history.jsonl"),
+		[]byte(withLaterUntagged+"\n"+
+			`{"display":"untagged prompt","timestamp":1779000000000,`+
+			`"workspace":"/tmp/fallback"}`))
+	unmappedAfterFallback, err := provider.Fingerprint(t.Context(), unmappedSrc)
+	require.NoError(t, err)
+	assert.NotEqual(t, unmappedBefore.Hash, unmappedAfterFallback.Hash)
 
 	mustWrite(t, filepath.Join(root, "brain", id, "task.md"), []byte("# Changed"))
 	afterBrain, err := provider.Fingerprint(t.Context(), source)
@@ -1863,4 +1899,248 @@ func TestAntigravityBrainTranscriptTransfersNormalizedModelAndReasoningEffort(t 
 	require.Len(t, usageEvents, 2)
 	assert.Equal(t, "gemini-4-neon", usageEvents[0].Model)
 	assert.Equal(t, "gemini-4-neon", usageEvents[1].Model)
+}
+
+func TestAntigravityCLIProviderFingerprintIgnoresUnrelatedCacheUpdates(t *testing.T) {
+	root := t.TempDir()
+	idA := "11111111-2222-3333-4444-555555555555"
+	idB := "66666667-7777-8888-9999-aaaaaaaaaaaa"
+	convDir := filepath.Join(root, "conversations")
+	mustMkdir(t, convDir)
+	mustWrite(t, filepath.Join(convDir, idA+".pb"), []byte("pb-a"))
+	mustWrite(t, filepath.Join(convDir, idB+".pb"), []byte("pb-b"))
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	historyPath := filepath.Join(root, "history.jsonl")
+	mustMkdir(t, filepath.Dir(cachePath))
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/proj-a":%q,"/tmp/proj-b":%q}`, idA, idB)))
+	mustWrite(t, historyPath, []byte(fmt.Sprintf(`{"conversationId":%q,"workspace":"/tmp/proj-a","display":"a"}`+"\n", idA)))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	srcA, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: idA})
+	require.NoError(t, err)
+	require.True(t, ok)
+	srcB, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: idB})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	fpABefore, err := provider.Fingerprint(t.Context(), srcA)
+	require.NoError(t, err)
+	fpBBefore, err := provider.Fingerprint(t.Context(), srcB)
+	require.NoError(t, err)
+
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/proj-a":%q,"/tmp/proj-b-new":%q}`, idA, idB)))
+	mustWrite(t, historyPath, []byte(fmt.Sprintf(
+		`{"conversationId":%q,"workspace":"/tmp/proj-a","display":"a"}`+"\n"+
+			`{"conversationId":%q,"workspace":"/tmp/proj-b-new","display":"b"}`+"\n",
+		idA, idB,
+	)))
+	late := time.Now().Add(2 * time.Minute)
+	require.NoError(t, os.Chtimes(cachePath, late, late))
+	require.NoError(t, os.Chtimes(historyPath, late, late))
+
+	srcAAfter, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: idA})
+	require.NoError(t, err)
+	require.True(t, ok)
+	srcBAfter, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: idB})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	fpAAfter, err := provider.Fingerprint(t.Context(), srcAAfter)
+	require.NoError(t, err)
+	fpBAfter, err := provider.Fingerprint(t.Context(), srcBAfter)
+	require.NoError(t, err)
+
+	assert.Equal(t, fpABefore.Size, fpAAfter.Size)
+	assert.Equal(t, fpABefore.MTimeNS, fpAAfter.MTimeNS)
+	assert.Equal(t, fpABefore.Hash, fpAAfter.Hash)
+	assert.NotEqual(t, fpBBefore.Hash, fpBAfter.Hash)
+}
+
+func TestAntigravityCLIProviderMultiFileStatHashTracksSideInputs(t *testing.T) {
+	root := t.TempDir()
+	idA := "11111111-2222-3333-4444-555555555555"
+	idB := "66666667-7777-8888-9999-aaaaaaaaaaaa"
+	convDir := filepath.Join(root, "conversations")
+	mustMkdir(t, convDir)
+	pbA := filepath.Join(convDir, idA+".pb")
+	pbB := filepath.Join(convDir, idB+".pb")
+	mustWrite(t, pbA, []byte("pb-a"))
+	mustWrite(t, pbB, []byte("pb-b"))
+	old := time.UnixMilli(1779000000000)
+	require.NoError(t, os.Chtimes(pbA, old, old))
+	require.NoError(t, os.Chtimes(pbB, old, old))
+
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	historyPath := filepath.Join(root, "history.jsonl")
+	mustMkdir(t, filepath.Dir(cachePath))
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/proj-a":%q,"/tmp/proj-b":%q}`, idA, idB)))
+	mustWrite(t, historyPath, []byte(fmt.Sprintf(`{"conversationId":%q,"workspace":"/tmp/proj-a","display":"a"}`+"\n", idA)))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	hasher, ok := provider.(MultiFileStatHasher)
+	require.True(t, ok)
+
+	hABefore := hasher.ComputeMultiFileStatHash(pbA)
+	require.NotZero(t, hABefore)
+	hBBefore := hasher.ComputeMultiFileStatHash(pbB)
+	require.NotZero(t, hBBefore)
+
+	// Unrelated cache change, unrelated tagged history line, and newer untagged
+	// prompt must all keep idA's stat hash identical while changing idB's.
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{"/tmp/proj-a":%q,"/tmp/proj-b-new":%q}`, idA, idB)))
+	mustWrite(t, historyPath, []byte(fmt.Sprintf(
+		`{"conversationId":%q,"workspace":"/tmp/proj-a","display":"a"}`+"\n"+
+			`{"conversationId":%q,"workspace":"/tmp/proj-b-new","display":"b"}`+"\n"+
+			`{"display":"new prompt","timestamp":1779000600000,"workspace":"/tmp/other"}`+"\n",
+		idA, idB,
+	)))
+	assert.Equal(t, hABefore, hasher.ComputeMultiFileStatHash(pbA))
+	assert.NotEqual(t, hBBefore, hasher.ComputeMultiFileStatHash(pbB))
+
+	// A brain artifact edit for idA must change idA's stat hash.
+	brainDir := filepath.Join(root, "brain", idA)
+	mustMkdir(t, brainDir)
+	mustWrite(t, filepath.Join(brainDir, "task.md"), []byte("# Task"))
+	assert.NotEqual(t, hABefore, hasher.ComputeMultiFileStatHash(pbA))
+}
+
+func TestAntigravityProviderMultiFileStatHashAndMeteredFingerprint(t *testing.T) {
+	root := t.TempDir()
+	id := "abababab-1111-2222-3333-cdcdcdcdcdcd"
+	writeAntigravityIDEProviderFixture(t, root, id)
+	dbPath := filepath.Join(root, "conversations", id+".db")
+
+	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	assert.Equal(t, CapabilitySupported, provider.Capabilities().Source.MultiFileStatHash)
+	hasher, ok := provider.(MultiFileStatHasher)
+	require.True(t, ok)
+
+	src, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	var meter ContentReadMeter
+	fp, err := provider.Fingerprint(WithContentReadMeter(t.Context(), &meter), src)
+	require.NoError(t, err)
+	assert.NotEmpty(t, fp.Hash)
+	assert.Positive(t, meter.Reads())
+	assert.Positive(t, meter.Bytes())
+
+	baseHash := hasher.ComputeMultiFileStatHash(dbPath)
+	require.NotZero(t, baseHash)
+
+	// An empty WAL and a .db-shm read index must not invalidate the stat hash.
+	mustWrite(t, dbPath+"-wal", []byte{})
+	mustWrite(t, dbPath+"-shm", make([]byte, 64))
+	assert.Equal(t, baseHash, hasher.ComputeMultiFileStatHash(dbPath))
+
+	// A framed WAL, sidecar, annotation, brain doc, metadata, and brain
+	// transcript must each invalidate the stat hash.
+	walPath := dbPath + "-wal"
+	mustWrite(t, walPath, make([]byte, 32+24+64))
+	hWithWAL := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, baseHash, hWithWAL)
+	require.NoError(t, os.Remove(walPath))
+
+	mustWrite(t, filepath.Join(root, "annotations", id+".pbtxt"),
+		[]byte("last_user_view_time:{seconds:1779999999 nanos:0}\n"))
+	hAnn := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, baseHash, hAnn)
+
+	writeAntigravityTestSidecar(t, root, id, 2)
+	hSidecar := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, hAnn, hSidecar)
+
+	mustWrite(t, filepath.Join(root, "brain", id, "plan.md"), []byte("# Updated Plan"))
+	hBrain := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, hSidecar, hBrain)
+
+	transcriptPath := antigravityBrainTranscriptPath(root, id)
+	mustMkdir(t, filepath.Dir(transcriptPath))
+	mustWrite(t, transcriptPath, []byte(`{"role":"user","text":"hello"}`+"\n"))
+	hTranscript := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, hBrain, hTranscript)
+
+	// Standalone brain transcript session (no DB) also hashes safely.
+	standaloneID := "efefefef-1111-2222-3333-909090909090"
+	standalonePath := antigravityBrainTranscriptPath(root, standaloneID)
+	mustMkdir(t, filepath.Dir(standalonePath))
+	mustWrite(t, standalonePath, []byte(`{"role":"user","text":"v1"}`+"\n"))
+	hStandaloneBefore := hasher.ComputeMultiFileStatHash(standalonePath)
+	require.NotZero(t, hStandaloneBefore)
+	mustWrite(t, standalonePath, []byte(`{"role":"user","text":"v1-updated"}`+"\n"))
+	assert.NotEqual(t, hStandaloneBefore, hasher.ComputeMultiFileStatHash(standalonePath))
+}
+
+func TestAntigravityCLIProviderPostScanWorkspaceReplaceConsistency(t *testing.T) {
+	root := t.TempDir()
+	id := "cafebabe-1111-2222-3333-deadbeef0001"
+	convDir := filepath.Join(root, "conversations")
+	mustMkdir(t, convDir)
+	pbPath := filepath.Join(convDir, id+".pb")
+	mustWrite(t, pbPath, []byte("pb-payload"))
+	brainDir := filepath.Join(root, "brain", id)
+	mustMkdir(t, brainDir)
+	mustWrite(t, filepath.Join(brainDir, "task.md"), []byte("# Task"))
+
+	projA := filepath.Join(root, "proj-a")
+	projB := filepath.Join(root, "proj-b")
+	mustMkdir(t, projA)
+	mustMkdir(t, projB)
+
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	mustMkdir(t, filepath.Dir(cachePath))
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{%q:%q}`, projA, id)))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	hasher := provider.(MultiFileStatHasher)
+
+	var scanned []SourceRef
+	require.NoError(t, provider.(StreamingDiscoverer).DiscoverEach(
+		t.Context(),
+		func(ref SourceRef) error {
+			scanned = append(scanned, ref)
+			return nil
+		},
+	))
+	require.Len(t, scanned, 1)
+	statBefore := hasher.ComputeMultiFileStatHash(pbPath)
+	fpBefore, err := provider.Fingerprint(t.Context(), scanned[0])
+	require.NoError(t, err)
+
+	// Replace the workspace cache AFTER discovery scan while keeping the
+	// already-discovered SourceRef (simulating DiscoverEach -> processProviderFile).
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{%q:%q}`, projB, id)))
+	assert.NotEqual(t, statBefore, hasher.ComputeMultiFileStatHash(pbPath))
+
+	fpAfter, err := provider.Fingerprint(t.Context(), scanned[0])
+	require.NoError(t, err)
+	assert.NotEqual(t, fpBefore.Hash, fpAfter.Hash)
+
+	freshSrc, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
+	require.NoError(t, err)
+	require.True(t, found)
+	fpFresh, err := provider.Fingerprint(t.Context(), freshSrc)
+	require.NoError(t, err)
+	assert.Equal(t, fpFresh.Hash, fpAfter.Hash)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source:      scanned[0],
+		Fingerprint: fpAfter,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	assert.Equal(t, "proj_b", outcome.Results[0].Result.Session.Project)
 }

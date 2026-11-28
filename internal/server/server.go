@@ -301,6 +301,7 @@ func New(
 	modelGroups := service.NewModelGroups(cfg.ModelAliases)
 	backendOptions := []service.DirectBackendOption{
 		service.WithModelGroups(modelGroups), service.WithConfiguredDocbank(cfg),
+		service.WithAccountAliases(cfg.AccountAliases),
 	}
 	var sessions service.SessionService
 	if local, ok := database.(*db.DB); ok {
@@ -1043,7 +1044,7 @@ func (s *Server) Handler() http.Handler {
 // Archive probes report readiness rather than archive results.
 func archiveFreshnessProbe(path string) bool {
 	switch path {
-	case "/api/ping", "/api/v1/version", "/api/v1/sync/status":
+	case "/api/ping", "/api/v1/version", "/api/v1/sync/status", "/api/v1/codex-cloud/status":
 		return true
 	}
 	return false

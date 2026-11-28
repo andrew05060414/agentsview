@@ -200,7 +200,7 @@ type ContentSearchRequest struct {
 	// match (0 = off, max 10). See directBackend.SearchContent.
 	Context int `json:"context,omitempty"`
 
-	Project, ExcludeProject, Machine, Agent           string
+	Project, ExcludeProject, Machine, Account, Agent  string
 	SessionID, GitBranchExact                         string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	ExcludeActiveSince                                string
@@ -429,6 +429,7 @@ func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 
 // SessionList mirrors GET /api/v1/sessions.
 type SessionList struct {
+	AccountAliases  map[string]string          `json:"account_aliases,omitempty"`
 	ExclusionCounts *db.SessionExclusionCounts `json:"exclusion_counts,omitempty"`
 	Sessions        []db.Session               `json:"sessions"`
 	NextCursor      string                     `json:"next_cursor,omitempty"`
@@ -459,6 +460,7 @@ type ListFilter struct {
 	Project            string `json:"project,omitempty"`
 	ExcludeProject     string `json:"exclude_project,omitempty"`
 	Machine            string `json:"machine,omitempty"`
+	Account            string `json:"account,omitempty"`
 	GitBranch          string `json:"git_branch,omitempty"`
 	Agent              string `json:"agent,omitempty"`
 	Date               string `json:"date,omitempty"`

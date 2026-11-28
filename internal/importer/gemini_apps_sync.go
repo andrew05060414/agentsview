@@ -24,6 +24,7 @@ var geminiAppsRequests = browserRequests(parser.AgentGeminiApps)
 const (
 	geminiListRequest = iota
 	geminiDetailRequest
+	geminiAccountRequest
 )
 
 const (
@@ -48,6 +49,10 @@ func geminiAppsPlatform() BrowserPlatform {
 		AuthRequired: func(status int, _ []byte) bool { return status == 401 },
 		Sync:         syncGeminiApps,
 	}
+}
+
+func geminiAccountPath(path string, index int) string {
+	return "/u/" + strconv.Itoa(index) + path
 }
 
 // geminiRPCPayload unwraps one batchexecute response: an anti-JSON prefix,
@@ -139,47 +144,84 @@ func geminiListEntry(raw jsontext.Value) (geminiChat, bool) {
 	return chat, true
 }
 
-// syncGeminiApps imports new and changed Gemini Apps conversations.
+// syncGeminiApps imports new and changed Gemini Apps conversations from every
+// Google account signed in to the Chrome profile. Accounts live at /u/N/
+// slots; Sync starts at slot 0 and stops at the first slot with no new
+// account, up to ten accounts.
 func syncGeminiApps(ctx context.Context, store BrowserSyncStore, fetch BrowserFetch, opts BrowserSyncOptions, cb *ImportCallbacks) (stats ImportStats, retErr error) {
 	platform := geminiAppsPlatform()
+	identities := make(map[string]struct{})
+	for index := range 10 {
+		accountFetch := func(ctx context.Context, path string) (BrowserResponse, error) {
+			return fetch(ctx, geminiAccountPath(path, index))
+		}
+		path := geminiRequest(geminiAccountRequest, "", "")
+		account, available := browserAccount(ctx, accountFetch, path)
+		_, duplicate := identities[account]
+		if index > 0 && (!available || account == "" || duplicate) {
+			break
+		}
+		identities[account] = struct{}{}
+		runner := newBrowserSync(store, platform, &stats, opts, cb)
+		runner.refused = errGeminiRejected
+		var ids []string
+		err := syncGeminiAccount(ctx, platform, runner, accountFetch, opts, &ids)
+		if httpErr, ok := errors.AsType[*browserHTTPError](err); ctx.Err() != nil || ok && httpErr.rateLimited {
+			return stats, errors.Join(retErr, err)
+		}
+		// Slot 0's sign-in error reaches the user; a later slot's means the
+		// slots are done, not that the whole sync failed.
+		if errors.Is(err, ErrBrowserAuthRequired) && index > 0 {
+			break
+		}
+		retErr = errors.Join(retErr, err)
+		if err == nil {
+			retErr = errors.Join(retErr, runner.confirmAccount(ctx, accountFetch, path, account, ids))
+		}
+	}
+	return stats, errors.Join(retErr, ctx.Err())
+}
+
+// syncGeminiAccount syncs one Google account slot's chat list into stats.
+func syncGeminiAccount(ctx context.Context, platform BrowserPlatform, runner *browserSync, fetch BrowserFetch, opts BrowserSyncOptions, ids *[]string) error {
 	seen := make(map[string]struct{})
-	runner := newBrowserSync(store, platform, &stats, opts, cb)
-	runner.refused = errGeminiRejected
 	// A page with no chats or a cursor seen before would loop forever. Paging
 	// has no count limit, so a long list still finishes.
 	cursor, cursors := "", map[string]struct{}{"": {}}
 	for {
 		raw, err := fetchBrowser(ctx, platform, fetch, geminiRequest(geminiListRequest, "", cursor))
 		if err != nil {
-			return stats, err
+			return err
 		}
 		payload, err := geminiRPCPayload(platform, raw, geminiListRPC)
 		if err != nil {
-			return stats, err
+			return err
 		}
 		items, next, err := geminiPage(platform, payload, 2)
 		if err != nil {
-			return stats, err
+			return err
 		}
 		var entries []jsontext.Value
 		if err := json.Unmarshal(items, &entries); err != nil {
-			return stats, platform.wrap(ErrBrowserFormat)
+			return platform.wrap(ErrBrowserFormat)
 		}
 		for _, item := range entries {
 			if err := ctx.Err(); err != nil {
-				return stats, err
+				return err
 			}
 			chat, ok := geminiListEntry(item)
 			if !ok {
-				stats.Errors++
-				cb.progress(stats)
+				runner.stats.Errors++
+				runner.cb.progress(*runner.stats)
 				continue
 			}
 			if _, ok := seen[chat.id]; ok {
 				continue
 			}
 			seen[chat.id] = struct{}{}
-			err := runner.conversation(ctx, "gemini-apps:"+chat.id, browserConversation{
+			id := "gemini-apps:" + chat.id
+			*ids = append(*ids, id)
+			err := runner.conversation(ctx, id, browserConversation{
 				freshness: func(session *db.Session) uint64 {
 					marker := ""
 					if !chat.updatedAt.IsZero() {
@@ -207,18 +249,18 @@ func syncGeminiApps(ctx context.Context, store BrowserSyncStore, fetch BrowserFe
 				},
 			})
 			if err != nil {
-				return stats, err
+				return err
 			}
 		}
 		if next == "" || len(entries) == 0 {
 			break
 		}
 		if _, ok := cursors[next]; ok {
-			return stats, errors.New("the Gemini chat list repeated a page")
+			return errors.New("the Gemini chat list repeated a page")
 		}
 		cursor, cursors[next] = next, struct{}{}
 	}
-	return stats, runner.formatErr
+	return runner.formatErr
 }
 
 // fetchGeminiConversation follows the turn cursor and assembles the pages

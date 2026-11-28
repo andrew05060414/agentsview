@@ -2,6 +2,7 @@ package parser
 
 import (
 	"encoding/json/v2"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1362,4 +1363,65 @@ func TestGrokProviderCountsOversizedUpdatesRecordOnce(t *testing.T) {
 	assert.Equal(t, 1, result.Session.MalformedLines)
 	require.Len(t, result.UsageEvents, 2)
 	assert.Equal(t, 23, result.Session.TotalOutputTokens)
+}
+
+func TestGrokProviderMultiFileStatHashTracksAllInputs(t *testing.T) {
+	root := t.TempDir()
+	cwdKey := "cwd-key"
+	parentID := "11111111-1111-4111-8111-111111111111"
+	childID := "22222222-2222-4222-8222-222222222222"
+
+	summaryPath := grokSummaryPath(root, cwdKey, childID)
+	writeGrokFixtureFile(t, summaryPath, `{
+		"summary": "Child",
+		"firstPrompt": "child prompt",
+		"session_kind": "subagent",
+		"createdAt": "2026-07-08T10:00:00Z"
+	}`)
+	for name, body := range map[string]string{
+		"signals.json":        `{}`,
+		"chat_history.jsonl":  `{"role":"user","content":"hi"}` + "\n",
+		"updates.jsonl":       `{"params":{"update":{"usage":{"inputTokens":1}}}}` + "\n",
+		"prompt_context.json": `{"files":[]}`,
+	} {
+		writeGrokFixtureFile(t, filepath.Join(filepath.Dir(summaryPath), name), body)
+	}
+	metaPath := filepath.Join(root, cwdKey, parentID, "subagents", childID, "meta.json")
+	writeGrokFixtureFile(t, metaPath, fmt.Sprintf(`{"parent_session_id":%q,"child_session_id":%q}`, parentID, childID))
+
+	provider := newGrokTestProvider(t, root)
+	assert.Equal(t, CapabilitySupported, provider.Capabilities().Source.MultiFileStatHash)
+	hasher, ok := provider.(MultiFileStatHasher)
+	require.True(t, ok)
+
+	assert.Zero(t, hasher.ComputeMultiFileStatHash(filepath.Join(filepath.Dir(summaryPath), "signals.json")))
+
+	prev := hasher.ComputeMultiFileStatHash(summaryPath)
+	require.NotZero(t, prev)
+
+	for name, updated := range map[string]string{
+		"summary.json": `{
+			"summary": "Child updated",
+			"firstPrompt": "child prompt",
+			"session_kind": "subagent",
+			"createdAt": "2026-07-08T10:00:00Z"
+		}`,
+		"signals.json":        `{"ok":true}`,
+		"chat_history.jsonl":  `{"role":"user","content":"hi again"}` + "\n",
+		"updates.jsonl":       `{"params":{"update":{"usage":{"inputTokens":2}}}}` + "\n",
+		"prompt_context.json": `{"files":["a.go"]}`,
+	} {
+		target := filepath.Join(filepath.Dir(summaryPath), name)
+		writeGrokFixtureFile(t, target, updated)
+		next := hasher.ComputeMultiFileStatHash(summaryPath)
+		assert.NotEqual(t, prev, next, "editing %s must change stat hash", name)
+		prev = next
+	}
+
+	writeGrokFixtureFile(t, metaPath, fmt.Sprintf(`{"parent_session_id":%q,"child_session_id":%q,"tag":"x"}`, parentID, childID))
+	afterMetaEdit := hasher.ComputeMultiFileStatHash(summaryPath)
+	assert.NotEqual(t, prev, afterMetaEdit)
+
+	require.NoError(t, os.Remove(metaPath))
+	assert.NotEqual(t, afterMetaEdit, hasher.ComputeMultiFileStatHash(summaryPath))
 }

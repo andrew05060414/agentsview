@@ -548,7 +548,6 @@ func TestCodexLabeledForkResolvesAndCapturesParent(t *testing.T) {
 	}
 	assert.Contains(t, paths, parent)
 }
-
 func BenchmarkCodexForkParentDatedDirectories(b *testing.B) {
 	for _, days := range []int{10, 1000} {
 		b.Run(strconv.Itoa(days), func(b *testing.B) {

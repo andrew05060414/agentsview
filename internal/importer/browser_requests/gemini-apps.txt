@@ -1,2 +1,3 @@
 /_/BardChatUi/data/batchexecute?rpcids=MaZiqc&cursor={cursor}
 /_/BardChatUi/data/batchexecute?rpcids=hNvQHb&chat={chat}&cursor={cursor}
+/app

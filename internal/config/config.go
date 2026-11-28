@@ -1209,7 +1209,8 @@ type Config struct {
 	// IDs created before the time was recorded.
 	InstallationCreatedAt time.Time `json:"-" toml:"-"`
 	// LocalMachineName is the display label, defaulting to the system hostname.
-	LocalMachineName string `json:"-" toml:"local_machine_name"`
+	LocalMachineName string            `json:"-" toml:"local_machine_name"`
+	AccountAliases   map[string]string `json:"-" toml:"account_aliases"`
 	// CursorAdminAPIKeyFile names a private file holding the Cursor admin API
 	// key, read by ResolveCursorAdminAPIKey.
 	CursorAdminAPIKeyFile string `json:"-" toml:"cursor_admin_api_key_file"`
@@ -2042,6 +2043,7 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 	var file struct {
 		LocalMachineName               *string                `toml:"local_machine_name"`
+		AccountAliases                 map[string]string      `toml:"account_aliases"`
 		GithubToken                    string                 `toml:"github_token"`
 		CursorSecret                   string                 `toml:"cursor_secret"`
 		CursorAdminAPIKey              string                 `toml:"cursor_admin_api_key"`
@@ -2135,6 +2137,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 	if file.CursorSecret != "" {
 		c.CursorSecret = file.CursorSecret
+	}
+	if file.AccountAliases != nil {
+		c.AccountAliases = file.AccountAliases
 	}
 	if file.LocalMachineName != nil {
 		name := strings.TrimSpace(*file.LocalMachineName)

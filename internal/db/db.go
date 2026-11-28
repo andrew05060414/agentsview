@@ -728,6 +728,7 @@ const (
 	walCheckpointAttempts    = 3
 	walCheckpointRetryDelay  = 250 * time.Millisecond
 	sqliteCacheSizeKiB       = -8 * 1024
+	sqliteWriterCacheSizeKiB = -64 * 1024
 	readerMaxOpenConns       = 4
 	bulkReadSlots            = readerMaxOpenConns - 1 // Keep one reader connection for quick reads.
 	readerConnMaxIdleTime    = 5 * time.Minute
@@ -1432,10 +1433,13 @@ func makeDSN(path string, readOnly bool) string {
 	params := url.Values{}
 	params.Set("_busy_timeout", "5000")
 	params.Set("_foreign_keys", "ON")
-	params.Set("_cache_size", strconv.Itoa(sqliteCacheSizeKiB))
 	if readOnly {
+		params.Set("_cache_size", strconv.Itoa(sqliteCacheSizeKiB))
 		params.Set("mode", "ro")
 	} else {
+		// Single-writer connections update multi-GB FTS5 B-trees, so give the
+		// writer a 64 MiB page cache while keeping the reader pool at 8 MiB.
+		params.Set("_cache_size", strconv.Itoa(sqliteWriterCacheSizeKiB))
 		// Imports repeatedly execute the same SQL, including project attribution.
 		params.Set("_stmt_cache_size", "64")
 		params.Set("_journal_mode", "WAL")
@@ -2642,6 +2646,7 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{"cursor_usage_events", "account_user_id", "ALTER TABLE cursor_usage_events ADD COLUMN account_user_id TEXT NOT NULL DEFAULT ''"},
 		{"cursor_usage_events", "account_polled_at", "ALTER TABLE cursor_usage_events ADD COLUMN account_polled_at TEXT NOT NULL DEFAULT ''"},
 		{"cursor_usage_events", "conversation_id", "ALTER TABLE cursor_usage_events ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''"},
+		{"sessions", "account", "ALTER TABLE sessions ADD COLUMN account TEXT NOT NULL DEFAULT ''"},
 		{"sessions", "usage_generation", "ALTER TABLE sessions ADD COLUMN usage_generation TEXT;" +
 			" UPDATE sessions SET usage_generation=lower(hex(randomblob(8)))"},
 		{"sessions", "trends_generation", "ALTER TABLE sessions ADD COLUMN trends_generation TEXT"},

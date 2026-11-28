@@ -93,7 +93,7 @@ type ContentSearchFilter struct {
 	Sources       []string // subset of {"messages","thinking","tool_input","tool_result"}
 	ExcludeSystem bool
 
-	Project, ExcludeProject, Machine, Agent           string
+	Project, ExcludeProject, Machine, Account, Agent  string
 	SessionID, GitBranchExact                         string
 	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
@@ -151,6 +151,8 @@ type ContentMatch struct {
 	Project        string   `json:"project"`
 	Agent          string   `json:"agent"`
 	Machine        string   `json:"machine"`
+	Account        string   `json:"account,omitempty"`
+	AccountAlias   string   `json:"account_alias,omitempty"`
 	SourceMachines []string `json:"source_machines,omitempty" doc:"Contributing hosted device machine IDs; omitted for sessions without hosted provenance."`
 	DisplayName    *string  `json:"display_name"`
 	Location       string   `json:"location" doc:"Where the match occurred: message, thinking, tool_input, or tool_result."`
@@ -235,7 +237,7 @@ func searchInputErrorf(format string, a ...any) error {
 func ContentSessionFilter(f ContentSearchFilter) SessionFilter {
 	return SessionFilter{
 		Project: f.Project, ExcludeProject: f.ExcludeProject,
-		Machine: f.Machine, GitBranch: f.GitBranch, Agent: f.Agent,
+		Machine: f.Machine, Account: f.Account, GitBranch: f.GitBranch, Agent: f.Agent,
 		SessionID: f.SessionID, GitBranchExact: f.GitBranchExact,
 		Date: f.Date, DateFrom: f.DateFrom, DateTo: f.DateTo,
 		Timezone:           f.Timezone,
@@ -740,7 +742,7 @@ func (db *DB) termsSearchPage(
 		query, args = buildTermsAnchorSQL(f, terms, anchor, indexed[anchor])
 	} else {
 		var err error
-		query, args, err = buildTermsSearchSQL(f, terms, SQLiteQueryDialect(), indexed)
+		query, args, err = buildTermsSearchSQL(f, terms, SQLiteQueryDialect(), indexed, false)
 		if err != nil {
 			return ContentSearchPage{}, err
 		}

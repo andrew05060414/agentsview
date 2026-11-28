@@ -1114,3 +1114,100 @@ func TestAntigravityCLIPartialDiscoverySyncsHealthyStandaloneWhenContainerUnread
 	require.NotNil(t, archived)
 	assert.Nil(t, archived.SourceMissingAt)
 }
+
+func TestSyncPathsAntigravityCLIHistoryOrCachePreservesUnchangedSessions(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentAntigravityCLI)
+	mappedID := "11111111-2222-3333-4444-555555555555"
+	unmappedID := "22222222-3333-4444-5555-666666666666"
+	activeID := "33333333-4444-5555-6666-777777777777"
+
+	convDir := filepath.Join(env.antigravityCLIDir, "conversations")
+	cacheDir := filepath.Join(env.antigravityCLIDir, "cache")
+	require.NoError(t, os.MkdirAll(convDir, 0o755))
+	require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+
+	mappedDB := filepath.Join(convDir, mappedID+".db")
+	createAntigravityCLIDisplayStepDB(t, mappedDB, "Mapped session prompt")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(convDir, mappedID+".trajectory.json"),
+		[]byte(antigravityCLISingleUserTrajectory(mappedID, "Mapped session prompt")),
+		0o644,
+	))
+	unmappedPB := filepath.Join(convDir, unmappedID+".pb")
+	require.NoError(t, os.WriteFile(unmappedPB, []byte("old-pb"), 0o644))
+	activeDB := filepath.Join(convDir, activeID+".db")
+	createAntigravityCLIDisplayStepDB(t, activeDB, "Active session prompt")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(convDir, activeID+".trajectory.json"),
+		[]byte(antigravityCLISingleUserTrajectory(activeID, "Active session prompt")),
+		0o644,
+	))
+
+	oldTime := time.UnixMilli(1716244800000)
+	require.NoError(t, os.Chtimes(mappedDB, oldTime, oldTime))
+	require.NoError(t, os.Chtimes(filepath.Join(convDir, mappedID+".trajectory.json"), oldTime, oldTime))
+	require.NoError(t, os.Chtimes(unmappedPB, oldTime, oldTime))
+	require.NoError(t, os.Chtimes(activeDB, oldTime, oldTime))
+	require.NoError(t, os.Chtimes(filepath.Join(convDir, activeID+".trajectory.json"), oldTime, oldTime))
+
+	historyPath := filepath.Join(env.antigravityCLIDir, "history.jsonl")
+	cachePath := filepath.Join(cacheDir, "last_conversations.json")
+	require.NoError(t, os.WriteFile(cachePath, []byte(fmt.Sprintf(
+		`{"/home/user/mapped":%q,"/home/user/active":%q}`,
+		mappedID, activeID,
+	)), 0o644))
+	require.NoError(t, os.WriteFile(historyPath, []byte(fmt.Sprintf(
+		`{"conversationId":%q,"workspace":"/home/user/mapped","timestamp":%d,"display":"Mapped session prompt"}`+"\n",
+		mappedID, oldTime.UnixMilli(),
+	)), 0o644))
+
+	stats := env.engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+	require.Zero(t, stats.Failed)
+
+	sentinel := "2000-01-01T00:00:00.000Z"
+	require.NoError(t, env.db.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
+			`UPDATE sessions SET local_modified_at = ?`, sentinel)
+		return err
+	}))
+
+	readModAndMarker := func(id string) (string, string) {
+		var mod, marker string
+		err := env.db.Reader().QueryRowContext(t.Context(),
+			`SELECT COALESCE(local_modified_at,''), COALESCE(sync_marker,'') FROM sessions WHERE id = ?`,
+			"antigravity-cli:"+id,
+		).Scan(&mod, &marker)
+		require.NoError(t, err)
+		return mod, marker
+	}
+	mappedBeforeMod, mappedBeforeMarker := readModAndMarker(mappedID)
+	unmappedBeforeMod, unmappedBeforeMarker := readModAndMarker(unmappedID)
+	activeBeforeMod, activeBeforeMarker := readModAndMarker(activeID)
+
+	// Append an untagged prompt from a later session and update an unrelated
+	// workspace entry in last_conversations.json.
+	newTime := oldTime.Add(2 * time.Hour)
+	require.NoError(t, os.WriteFile(historyPath, []byte(fmt.Sprintf(
+		`{"conversationId":%q,"workspace":"/home/user/mapped","timestamp":%d,"display":"Mapped session prompt"}`+"\n"+
+			`{"display":"Untagged prompt","timestamp":%d,"workspace":"/home/user/other"}`+"\n",
+		mappedID, oldTime.UnixMilli(), newTime.UnixMilli(),
+	)), 0o644))
+	require.NoError(t, os.WriteFile(cachePath, []byte(fmt.Sprintf(
+		`{"/home/user/mapped":%q,"/home/user/active-new":%q}`,
+		mappedID, activeID,
+	)), 0o644))
+
+	require.NoError(t, env.engine.SyncPathsContext(t.Context(), []string{historyPath, cachePath}))
+
+	mappedAfterMod, mappedAfterMarker := readModAndMarker(mappedID)
+	unmappedAfterMod, unmappedAfterMarker := readModAndMarker(unmappedID)
+	activeAfterMod, activeAfterMarker := readModAndMarker(activeID)
+
+	assert.Equal(t, mappedBeforeMod, mappedAfterMod, "unchanged mapped session must not bump local_modified_at")
+	assert.Equal(t, mappedBeforeMarker, mappedAfterMarker, "unchanged mapped session must not bump sync_marker")
+	assert.Equal(t, unmappedBeforeMod, unmappedAfterMod, "older unmapped session must not bump local_modified_at")
+	assert.Equal(t, unmappedBeforeMarker, unmappedAfterMarker, "older unmapped session must not bump sync_marker")
+	assert.NotEqual(t, activeBeforeMod, activeAfterMod, "session whose workspace changed must refresh")
+	assert.NotEqual(t, activeBeforeMarker, activeAfterMarker, "session whose workspace changed must advance sync_marker")
+}

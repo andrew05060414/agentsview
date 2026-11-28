@@ -1,11 +1,17 @@
 package postgres
 
 import (
+	"cmp"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ccoveille/go-safecast/v2"
@@ -808,7 +814,141 @@ func upsertPGGenAIPricing(
 	return nil
 }
 
+// syncedModelPricing caches the last local pricing digest confirmed to be in
+// sync with PostgreSQL per target+archive key. The daemon builds a fresh Sync
+// for every HTTP push, so caching across Sync instances avoids repeating the
+// pricing lock and catalog queries on every incremental push while nothing in
+// the local pricing catalog has changed.
+var syncedModelPricing sync.Map
+
+type pricingSyncMemo struct {
+	targetFingerprint string
+	digest            string
+}
+
+func (s *Sync) pricingSyncCacheKey() string {
+	if s.targetFingerprint == "" {
+		return ""
+	}
+	return s.targetFingerprint + "\x00" + s.archiveID
+}
+
+func (s *Sync) hasSyncedModelPricing(digest string) bool {
+	s.pricingSyncMu.Lock()
+	matched := s.hasPricingSynced &&
+		s.pricingSyncedTarget == s.targetFingerprint &&
+		s.pricingSyncedDigest == digest
+	s.pricingSyncMu.Unlock()
+	if matched {
+		return true
+	}
+	key := s.pricingSyncCacheKey()
+	if key == "" {
+		return false
+	}
+	raw, ok := syncedModelPricing.Load(key)
+	if !ok {
+		return false
+	}
+	memo, ok := raw.(pricingSyncMemo)
+	return ok && memo.targetFingerprint == s.targetFingerprint &&
+		memo.digest == digest
+}
+
+func (s *Sync) recordSyncedModelPricing(digest string) {
+	s.pricingSyncMu.Lock()
+	s.pricingSyncedTarget = s.targetFingerprint
+	s.pricingSyncedDigest = digest
+	s.hasPricingSynced = true
+	s.pricingSyncMu.Unlock()
+	if key := s.pricingSyncCacheKey(); key != "" {
+		syncedModelPricing.Store(key, pricingSyncMemo{
+			targetFingerprint: s.targetFingerprint,
+			digest:            digest,
+		})
+	}
+}
+
+func (s *Sync) forgetSyncedModelPricing() {
+	s.pricingSyncMu.Lock()
+	s.hasPricingSynced = false
+	s.pricingSyncedDigest = ""
+	s.pricingSyncedTarget = ""
+	s.pricingSyncMu.Unlock()
+	if key := s.pricingSyncCacheKey(); key != "" {
+		syncedModelPricing.Delete(key)
+	}
+}
+
+func localModelPricingDigest(
+	prices []db.ModelPricing,
+	localOpenRouter string,
+	localGenAI *db.GenAIPricingDocument,
+) string {
+	h := sha256.New()
+	writeUvarint := func(v uint64) {
+		var buf [binary.MaxVarintLen64]byte
+		n := binary.PutUvarint(buf[:], v)
+		_, _ = h.Write(buf[:n])
+	}
+	writeString := func(v string) {
+		writeUvarint(uint64(len(v)))
+		_, _ = h.Write([]byte(v))
+	}
+	writeInt64 := func(v int64) {
+		writeUvarint(uint64(v))
+	}
+
+	sorted := append([]db.ModelPricing(nil), prices...)
+	slices.SortFunc(sorted, func(a, b db.ModelPricing) int {
+		return strings.Compare(a.ModelPattern, b.ModelPattern)
+	})
+	writeUvarint(uint64(len(sorted)))
+	for _, p := range sorted {
+		writeString(p.ModelPattern)
+		writeInt64(p.InputPerMTok.Microdollars)
+		writeInt64(p.OutputPerMTok.Microdollars)
+		writeInt64(p.CacheCreationPerMTok.Microdollars)
+		writeInt64(p.CacheCreation1hPerMTok.Microdollars)
+		writeInt64(p.CacheReadPerMTok.Microdollars)
+		writeString(p.UpdatedAt)
+
+		bands := append([]db.PricingBand(nil), p.Bands...)
+		slices.SortFunc(bands, func(a, b db.PricingBand) int {
+			return cmp.Compare(a.AboveInputTokens, b.AboveInputTokens)
+		})
+		writeUvarint(uint64(len(bands)))
+		for _, b := range bands {
+			writeInt64(int64(b.AboveInputTokens))
+			writeInt64(b.InputPerMTok.Microdollars)
+			writeInt64(b.OutputPerMTok.Microdollars)
+			writeInt64(b.CacheCreationPerMTok.Microdollars)
+			writeInt64(b.CacheCreation1hPerMTok.Microdollars)
+			writeInt64(b.CacheReadPerMTok.Microdollars)
+			writeString(b.UpdatedAt)
+		}
+	}
+
+	writeString(localOpenRouter)
+	if localGenAI != nil {
+		writeUvarint(1)
+		writeString(localGenAI.Version)
+		writeString(localGenAI.SourceRef)
+		writeString(localGenAI.Source)
+		writeString(localGenAI.UpdatedAt)
+		writeUvarint(uint64(len(localGenAI.Data)))
+		_, _ = h.Write(localGenAI.Data)
+	} else {
+		writeUvarint(0)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func (s *Sync) syncModelPricing(ctx context.Context) error {
+	return s.syncModelPricingWithForce(ctx, false)
+}
+
+func (s *Sync) syncModelPricingWithForce(ctx context.Context, force bool) error {
 	prices, localOpenRouter, err := s.local.ListModelPricingWithOpenRouter(ctx)
 	if err != nil {
 		return fmt.Errorf("listing local model pricing: %w", err)
@@ -823,6 +963,10 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	if localGenAI == nil {
 		embedded := db.EmbeddedGenAIPricingDocument()
 		localGenAI = &embedded
+	}
+	digest := localModelPricingDigest(prices, localOpenRouter, localGenAI)
+	if !force && s.hasSyncedModelPricing(digest) {
+		return nil
 	}
 	tx, err := s.pg.BeginTx(ctx, nil)
 	if err != nil {
@@ -857,6 +1001,7 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	genAIChanged := !existingGenAI.Matches(localGenAI)
 	if len(plan.Changed) == 0 && len(plan.Remove) == 0 &&
 		plan.OpenRouterModels == "" && !genAIChanged {
+		s.recordSyncedModelPricing(digest)
 		return nil
 	}
 	if err := reconcileModelPricing(
@@ -881,5 +1026,6 @@ func (s *Sync) syncModelPricing(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing pg pricing sync: %w", err)
 	}
+	s.recordSyncedModelPricing(digest)
 	return nil
 }

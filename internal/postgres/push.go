@@ -128,6 +128,7 @@ func (s *Sync) PushWithOptions(
 		s.schemaMu.Lock()
 		s.forgetEnsuredSchemaLocked()
 		s.schemaMu.Unlock()
+		s.forgetSyncedModelPricing()
 	}
 	switch {
 	case err == nil || errors.Is(err, db.ErrDiagnosticConflict) || completed:
@@ -556,7 +557,12 @@ func (s *Sync) pushWithOptions(
 		return result, err
 	}
 	if err := timedPushSetupStep("model pricing sync",
-		func() error { return s.syncModelPricing(ctx) }); err != nil {
+		func() error {
+			if full {
+				s.forgetSyncedModelPricing()
+			}
+			return s.syncModelPricingWithForce(ctx, full)
+		}); err != nil {
 		return result, err
 	}
 	if err := timedPushSetupStep("cursor usage event sync",
@@ -2623,6 +2629,7 @@ func sessionPushFingerprint(
 		sess.Project,
 		strconv.FormatBool(sess.ProjectAssigned),
 		pushedMachine,
+		sess.Account,
 		sourceArchiveID,
 		ownerMarker,
 		dependencyFingerprint,
@@ -2911,7 +2918,7 @@ func pgSessionUpsert(sess db.Session, markerID string, legacyMarkerMachines []st
 			trash_includes_codex_pages, source_trash_includes_codex_pages,
 			pr_links, labels,
 			friction_count, friction_rules_version, friction_hash,
-			parser_relationship_type, relationship_inferred, spawn_linked,
+			parser_relationship_type, relationship_inferred, spawn_linked, account,
 			updated_at
 			)
 			SELECT
@@ -2932,12 +2939,13 @@ func pgSessionUpsert(sess db.Session, markerID string, legacyMarkerMachines []st
 				$52, $53, $54, $55, $56, $57, $58, $59, $60, $61,
 				$62, $63, $64, $65, $66, $67, $68,
 				$70, $71, $72, $72, $73, $74::text[], $75, $76, $77,
-				$80, $81, $82, NOW()
+				$80, $81, $82, $83, NOW()
 			WHERE NOT EXISTS (
 				SELECT 1 FROM excluded_session
 			)
 			ON CONFLICT (id) DO UPDATE SET
 			machine = EXCLUDED.machine,
+			account = COALESCE(NULLIF(EXCLUDED.account, ''), sessions.account),
 			owner_marker = EXCLUDED.owner_marker,
 			project = EXCLUDED.project,
 			agent = EXCLUDED.agent,
@@ -3059,6 +3067,7 @@ func pgSessionUpsert(sess db.Session, markerID string, legacyMarkerMachines []st
 			AND NOT $79::boolean
 			AND (
 			sessions.machine IS DISTINCT FROM EXCLUDED.machine
+			OR (EXCLUDED.account <> '' AND sessions.account IS DISTINCT FROM EXCLUDED.account)
 			OR sessions.owner_marker IS DISTINCT FROM EXCLUDED.owner_marker
 			OR sessions.project IS DISTINCT FROM EXCLUDED.project
 			OR sessions.agent IS DISTINCT FROM EXCLUDED.agent
@@ -3202,6 +3211,7 @@ func pgSessionUpsert(sess db.Session, markerID string, legacyMarkerMachines []st
 		sanitizePG(options.ExternalParent),
 		options.InsertOnly,
 		parserRelationship, relationshipInferred, sess.SpawnLinked(),
+		sess.Account,
 	}
 	return query, args, nil
 }

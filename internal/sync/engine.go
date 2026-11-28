@@ -1748,6 +1748,9 @@ func (e *Engine) applyChangedPathSyncLocked(
 		SessionsTotal: len(prepared.files),
 	})
 	processingCtx := context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
+	if e.soleArchiveWriter.Load() && len(prepared.files) > 0 {
+		processingCtx = e.withSourceFreshnessSnapshot(processingCtx, prepared.files)
+	}
 	results := e.startWorkers(processingCtx, prepared.files)
 	affectedSessionIDs := make(changedSessionLinks)
 	stats := e.collectAndBatchWithOptions(
@@ -2496,6 +2499,18 @@ func providerChangedPathForceParse(
 		if eventKind != "remove" &&
 			agent == parser.AgentGemini &&
 			parser.IsGeminiProjectMetadataFile(eventPath) {
+			return false
+		}
+		// Antigravity CLI history.jsonl and cache/last_conversations.json
+		// fan out to every session under the root. Each session's
+		// fingerprint hashes its own history slice, resolved workspace, and
+		// summary digest, so the freshness gates re-parse only sessions whose
+		// resolved metadata or history rows actually changed; a forced parse
+		// would rewrite every historical session and bump local_modified_at
+		// on every prompt. Remove events keep the force so removal re-emits.
+		if eventKind != "remove" &&
+			agent == parser.AgentAntigravityCLI &&
+			parser.IsAntigravityCLIHistoryOrCacheFile(eventPath) {
 			return false
 		}
 		// A Hermes/Augure Desktop state.db event's orphan-transcript
@@ -5823,6 +5838,25 @@ func reconciliationWatchRoot(
 	return best
 }
 
+// cursorIDEContainerCandidateSource reports whether a reconciliation
+// candidate's resolved source addresses a whole Cursor IDE state.vscdb
+// container. Lost-events recovery normally force-parses every candidate so a
+// dropped watcher event can never leave a stale source resting on an
+// inherited cache hit; a Cursor IDE container is the one exception, because
+// clearWatcherOverflowCaches already retains (and the forced discovery pass
+// would otherwise discard) a cache entry whose key proves freshness on its
+// own, independent of which events were lost. Forcing the candidate anyway
+// would still have defeated that retained entry: forceParseBypassesCache
+// skips the cache lookup entirely whenever file.ForceParse is set, so the
+// container would be fully reparsed despite the entry surviving in memory
+// and in skipped_files.
+func cursorIDEContainerCandidateSource(
+	agent parser.AgentType, source parser.SourceRef,
+) bool {
+	return agent == parser.AgentCursorIDE &&
+		parser.IsCursorIDEContainerSource(source)
+}
+
 func (e *Engine) rehydrateReconciliationPage(
 	ctx context.Context, page []reconciliationCandidate,
 	providers map[parser.AgentType]parser.Provider,
@@ -5831,7 +5865,6 @@ func (e *Engine) rehydrateReconciliationPage(
 	e.refreshReconciliationPageContainerCaptures(page)
 	files := make([]parser.DiscoveredFile, 0, len(page))
 	for _, candidate := range page {
-		forceCandidate := force
 		provider := providers[candidate.Provider]
 		if provider == nil {
 			return nil, fmt.Errorf("rehydrate %s source: provider unavailable", candidate.Provider)
@@ -5860,7 +5893,10 @@ func (e *Engine) rehydrateReconciliationPage(
 				) {
 					file := parser.DiscoveredFile{
 						Path: candidate.Path, Project: source.ProjectHint,
-						Agent: candidate.Provider, ForceParse: forceCandidate,
+						Agent: candidate.Provider,
+						ForceParse: force && !cursorIDEContainerCandidateSource(
+							candidate.Provider, source,
+						),
 						Machine:        candidate.Machine,
 						ProviderSource: &source, ProviderProcess: true,
 					}
@@ -5902,7 +5938,10 @@ func (e *Engine) rehydrateReconciliationPage(
 		)
 		file := parser.DiscoveredFile{
 			Path: candidate.Path, Project: source.ProjectHint,
-			Agent: candidate.Provider, ForceParse: forceCandidate,
+			Agent: candidate.Provider,
+			ForceParse: force && !cursorIDEContainerCandidateSource(
+				candidate.Provider, source,
+			),
 			// Carry the candidate's stored attribution: recomputing it from the
 			// physical path is wrong for providers whose source can sit outside
 			// the labeled root it was configured under.
@@ -10031,6 +10070,18 @@ func (e *Engine) providerStatFreshnessMtime(
 		return e.codexMetadata().EffectiveMtime(
 			lookupPath, chatInfo.ModTime().UnixNano(),
 		)
+	case parser.AgentAntigravity:
+		if info, err := parser.AntigravityFileInfo(lookupPath); err == nil {
+			return info.ModTime().UnixNano()
+		}
+		return chatInfo.ModTime().UnixNano()
+	case parser.AgentAntigravityCLI:
+		if info, err := parser.AntigravityCLISessionFileInfo(lookupPath); err == nil {
+			return info.ModTime().UnixNano()
+		}
+		return chatInfo.ModTime().UnixNano()
+	case parser.AgentGrok:
+		return parser.GrokEffectiveMtime(lookupPath, chatInfo)
 	default:
 		return chatInfo.ModTime().UnixNano()
 	}
@@ -10053,7 +10104,7 @@ func (e *Engine) providerStatDigestEligible(agent parser.AgentType) bool {
 	if e.pathRewriter == nil {
 		return true
 	}
-	return agent != parser.AgentClaude && agent != parser.AgentEvener && agent != parser.AgentMusePersonal && !isCodexFormatAgent(agent)
+	return agent != parser.AgentClaude && agent != parser.AgentEvener && agent != parser.AgentMusePersonal && agent != parser.AgentAntigravity && agent != parser.AgentAntigravityCLI && agent != parser.AgentGrok && !isCodexFormatAgent(agent)
 }
 
 // providerFreshDigestSourceCurrentInDB reports whether the active stored
@@ -13063,7 +13114,7 @@ func (e *Engine) SourceMtime(ctx context.Context, sessionID string) int64 {
 		}
 	}
 	if def.Type == parser.AgentAntigravityCLI {
-		info, err := parser.AntigravityCLIFileInfo(path)
+		info, err := parser.AntigravityCLISessionFileInfo(path)
 		if err != nil {
 			return 0
 		}

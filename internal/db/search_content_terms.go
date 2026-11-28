@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // termsSnippetSeparator joins the per-term windows of a terms snippet when
@@ -98,7 +100,83 @@ var termsSQLByDialect = map[string]termsSQLFragments{
 func BuildTermsSearchSQL(
 	f ContentSearchFilter, terms []string, dialect QueryDialect,
 ) (string, []any, error) {
-	return buildTermsSearchSQL(f, terms, dialect, nil)
+	return buildTermsSearchSQL(f, terms, dialect, nil, false)
+}
+
+// BuildPostgresTermsSearchSQL renders the terms-mode query for PostgreSQL
+// using a trigram-first materialized prefilter when any term can use pg_trgm
+// and single-pass BOOL_OR grouping for short terms, avoiding repeated full-table
+// scans on short CJK terms.
+func BuildPostgresTermsSearchSQL(
+	f ContentSearchFilter, terms []string, dialect QueryDialect,
+) (string, []any, error) {
+	return buildTermsSearchSQL(f, terms, dialect, nil, true)
+}
+
+func hasPGTrigramRun(term string) bool {
+	run := 0
+	for _, r := range term {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			run++
+			if run >= 3 {
+				return true
+			}
+		} else {
+			run = 0
+		}
+	}
+	return false
+}
+
+func buildPostgresTermsScopedCTEs(
+	where string, terms []string, frag termsSQLFragments, b *QueryBuilder, dialect QueryDialect,
+) string {
+	var triTerms, shortTerms []string
+	for _, term := range terms {
+		if hasPGTrigramRun(term) {
+			triTerms = append(triTerms, term)
+		} else {
+			shortTerms = append(shortTerms, term)
+		}
+	}
+	// Evaluate the longest trigram term first so the GIN-indexed pass narrows
+	// candidate sessions maximally before joining shorter terms.
+	slices.SortStableFunc(triTerms, func(a, b string) int {
+		return cmp.Compare(utf8.RuneCountInString(b), utf8.RuneCountInString(a))
+	})
+
+	var ctes strings.Builder
+	if len(triTerms) == 0 {
+		fmt.Fprintf(&ctes, "raw_scoped AS MATERIALIZED (\n\t\t\tSELECT id FROM sessions WHERE %s\n\t\t)", where)
+		conds := make([]string, len(shortTerms))
+		for i, term := range shortTerms {
+			conds[i] = fmt.Sprintf("BOOL_OR(%s)", b.ContainsPredicate("m."+frag.prefilterText, term))
+		}
+		fmt.Fprintf(&ctes, ", scoped AS MATERIALIZED (\n\t\t\tSELECT m.session_id AS id\n\t\t\tFROM messages m\n\t\t\tJOIN raw_scoped sc ON sc.id = m.session_id\n\t\t\tWHERE m.role IN ('user','assistant') AND m.is_system = %s\n\t\t\tGROUP BY m.session_id\n\t\t\tHAVING %s\n\t\t)",
+			dialect.falseLiteral, strings.Join(conds, " AND "))
+		return ctes.String()
+	}
+
+	fmt.Fprintf(&ctes, "raw_scoped AS (\n\t\t\tSELECT id FROM sessions WHERE %s\n\t\t)", where)
+	prevCTE := "raw_scoped"
+	for i, term := range triTerms {
+		cteName := fmt.Sprintf("tri_%d", i)
+		if i == len(triTerms)-1 && len(shortTerms) == 0 {
+			cteName = "scoped"
+		}
+		fmt.Fprintf(&ctes, ", %s AS MATERIALIZED (\n\t\t\tSELECT DISTINCT m.session_id AS id\n\t\t\tFROM messages m\n\t\t\tJOIN %s sc ON sc.id = m.session_id\n\t\t\tWHERE m.role IN ('user','assistant') AND m.is_system = %s\n\t\t\t  AND %s\n\t\t)",
+			cteName, prevCTE, dialect.falseLiteral, b.ContainsPredicate("m."+frag.prefilterText, term))
+		prevCTE = cteName
+	}
+	if len(shortTerms) > 0 {
+		conds := make([]string, len(shortTerms))
+		for i, term := range shortTerms {
+			conds[i] = fmt.Sprintf("BOOL_OR(%s)", b.ContainsPredicate("m."+frag.prefilterText, term))
+		}
+		fmt.Fprintf(&ctes, ", scoped AS MATERIALIZED (\n\t\t\tSELECT m.session_id AS id\n\t\t\tFROM messages m\n\t\t\tJOIN %s sc ON sc.id = m.session_id\n\t\t\tWHERE m.role IN ('user','assistant') AND m.is_system = %s\n\t\t\tGROUP BY m.session_id\n\t\t\tHAVING %s\n\t\t)",
+			prevCTE, dialect.falseLiteral, strings.Join(conds, " AND "))
+	}
+	return ctes.String()
 }
 
 // termsScopeSQL renders the sessions WHERE clause that scopes a terms search,
@@ -123,7 +201,7 @@ func termsScopeSQL(f ContentSearchFilter, dialect QueryDialect) (string, []any) 
 // session prefilter then reads only the messages the index lists.
 func buildTermsSearchSQL(
 	f ContentSearchFilter, terms []string, dialect QueryDialect,
-	indexed map[string]string,
+	indexed map[string]string, pgMaterialized bool,
 ) (string, []any, error) {
 	frag, ok := termsSQLByDialect[dialect.name]
 	if !ok {
@@ -132,6 +210,11 @@ func buildTermsSearchSQL(
 	}
 	where, scopeArgs := termsScopeSQL(f, dialect)
 	b := NewQueryBuilder(dialect, len(scopeArgs))
+
+	scopedCTEs := fmt.Sprintf("scoped AS (\n\t\t\tSELECT id FROM sessions WHERE %s\n\t\t)", where)
+	if pgMaterialized {
+		scopedCTEs = buildPostgresTermsScopedCTEs(where, terms, frag, b, dialect)
+	}
 
 	// SQLite binds ? placeholders by position, so the hit flags in the
 	// eligible select list take their arguments before the prefilter.
@@ -145,17 +228,19 @@ func buildTermsSearchSQL(
 		hitTests[i] = fmt.Sprintf("h.exchange_hit_%d = 1", i)
 	}
 	var prefilter strings.Builder
-	for _, term := range terms {
-		listed := ""
-		if query, ok := indexed[term]; ok {
-			listed = "id IN (SELECT rowid FROM message_trigram_fts WHERE message_trigram_fts MATCH " +
-				b.Add(query) + ")\n\t\t\t\t  AND "
-		}
-		prefilter.WriteString(`
+	if !pgMaterialized {
+		for _, term := range terms {
+			listed := ""
+			if query, ok := indexed[term]; ok {
+				listed = "id IN (SELECT rowid FROM message_trigram_fts WHERE message_trigram_fts MATCH " +
+					b.Add(query) + ")\n\t\t\t\t  AND "
+			}
+			prefilter.WriteString(`
 			  AND m.session_id IN (
 				SELECT session_id FROM messages
 				WHERE ` + listed + `session_id IN (SELECT id FROM scoped)
 				  AND ` + b.ContainsPredicate(frag.prefilterText, term) + ")")
+		}
 	}
 	predicates := make([]string, 0, len(terms)+1)
 	for _, term := range terms {
@@ -169,9 +254,7 @@ func buildTermsSearchSQL(
 	}
 
 	query := fmt.Sprintf(`
-		WITH scoped AS (
-			SELECT id FROM sessions WHERE %s
-		), eligible AS (
+		WITH %s, eligible AS (
 			SELECT m.session_id, m.ordinal, m.is_sidechain,
 				CASE WHEN m.role = 'user' THEN 1 ELSE 0 END AS user_start%s
 			FROM messages m
@@ -224,7 +307,7 @@ func buildTermsSearchSQL(
 		WHERE %s
 		ORDER BY subordinate ASC, %s, session_id ASC, start_ordinal ASC
 		LIMIT %s OFFSET %s`,
-		where, strings.Join(hitFlags, ""),
+		scopedCTEs, strings.Join(hitFlags, ""),
 		dialect.falseLiteral, frag.systemPrefix("m.content", "m.role"),
 		prefilter.String(), strings.Join(exchangeHits, ""),
 		frag.timestamp, frag.messageText, frag.sessionSort,

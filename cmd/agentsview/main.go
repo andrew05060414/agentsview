@@ -2709,13 +2709,9 @@ func startFileWatcher(
 			}
 			continue
 		}
-		if result.Unwatched > 0 || result.BudgetExhausted ||
-			result.ResourceExhausted || result.Err != nil {
+		if isWatchResultDegraded(result) {
 			unwatchedDirs = appendUniqueStrings(unwatchedDirs, r.syncDirs()...)
-			log.Printf(
-				"Couldn't watch %d directories under %s, will poll every %s",
-				result.Unwatched, r.path, unwatchedPollInterval,
-			)
+			log.Print(watchDegradedLogMessage(r.path, result))
 			if result.Err != nil {
 				log.Printf("watching %s: %v", r.path, result.Err)
 			}
@@ -2766,6 +2762,36 @@ func startFileWatcher(
 		flushPending:  flushPending,
 		flushRetry:    flushRetry,
 		unwatchedDirs: unwatchedDirs,
+	}
+}
+
+func isWatchResultDegraded(result sync.RecursiveWatchResult) bool {
+	return result.Unwatched > 0 || result.BudgetExhausted ||
+		result.ResourceExhausted || result.Err != nil
+}
+
+func watchDegradedLogMessage(path string, result sync.RecursiveWatchResult) string {
+	switch {
+	case result.Unwatched > 0:
+		return fmt.Sprintf(
+			"Couldn't watch %d directories under %s, will poll every %s",
+			result.Unwatched, path, unwatchedPollInterval,
+		)
+	case result.BudgetExhausted:
+		return fmt.Sprintf(
+			"Watch budget exhausted under %s (%d watched), will poll every %s",
+			path, result.Watched, unwatchedPollInterval,
+		)
+	case result.ResourceExhausted:
+		return fmt.Sprintf(
+			"Watch resource limit reached under %s (%d watched), will poll every %s",
+			path, result.Watched, unwatchedPollInterval,
+		)
+	default:
+		return fmt.Sprintf(
+			"Couldn't watch %s cleanly (%d watched), will poll every %s",
+			path, result.Watched, unwatchedPollInterval,
+		)
 	}
 }
 
@@ -2850,8 +2876,7 @@ func watchPollingObligations(
 			}
 			continue
 		}
-		if result.Unwatched > 0 || result.BudgetExhausted ||
-			result.ResourceExhausted || result.Err != nil {
+		if root.exists && isWatchResultDegraded(result) {
 			for _, scope := range root.scopes {
 				key := pollingObligationKey("degraded:"+string(scope.agent), root.path)
 				addScope(key, root.path, pollingScope{Agent: scope.agent, Root: scope.syncDir})
