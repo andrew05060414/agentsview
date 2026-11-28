@@ -305,6 +305,11 @@ type Sync struct {
 
 	schemaMu   sync.Mutex
 	schemaDone bool
+
+	pricingSyncMu       sync.Mutex
+	pricingSyncedTarget string
+	pricingSyncedDigest string
+	hasPricingSynced    bool
 }
 
 func (s *Sync) effectiveSyncState() syncStateStore {

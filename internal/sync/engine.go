@@ -1739,6 +1739,9 @@ func (e *Engine) applyChangedPathSyncLocked(
 		SessionsTotal: len(prepared.files),
 	})
 	processingCtx := context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
+	if e.soleArchiveWriter.Load() && len(prepared.files) > 0 {
+		processingCtx = e.withSourceFreshnessSnapshot(processingCtx, prepared.files)
+	}
 	results := e.startWorkers(processingCtx, prepared.files)
 	affectedSessionIDs := make(changedSessionLinks)
 	stats := e.collectAndBatchWithOptions(
@@ -9959,11 +9962,18 @@ func (e *Engine) providerStatFreshnessMtime(
 		return e.codexMetadata().EffectiveMtime(
 			lookupPath, chatInfo.ModTime().UnixNano(),
 		)
+	case parser.AgentAntigravity:
+		if info, err := parser.AntigravityFileInfo(lookupPath); err == nil {
+			return info.ModTime().UnixNano()
+		}
+		return chatInfo.ModTime().UnixNano()
 	case parser.AgentAntigravityCLI:
 		if info, err := parser.AntigravityCLISessionFileInfo(lookupPath); err == nil {
 			return info.ModTime().UnixNano()
 		}
 		return chatInfo.ModTime().UnixNano()
+	case parser.AgentGrok:
+		return parser.GrokEffectiveMtime(lookupPath, chatInfo)
 	default:
 		return chatInfo.ModTime().UnixNano()
 	}
@@ -9986,7 +9996,7 @@ func (e *Engine) providerStatDigestEligible(agent parser.AgentType) bool {
 	if e.pathRewriter == nil {
 		return true
 	}
-	return agent != parser.AgentClaude && agent != parser.AgentEvener && agent != parser.AgentMusePersonal && agent != parser.AgentAntigravityCLI && !isCodexFormatAgent(agent)
+	return agent != parser.AgentClaude && agent != parser.AgentEvener && agent != parser.AgentMusePersonal && agent != parser.AgentAntigravity && agent != parser.AgentAntigravityCLI && agent != parser.AgentGrok && !isCodexFormatAgent(agent)
 }
 
 // providerFreshDigestSourceCurrentInDB reports whether the active stored

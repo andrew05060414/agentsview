@@ -10,7 +10,10 @@ import (
 	"strings"
 )
 
-var _ Provider = (*antigravityProvider)(nil)
+var (
+	_ Provider            = (*antigravityProvider)(nil)
+	_ MultiFileStatHasher = (*antigravityProvider)(nil)
+)
 
 type antigravityProviderFactory struct {
 	def AgentDef
@@ -105,6 +108,33 @@ func (p *antigravityProvider) Fingerprint(
 	source SourceRef,
 ) (SourceFingerprint, error) {
 	return p.sources.Fingerprint(ctx, source)
+}
+
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher over the IDE
+// session DB (or standalone brain transcript), its companions (non-empty -wal,
+// .pbtxt annotations, .trajectory.json sidecar, brain transcript/markdown
+// artifacts), and the per-session summary digest so warm sweeps skip unchanged
+// multi-file sessions without re-reading multi-GB DB payloads.
+func (p *antigravityProvider) ComputeMultiFileStatHash(path string) uint64 {
+	clean := filepath.Clean(path)
+	var root, id string
+	var companions []string
+	if brainRoot, brainID, ok := antigravityBrainTranscriptConversation(clean); ok {
+		root = brainRoot
+		id = brainID
+	} else {
+		candidateRoot := filepath.Dir(filepath.Dir(clean))
+		dbPath, convID, ok := antigravityConversationDBForPath(candidateRoot, clean)
+		if !ok || !samePath(dbPath, clean) {
+			return 0
+		}
+		root = candidateRoot
+		id = convID
+		companions = antigravityIDECompanionPaths(clean)
+	}
+	return antigravityStatHashFromCompanions(
+		context.Background(), clean, companions, root, id, nil,
+	)
 }
 
 func (p *antigravityProvider) Parse(
@@ -441,7 +471,7 @@ func (s antigravitySourceSet) Fingerprint(
 		}
 		return SourceFingerprint{}, err
 	}
-	hash, err := antigravityCompositeHash(src.Path, antigravityIDECompanionPaths(src.Path)...)
+	hash, err := antigravityCompositeHash(ctx, src.Path, antigravityIDECompanionPaths(src.Path)...)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -653,6 +683,7 @@ func antigravityWatchRootMatches(root, watchRoot string) bool {
 func antigravityProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
 	source.StreamingDiscovery = CapabilitySupported
+	source.MultiFileStatHash = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
 	source.ChangedPathRelevance = CapabilitySupported
 	return Capabilities{

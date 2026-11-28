@@ -532,7 +532,8 @@ func (b daemonArchiveWriteBackend) ReplicaPushWatch(
 			func(opts storage.PushOptions) (storage.PushResult, error) {
 				pushCfg := cfg
 				pushCfg.Full = full
-				pushCfg.NoSourceSync = ready && reason == reasonArchiveChange
+				pushCfg.NoSourceSync = ready && !full &&
+					(reason == reasonArchiveChange || reason == reasonInterval)
 				pushCfg.ScopeVectorsToChangedSessions = opts.ScopeVectorsToChangedSessions
 				pushCfg.LastReconciledVectorGeneration = opts.LastReconciledVectorGeneration
 				if b.watchHooks != nil && b.watchHooks.replicaPush != nil {

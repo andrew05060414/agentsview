@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
+	"hash"
+	"hash/fnv"
 	"io"
 	"maps"
 	"os"
@@ -21,6 +24,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/ctxio"
 )
 
 // maxTrajectorySidecarBytes caps how much of a <uuid>.trajectory.json
@@ -1353,11 +1357,12 @@ func antigravityCompanionCounts(path string, info os.FileInfo) bool {
 	return !strings.HasSuffix(path, "-wal") || SQLiteWALInfoHasFrames(info)
 }
 
-func antigravityCompositeHash(path string, companions ...string) (string, error) {
-	return antigravityCompositeHashWithExtra(path, companions, nil)
+func antigravityCompositeHash(ctx context.Context, path string, companions ...string) (string, error) {
+	return antigravityCompositeHashWithExtra(ctx, path, companions, nil)
 }
 
 func antigravityCompositeHashWithExtra(
+	ctx context.Context,
 	path string,
 	companions []string,
 	extra func(interface{ Write([]byte) (int, error) }) error,
@@ -1371,7 +1376,7 @@ func antigravityCompositeHashWithExtra(
 	}
 
 	h := sha256.New()
-	if err := addAntigravityFingerprintPart(h, "source", path, info); err != nil {
+	if err := addAntigravityFingerprintPart(ctx, h, "source", path, info); err != nil {
 		return "", err
 	}
 
@@ -1388,6 +1393,7 @@ func antigravityCompositeHashWithExtra(
 			continue
 		}
 		if err := addAntigravityFingerprintPart(
+			ctx,
 			h,
 			"companion",
 			companion,
@@ -1412,6 +1418,7 @@ func antigravityCLICompositeHash(ctx context.Context, path, id, workspace string
 	root := filepath.Dir(filepath.Dir(path))
 	trimmedID := strings.TrimPrefix(id, antigravityImplicitTag)
 	hash, err := antigravityCompositeHashWithExtra(
+		ctx,
 		path,
 		antigravityCLIProviderCompanionPaths(path),
 		func(h interface{ Write([]byte) (int, error) }) error {
@@ -1517,6 +1524,7 @@ func addAntigravityCLIHistoryFingerprintPart(
 }
 
 func addAntigravityFingerprintPart(
+	ctx context.Context,
 	h interface{ Write([]byte) (int, error) },
 	label string,
 	path string,
@@ -1537,13 +1545,95 @@ func addAntigravityFingerprintPart(
 		return fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
-	if _, err := io.Copy(h, f); err != nil {
+	n, err := io.Copy(h, ctxio.Reader{Context: ctx, Reader: f})
+	recordContentRead(ctx, n)
+	if err != nil {
 		return fmt.Errorf("hash %s: %w", path, err)
 	}
 	if _, err := h.Write([]byte{0}); err != nil {
 		return err
 	}
 	return nil
+}
+
+// antigravityStatHashFromCompanions hashes the stat tuples of the primary
+// source file and its counted companions plus any optional extra digest and the
+// per-session summary digest, returning 0 if file identity/ctime is unavailable
+// or the summary store is unreadable so callers fail closed to fingerprinting.
+func antigravityStatHashFromCompanions(
+	ctx context.Context,
+	path string,
+	companions []string,
+	root string,
+	id string,
+	extra func(h hash.Hash64, maxMtimeNS int64) bool,
+) uint64 {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte{0xAC})
+
+	var buf [32]byte
+	writeStatTuple := func(label, p string, fi os.FileInfo) (int64, bool) {
+		ctime, ok := codexIndexChangeTime(p, fi)
+		if !ok {
+			return 0, false
+		}
+		inode, _ := sourceFileIdentityForPath(p, fi)
+		if inode == 0 {
+			return 0, false
+		}
+		_, _ = fmt.Fprintf(h, "%s\x00%s\x00", label, p)
+		mtime := fi.ModTime().UnixNano()
+		binary.LittleEndian.PutUint64(buf[:8], uint64(fi.Size()))
+		binary.LittleEndian.PutUint64(buf[8:16], uint64(mtime))
+		binary.LittleEndian.PutUint64(buf[16:24], uint64(ctime))
+		binary.LittleEndian.PutUint64(buf[24:32], inode)
+		_, _ = h.Write(buf[:])
+		return mtime, true
+	}
+
+	maxMtimeNS, ok := writeStatTuple("source", path, info)
+	if !ok {
+		return 0
+	}
+	sort.Strings(companions)
+	var prev string
+	for _, companion := range companions {
+		if companion == "" || companion == prev {
+			continue
+		}
+		prev = companion
+		ci, err := os.Stat(companion)
+		if err != nil || ci.IsDir() || !antigravityCompanionCounts(companion, ci) {
+			continue
+		}
+		cmtime, ok := writeStatTuple("companion", companion, ci)
+		if !ok {
+			return 0
+		}
+		if cmtime > maxMtimeNS {
+			maxMtimeNS = cmtime
+		}
+	}
+
+	if extra != nil && !extra(h, maxMtimeNS) {
+		return 0
+	}
+	summaries := loadAntigravitySummaries(ctx, root)
+	if summaries.err != nil {
+		return 0
+	}
+	digest := summaries.fingerprintDigest(id)
+	_, _ = fmt.Fprintf(h, "summary\x00%d\x00%s\x00", len(digest), digest)
+
+	sum := h.Sum64()
+	if sum == 0 {
+		return 1
+	}
+	return sum
 }
 
 type fakeFileInfo struct {

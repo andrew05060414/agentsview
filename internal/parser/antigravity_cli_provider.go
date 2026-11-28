@@ -2,10 +2,9 @@ package parser
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
+	"hash"
 	"os"
 	"path/filepath"
 	"sort"
@@ -131,17 +130,26 @@ func (p *antigravityCLIProvider) Parse(
 		return ParseOutcome{}, fmt.Errorf("stat %s: %w", src.Path, err)
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
+	projectHint := req.Source.ProjectHint
 	cwd := ""
 	if req.Source.CwdResolution.State == SourceCwdResolved {
 		cwd = req.Source.CwdResolution.Path
 	}
 	if req.Source.CwdResolution.State == SourceCwdRemote {
 		ctx = WithoutFilesystemProjectDiscovery(ctx)
+	} else if src.Root != "" {
+		// Align post-scan workspace replacements with ComputeMultiFileStatHash
+		// and Fingerprint so a mapping update between discovery and parse
+		// cannot leave stale workspace/project data pinned behind a new digest.
+		if workspace := antigravityCLIWorkspaceForID(ctx, src.Root, src.ID); workspace != src.Workspace {
+			projectHint = workspace
+			cwd = normalizeAntigravityCLIWorkspace(workspace)
+		}
 	}
 	sess, msgs, usageEvents, status, err := p.parseSessionWithStatus(
 		ctx,
 		src.Path,
-		req.Source.ProjectHint,
+		projectHint,
 		cwd,
 		machine,
 	)
@@ -533,7 +541,11 @@ func (s antigravityCLISourceSet) Fingerprint(
 		}
 		return SourceFingerprint{}, err
 	}
-	hash, err := antigravityCLICompositeHash(ctx, src.Path, src.ID, src.Workspace)
+	workspace := src.Workspace
+	if src.Root != "" {
+		workspace = antigravityCLIWorkspaceForID(ctx, src.Root, src.ID)
+	}
+	hash, err := antigravityCLICompositeHash(ctx, src.Path, src.ID, workspace)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -851,82 +863,25 @@ func IsAntigravityCLIHistoryOrCacheFile(path string) bool {
 }
 
 func antigravityCLISessionStatHash(path string) uint64 {
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		return 0
-	}
 	id, _, ok := antigravityCLIPathID(filepath.Base(path))
 	if !ok {
 		return 0
 	}
-	h := fnv.New64a()
-	_, _ = h.Write([]byte{0xAC})
-
-	var buf [32]byte
-	writeStatTuple := func(label, p string, fi os.FileInfo) (int64, bool) {
-		ctime, ok := codexIndexChangeTime(p, fi)
-		if !ok {
-			return 0, false
-		}
-		inode, _ := sourceFileIdentityForPath(p, fi)
-		if inode == 0 {
-			return 0, false
-		}
-		_, _ = fmt.Fprintf(h, "%s\x00%s\x00", label, p)
-		mtime := fi.ModTime().UnixNano()
-		binary.LittleEndian.PutUint64(buf[:8], uint64(fi.Size()))
-		binary.LittleEndian.PutUint64(buf[8:16], uint64(mtime))
-		binary.LittleEndian.PutUint64(buf[16:24], uint64(ctime))
-		binary.LittleEndian.PutUint64(buf[24:32], inode)
-		_, _ = h.Write(buf[:])
-		return mtime, true
-	}
-
-	maxMtimeNS, ok := writeStatTuple("source", path, info)
-	if !ok {
-		return 0
-	}
-	companions := antigravityCLIProviderCompanionPaths(path)
-	sort.Strings(companions)
-	var prev string
-	for _, companion := range companions {
-		if companion == "" || companion == prev {
-			continue
-		}
-		prev = companion
-		ci, err := os.Stat(companion)
-		if err != nil || ci.IsDir() || !antigravityCompanionCounts(companion, ci) {
-			continue
-		}
-		cmtime, ok := writeStatTuple("companion", companion, ci)
-		if !ok {
-			return 0
-		}
-		if cmtime > maxMtimeNS {
-			maxMtimeNS = cmtime
-		}
-	}
-
 	root := filepath.Dir(filepath.Dir(path))
 	ctx := context.Background()
-	workspace := antigravityCLIWorkspaceForID(ctx, root, id)
-	if err := writeAntigravityCLIHistoryAndWorkspaceDigest(
-		h, root, id, workspace, maxMtimeNS,
-	); err != nil {
-		return 0
-	}
-	summaries := loadAntigravitySummaries(ctx, root)
-	if summaries.err != nil {
-		return 0
-	}
-	digest := summaries.fingerprintDigest(id)
-	_, _ = fmt.Fprintf(h, "summary\x00%d\x00%s\x00", len(digest), digest)
-
-	sum := h.Sum64()
-	if sum == 0 {
-		return 1
-	}
-	return sum
+	return antigravityStatHashFromCompanions(
+		ctx,
+		path,
+		antigravityCLIProviderCompanionPaths(path),
+		root,
+		id,
+		func(h hash.Hash64, maxMtimeNS int64) bool {
+			workspace := antigravityCLIWorkspaceForID(ctx, root, id)
+			return writeAntigravityCLIHistoryAndWorkspaceDigest(
+				h, root, id, workspace, maxMtimeNS,
+			) == nil
+		},
+	)
 }
 
 func antigravityCLIProviderCapabilities() Capabilities {

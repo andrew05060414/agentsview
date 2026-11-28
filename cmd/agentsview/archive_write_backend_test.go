@@ -417,10 +417,49 @@ func TestDaemonPGPushWatchCopiesChangesAfterSuccessfulCatchup(t *testing.T) {
 		assert.Equal(t, pushWatchAttempt{index: 2, reason: reasonArchiveChange, noSourceSync: true}, receiveArchiveTest(t, h.attempts))
 
 		h.floor <- time.Now()
-		assert.Equal(t, pushWatchAttempt{index: 3, reason: reasonInterval}, receiveArchiveTest(t, h.attempts))
+		assert.Equal(t, pushWatchAttempt{index: 3, reason: reasonInterval, noSourceSync: true}, receiveArchiveTest(t, h.attempts))
 		cancel()
 		require.NoError(t, receiveArchiveTest(t, done))
 		assert.Equal(t, pushWatchAttempt{index: 4, reason: reasonShutdown}, receiveArchiveTest(t, h.attempts))
+	})
+}
+
+func TestDaemonPGPushWatchIntervalSkipsSourceSyncOnlyWhenReady(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newPushWatchOwnerHarness(1)
+		backend := daemonArchiveWriteBackend{watchHooks: h.hooks()}
+		ctx, cancel := context.WithCancel(t.Context())
+		t.Cleanup(cancel)
+		done := make(chan error, 1)
+		go func() {
+			done <- backend.ReplicaPushWatch(
+				ctx, pgReplica{}, storage.ConfiguredReplica{},
+				ReplicaPushConfig{Full: true}, nil, nil, time.Hour, time.Hour,
+			)
+		}()
+
+		// Initial --full startup push fails partially, keeping ready=false.
+		assert.Equal(t, pushWatchAttempt{
+			index: 1, reason: reasonStartup, full: true, noSourceSync: false,
+		}, receiveArchiveTest(t, h.attempts))
+		synctest.Wait()
+
+		// While startup has not succeeded cleanly, interval retries must still
+		// allow source sync (noSourceSync: false).
+		h.floor <- time.Now()
+		assert.Equal(t, pushWatchAttempt{
+			index: 2, reason: reasonInterval, full: false, noSourceSync: false,
+		}, receiveArchiveTest(t, h.attempts))
+		receiveArchiveTest(t, h.opened)
+
+		// Once ready=true, subsequent interval pushes skip redundant source sync.
+		h.floor <- time.Now()
+		assert.Equal(t, pushWatchAttempt{
+			index: 3, reason: reasonInterval, full: false, noSourceSync: true,
+		}, receiveArchiveTest(t, h.attempts))
+
+		cancel()
+		require.NoError(t, receiveArchiveTest(t, done))
 	})
 }
 

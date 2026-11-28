@@ -126,6 +126,7 @@ func (s *Sync) PushWithOptions(
 		s.schemaMu.Lock()
 		s.forgetEnsuredSchemaLocked()
 		s.schemaMu.Unlock()
+		s.forgetSyncedModelPricing()
 	}
 	switch {
 	case err == nil || errors.Is(err, db.ErrDiagnosticConflict) || completed:
@@ -536,7 +537,12 @@ func (s *Sync) pushWithOptions(
 		return result, err
 	}
 	if err := timedPushSetupStep("model pricing sync",
-		func() error { return s.syncModelPricing(ctx) }); err != nil {
+		func() error {
+			if full {
+				s.forgetSyncedModelPricing()
+			}
+			return s.syncModelPricingWithForce(ctx, full)
+		}); err != nil {
 		return result, err
 	}
 	if err := timedPushSetupStep("cursor usage event sync",

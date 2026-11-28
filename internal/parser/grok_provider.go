@@ -3,33 +3,75 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
+var (
+	_ Provider            = (*grokProvider)(nil)
+	_ MultiFileStatHasher = (*grokProvider)(nil)
+)
+
+type grokProviderFactory struct {
+	inner ProviderFactory
+}
+
+func (f grokProviderFactory) Definition() AgentDef {
+	return f.inner.Definition()
+}
+
+func (f grokProviderFactory) Capabilities() Capabilities {
+	return f.inner.Capabilities()
+}
+
+func (f grokProviderFactory) NewProvider(cfg ProviderConfig) Provider {
+	p := f.inner.NewProvider(cfg)
+	ssp, ok := p.(*SourceSetProvider)
+	if !ok {
+		return p
+	}
+	return &grokProvider{SourceSetProvider: ssp}
+}
+
+type grokProvider struct {
+	*SourceSetProvider
+}
+
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher across
+// summary.json, every companion metadata/transcript file, and any sibling
+// subagent parent metadata so warm sweeps skip unchanged sessions without
+// re-hashing their contents.
+func (p *grokProvider) ComputeMultiFileStatHash(path string) uint64 {
+	return grokComputeMultiFileStatHash(path)
+}
+
 func newGrokProviderFactory(def AgentDef) ProviderFactory {
-	return NewSingleFileProviderFactory(
-		def,
-		grokProviderCapabilities(),
-		func(cfg ProviderConfig) singleFileSourceSet {
-			return NewSingleFileSourceSet(
-				AgentGrok,
-				cfg.Roots,
-				WithStreamingFileDiscovery(grokDiscoverEach),
-				WithFileWatchRoots(grokWatchRoots),
-				WithFileChangedPathClassifier(grokClassifyPath),
-				WithFileLookup(func(_ context.Context, root, rawID string) (singleFileMatch, bool) {
-					return grokFindFile(root, rawID)
-				}),
-				WithFileFingerprint(grokFingerprintSource),
-				WithFileParse(grokParseFile),
-			)
-		},
-	)
+	return grokProviderFactory{
+		inner: NewSingleFileProviderFactory(
+			def,
+			grokProviderCapabilities(),
+			func(cfg ProviderConfig) singleFileSourceSet {
+				return NewSingleFileSourceSet(
+					AgentGrok,
+					cfg.Roots,
+					WithStreamingFileDiscovery(grokDiscoverEach),
+					WithFileWatchRoots(grokWatchRoots),
+					WithFileChangedPathClassifier(grokClassifyPath),
+					WithFileLookup(func(_ context.Context, root, rawID string) (singleFileMatch, bool) {
+						return grokFindFile(root, rawID)
+					}),
+					WithFileFingerprint(grokFingerprintSource),
+					WithFileParse(grokParseFile),
+				)
+			},
+		),
+	}
 }
 
 func grokDiscoverEach(
@@ -293,9 +335,110 @@ func grokParseFile(
 	return []ParseResult{result}, nil, nil
 }
 
+// GrokEffectiveMtime returns the max ModTime().UnixNano() across summary.json
+// and its companion and subagent metadata files, matching grokFingerprintSource.
+func GrokEffectiveMtime(summaryPath string, base os.FileInfo) int64 {
+	mtime := base.ModTime().UnixNano()
+	companions := grokCompanionFiles(summaryPath)
+	labels := make([]string, 0, len(companions))
+	for label := range companions {
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	for _, label := range labels {
+		ci, err := siblingMetadataFileInfo(companions[label])
+		if err != nil || ci == nil {
+			continue
+		}
+		if ts := ci.ModTime().UnixNano(); ts > mtime {
+			mtime = ts
+		}
+	}
+	if metaPath := grokParentSubagentMetaPath(summaryPath); metaPath != "" {
+		if mi, err := siblingMetadataFileInfo(metaPath); err == nil && mi != nil {
+			if ts := mi.ModTime().UnixNano(); ts > mtime {
+				mtime = ts
+			}
+		}
+	}
+	return mtime
+}
+
+func grokComputeMultiFileStatHash(summaryPath string) uint64 {
+	clean := filepath.Clean(summaryPath)
+	if filepath.Base(clean) != "summary.json" {
+		return 0
+	}
+	info, err := os.Stat(clean)
+	if err != nil || info.IsDir() {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte{0x67})
+
+	var buf [32]byte
+	writeStatTuple := func(label, p string, fi os.FileInfo) bool {
+		ctime, ok := codexIndexChangeTime(p, fi)
+		if !ok {
+			return false
+		}
+		inode, _ := sourceFileIdentityForPath(p, fi)
+		if inode == 0 {
+			return false
+		}
+		_, _ = fmt.Fprintf(h, "%s\x00%s\x00", label, p)
+		binary.LittleEndian.PutUint64(buf[:8], uint64(fi.Size()))
+		binary.LittleEndian.PutUint64(buf[8:16], uint64(fi.ModTime().UnixNano()))
+		binary.LittleEndian.PutUint64(buf[16:24], uint64(ctime))
+		binary.LittleEndian.PutUint64(buf[24:32], inode)
+		_, _ = h.Write(buf[:])
+		return true
+	}
+
+	if !writeStatTuple("summary", clean, info) {
+		return 0
+	}
+	companions := grokCompanionFiles(clean)
+	labels := make([]string, 0, len(companions))
+	for label := range companions {
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	for _, label := range labels {
+		companion := companions[label]
+		ci, err := siblingMetadataFileInfo(companion)
+		if err != nil {
+			return 0
+		}
+		if ci == nil {
+			continue
+		}
+		if !writeStatTuple(label, companion, ci) {
+			return 0
+		}
+	}
+	if metaPath := grokParentSubagentMetaPath(clean); metaPath != "" {
+		mi, err := siblingMetadataFileInfo(metaPath)
+		if err != nil {
+			return 0
+		}
+		if mi != nil && !writeStatTuple("subagent_parent_meta", metaPath, mi) {
+			return 0
+		}
+	}
+
+	sum := h.Sum64()
+	if sum == 0 {
+		return 1
+	}
+	return sum
+}
+
 func grokProviderCapabilities() Capabilities {
+	source := jsonlFileProviderSourceCapabilities()
+	source.MultiFileStatHash = CapabilitySupported
 	return Capabilities{
-		Source: jsonlFileProviderSourceCapabilities(),
+		Source: source,
 		Sync: ProviderSyncSemantics{
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,

@@ -2389,6 +2389,70 @@ func TestWatchPollingObligationsCoverRegistrationFailureByLogicalRoot(t *testing
 	}}, got)
 }
 
+func TestWatchPollingObligationsDegradeOnlyAffectedRoots(t *testing.T) {
+	base := t.TempDir()
+	claudeDir := filepath.Join(base, "claude")
+	cursorDir := filepath.Join(base, "cursor")
+	absentDir := filepath.Join(base, "absent")
+	roots := []watchRoot{
+		{
+			path: filepath.Join(claudeDir, "projects"), exists: true, recursive: true,
+			scopes: []watchScope{{agent: parser.AgentClaude, syncDir: claudeDir}},
+		},
+		{
+			path: filepath.Join(cursorDir, "projects"), exists: true, recursive: true,
+			scopes: []watchScope{{agent: parser.AgentCursor, syncDir: cursorDir}},
+		},
+		{
+			path: filepath.Join(absentDir, "sessions"), exists: false, recursive: true,
+			scopes: []watchScope{{agent: parser.AgentCodex, syncDir: absentDir}},
+		},
+	}
+
+	got := watchPollingObligations(
+		roots,
+		[]agentsync.RecursiveWatchResult{
+			{Watched: 3000},
+			{Watched: 1, BudgetExhausted: true},
+			// Non-existent roots should never be marked degraded even if a
+			// backend result carries stale fields.
+			{BudgetExhausted: true},
+		},
+		[]string{cursorDir},
+		nil,
+	)
+
+	assert.Equal(t, []agentsync.PollingObligation{{
+		Key:    "degraded:cursor:" + filepath.Join(cursorDir, "projects"),
+		Scopes: []agentsync.PollingScope{{Agent: "cursor", Root: cursorDir}},
+		Probe:  filepath.Join(cursorDir, "projects"),
+	}}, got)
+}
+
+func TestWatchDegradedLogMessageAvoidsZeroDirectoryMisreport(t *testing.T) {
+	assert.Equal(t,
+		"Watch budget exhausted under /tmp/cursor (12 watched), will poll every 2m0s",
+		watchDegradedLogMessage("/tmp/cursor", agentsync.RecursiveWatchResult{
+			Watched:         12,
+			BudgetExhausted: true,
+		}),
+	)
+	assert.Equal(t,
+		"Watch resource limit reached under /tmp/cursor (5 watched), will poll every 2m0s",
+		watchDegradedLogMessage("/tmp/cursor", agentsync.RecursiveWatchResult{
+			Watched:           5,
+			ResourceExhausted: true,
+		}),
+	)
+	assert.Equal(t,
+		"Couldn't watch 3 directories under /tmp/cursor, will poll every 2m0s",
+		watchDegradedLogMessage("/tmp/cursor", agentsync.RecursiveWatchResult{
+			Watched:   10,
+			Unwatched: 3,
+		}),
+	)
+}
+
 // A persistent polling obligation probes the configured dir, which can still
 // exist while a recursive symlink root's target holding every session is gone.
 // The symlink obligation must gate the dir on the target itself so the poll

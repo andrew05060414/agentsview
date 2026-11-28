@@ -1856,7 +1856,6 @@ func TestAntigravityBrainTranscriptGenMetadataTargetsModelEntry(t *testing.T) {
 	}
 }
 
-
 func TestAntigravityCLIProviderFingerprintIgnoresUnrelatedCacheUpdates(t *testing.T) {
 	root := t.TempDir()
 	idA := "11111111-2222-3333-4444-555555555555"
@@ -1964,4 +1963,139 @@ func TestAntigravityCLIProviderMultiFileStatHashTracksSideInputs(t *testing.T) {
 	mustMkdir(t, brainDir)
 	mustWrite(t, filepath.Join(brainDir, "task.md"), []byte("# Task"))
 	assert.NotEqual(t, hABefore, hasher.ComputeMultiFileStatHash(pbA))
+}
+
+func TestAntigravityProviderMultiFileStatHashAndMeteredFingerprint(t *testing.T) {
+	root := t.TempDir()
+	id := "abababab-1111-2222-3333-cdcdcdcdcdcd"
+	writeAntigravityIDEProviderFixture(t, root, id)
+	dbPath := filepath.Join(root, "conversations", id+".db")
+
+	provider, ok := NewProvider(AgentAntigravity, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	assert.Equal(t, CapabilitySupported, provider.Capabilities().Source.MultiFileStatHash)
+	hasher, ok := provider.(MultiFileStatHasher)
+	require.True(t, ok)
+
+	src, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	var meter ContentReadMeter
+	fp, err := provider.Fingerprint(WithContentReadMeter(t.Context(), &meter), src)
+	require.NoError(t, err)
+	assert.NotEmpty(t, fp.Hash)
+	assert.Positive(t, meter.Reads())
+	assert.Positive(t, meter.Bytes())
+
+	baseHash := hasher.ComputeMultiFileStatHash(dbPath)
+	require.NotZero(t, baseHash)
+
+	// An empty WAL and a .db-shm read index must not invalidate the stat hash.
+	mustWrite(t, dbPath+"-wal", []byte{})
+	mustWrite(t, dbPath+"-shm", make([]byte, 64))
+	assert.Equal(t, baseHash, hasher.ComputeMultiFileStatHash(dbPath))
+
+	// A framed WAL, sidecar, annotation, brain doc, metadata, and brain
+	// transcript must each invalidate the stat hash.
+	walPath := dbPath + "-wal"
+	mustWrite(t, walPath, make([]byte, 32+24+64))
+	hWithWAL := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, baseHash, hWithWAL)
+	require.NoError(t, os.Remove(walPath))
+
+	mustWrite(t, filepath.Join(root, "annotations", id+".pbtxt"),
+		[]byte("last_user_view_time:{seconds:1779999999 nanos:0}\n"))
+	hAnn := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, baseHash, hAnn)
+
+	writeAntigravityTestSidecar(t, root, id, 2)
+	hSidecar := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, hAnn, hSidecar)
+
+	mustWrite(t, filepath.Join(root, "brain", id, "plan.md"), []byte("# Updated Plan"))
+	hBrain := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, hSidecar, hBrain)
+
+	transcriptPath := antigravityBrainTranscriptPath(root, id)
+	mustMkdir(t, filepath.Dir(transcriptPath))
+	mustWrite(t, transcriptPath, []byte(`{"role":"user","text":"hello"}`+"\n"))
+	hTranscript := hasher.ComputeMultiFileStatHash(dbPath)
+	assert.NotEqual(t, hBrain, hTranscript)
+
+	// Standalone brain transcript session (no DB) also hashes safely.
+	standaloneID := "efefefef-1111-2222-3333-909090909090"
+	standalonePath := antigravityBrainTranscriptPath(root, standaloneID)
+	mustMkdir(t, filepath.Dir(standalonePath))
+	mustWrite(t, standalonePath, []byte(`{"role":"user","text":"v1"}`+"\n"))
+	hStandaloneBefore := hasher.ComputeMultiFileStatHash(standalonePath)
+	require.NotZero(t, hStandaloneBefore)
+	mustWrite(t, standalonePath, []byte(`{"role":"user","text":"v1-updated"}`+"\n"))
+	assert.NotEqual(t, hStandaloneBefore, hasher.ComputeMultiFileStatHash(standalonePath))
+}
+
+func TestAntigravityCLIProviderPostScanWorkspaceReplaceConsistency(t *testing.T) {
+	root := t.TempDir()
+	id := "cafebabe-1111-2222-3333-deadbeef0001"
+	convDir := filepath.Join(root, "conversations")
+	mustMkdir(t, convDir)
+	pbPath := filepath.Join(convDir, id+".pb")
+	mustWrite(t, pbPath, []byte("pb-payload"))
+	brainDir := filepath.Join(root, "brain", id)
+	mustMkdir(t, brainDir)
+	mustWrite(t, filepath.Join(brainDir, "task.md"), []byte("# Task"))
+
+	projA := filepath.Join(root, "proj-a")
+	projB := filepath.Join(root, "proj-b")
+	mustMkdir(t, projA)
+	mustMkdir(t, projB)
+
+	cachePath := filepath.Join(root, "cache", "last_conversations.json")
+	mustMkdir(t, filepath.Dir(cachePath))
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{%q:%q}`, projA, id)))
+
+	provider, ok := NewProvider(AgentAntigravityCLI, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	hasher := provider.(MultiFileStatHasher)
+
+	var scanned []SourceRef
+	require.NoError(t, provider.(StreamingDiscoverer).DiscoverEach(
+		t.Context(),
+		func(ref SourceRef) error {
+			scanned = append(scanned, ref)
+			return nil
+		},
+	))
+	require.Len(t, scanned, 1)
+	statBefore := hasher.ComputeMultiFileStatHash(pbPath)
+	fpBefore, err := provider.Fingerprint(t.Context(), scanned[0])
+	require.NoError(t, err)
+
+	// Replace the workspace cache AFTER discovery scan while keeping the
+	// already-discovered SourceRef (simulating DiscoverEach -> processProviderFile).
+	mustWrite(t, cachePath, []byte(fmt.Sprintf(`{%q:%q}`, projB, id)))
+	assert.NotEqual(t, statBefore, hasher.ComputeMultiFileStatHash(pbPath))
+
+	fpAfter, err := provider.Fingerprint(t.Context(), scanned[0])
+	require.NoError(t, err)
+	assert.NotEqual(t, fpBefore.Hash, fpAfter.Hash)
+
+	freshSrc, found, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: id})
+	require.NoError(t, err)
+	require.True(t, found)
+	fpFresh, err := provider.Fingerprint(t.Context(), freshSrc)
+	require.NoError(t, err)
+	assert.Equal(t, fpFresh.Hash, fpAfter.Hash)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source:      scanned[0],
+		Fingerprint: fpAfter,
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	assert.Equal(t, "proj_b", outcome.Results[0].Result.Session.Project)
 }

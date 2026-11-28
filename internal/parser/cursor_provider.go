@@ -86,6 +86,14 @@ func (p *cursorProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
 }
 
+// SourceForReconciliation resolves an already-discovered Cursor transcript
+// directly without scanning sibling subagent directories or chats metadata.
+func (p *cursorProvider) SourceForReconciliation(
+	ctx context.Context, path, project string,
+) (SourceRef, bool, error) {
+	return p.sources.SourceForReconciliation(ctx, path, project)
+}
+
 func (p *cursorProvider) SourcesForChangedPath(
 	ctx context.Context,
 	req ChangedPathRequest,
@@ -754,6 +762,32 @@ func (s cursorSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	return WatchPlan{Roots: roots}, nil
 }
 
+func (s cursorSourceSet) SourceForReconciliation(
+	ctx context.Context, path, _ string,
+) (SourceRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return SourceRef{}, false, err
+	}
+	clean := filepath.Clean(path)
+	for _, root := range s.roots {
+		loc, ok := cursorTranscriptLocationInRoot(root, clean)
+		if !ok {
+			continue
+		}
+		if loc.ParentRawID != "" {
+			topLoc := loc
+			topLoc.ParentRawID = ""
+			if top := cursorFindSourceFileInProject(root, topLoc); top != "" {
+				if ref, found, err := s.streamingSourceRefWithCache(root, top, nil); err != nil || found {
+					return ref, found, err
+				}
+			}
+		}
+		return s.streamingSourceRefWithCache(root, clean, nil)
+	}
+	return SourceRef{}, false, nil
+}
+
 func (s cursorSourceSet) SourcesForChangedPath(
 	ctx context.Context,
 	req ChangedPathRequest,
@@ -1031,7 +1065,11 @@ func (s cursorSourceSet) sourceForPathInRoot(
 	if selected == "" {
 		return SourceRef{}, false
 	}
-	return s.sourceRef(root, selected)
+	loc, ok = cursorTranscriptLocationInRoot(root, selected)
+	if !ok {
+		return SourceRef{}, false
+	}
+	return s.verifiedSourceRef(root, selected, loc, nil), true
 }
 
 func (s cursorSourceSet) sourceRef(root, path string) (SourceRef, bool) {
@@ -1054,6 +1092,16 @@ func (s cursorSourceSet) sourceRefWithCache(
 	if selected == "" || !samePath(selected, path) {
 		return SourceRef{}, false
 	}
+	return s.verifiedSourceRef(root, path, loc, resolutionCache), true
+}
+
+func (s cursorSourceSet) verifiedSourceRef(
+	root, path string,
+	loc cursorTranscriptLocation,
+	resolutionCache cursorResolutionCache,
+) SourceRef {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
 	project := DecodeCursorProjectDir(loc.ProjectDir)
 	if project == "" {
 		project = "unknown"
@@ -1072,7 +1120,7 @@ func (s cursorSourceSet) sourceRefWithCache(
 			Root: root,
 			Path: path,
 		},
-	}, true
+	}
 }
 
 func (s cursorSourceSet) hasRoot(root string) bool {
