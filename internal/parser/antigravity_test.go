@@ -864,9 +864,9 @@ func TestAntigravityCLIDBFileInfoIgnoresFramelessWAL(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, before.Size(), after.Size())
 	assert.Equal(t, before.ModTime(), after.ModTime())
-	hashBefore, err := antigravityCompositeHash(dbPath)
+	hashBefore, err := antigravityCompositeHash(t.Context(), dbPath)
 	require.NoError(t, err)
-	hashAfter, err := antigravityCompositeHash(dbPath, dbPath+"-wal")
+	hashAfter, err := antigravityCompositeHash(t.Context(), dbPath, dbPath+"-wal")
 	require.NoError(t, err)
 	assert.Equal(t, hashBefore, hashAfter)
 }

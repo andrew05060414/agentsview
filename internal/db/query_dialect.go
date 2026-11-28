@@ -783,6 +783,10 @@ func buildSessionFilterWithBuilder(
 		return strings.Join(allPreds, " AND ")
 	}
 
+	if accounts := CSVFilterValues(f.Account); len(accounts) > 0 {
+		// A matching root cannot assign its account to a descendant.
+		basePreds = append(basePreds, inPredicate(q("account"), accounts, b))
+	}
 	baseWhere := strings.Join(basePreds, " AND ")
 	rootFilter, oneShotPred := sessionFilterPredicates(f, b, func(col string) string {
 		return "root_session." + col
@@ -875,6 +879,9 @@ func sessionFilterPredicates(
 	if f.ExcludeProject != "" {
 		preds = append(preds,
 			q("project")+" != "+b.Add(f.ExcludeProject))
+	}
+	if accounts := CSVFilterValues(f.Account); len(accounts) > 0 {
+		preds = append(preds, inPredicate(q("account"), accounts, b))
 	}
 	if f.Machine != "" {
 		preds = append(preds,

@@ -430,7 +430,19 @@ func clearUsageOnlyTextTx(
 		return fmt.Errorf("clearing usage-only pin notes for %s: %w", sessionID, err)
 	}
 	// Continuation state can retain the last message or raw SHA input bytes.
-	for _, table := range []string{"session_signal_state", "session_frustration_markers", "parser_checkpoints", "parser_checkpoint_blobs"} {
+	tables := []string{"session_signal_state", "session_frustration_markers"}
+	var blobs ParserCheckpointBlobs
+	err := tx.QueryRow(
+		`SELECT cursor, hash_state FROM parser_checkpoint_blobs WHERE session_id = ?`,
+		sessionID,
+	).Scan(&blobs.Cursor, &blobs.HashState)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("reading usage-only checkpoint state for %s: %w", sessionID, err)
+	}
+	if err != nil || !blobs.keptUnder(config.ArchiveContentUsage) {
+		tables = append(tables, "parser_checkpoints", "parser_checkpoint_blobs")
+	}
+	for _, table := range tables {
 		if _, err := tx.Exec("DELETE FROM "+table+" WHERE session_id = ?", sessionID); err != nil {
 			return fmt.Errorf("clearing usage-only continuation state for %s: %w", sessionID, err)
 		}
@@ -457,16 +469,16 @@ func updateUsageOnlyAutomationTx(
 	}
 	var userMessageCount int
 	var automated bool
-	var sessionKind string
+	var sessionKind, entrypoint string
 	err := tx.QueryRow(
-		`SELECT user_message_count, is_automated, session_kind
+		`SELECT user_message_count, is_automated, session_kind, entrypoint
 		   FROM sessions WHERE id = ?`,
 		sessionID,
-	).Scan(&userMessageCount, &automated, &sessionKind)
+	).Scan(&userMessageCount, &automated, &sessionKind, &entrypoint)
 	if err != nil {
 		return err
 	}
-	if IsAutomatedSessionMetadata(sessionKind) {
+	if IsAutomatedSessionMetadata(sessionKind, entrypoint) {
 		if automated {
 			return nil
 		}

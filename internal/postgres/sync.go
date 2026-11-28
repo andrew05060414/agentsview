@@ -253,6 +253,7 @@ type Sync struct {
 	targetFingerprint      string
 	syncStateTarget        string
 	migrateLegacySyncState bool
+	accountAliases         map[string]string
 
 	// archiveID caches this local archive's stable identifier, populated at
 	// the top of Push and stamped onto every pushed session's
@@ -298,12 +299,26 @@ type Sync struct {
 	afterPushBatch func()
 	// afterMessagePage is a test hook called after each copied message page.
 	afterMessagePage func()
+	// sequentialNewSessions, a test hook, writes new sessions one statement
+	// at a time, as sessions PostgreSQL already has are written.
+	sequentialNewSessions bool
+	// beforeNewSessionBatch is a test hook called after a chunk's new
+	// sessions are chosen and before their batched writes are sent.
+	beforeNewSessionBatch func()
+	// afterMessageSnapshot is a test hook called once a session push has
+	// opened its local message snapshot.
+	afterMessageSnapshot func()
 
 	closeOnce sync.Once
 	closeErr  error
 
 	schemaMu   sync.Mutex
 	schemaDone bool
+
+	pricingSyncMu       sync.Mutex
+	pricingSyncedTarget string
+	pricingSyncedDigest string
+	hasPricingSynced    bool
 }
 
 func (s *Sync) effectiveSyncState() syncStateStore {
@@ -395,6 +410,7 @@ func New(
 		targetFingerprint:      targetFingerprint,
 		syncStateTarget:        syncStateScope,
 		migrateLegacySyncState: migrateLegacySyncState,
+		accountAliases:         opts.AccountAliases,
 		projects:               opts.Projects,
 		excludeProjects:        opts.ExcludeProjects,
 		vectorSource:           opts.VectorSource,

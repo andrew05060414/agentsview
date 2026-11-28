@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"go.kenn.io/agentsview/internal/ctxio"
 )
 
 // Cursor IDE stores every chat session in one shared SQLite database
@@ -119,7 +121,7 @@ func cursorIDEFingerprintSource(
 		); err == nil {
 			mtime = composite
 		}
-		stateHash, err := cursorIDESQLiteStateHash(src.Container)
+		stateHash, err := cursorIDESQLiteStateHash(ctx, src.Container)
 		if err != nil {
 			return SourceFingerprint{}, err
 		}
@@ -167,7 +169,10 @@ func cursorIDEFingerprintSource(
 // it (FingerprintHashInCacheKey), so a rewrite that leaves the database's
 // size and mtime unchanged still misses the cache and reparses, without the
 // full-file hashing this provider deliberately avoids.
-func cursorIDESQLiteStateHash(dbPath string) (string, error) {
+func cursorIDESQLiteStateHash(ctx context.Context, dbPath string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	h := fnv.New64a()
 	f, err := os.Open(dbPath)
 	if err != nil {
@@ -182,7 +187,10 @@ func cursorIDESQLiteStateHash(dbPath string) (string, error) {
 	id, volume := sourceFileHandleIdentity(f)
 	_, _ = fmt.Fprintf(h, "%d|%d|", id, volume)
 	header := make([]byte, 100)
-	n, err := io.ReadFull(f, header)
+	n, err := io.ReadFull(ctxio.Reader{Context: ctx, Reader: f}, header)
+	if n > 0 {
+		recordContentRead(ctx, int64(n))
+	}
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return "", fmt.Errorf("reading cursor IDE db header %s: %w", dbPath, err)
 	}
@@ -192,9 +200,15 @@ func cursorIDESQLiteStateHash(dbPath string) (string, error) {
 		_, _ = fmt.Fprintf(h, "|wal:%d|", info.Size())
 		if wal, err := os.Open(walPath); err == nil {
 			walHeader := make([]byte, 32)
-			wn, _ := io.ReadFull(wal, walHeader)
-			_, _ = h.Write(walHeader[:wn])
+			wn, walErr := io.ReadFull(ctxio.Reader{Context: ctx, Reader: wal}, walHeader)
+			if wn > 0 {
+				recordContentRead(ctx, int64(wn))
+			}
 			_ = wal.Close()
+			if walErr != nil && !errors.Is(walErr, io.ErrUnexpectedEOF) && !errors.Is(walErr, io.EOF) {
+				return "", fmt.Errorf("reading cursor IDE wal header %s: %w", walPath, walErr)
+			}
+			_, _ = h.Write(walHeader[:wn])
 		}
 	}
 	return strconv.FormatUint(h.Sum64(), 16), nil

@@ -418,3 +418,84 @@ func TestCodexCompressedChangedPathFindsDatedPlainByFilename(t *testing.T) {
 	require.Len(t, sources, 1)
 	assert.Equal(t, plain, sources[0].DisplayPath)
 }
+
+func TestCodexPlainChangedPathFindsCompressedRollover(t *testing.T) {
+	root := t.TempDir()
+	name := compressedDayPrefix + compressedThreadA + ".jsonl"
+	compressed := writeFileIn(t, codexDayDir(root), name+".zst",
+		zstdCompress(t, []byte(codexRolloutContent(compressedThreadA, "rolled over"))))
+	plain := filepath.Join(codexDayDir(root), name)
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	// A source recorded before Codex compressed the rollout in place still
+	// names the plain file; reconciliation must find the .zst sibling.
+	source, found, err := provider.(ReconciliationSourceResolver).SourceForReconciliation(
+		t.Context(), plain, "codex:"+compressedThreadA,
+	)
+	require.NoError(t, err)
+	require.True(t, found, "a plain path rolled over to .zst must still resolve")
+	assert.Equal(t, compressed, source.DisplayPath)
+
+	// A watcher delete/rename event on the plain path lands the same way.
+	sources, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
+		Path: plain, EventKind: "remove",
+	})
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	assert.Equal(t, compressed, sources[0].DisplayPath)
+}
+
+func TestCodexPlainChangedPathStaysGoneWhenNothingRolledOver(t *testing.T) {
+	root := t.TempDir()
+	plain := filepath.Join(codexDayDir(root),
+		compressedDayPrefix+compressedThreadA+".jsonl")
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	// A truly deleted rollout still reports its stored path so the engine can
+	// tombstone the session; it just does not masquerade as a .zst source.
+	sources, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
+		Path: plain, EventKind: "remove",
+	})
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	assert.Equal(t, plain, sources[0].DisplayPath)
+
+	_, found, err := provider.(ReconciliationSourceResolver).SourceForReconciliation(
+		t.Context(), plain, "codex:"+compressedThreadA,
+	)
+	require.NoError(t, err)
+	assert.False(t, found)
+}
+
+func TestCodexRolloverBetweenDiscoveryAndParse(t *testing.T) {
+	root := t.TempDir()
+	content := codexRolloutContent(compressedThreadA, "rolled over mid-sync")
+	name := compressedDayPrefix + compressedThreadA + ".jsonl"
+	plain := writeFileIn(t, codexDayDir(root), name, []byte(content))
+
+	provider, ok := NewProvider(AgentCodex, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	source, ok := provider.(interface {
+		SourceRefForPath(string) (SourceRef, bool)
+	}).SourceRefForPath(plain)
+	require.True(t, ok)
+
+	// Codex compresses the rollout in place between discovery and parse.
+	require.NoError(t, os.Remove(plain))
+	compressed := writeFileIn(t, codexDayDir(root), name+".zst",
+		zstdCompress(t, []byte(content)))
+
+	// The source captured before the rollover must still fingerprint and
+	// parse the compressed sibling.
+	fingerprint, err := provider.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source, Fingerprint: fingerprint})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0].Result
+	assert.Equal(t, compressed, result.Session.File.Path)
+	assert.Equal(t, 2, result.Session.MessageCount)
+	assert.NotEmpty(t, result.Session.FirstMessage)
+}

@@ -569,8 +569,16 @@ command counts raw `tool_calls.result_content` and `tool_result_events.content`
 bytes separately from decoded image bytes. `db compact` reports file-size
 reclamation separately.
 
-Transcript-only and usage-only writes omit parser checkpoints because resumable
-hash state can contain raw trailing transcript bytes. They retain staged parsing
+Transcript-only and usage-only writes keep parser checkpoints only in a form
+that holds no transcript bytes. A SHA-256 state buffers the input after the
+last 64-byte block, so these archives save the state at that block boundary,
+and a resume re-reads the bytes from the boundary to the committed offset.
+Claude checkpoints have no cursor. A Codex cursor holds session metadata,
+digests, and pending tool call IDs and names; transcript-only archives keep
+it, and usage-only archives, which drop tool call names and IDs, keep no Codex
+checkpoint. Every checkpoint write goes through one database helper that
+aligns the state and deletes the session's checkpoint when the payload still
+does not meet these rules. Restricted writes retain staged parsing
 but publish projected messages and tool metadata without staged output. Late
 result updates use the same projection as newly inserted messages.
 
@@ -1231,6 +1239,39 @@ missing indexes automatically. Each first build scans `sessions` and blocks
 writes until installation commits. Restricted publishers keep writing before
 owner installation, using the existing queries until the indexes are available.
 
+### PostgreSQL push batches for new sessions
+
+A push writes sessions in transactions of up to 50. Within each transaction,
+sessions PostgreSQL has no row for are written with pipelined pgx batches
+(`newSessionBatch`), so a first load costs a few round trips per 50 sessions
+instead of about 20 per session. The batch reuses the sequential writers and
+their SQL. It skips only reads that cannot find anything for a session with no
+row: the ownership check, the pin snapshot, and image text, because those
+tables reference `sessions`. The existence check, exclusions, and published
+commit links (which can outlive their session) are read once per transaction.
+
+Sessions keep their order within the transaction. Queued statements are sent
+before any session that takes the sequential path, because a session's upsert
+can read rows an earlier session wrote, such as a Codex thread's trash state.
+The batch also sends early once it holds 8 MiB, even partway through a
+transcript.
+
+The batch confirms that each session was still new when written. Its session
+upsert is insert-only (`pgSessionWriteOptions.InsertOnly`), so a row another
+push created after the existence check reports no affected rows instead of
+being overwritten without reconciling its pins, image text, and commit links.
+The last batch also checks that no exclusion applies to any of the sessions'
+tombstone IDs, as the sequential path does after its upsert.
+
+Sessions PostgreSQL already has, sessions an exclusion may apply to, and
+usage-only archives keep the sequential path. If any batched statement fails,
+or a session's upsert does not create its row, the transaction rolls back and is
+rewritten one statement at a time, which applies the usual per-session error
+handling; a session that fails this way is retried alone, batched and then
+sequentially. The batch's writers report zero affected rows for every statement,
+which is the true count only because nothing exists to delete for a new
+session; do not queue writes for sessions PostgreSQL already has.
+
 ### PostgreSQL schema step reuse
 
 A push starts with a schema step that checks every table, column, and index the
@@ -1724,9 +1765,10 @@ These tests use the `chtest` build tag. Never point them at a live mirror.
 ## PostgreSQL Integration Tests
 
 Run PostgreSQL integration tests only against a dedicated test server. Each
-top-level test in `internal/postgres` creates its own database on the
-`TEST_PG_URL` server, named `agentsview_test_<hex>`, and drops it when the test
-ends.
+test in `internal/postgres` that asks for a database creates one on the
+`TEST_PG_URL` server, named `agentsview_test_<hex>`. A subtest reuses an
+ancestor's database if one exists. The database is dropped when the last test
+using it ends.
 
 The `TEST_PG_URL` server must run PostgreSQL 15 or later, because the tests
 create their databases with `STRATEGY FILE_COPY`.
@@ -1754,8 +1796,9 @@ Because each test owns a database, the tests run in parallel:
 
 - Start a new `pgtest` test with `t.Parallel()` and get its database from
   `testPGURL(t)`, or `PGTestURL(t)` in the external `postgres_test` package.
-  Subtests share their top-level test's database. `isolatedPGDatabase(t)`
-  returns another, separate database.
+  Subtests inherit an ancestor test's database when one already exists; sibling
+  subtests whose parent did not create a database each get their own.
+  `isolatedPGDatabase(t)` returns another, separate database.
 - A test that only needs a schema to exist before it starts gets its database
   from `testPGSchemaURL(t, schema)`. On PostgreSQL that database is a copy of
   a template in which `EnsureSchema` already created `schema`. Copying and the
@@ -1783,10 +1826,11 @@ Because each test owns a database, the tests run in parallel:
 - Roles are server-wide. Give each role a name no other test uses.
 - Concurrent tests share the server's connections and lock table. Hosted schema
   creation and cleanup can exhaust lock memory (SQLSTATE 53200) with 12
-  concurrent tests on a default 100-connection server. Each top-level test
-  holds a slot while its databases exist. PostgreSQL permits the smaller of
+  concurrent tests on a default 100-connection server. Each database-owning test
+  holds a slot while its databases exist, and subtests inherit an ancestor's
+  held slot. PostgreSQL permits the smaller of
   `max_connections / 8` and `max_connections * max_locks_per_transaction / 2048`
-  tests, with at least one slot. The default settings permit three tests, so
+  slots, with at least one slot. The default settings permit three slots, so
   the CI service and `docker-compose.test.yml` set
   `max_locks_per_transaction=256`, which permits 12. Slot files in the system
   temporary directory, keyed by server address, share this limit across test

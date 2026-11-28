@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 )
 
-var _ Provider = (*antigravityCLIProvider)(nil)
+var (
+	_ Provider            = (*antigravityCLIProvider)(nil)
+	_ MultiFileStatHasher = (*antigravityCLIProvider)(nil)
+)
 
 type antigravityCLIProviderFactory struct {
 	def AgentDef
@@ -104,6 +108,14 @@ func (p *antigravityCLIProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher over the
+// conversation source, its per-session companions, its slice of history.jsonl,
+// its resolved workspace, and the summary store digest, avoiding reading multi-GB
+// historical conversation payloads on unrelated history/cache updates.
+func (p *antigravityCLIProvider) ComputeMultiFileStatHash(path string) uint64 {
+	return antigravityCLISessionStatHash(path)
+}
+
 func (p *antigravityCLIProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -126,17 +138,26 @@ func (p *antigravityCLIProvider) Parse(
 		return ParseOutcome{}, fmt.Errorf("stat %s: %w", src.Path, err)
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
+	projectHint := req.Source.ProjectHint
 	cwd := ""
 	if req.Source.CwdResolution.State == SourceCwdResolved {
 		cwd = req.Source.CwdResolution.Path
 	}
 	if req.Source.CwdResolution.State == SourceCwdRemote {
 		ctx = WithoutFilesystemProjectDiscovery(ctx)
+	} else if src.Root != "" {
+		// Align post-scan workspace replacements with ComputeMultiFileStatHash
+		// and Fingerprint so a mapping update between discovery and parse
+		// cannot leave stale workspace/project data pinned behind a new digest.
+		if workspace := antigravityCLIWorkspaceForID(ctx, src.Root, src.ID); workspace != src.Workspace {
+			projectHint = workspace
+			cwd = normalizeAntigravityCLIWorkspace(workspace)
+		}
 	}
 	sess, msgs, usageEvents, status, err := p.parseSessionWithStatus(
 		ctx,
 		src.Path,
-		req.Source.ProjectHint,
+		projectHint,
 		cwd,
 		machine,
 	)
@@ -149,6 +170,9 @@ func (p *antigravityCLIProvider) Parse(
 			ForceReplace:      true,
 			SkipReason:        SkipNoSession,
 		}, nil
+	}
+	if !strings.HasPrefix(src.ID, antigravityImplicitTag) {
+		applyAntigravityTitle(ctx, sess, src.Root, src.ID)
 	}
 	if antigravityHashCoversSummary(req.Fingerprint.Hash, status.summaryDigest) {
 		sess.File.Hash = req.Fingerprint.Hash
@@ -284,12 +308,13 @@ func (s antigravityCLISourceSet) Discover(ctx context.Context) ([]SourceRef, err
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		files, projects := s.discoverSessionsAndProjects(root)
+		files, projects, summariesErr := s.discoverSessionsAndProjectsWithSummariesErr(root)
 		for _, file := range files {
-			// Thread the prebuilt project map so per-source resolution does not
-			// re-read and re-parse history.jsonl for every project-less source.
+			// Thread the prebuilt project map and summary error so per-source
+			// resolution does not re-read history.jsonl or re-stat the summary
+			// DB for every discovered source.
 			source, ok := s.sourceRefWithProjects(
-				root, file.Path, file.Project, projects, false,
+				root, file.Path, file.Project, projects, summariesErr, false,
 			)
 			if ok {
 				addJSONLSource(source, &sources, seen)
@@ -359,7 +384,8 @@ func (s antigravityCLISourceSet) discoverRootEach(
 	}
 	// Matches buildAntigravityCLIProjectMap: the summary store only
 	// fills conversations the history and cache leave unmapped.
-	for id, summary := range loadAntigravitySummaries(ctx, root).byID {
+	summaries := loadAntigravitySummaries(ctx, root)
+	for id, summary := range summaries.byID {
 		if summary.workspace == "" {
 			continue
 		}
@@ -388,7 +414,7 @@ func (s antigravityCLISourceSet) discoverRootEach(
 				callbackErr = err
 				return err
 			}
-			if err := yield(s.newSourceRef(root, path, rawID, project, project)); err != nil {
+			if err := yield(s.newSourceRefWithSummariesErr(root, path, rawID, project, project, summaries.err)); err != nil {
 				callbackErr = err
 				return err
 			}
@@ -424,10 +450,17 @@ func (s antigravityCLISourceSet) discoverSessions(root string) []DiscoveredFile 
 func (s antigravityCLISourceSet) discoverSessionsAndProjects(
 	root string,
 ) ([]DiscoveredFile, map[string]string) {
+	files, projects, _ := s.discoverSessionsAndProjectsWithSummariesErr(root)
+	return files, projects
+}
+
+func (s antigravityCLISourceSet) discoverSessionsAndProjectsWithSummariesErr(
+	root string,
+) ([]DiscoveredFile, map[string]string, error) {
 	if root == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
-	projects := buildAntigravityCLIProjectMap(root)
+	projects, summariesErr := buildAntigravityCLIProjectMapWithSummariesErr(root)
 	var files []DiscoveredFile
 	for _, sub := range []string{"conversations", "implicit"} {
 		dir := filepath.Join(root, sub)
@@ -463,7 +496,7 @@ func (s antigravityCLISourceSet) discoverSessionsAndProjects(
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].Path < files[j].Path
 	})
-	return files, projects
+	return files, projects, summariesErr
 }
 
 // findSourceFile locates the source file for a session id (without the agent
@@ -529,10 +562,14 @@ func (s antigravityCLISourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 				DebounceKey:  string(AgentAntigravityCLI) + ":conversations:" + root,
 			},
 			WatchRoot{
-				Path:         root,
-				Recursive:    false,
-				IncludeGlobs: []string{"history.jsonl"},
-				DebounceKey:  string(AgentAntigravityCLI) + ":history:" + root,
+				Path:      root,
+				Recursive: false,
+				IncludeGlobs: []string{
+					"history.jsonl",
+					AntigravitySummariesDBName,
+					AntigravitySummariesDBName + "-wal",
+				},
+				DebounceKey: string(AgentAntigravityCLI) + ":history:" + root,
 			},
 			WatchRoot{
 				Path:         filepath.Join(root, "cache"),
@@ -694,14 +731,18 @@ func (s antigravityCLISourceSet) Fingerprint(
 		return SourceFingerprint{}, errors.New("antigravity cli source path unavailable")
 	}
 	key := firstNonEmptyJSONLString(source.FingerprintKey, source.Key, src.Path)
-	info, err := AntigravityCLIFileInfo(src.Path)
+	info, err := AntigravityCLISessionFileInfo(src.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return SourceFingerprint{Key: key}, nil
 		}
 		return SourceFingerprint{}, err
 	}
-	hash, err := antigravityCLICompositeHash(ctx, src.Path, src.ID, src.Workspace)
+	workspace := src.Workspace
+	if src.Root != "" {
+		workspace = antigravityCLIWorkspaceForID(ctx, src.Root, src.ID)
+	}
+	hash, err := antigravityCLICompositeHash(ctx, src.Path, src.ID, workspace)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -783,18 +824,62 @@ func (s antigravityCLISourceSet) sourcesForChangedPath(
 
 func (s antigravityCLISourceSet) sourcesForHistoryChange(
 	root string,
-	_ ChangedPathRequest,
+	req ChangedPathRequest,
 ) []SourceRef {
-	return s.sourcesForUntaggedHistoryChange(root)
+	cleanPath := filepath.Clean(req.Path)
+	var (
+		affectedIDs []string
+		fallback    bool
+	)
+	if samePath(cleanPath, filepath.Join(root, "cache", "last_conversations.json")) {
+		affectedIDs, fallback = diffAntigravityLastConversationsChange(cleanPath)
+	} else {
+		affectedIDs, fallback = diffAntigravityHistoryChange(cleanPath)
+	}
+	if fallback {
+		return s.sourcesForUntaggedHistoryChange(root)
+	}
+	return s.sourcesForIDs(root, affectedIDs)
+}
+
+func (s antigravityCLISourceSet) sourcesForIDs(root string, ids []string) []SourceRef {
+	if len(ids) == 0 {
+		return nil
+	}
+	projects, summariesErr := buildAntigravityCLIProjectMapWithSummariesErr(root)
+	var sources []SourceRef
+	seen := make(map[string]struct{})
+	for _, rawID := range ids {
+		id := strings.TrimPrefix(rawID, antigravityImplicitTag)
+		if !IsValidSessionID(id) {
+			continue
+		}
+		for _, sourcePath := range []string{
+			antigravityCLIConversationSource(root, id),
+			filepath.Join(root, "implicit", id+".pb"),
+		} {
+			if sourcePath == "" {
+				continue
+			}
+			source, ok := s.sourceRefWithProjects(
+				root, sourcePath, projects[id], projects, summariesErr, false,
+			)
+			if ok {
+				addJSONLSource(source, &sources, seen)
+			}
+		}
+	}
+	sortJSONLSources(sources)
+	return sources
 }
 
 func (s antigravityCLISourceSet) sourcesForUntaggedHistoryChange(root string) []SourceRef {
 	var sources []SourceRef
 	seen := make(map[string]struct{})
-	files, projects := s.discoverSessionsAndProjects(root)
+	files, projects, summariesErr := s.discoverSessionsAndProjectsWithSummariesErr(root)
 	for _, file := range files {
 		source, ok := s.sourceRefWithProjects(
-			root, file.Path, file.Project, projects, false,
+			root, file.Path, file.Project, projects, summariesErr, false,
 		)
 		if ok {
 			addJSONLSource(source, &sources, seen)
@@ -847,10 +932,12 @@ func (s antigravityCLISourceSet) sourceRef(
 
 // sourceRefWithProjects is sourceRef but resolves a missing project from a
 // prebuilt project map instead of rebuilding it from history.jsonl per call.
-// Discovery builds the map once per root and threads it for every source.
+// Discovery builds the map and summary error once per root and threads them for
+// every source.
 func (s antigravityCLISourceSet) sourceRefWithProjects(
 	root, path, project string,
 	projects map[string]string,
+	summariesErr error,
 	allowMissing bool,
 ) (SourceRef, bool) {
 	root = filepath.Clean(root)
@@ -866,11 +953,22 @@ func (s antigravityCLISourceSet) sourceRefWithProjects(
 	if project == "" {
 		project = workspace
 	}
-	return s.newSourceRef(root, path, id, project, workspace), true
+	return s.newSourceRefWithSummariesErr(root, path, id, project, workspace, summariesErr), true
 }
 
 func (s antigravityCLISourceSet) newSourceRef(
 	root, path, id, project, workspace string,
+) SourceRef {
+	var summariesErr error
+	if normalizeAntigravityCLIWorkspace(workspace) == "" {
+		summariesErr = loadAntigravitySummaries(context.Background(), root).err
+	}
+	return s.newSourceRefWithSummariesErr(root, path, id, project, workspace, summariesErr)
+}
+
+func (s antigravityCLISourceSet) newSourceRefWithSummariesErr(
+	root, path, id, project, workspace string,
+	summariesErr error,
 ) SourceRef {
 	cwd := normalizeAntigravityCLIWorkspace(workspace)
 	resolution := SourceCwdResolution{}
@@ -880,7 +978,7 @@ func (s antigravityCLISourceSet) newSourceRef(
 		resolution.State = SourceCwdAmbiguous
 	} else if cwd != "" {
 		resolution = SourceCwdResolution{State: SourceCwdResolved, Path: cwd}
-	} else if loadAntigravitySummaries(context.Background(), root).err != nil {
+	} else if summariesErr != nil {
 		// The summary store may hold the only workspace for this
 		// conversation, so an unreadable store must not clear a stored one.
 		resolution.State = SourceCwdUnavailable
@@ -1008,15 +1106,50 @@ func antigravityCLIWatchRootMatches(root, watchRoot string) bool {
 	return samePath(watchRoot, filepath.Clean(root))
 }
 
+// IsAntigravityCLIHistoryOrCacheFile reports whether path names one of the
+// root-level Antigravity CLI history or workspace-cache files whose edits
+// fan out to sessions under the root.
+func IsAntigravityCLIHistoryOrCacheFile(path string) bool {
+	clean := filepath.Clean(path)
+	base := filepath.Base(clean)
+	return base == "history.jsonl" ||
+		(base == "last_conversations.json" &&
+			filepath.Base(filepath.Dir(clean)) == "cache")
+}
+
+func antigravityCLISessionStatHash(path string) uint64 {
+	id, _, ok := antigravityCLIPathID(filepath.Base(path))
+	if !ok {
+		return 0
+	}
+	root := filepath.Dir(filepath.Dir(path))
+	ctx := context.Background()
+	return antigravityStatHashFromCompanions(
+		ctx,
+		path,
+		antigravityCLIProviderCompanionPaths(path),
+		root,
+		id,
+		func(h hash.Hash64, maxMtimeNS int64) bool {
+			workspace := antigravityCLIWorkspaceForID(ctx, root, id)
+			return writeAntigravityCLIHistoryAndWorkspaceDigest(
+				h, root, id, workspace, maxMtimeNS,
+			) == nil
+		},
+	)
+}
+
 func antigravityCLIProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
 	source.StreamingDiscovery = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
 	source.ChangedPathRelevance = CapabilitySupported
+	source.MultiFileStatHash = CapabilitySupported
 	return Capabilities{
 		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			SessionName:          CapabilitySupported,
 			Cwd:                  CapabilitySupported,
 			Relationships:        CapabilitySupported,
 			Thinking:             CapabilitySupported,

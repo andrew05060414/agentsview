@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -86,4 +87,47 @@ func TestSearchContentTermsAnchorMatchesScan(t *testing.T) {
 		}
 	}
 	assert.Greater(t, nonEmpty, 20)
+}
+
+func TestBuildPostgresTermsSearchSQL(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		pattern  string
+		wantCTEs []string
+		wantSub  string
+	}{
+		{
+			name:     "mixed trigram and short cjk",
+			pattern:  "agentsview 记忆 修复",
+			wantCTEs: []string{"raw_scoped AS (", "tri_0 AS MATERIALIZED", "scoped AS MATERIALIZED", "BOOL_OR("},
+			wantSub:  "%agentsview%",
+		},
+		{
+			name:     "short cjk only",
+			pattern:  "记忆 修复",
+			wantCTEs: []string{"raw_scoped AS MATERIALIZED", "scoped AS MATERIALIZED", "BOOL_OR("},
+			wantSub:  "%记忆%",
+		},
+		{
+			name:     "trigram only",
+			pattern:  "alpha-term beta-term",
+			wantCTEs: []string{"raw_scoped AS (", "tri_0 AS MATERIALIZED", "scoped AS MATERIALIZED"},
+			wantSub:  "%alpha-term%",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := ContentSearchFilter{Pattern: tc.pattern, Mode: "terms", DateFrom: "2026-11-21", Limit: 10}
+			terms := ParseContentSearchTerms(tc.pattern)
+			query, args, err := BuildPostgresTermsSearchSQL(f, terms, PostgresQueryDialect())
+			require.NoError(t, err)
+			for _, want := range tc.wantCTEs {
+				assert.Contains(t, query, want)
+			}
+			assert.NotContains(t, query, "m.session_id IN (\n\t\t\t\tSELECT session_id FROM messages")
+			assert.Contains(t, fmt.Sprint(args), tc.wantSub)
+			assert.Contains(t, query, fmt.Sprintf("$%d", len(args)))
+			assert.NotContains(t, query, fmt.Sprintf("$%d", len(args)+1))
+			assert.True(t, strings.HasPrefix(strings.TrimSpace(query), "WITH raw_scoped AS"))
+		})
+	}
 }

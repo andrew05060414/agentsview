@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"database/sql/driver"
 	_ "embed"
 	"encoding/hex"
 	"errors"
@@ -709,7 +710,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // indexing see them. Re-parse toolResultContentLength and raw tool-result array
 // providers in place; source and session identities are unchanged.)
 // (190: include retained tool calls in pull request links.)
-const dataVersion = 190
+// (191: import Antigravity CLI session titles from conversation_summaries.db;
+// native title reconciliation backfills stored sessions without reparsing.)
+// (192: use recorded labels for retained Codex runs.)
+const dataVersion = 192
 
 const archiveOnlyVersionBase = 1 << 20
 
@@ -724,7 +728,8 @@ const (
 	walCheckpointAttempts    = 3
 	walCheckpointRetryDelay  = 250 * time.Millisecond
 	sqliteCacheSizeKiB       = -8 * 1024
-	readerMaxOpenConns       = 4
+	sqliteWriterCacheSizeKiB = -64 * 1024
+	readerMaxOpenConns       = 8
 	bulkReadSlots            = readerMaxOpenConns - 1 // Keep one reader connection for quick reads.
 	readerConnMaxIdleTime    = 5 * time.Minute
 )
@@ -990,7 +995,8 @@ type DB struct {
 	mu                   sync.Mutex // serializes writes
 	compactMu            sync.Mutex // serializes staged archive compactions
 	connMu               sync.RWMutex
-	retired              []*sql.DB // old pools kept open for in-flight reads
+	readPause            atomic.Pointer[chan struct{}] // non-nil while a live file swap pauses new readers
+	retired              []*sql.DB                     // old pools kept open for in-flight reads
 	// undrainedPools holds closed pools whose connections had not drained
 	// when CloseWriter or CloseConnections gave up. They must drain before
 	// a later close reports success, or write ownership could be released
@@ -1103,22 +1109,45 @@ func (r *readerHandle) current() *sql.DB {
 	return r.owner.reader.Load()
 }
 
+// acquirePool waits while a live database swap has paused new readers, then
+// returns the active reader pool alongside a once-wrapped connMu.RUnlock.
+func (r *readerHandle) acquirePool(ctx context.Context) (*sql.DB, func(), error) {
+	for {
+		r.owner.connMu.RLock()
+		if ch := r.owner.readPause.Load(); ch != nil {
+			r.owner.connMu.RUnlock()
+			select {
+			case <-*ch:
+				continue
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			}
+		}
+		return r.current(), sync.OnceFunc(r.owner.connMu.RUnlock), nil
+	}
+}
+
 func (r *readerHandle) Exec(ctx context.Context,
 	query string, args ...any,
 ) (sql.Result, error) {
-	r.owner.connMu.RLock()
-	defer r.owner.connMu.RUnlock()
-	return r.current().ExecContext(ctx, query, args...)
+	pool, unlock, err := r.acquirePool(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return pool.ExecContext(ctx, query, args...)
 }
 
 func (r *readerHandle) Query(ctx context.Context,
 	query string, args ...any,
 ) (*sql.Rows, error) {
-	r.owner.connMu.RLock()
-	unlock := sync.OnceFunc(r.owner.connMu.RUnlock)
+	pool, unlock, err := r.acquirePool(ctx)
+	if err != nil {
+		return nil, err
+	}
 	defer unlock()
 	ctx = context.WithValue(ctx, readerQueryUnlockKey{}, unlock)
-	return r.current().QueryContext(ctx, query, args...)
+	return pool.QueryContext(ctx, query, args...)
 }
 
 func (r *readerHandle) QueryContext(
@@ -1127,14 +1156,32 @@ func (r *readerHandle) QueryContext(
 	return r.Query(ctx, query, args...)
 }
 
+type errConnector struct {
+	err error
+}
+
+func (c errConnector) Connect(context.Context) (driver.Conn, error) {
+	return nil, c.err
+}
+
+func (errConnector) Driver() driver.Driver { return nil }
+
+func errorSQLRow(ctx context.Context, err error) *sql.Row {
+	tmp := sql.OpenDB(errConnector{err: err})
+	defer func() { _ = tmp.Close() }()
+	return tmp.QueryRowContext(ctx, "")
+}
+
 func (r *readerHandle) QueryRow(ctx context.Context,
 	query string, args ...any,
 ) *sql.Row {
-	r.owner.connMu.RLock()
-	unlock := sync.OnceFunc(r.owner.connMu.RUnlock)
+	pool, unlock, err := r.acquirePool(ctx)
+	if err != nil {
+		return errorSQLRow(ctx, err)
+	}
 	defer unlock()
 	ctx = context.WithValue(ctx, readerQueryUnlockKey{}, unlock)
-	return r.current().QueryRowContext(ctx, query, args...)
+	return pool.QueryRowContext(ctx, query, args...)
 }
 
 func (r *readerHandle) QueryRowContext(
@@ -1146,15 +1193,21 @@ func (r *readerHandle) QueryRowContext(
 func (r *readerHandle) BeginTx(
 	ctx context.Context, opts *sql.TxOptions,
 ) (*sql.Tx, error) {
-	r.owner.connMu.RLock()
-	defer r.owner.connMu.RUnlock()
-	return r.current().BeginTx(ctx, opts)
+	pool, unlock, err := r.acquirePool(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return pool.BeginTx(ctx, opts)
 }
 
 func (r *readerHandle) Conn(ctx context.Context) (*sql.Conn, error) {
-	r.owner.connMu.RLock()
-	defer r.owner.connMu.RUnlock()
-	return r.current().Conn(ctx)
+	pool, unlock, err := r.acquirePool(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return pool.Conn(ctx)
 }
 
 func (w *writerHandle) current() (*sql.DB, error) {
@@ -1380,10 +1433,13 @@ func makeDSN(path string, readOnly bool) string {
 	params := url.Values{}
 	params.Set("_busy_timeout", "5000")
 	params.Set("_foreign_keys", "ON")
-	params.Set("_cache_size", strconv.Itoa(sqliteCacheSizeKiB))
 	if readOnly {
+		params.Set("_cache_size", strconv.Itoa(sqliteCacheSizeKiB))
 		params.Set("mode", "ro")
 	} else {
+		// Single-writer connections update multi-GB FTS5 B-trees, so give the
+		// writer a 64 MiB page cache while keeping the reader pool at 8 MiB.
+		params.Set("_cache_size", strconv.Itoa(sqliteWriterCacheSizeKiB))
 		// Imports repeatedly execute the same SQL, including project attribution.
 		params.Set("_stmt_cache_size", "64")
 		params.Set("_journal_mode", "WAL")
@@ -2169,6 +2225,7 @@ var readOnlyRequiredTables = []string{
 	"usage_events",
 	"session_plan_usage",
 	"session_usage_totals",
+	"codex_cloud_accounts",
 	"tool_calls",
 	"tool_result_events",
 	"image_text_cache",
@@ -2589,6 +2646,7 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{"cursor_usage_events", "account_user_id", "ALTER TABLE cursor_usage_events ADD COLUMN account_user_id TEXT NOT NULL DEFAULT ''"},
 		{"cursor_usage_events", "account_polled_at", "ALTER TABLE cursor_usage_events ADD COLUMN account_polled_at TEXT NOT NULL DEFAULT ''"},
 		{"cursor_usage_events", "conversation_id", "ALTER TABLE cursor_usage_events ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''"},
+		{"sessions", "account", "ALTER TABLE sessions ADD COLUMN account TEXT NOT NULL DEFAULT ''"},
 		{"sessions", "usage_generation", "ALTER TABLE sessions ADD COLUMN usage_generation TEXT;" +
 			" UPDATE sessions SET usage_generation=lower(hex(randomblob(8)))"},
 		{"sessions", "trends_generation", "ALTER TABLE sessions ADD COLUMN trends_generation TEXT"},
@@ -3133,6 +3191,19 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{
 			"session_project_identity_snapshots", "recorded_git_remote",
 			"ALTER TABLE session_project_identity_snapshots ADD COLUMN recorded_git_remote TEXT NOT NULL DEFAULT ''",
+		},
+		{
+			// These follow the columns their backfills read. Backfill once
+			// when the column is added; later writes compute it.
+			"sessions", "relationship_inferred",
+			"ALTER TABLE sessions ADD COLUMN relationship_inferred INTEGER NOT NULL DEFAULT 0;" +
+				" UPDATE sessions SET relationship_inferred = 1 WHERE " + legacyRelationshipInferredSQL,
+		},
+		{
+			// Backfill once from current links; later linking sets it.
+			"sessions", "spawn_linked",
+			"ALTER TABLE sessions ADD COLUMN spawn_linked INTEGER NOT NULL DEFAULT 0;" +
+				" UPDATE sessions SET spawn_linked = 1 WHERE " + legacySpawnLinkedSQL,
 		},
 	}
 }
@@ -4098,8 +4169,9 @@ END;
 const automationAuditSchemaSQL = `
 DROP TRIGGER IF EXISTS trg_sessions_automation_audit;
 CREATE TRIGGER IF NOT EXISTS trg_sessions_automation_audit
-AFTER UPDATE OF session_kind, first_message, user_message_count, is_automated, transcript_revision ON sessions
+AFTER UPDATE OF session_kind, entrypoint, first_message, user_message_count, is_automated, transcript_revision ON sessions
 WHEN NEW.session_kind IS NOT OLD.session_kind
+  OR NEW.entrypoint IS NOT OLD.entrypoint
   OR NEW.first_message IS NOT OLD.first_message
   OR NEW.user_message_count IS NOT OLD.user_message_count
   OR NEW.is_automated IS NOT OLD.is_automated
@@ -4589,11 +4661,28 @@ const clearAutomationAuditSQL = `UPDATE sessions SET automation_audit = 0 WHERE 
 // classifier changes. The writer is exclusively owned during the audit, and
 // interrupted audits leave stale rows for retry.
 func (db *DB) backfillIsAutomatedLocked(ctx context.Context, w *writerHandle) error {
-	if err := repairParentlessWorkers(ctx, w); err != nil {
-		return err
-	}
 	current := ClassifierHash()
+	var stored string
+	err := w.QueryRow(ctx,
+		`SELECT value FROM stats WHERE key = ?`,
+		ClassifierHashKey,
+	).Scan(&stored)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf(
+			"probing classifier hash: %w", err,
+		)
+	}
+	matchingHash := stored == current
 	if db.usageOnlyStorage() {
+		if err := applyUsageOnlyMetadataAutomation(ctx, w, matchingHash); err != nil {
+			return err
+		}
+		if err := reconcileParentlessWorkers(ctx, w, matchingHash); err != nil {
+			return err
+		}
+		if _, err := w.Exec(ctx, clearAutomationAuditSQL); err != nil {
+			return fmt.Errorf("marking automation audit rows fresh: %w", err)
+		}
 		// Usage-only archives deliberately discard the text this migration
 		// audits. Session writes classify while raw parser/importer data is
 		// still available, so the stored flag is the durable authority here.
@@ -4607,20 +4696,10 @@ func (db *DB) backfillIsAutomatedLocked(ctx context.Context, w *writerHandle) er
 		}
 		return nil
 	}
-	var stored string
-	err := w.QueryRow(ctx,
-		`SELECT value FROM stats WHERE key = ?`,
-		ClassifierHashKey,
-	).Scan(&stored)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf(
-			"probing classifier hash: %w", err,
-		)
-	}
 
 	patterns := snapshotAutomationPatterns()
 	var setIDs, clearIDs []string
-	if stored == current {
+	if matchingHash {
 		setIDs, clearIDs, err = auditAutomatedMatchingHash(ctx, w, patterns)
 	} else {
 		setIDs, clearIDs, err = auditAutomatedFull(ctx, w, patterns)
@@ -4637,6 +4716,9 @@ func (db *DB) backfillIsAutomatedLocked(ctx context.Context, w *writerHandle) er
 	if err := batchUpdateAutomated(ctx,
 		w, clearIDs, 0,
 	); err != nil {
+		return err
+	}
+	if err := reconcileParentlessWorkers(ctx, w, matchingHash); err != nil {
 		return err
 	}
 	if _, err := w.Exec(ctx,
@@ -4772,32 +4854,179 @@ func batchUpdateAutomated(ctx context.Context,
 	w *writerHandle, ids []string, val int,
 ) error {
 	const batchSize = 500
+	now := time.Now().UTC()
 	for i := 0; i < len(ids); i += batchSize {
-		end := min(i+batchSize, len(ids))
-		batch := ids[i:end]
-		args := make([]any, len(batch)+1)
-		phs := make([]string, len(batch))
-		args[0] = val
-		for j, id := range batch {
-			args[j+1] = id
-			phs[j] = "?"
-		}
-		_, err := w.Exec(ctx,
-			"UPDATE sessions"+
-				" SET is_automated = ?,"+
-				"     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"+
-				" WHERE id IN ("+
-				strings.Join(phs, ",")+
-				")",
-			args...,
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"updating is_automated: %w", err,
-			)
+		batch := ids[i:min(i+batchSize, len(ids))]
+		if err := applyAutomatedBatchLocked(ctx, w, batch, val, now); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+type automatedSignalRefresh struct {
+	id  string
+	res SessionSignalRefreshResult
+}
+
+func applyAutomatedBatchLocked(
+	ctx context.Context, w *writerHandle, batch []string, val int, now time.Time,
+) error {
+	tx, err := w.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("starting automation update transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	args := make([]any, len(batch)+1)
+	phs := make([]string, len(batch))
+	args[0] = val
+	for j, id := range batch {
+		args[j+1] = id
+		phs[j] = "?"
+	}
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE sessions"+
+			" SET is_automated = ?,"+
+			"     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"+
+			" WHERE id IN ("+
+			strings.Join(phs, ",")+
+			")",
+		args...,
+	); err != nil {
+		return fmt.Errorf("updating is_automated: %w", err)
+	}
+
+	updates, err := loadAutomatedSignalRefreshesTx(ctx, tx, batch, now)
+	if err != nil {
+		return err
+	}
+	for _, u := range updates {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE sessions
+			 SET outcome = ?,
+			     outcome_confidence = ?,
+			     signals_pending_since = ?,
+			     health_score = ?,
+			     health_grade = ?,
+			     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			 WHERE id = ?`,
+			u.res.Outcome, u.res.OutcomeConfidence,
+			u.res.SignalsPendingSince, u.res.HealthScore,
+			u.res.HealthGrade, u.id,
+		); err != nil {
+			return fmt.Errorf("refreshing signals for automated session %s: %w", u.id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing automation update batch: %w", err)
+	}
+	return nil
+}
+
+func loadAutomatedSignalRefreshesTx(
+	ctx context.Context, tx *sql.Tx, batch []string, now time.Time,
+) ([]automatedSignalRefresh, error) {
+	args := make([]any, len(batch))
+	phs := make([]string, len(batch))
+	for j, id := range batch {
+		args[j] = id
+		phs[j] = "?"
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT s.id, s.is_automated, s.message_count, s.ended_at,
+		        s.ended_with_role, s.final_failure_streak,
+		        s.signals_pending_since, s.has_tool_calls,
+		        s.tool_failure_signal_count, s.tool_retry_count,
+		        s.edit_churn_count, s.consecutive_failure_max,
+		        s.has_context_data, s.compaction_count,
+		        s.mid_task_compaction_count, s.context_pressure_max,
+		        s.short_prompt_count, s.unstructured_start,
+		        s.missing_success_criteria_count,
+		        s.missing_verification_count, s.duplicate_prompt_count,
+		        s.no_code_context_count, s.runaway_tool_loop_count,
+		        s.outcome, s.outcome_confidence,
+		        s.health_score, s.health_grade,
+		        COALESCE((
+		            SELECT m.role FROM messages m
+		            WHERE m.session_id = s.id
+		              AND m.is_system = 0
+		              AND m.source_subtype <> 'tool_result'
+		            ORDER BY m.ordinal DESC
+		            LIMIT 1
+		        ), '') AS last_role,
+		        COALESCE((
+		            SELECT m.content FROM messages m
+		            WHERE m.session_id = s.id
+		              AND m.is_system = 0
+		              AND m.source_subtype <> 'tool_result'
+		            ORDER BY m.ordinal DESC
+		            LIMIT 1
+		        ), '') AS last_content
+		 FROM sessions s
+		 WHERE s.id IN (`+strings.Join(phs, ",")+`)
+		   AND NOT (
+		       s.outcome = '' AND s.outcome_confidence = ''
+		       AND s.health_score IS NULL AND s.health_grade IS NULL
+		       AND s.signals_pending_since IS NULL
+		   )
+		   AND (
+		       s.quality_signal_version > 0
+		       OR s.outcome <> 'unknown'
+		       OR s.outcome_confidence <> 'low'
+		       OR s.health_score IS NOT NULL
+		       OR s.health_grade IS NOT NULL
+		       OR s.signals_pending_since IS NOT NULL
+		   )`,
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("loading changed sessions for signal refresh: %w", err)
+	}
+	defer rows.Close()
+	var updates []automatedSignalRefresh
+	for rows.Next() {
+		var (
+			id, curOutcome, curConfidence string
+			lastRole, lastContent         string
+			isAutomated, hasToolCalls     int
+			hasContextData, unstructured  int
+			curScore                      *int
+			curGrade                      *string
+			in                            SessionSignalRefreshInput
+		)
+		if err := rows.Scan(
+			&id, &isAutomated, &in.MessageCount, &in.EndedAt,
+			&in.EndedWithRole, &in.FinalFailureStreak,
+			&in.SignalsPendingSince, &hasToolCalls,
+			&in.ToolFailureSignalCount, &in.ToolRetryCount,
+			&in.EditChurnCount, &in.ConsecutiveFailureMax,
+			&hasContextData, &in.CompactionCount,
+			&in.MidTaskCompactionCount, &in.ContextPressureMax,
+			&in.ShortPromptCount, &unstructured,
+			&in.MissingSuccessCriteriaCount,
+			&in.MissingVerificationCount, &in.DuplicatePromptCount,
+			&in.NoCodeContextCount, &in.RunawayToolLoopCount,
+			&curOutcome, &curConfidence,
+			&curScore, &curGrade,
+			&lastRole, &lastContent,
+		); err != nil {
+			return nil, fmt.Errorf("scanning changed session for signal refresh: %w", err)
+		}
+		in.IsAutomated = isAutomated != 0
+		in.HasToolCalls = hasToolCalls != 0
+		in.HasContextData = hasContextData != 0
+		in.UnstructuredStart = unstructured != 0
+		if next, changed := in.RefreshIfChanged(
+			lastRole, lastContent, curOutcome, curConfidence, curScore, curGrade, now,
+		); changed {
+			updates = append(updates, automatedSignalRefresh{id: id, res: next})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading changed sessions for signal refresh: %w", err)
+	}
+	return updates, nil
 }
 
 func (db *DB) shouldRunTokenCoverageRepairLocked(ctx context.Context,
@@ -5849,6 +6078,90 @@ func SetCloseDrainTimeoutForTest(d time.Duration) (restore func()) {
 	return func() { closeDrainTimeout = prev }
 }
 
+// pauseReadsLocked holds new readerHandle queries until reopenLockedWithBarrier
+// installs a fresh reader pool or the returned resume function runs. The caller
+// must hold db.mu for the entire paused interval so no other db.mu-holding
+// method can block on paused reads and deadlock Reopen. In-flight queries that
+// already leased a connection keep running and drain in closeConnectionsLocked.
+func (db *DB) pauseReadsLocked() func() {
+	ch := make(chan struct{})
+	db.connMu.Lock()
+	if prev := db.readPause.Swap(&ch); prev != nil {
+		close(*prev)
+	}
+	db.connMu.Unlock()
+	return sync.OnceFunc(func() {
+		db.connMu.Lock()
+		if db.readPause.CompareAndSwap(&ch, nil) {
+			close(ch)
+		}
+		db.connMu.Unlock()
+	})
+}
+
+func (db *DB) clearReadPause() {
+	db.connMu.Lock()
+	if prev := db.readPause.Swap(nil); prev != nil {
+		close(*prev)
+	}
+	db.connMu.Unlock()
+}
+
+// ArchiveSwap exposes locked close and reopen operations inside
+// WithArchiveSwap.
+type ArchiveSwap struct {
+	db       *DB
+	reopened bool
+}
+
+// Close closes and drains both connection pools while db.mu is held.
+func (s *ArchiveSwap) Close(ctx context.Context) error {
+	return s.db.closeConnectionsLocked(ctx)
+}
+
+// Reopen reopens both connection pools and wakes paused readers while db.mu is
+// held.
+func (s *ArchiveSwap) Reopen() error {
+	if err := s.db.reopenLocked(); err != nil {
+		return err
+	}
+	s.db.startWALCheckpointLoop()
+	s.reopened = true
+	return nil
+}
+
+// WithArchiveSwap pauses new readerHandle queries while holding db.mu across
+// fn's close, file replacement, and reopen sequence. Holding db.mu for the
+// entire paused interval guarantees no db.mu-holding caller can block on
+// paused reads and deadlock Reopen. If fn reopened the pools, post-reopen
+// cache retirement and backfill restart run after db.mu is released.
+func (db *DB) WithArchiveSwap(
+	_ context.Context,
+	fn func(*ArchiveSwap) error,
+) error {
+	if db.readOnly {
+		return ErrReadOnly
+	}
+	db.StopUsageCacheBackfill()
+	db.stopWALCheckpointLoop()
+	db.mu.Lock()
+	resumeReads := db.pauseReadsLocked()
+	swap := &ArchiveSwap{db: db}
+	err := func() error {
+		defer db.mu.Unlock()
+		defer resumeReads()
+		return fn(swap)
+	}()
+	if !swap.reopened {
+		return err
+	}
+	finishErr := db.finishReopen()
+	if err != nil {
+		return errors.Join(err, finishErr)
+	}
+	return finishErr
+}
+
 // CloseConnections closes both connections without reopening,
 // releasing file locks so the database file can be renamed.
 // Also drains any retired pools from previous Reopen calls.
@@ -6015,6 +6328,10 @@ func (db *DB) Reopen() error {
 	}
 	db.startWALCheckpointLoop()
 	db.mu.Unlock()
+	return db.finishReopen()
+}
+
+func (db *DB) finishReopen() error {
 	// Reopen can follow a full archive replacement. Retire cache generations
 	// tied to the old database ID so their notification workers do not keep
 	// querying the replacement archive or retain SQLite pools indefinitely.
@@ -6074,6 +6391,11 @@ func (db *DB) reopenLockedWithBarrier(keepWriterBarrier bool) error {
 	// resync swap that ran behind the worker write barrier would reopen the
 	// pool yet keep rejecting writes.
 	db.writerClosed.Store(keepWriterBarrier)
+	// Resume readers paused for a live swap now that the replacement reader
+	// pool is installed.
+	if paused := db.readPause.Swap(nil); paused != nil {
+		close(*paused)
+	}
 
 	// Retire the just-swapped pools. Concurrent readers that
 	// loaded the old pointer before the swap may still have

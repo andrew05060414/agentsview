@@ -2048,3 +2048,68 @@ func writeDeepSeekHarnessVersionedFixture(
 	require.NoError(t, os.WriteFile(path, encoded, 0o600))
 	return path
 }
+
+func TestDeepSeekHarnessProviderMultiFileStatHash(t *testing.T) {
+	for _, compression := range []string{"plain", "zstd"} {
+		t.Run(compression, func(t *testing.T) {
+			root := t.TempDir()
+			records := deepSeekHarnessV4Fixture("stat-hash-" + compression)
+			path := writeDeepSeekHarnessVersionedFixture(
+				t, root, "stat-hash-"+compression, deepSeekHarnessFixtureCwd,
+				compression, 4, records,
+			)
+
+			provider, ok := NewProvider(AgentDeepSeekHarness, ProviderConfig{
+				Roots:   []string{root},
+				Machine: "local",
+			})
+			require.True(t, ok)
+			assert.Equal(t, CapabilitySupported, provider.Capabilities().Source.MultiFileStatHash)
+			hasher, ok := provider.(MultiFileStatHasher)
+			require.True(t, ok, "deepseek-harness provider must implement MultiFileStatHasher")
+
+			sources, err := provider.Discover(t.Context())
+			require.NoError(t, err)
+			require.Len(t, sources, 1)
+
+			var meter ContentReadMeter
+			fp, err := provider.Fingerprint(WithContentReadMeter(t.Context(), &meter), sources[0])
+			require.NoError(t, err)
+			assert.Zero(t, meter.Bytes(), "stat-only DeepSeek Harness Fingerprint must read 0 content bytes")
+
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			assert.Equal(t, fp.MTimeNS, DeepSeekHarnessEffectiveMtime(path, info))
+
+			baseHash := hasher.ComputeMultiFileStatHash(path)
+			if _, changeTimeOK := codexIndexChangeTime(path, info); !changeTimeOK {
+				assert.Zero(t, baseHash)
+				return
+			}
+			require.NotZero(t, baseHash)
+			assert.Equal(t, baseHash, hasher.ComputeMultiFileStatHash(path),
+				"hash must stay stable while primary and companion stats are unchanged")
+
+			// Appearing alternate-encoding companion must break the digest.
+			altPath, hasAlt := deepSeekHarnessAlternateSourcePath(path)
+			require.True(t, hasAlt)
+			require.NoError(t, os.WriteFile(altPath, []byte("conflicting"), 0o600))
+			withAlt := hasher.ComputeMultiFileStatHash(path)
+			assert.NotZero(t, withAlt)
+			assert.NotEqual(t, baseHash, withAlt, "appearing alternate companion must change digest")
+
+			// Modifying the alternate companion must change the digest.
+			require.NoError(t, os.WriteFile(altPath, []byte("conflicting-updated"), 0o600))
+			afterAltEdit := hasher.ComputeMultiFileStatHash(path)
+			assert.NotEqual(t, withAlt, afterAltEdit)
+
+			// Modifying the primary file must change the digest.
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+			require.NoError(t, err)
+			_, err = f.WriteString("\n")
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+			assert.NotEqual(t, afterAltEdit, hasher.ComputeMultiFileStatHash(path))
+		})
+	}
+}

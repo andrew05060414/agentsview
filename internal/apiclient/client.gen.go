@@ -24412,6 +24412,7 @@ func (g GetAPIV1SearchQuery) Validate() error {
 }
 
 type GetAPIV1SearchContentQuery struct {
+	Account *string `json:"account,omitempty"`
 	// Pattern Pattern to search for; mutually exclusive with concepts
 	Pattern *string `json:"pattern,omitempty"`
 
@@ -24704,6 +24705,7 @@ type GetAPIV1SessionsQuery struct {
 	// Flat Match child sessions individually when include_children is true
 	Flat *bool `json:"flat,omitempty"`
 
+	Account *string `json:"account,omitempty"`
 	// ExclusionCounts Include default-exclusion counts; true also samples hidden children, false counts only one-shot and automated sessions. First page only.
 	ExclusionCounts *bool `json:"exclusion_counts,omitempty"`
 

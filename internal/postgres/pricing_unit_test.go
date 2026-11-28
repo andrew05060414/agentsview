@@ -22,6 +22,7 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/pricing"
 )
 
 type pricingProbeDriver struct{}
@@ -738,4 +739,119 @@ func TestSyncModelPricingSkipsWriteWhenRemoteRowsUnchanged(t *testing.T) {
 	require.Len(t, execs, 2, "only the serialization lock, no writes")
 	assert.Contains(t, execs[0], "ON CONFLICT (key) DO NOTHING")
 	assert.Contains(t, execs[1], "FOR UPDATE")
+}
+
+func TestSyncModelPricingSkipsRepeatAndResyncsOnChangesOrForce(t *testing.T) {
+	ctx := t.Context()
+	local, err := db.Open(ctx, t.TempDir()+"/local.db")
+	require.NoError(t, err, "open local db")
+	t.Cleanup(func() { local.Close() })
+
+	seedRows := func(input string, bands []db.PricingBand, openRouter string) {
+		require.NoError(t, local.ReconcileModelPricing(
+			[]db.ModelPricing{{
+				ModelPattern:         "same-model",
+				InputPerMTok:         money.MustParseDollars(input),
+				OutputPerMTok:        money.MustParseDollars("2"),
+				CacheCreationPerMTok: money.MustParseDollars("3"),
+				CacheReadPerMTok:     money.MustParseDollars("4"),
+				Bands:                bands,
+			}},
+			nil,
+			db.PricingMeta{Key: pricing.OpenRouterModelsMetaKey, Value: openRouter},
+		))
+	}
+	seedRows("1", nil, `["same-model"]`)
+	require.NoError(t, local.UpsertGenAIPricing(ctx, db.GenAIPricingDocument{
+		Version: "v1", SourceRef: "ref-1",
+		Source: db.GenAIPricingSourceFetched, Data: []byte(`{"a":1}`),
+	}))
+
+	state := &pricingProbeState{
+		rows: [][]driver.Value{{
+			"same-model", int64(1000000), int64(2000000), int64(3000000), int64(0), int64(4000000),
+			time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		}},
+		genAIRows: [][]driver.Value{{
+			"v1", "ref-1", db.GenAIPricingSourceFetched, []byte(`{"a":1}`),
+			time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		}},
+	}
+	pg := newPricingProbeDB(t, state)
+	targetA := t.Name() + ":target-a"
+	targetB := t.Name() + ":target-b"
+	syncA := &Sync{
+		pg: pg, local: local, targetFingerprint: targetA, archiveID: "arch-1",
+	}
+	t.Cleanup(syncA.forgetSyncedModelPricing)
+
+	// Failed sync must not cache the digest.
+	state.mu.Lock()
+	state.err = errors.New("temporary pg failure")
+	state.mu.Unlock()
+	require.Error(t, syncA.syncModelPricing(ctx))
+	assert.Equal(t, 1, state.queryCount())
+
+	// Next sync succeeds and hits PG once.
+	state.mu.Lock()
+	state.err = nil
+	state.mu.Unlock()
+	require.NoError(t, syncA.syncModelPricing(ctx))
+	assert.Equal(t, 2, state.queryCount())
+	execsBeforeSkip := len(state.execStatements())
+
+	// Repeat call on same Sync skips PG completely.
+	require.NoError(t, syncA.syncModelPricing(ctx))
+	assert.Equal(t, 2, state.queryCount())
+	assert.Len(t, state.execStatements(), execsBeforeSkip)
+
+	// New Sync instance (simulating daemon HTTP push) with same target+archive
+	// also skips PG completely.
+	syncA2 := &Sync{
+		pg: pg, local: local, targetFingerprint: targetA, archiveID: "arch-1",
+	}
+	require.NoError(t, syncA2.syncModelPricing(ctx))
+	assert.Equal(t, 2, state.queryCount())
+	assert.Len(t, state.execStatements(), execsBeforeSkip)
+
+	// force=true (e.g. --full push) bypasses cache.
+	require.NoError(t, syncA2.syncModelPricingWithForce(ctx, true))
+	assert.Equal(t, 3, state.queryCount())
+
+	// Updating pricing row invalidates cache.
+	seedRows("1.5", nil, `["same-model"]`)
+	require.NoError(t, syncA2.syncModelPricing(ctx))
+	assert.Equal(t, 4, state.queryCount())
+
+	// Updating pricing bands invalidates cache.
+	seedRows("1.5", []db.PricingBand{{
+		AboveInputTokens: 1000,
+		InputPerMTok:     money.MustParseDollars("5"),
+	}}, `["same-model"]`)
+	require.NoError(t, syncA2.syncModelPricing(ctx))
+	assert.Equal(t, 5, state.queryCount())
+
+	// Updating OpenRouter ownership metadata invalidates cache.
+	seedRows("1.5", []db.PricingBand{{
+		AboveInputTokens: 1000,
+		InputPerMTok:     money.MustParseDollars("5"),
+	}}, `["same-model","other-model"]`)
+	require.NoError(t, syncA2.syncModelPricing(ctx))
+	assert.Equal(t, 6, state.queryCount())
+
+	// Updating GenAI pricing invalidates cache.
+	require.NoError(t, local.UpsertGenAIPricing(ctx, db.GenAIPricingDocument{
+		Version: "v2", SourceRef: "ref-2",
+		Source: db.GenAIPricingSourceFetched, Data: []byte(`{"a":2}`),
+	}))
+	require.NoError(t, syncA2.syncModelPricing(ctx))
+	assert.Equal(t, 7, state.queryCount())
+
+	// Different PG targetFingerprint misses cache and hits PG.
+	syncB := &Sync{
+		pg: pg, local: local, targetFingerprint: targetB, archiveID: "arch-1",
+	}
+	t.Cleanup(syncB.forgetSyncedModelPricing)
+	require.NoError(t, syncB.syncModelPricing(ctx))
+	assert.Equal(t, 8, state.queryCount())
 }

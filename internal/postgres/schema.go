@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS sync_metadata (
 CREATE TABLE IF NOT EXISTS sessions (
     id                 TEXT PRIMARY KEY,
     machine            TEXT NOT NULL,
+    account            TEXT NOT NULL DEFAULT '',
     owner_marker       TEXT NOT NULL DEFAULT '',
     project            TEXT NOT NULL,
     project_assigned   BOOLEAN NOT NULL DEFAULT FALSE,
@@ -148,6 +149,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     parent_session_id  TEXT,
     parser_parent_session_id TEXT,
     external_parent_session_id TEXT,
+    parser_relationship_type TEXT,
+    relationship_inferred BOOLEAN NOT NULL DEFAULT FALSE,
+    spawn_linked       BOOLEAN NOT NULL DEFAULT FALSE,
     relationship_type  TEXT NOT NULL DEFAULT '',
     total_output_tokens INT NOT NULL DEFAULT 0,
     peak_context_tokens INT NOT NULL DEFAULT 0,
@@ -2352,7 +2356,7 @@ func CheckSchemaCompat(
 	}
 
 	_, err = db.ExecContext(ctx,
-		`SELECT source_display_name, source_deleted_at, deletion_cause, source_trash_includes_codex_pages, owner_marker, external_parent_session_id
+		`SELECT source_display_name, source_deleted_at, deletion_cause, source_trash_includes_codex_pages, owner_marker, external_parent_session_id, parser_relationship_type, relationship_inferred, spawn_linked
 		 FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(

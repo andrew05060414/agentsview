@@ -102,7 +102,14 @@ func (s *Store) searchContentTermsPG(
 	if len(terms) == 0 {
 		return db.ContentSearchPage{}, nil
 	}
-	query, args, err := db.BuildTermsSearchSQL(f, terms, s.sessionDialect())
+	var query string
+	var args []any
+	var err error
+	if !s.cockroach {
+		query, args, err = db.BuildPostgresTermsSearchSQL(f, terms, s.sessionDialect())
+	} else {
+		query, args, err = db.BuildTermsSearchSQL(f, terms, s.sessionDialect())
+	}
 	if err != nil {
 		return db.ContentSearchPage{}, err
 	}

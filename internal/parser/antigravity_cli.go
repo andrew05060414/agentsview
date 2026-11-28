@@ -2,12 +2,16 @@ package parser
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
+	"hash"
+	"hash/fnv"
 	"io"
 	"maps"
 	"os"
@@ -17,9 +21,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/ctxio"
 )
 
 // maxTrajectorySidecarBytes caps how much of a <uuid>.trajectory.json
@@ -390,7 +396,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 
 	var size int64
 	var mtime int64
-	effInfo, statErr := AntigravityCLIFileInfo(path)
+	effInfo, statErr := AntigravityCLISessionFileInfo(path)
 	if statErr == nil {
 		size = effInfo.Size()
 		mtime = effInfo.ModTime().UnixNano()
@@ -778,6 +784,11 @@ func hasDisplayableAntigravityCLITrajectoryMessage(
 var buildAntigravityProjectMap = antigravityProjectMapFromHistory
 
 func buildAntigravityCLIProjectMap(root string) map[string]string {
+	out, _ := buildAntigravityCLIProjectMapWithSummariesErr(root)
+	return out
+}
+
+func buildAntigravityCLIProjectMapWithSummariesErr(root string) (map[string]string, error) {
 	out := buildAntigravityProjectMap(filepath.Join(root, "history.jsonl"))
 	// The current cache is newer than history and wins for matching IDs.
 	maps.Copy(out, antigravityProjectMapFromLastConversations(
@@ -786,49 +797,196 @@ func buildAntigravityCLIProjectMap(root string) map[string]string {
 	// The cache keeps only each folder's latest conversation and current
 	// history rows carry no conversation ID, so the summary store fills the
 	// conversations they leave unmapped.
-	for id, summary := range loadAntigravitySummaries(context.Background(), root).byID {
+	summaries := loadAntigravitySummaries(context.Background(), root)
+	for id, summary := range summaries.byID {
 		if _, ok := out[id]; !ok && summary.workspace != "" {
 			out[id] = summary.workspace
 		}
 	}
+	return out, summaries.err
+}
+
+type antigravityFileStatKey struct {
+	size  int64
+	mtime int64
+	ctime int64
+	inode uint64
+}
+
+type antigravityUntaggedHistoryEntry struct {
+	tsMS int64
+	raw  []byte
+}
+
+type antigravityHistorySnapshot struct {
+	stat            antigravityFileStatKey
+	projectByID     map[string]string
+	taggedLinesByID map[string][][]byte
+	untagged        []antigravityUntaggedHistoryEntry
+}
+
+type antigravityLastConversationsSnapshot struct {
+	stat        antigravityFileStatKey
+	projectByID map[string]string
+	valid       bool
+}
+
+var antigravityCLIMetadataCache = struct {
+	sync.Mutex
+	history           map[string]antigravityHistorySnapshot
+	lastConversations map[string]antigravityLastConversationsSnapshot
+}{
+	history:           make(map[string]antigravityHistorySnapshot),
+	lastConversations: make(map[string]antigravityLastConversationsSnapshot),
+}
+
+func antigravityVerifiedFileStatKey(path string) (antigravityFileStatKey, bool) {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return antigravityFileStatKey{}, false
+	}
+	ctime, ok := codexIndexChangeTime(path, info)
+	if !ok {
+		return antigravityFileStatKey{}, false
+	}
+	inode, _ := sourceFileIdentityForPath(path, info)
+	if inode == 0 {
+		return antigravityFileStatKey{}, false
+	}
+	return antigravityFileStatKey{
+		size:  info.Size(),
+		mtime: info.ModTime().UnixNano(),
+		ctime: ctime,
+		inode: inode,
+	}, true
+}
+
+func loadAntigravityLastConversationsMap(path string) map[string]string {
+	path = filepath.Clean(path)
+	key, cacheable := antigravityVerifiedFileStatKey(path)
+	if cacheable {
+		antigravityCLIMetadataCache.Lock()
+		if snap, ok := antigravityCLIMetadataCache.lastConversations[path]; ok && snap.stat == key {
+			antigravityCLIMetadataCache.Unlock()
+			return snap.projectByID
+		}
+		antigravityCLIMetadataCache.Unlock()
+	}
+
+	out, valid := parseAntigravityLastConversationsFile(path)
+	if !valid {
+		return out
+	}
+
+	if cacheable {
+		antigravityCLIMetadataCache.Lock()
+		if _, ok := antigravityCLIMetadataCache.lastConversations[path]; !ok &&
+			len(antigravityCLIMetadataCache.lastConversations) >= 32 {
+			clear(antigravityCLIMetadataCache.lastConversations)
+		}
+		antigravityCLIMetadataCache.lastConversations[path] = antigravityLastConversationsSnapshot{
+			stat:        key,
+			projectByID: out,
+			valid:       true,
+		}
+		antigravityCLIMetadataCache.Unlock()
+	}
 	return out
 }
 
-// antigravityProjectMapFromLastConversations reverses the current CLI cache's
-// workspace -> conversationId object into the provider's
-// conversationId -> workspace lookup shape.
-func antigravityProjectMapFromLastConversations(path string) map[string]string {
+func parseAntigravityLastConversationsFile(path string) (map[string]string, bool) {
 	out := make(map[string]string)
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return out
+		return out, false
 	}
 	root := gjson.ParseBytes(raw)
 	if !root.IsObject() {
-		return out
+		return out, false
 	}
 	root.ForEach(func(workspace, conversationID gjson.Result) bool {
 		id := strings.TrimSpace(conversationID.String())
-		path := strings.TrimSpace(workspace.String())
-		if id != "" && path != "" {
+		ws := strings.TrimSpace(workspace.String())
+		if id != "" && ws != "" {
 			if _, exists := out[id]; !exists {
-				out[id] = path
+				out[id] = ws
 			}
 		}
 		return true
 	})
-	return out
+	return out, true
 }
 
-// antigravityProjectMapFromHistory reads history.jsonl and returns a
-// map of conversationId -> workspace path.
-func antigravityProjectMapFromHistory(path string) map[string]string {
-	out := make(map[string]string)
+func diffAntigravityLastConversationsChange(path string) ([]string, bool) {
+	path = filepath.Clean(path)
+	antigravityCLIMetadataCache.Lock()
+	prevSnap, hasPrev := antigravityCLIMetadataCache.lastConversations[path]
+	antigravityCLIMetadataCache.Unlock()
+	if !hasPrev || !prevSnap.valid {
+		return nil, true
+	}
+	key, cacheable := antigravityVerifiedFileStatKey(path)
+	if !cacheable || key == prevSnap.stat {
+		return nil, true
+	}
+	curr, valid := parseAntigravityLastConversationsFile(path)
+	if !valid {
+		return nil, true
+	}
+	antigravityCLIMetadataCache.Lock()
+	antigravityCLIMetadataCache.lastConversations[path] = antigravityLastConversationsSnapshot{
+		stat:        key,
+		projectByID: curr,
+		valid:       true,
+	}
+	antigravityCLIMetadataCache.Unlock()
+
+	seen := make(map[string]struct{})
+	var affected []string
+	for id, ws := range curr {
+		if prevSnap.projectByID[id] != ws {
+			seen[id] = struct{}{}
+			affected = append(affected, id)
+		}
+	}
+	for id, ws := range prevSnap.projectByID {
+		if _, done := seen[id]; done {
+			continue
+		}
+		if curr[id] != ws {
+			seen[id] = struct{}{}
+			affected = append(affected, id)
+		}
+	}
+	return affected, false
+}
+
+func loadAntigravityHistorySnapshot(path string) (antigravityHistorySnapshot, error) {
+	path = filepath.Clean(path)
+	key, cacheable := antigravityVerifiedFileStatKey(path)
+	if cacheable {
+		antigravityCLIMetadataCache.Lock()
+		if snap, ok := antigravityCLIMetadataCache.history[path]; ok && snap.stat == key {
+			antigravityCLIMetadataCache.Unlock()
+			return snap, nil
+		}
+		antigravityCLIMetadataCache.Unlock()
+	}
+
+	snap := antigravityHistorySnapshot{
+		stat:            key,
+		projectByID:     make(map[string]string),
+		taggedLinesByID: make(map[string][][]byte),
+	}
 	f, err := os.Open(path)
 	if err != nil {
-		return out
+		if os.IsNotExist(err) {
+			return snap, nil
+		}
+		return antigravityHistorySnapshot{}, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
+
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for sc.Scan() {
@@ -836,13 +994,141 @@ func antigravityProjectMapFromHistory(path string) map[string]string {
 		if len(line) == 0 {
 			continue
 		}
-		id := gjson.GetBytes(line, "conversationId").Str
-		ws := gjson.GetBytes(line, "workspace").Str
-		if id != "" && ws != "" {
-			out[id] = ws
+		cid := gjson.GetBytes(line, "conversationId").Str
+		if cid != "" {
+			rawCopy := append([]byte(nil), line...)
+			snap.taggedLinesByID[cid] = append(snap.taggedLinesByID[cid], rawCopy)
+			if ws := gjson.GetBytes(line, "workspace").Str; ws != "" {
+				snap.projectByID[cid] = ws
+			}
+			continue
+		}
+		// Only untagged rows with display, workspace, and timestamp can
+		// match inferAntigravityProjectFromHistoryFallback.
+		if gjson.GetBytes(line, "display").Str == "" ||
+			gjson.GetBytes(line, "workspace").Str == "" {
+			continue
+		}
+		tsMS := gjson.GetBytes(line, "timestamp").Int()
+		if tsMS == 0 {
+			continue
+		}
+		rawCopy := append([]byte(nil), line...)
+		snap.untagged = append(snap.untagged, antigravityUntaggedHistoryEntry{
+			tsMS: tsMS,
+			raw:  rawCopy,
+		})
+	}
+	if err := sc.Err(); err != nil {
+		return antigravityHistorySnapshot{}, fmt.Errorf("scan %s: %w", path, err)
+	}
+
+	if cacheable {
+		antigravityCLIMetadataCache.Lock()
+		if _, ok := antigravityCLIMetadataCache.history[path]; !ok &&
+			len(antigravityCLIMetadataCache.history) >= 32 {
+			clear(antigravityCLIMetadataCache.history)
+		}
+		antigravityCLIMetadataCache.history[path] = snap
+		antigravityCLIMetadataCache.Unlock()
+	}
+	return snap, nil
+}
+
+func diffAntigravityHistoryChange(path string) ([]string, bool) {
+	path = filepath.Clean(path)
+	antigravityCLIMetadataCache.Lock()
+	prevSnap, hasPrev := antigravityCLIMetadataCache.history[path]
+	antigravityCLIMetadataCache.Unlock()
+	if !hasPrev {
+		return nil, true
+	}
+	key, cacheable := antigravityVerifiedFileStatKey(path)
+	if !cacheable || key == prevSnap.stat || key.size < prevSnap.stat.size {
+		return nil, true
+	}
+	currSnap, err := loadAntigravityHistorySnapshot(path)
+	if err != nil {
+		return nil, true
+	}
+	if len(currSnap.untagged) != len(prevSnap.untagged) {
+		return nil, true
+	}
+	for i := range currSnap.untagged {
+		if currSnap.untagged[i].tsMS != prevSnap.untagged[i].tsMS ||
+			!bytes.Equal(currSnap.untagged[i].raw, prevSnap.untagged[i].raw) {
+			return nil, true
 		}
 	}
-	return out
+
+	seen := make(map[string]struct{})
+	var affected []string
+	for id, lines := range currSnap.taggedLinesByID {
+		if currSnap.projectByID[id] != prevSnap.projectByID[id] ||
+			!antigravityByteSlicesEqual(lines, prevSnap.taggedLinesByID[id]) {
+			seen[id] = struct{}{}
+			affected = append(affected, id)
+		}
+	}
+	for id := range prevSnap.taggedLinesByID {
+		if _, done := seen[id]; done {
+			continue
+		}
+		if _, ok := currSnap.taggedLinesByID[id]; !ok {
+			seen[id] = struct{}{}
+			affected = append(affected, id)
+		}
+	}
+	return affected, false
+}
+
+func antigravityByteSlicesEqual(a, b [][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !bytes.Equal(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// antigravityCLIWorkspaceForID resolves the workspace for one conversation ID
+// using the same precedence as buildAntigravityCLIProjectMap without cloning
+// the full project map per session.
+func antigravityCLIWorkspaceForID(ctx context.Context, root, id string) string {
+	id = strings.TrimPrefix(id, antigravityImplicitTag)
+	if ws := loadAntigravityLastConversationsMap(
+		filepath.Join(root, "cache", "last_conversations.json"),
+	)[id]; ws != "" {
+		return ws
+	}
+	if snap, err := loadAntigravityHistorySnapshot(
+		filepath.Join(root, "history.jsonl"),
+	); err == nil {
+		if ws := snap.projectByID[id]; ws != "" {
+			return ws
+		}
+	}
+	return loadAntigravitySummaries(ctx, root).byID[id].workspace
+}
+
+// antigravityProjectMapFromLastConversations reverses the current CLI cache's
+// workspace -> conversationId object into the provider's
+// conversationId -> workspace lookup shape.
+func antigravityProjectMapFromLastConversations(path string) map[string]string {
+	return maps.Clone(loadAntigravityLastConversationsMap(path))
+}
+
+// antigravityProjectMapFromHistory reads history.jsonl and returns a
+// map of conversationId -> workspace path.
+func antigravityProjectMapFromHistory(path string) map[string]string {
+	snap, err := loadAntigravityHistorySnapshot(path)
+	if err != nil {
+		return make(map[string]string)
+	}
+	return maps.Clone(snap.projectByID)
 }
 
 func inferAntigravityProjectFromHistoryFallback(
@@ -1097,6 +1383,21 @@ func AntigravityCLIFileInfo(path string) (os.FileInfo, error) {
 	), nil
 }
 
+// AntigravityCLISessionFileInfo returns a composite os.FileInfo covering only
+// files owned by this conversation (.db/.pb, -wal, .trajectory.json, brain/<id>),
+// excluding shared workspace/history caches so edits in other conversations do
+// not invalidate every historical session's mtime and size.
+func AntigravityCLISessionFileInfo(path string) (os.FileInfo, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	return antigravityCLICombinedFileInfo(
+		info,
+		antigravityCLIProviderCompanionPaths(path)...,
+	), nil
+}
+
 func antigravityCLICompanionPaths(path string) []string {
 	root := filepath.Dir(filepath.Dir(path))
 	historyPath := filepath.Join(root, "history.jsonl")
@@ -1181,11 +1482,12 @@ func antigravityCompanionCounts(path string, info os.FileInfo) bool {
 	return !strings.HasSuffix(path, "-wal") || SQLiteWALInfoHasFrames(info)
 }
 
-func antigravityCompositeHash(path string, companions ...string) (string, error) {
-	return antigravityCompositeHashWithExtra(path, companions, nil)
+func antigravityCompositeHash(ctx context.Context, path string, companions ...string) (string, error) {
+	return antigravityCompositeHashWithExtra(ctx, path, companions, nil)
 }
 
 func antigravityCompositeHashWithExtra(
+	ctx context.Context,
 	path string,
 	companions []string,
 	extra func(interface{ Write([]byte) (int, error) }) error,
@@ -1199,7 +1501,7 @@ func antigravityCompositeHashWithExtra(
 	}
 
 	h := sha256.New()
-	if err := addAntigravityFingerprintPart(h, "source", path, info); err != nil {
+	if err := addAntigravityFingerprintPart(ctx, h, "source", path, info); err != nil {
 		return "", err
 	}
 
@@ -1216,6 +1518,7 @@ func antigravityCompositeHashWithExtra(
 			continue
 		}
 		if err := addAntigravityFingerprintPart(
+			ctx,
 			h,
 			"companion",
 			companion,
@@ -1233,35 +1536,54 @@ func antigravityCompositeHashWithExtra(
 }
 
 func antigravityCLICompositeHash(ctx context.Context, path, id, workspace string) (string, error) {
+	var sessionMtimeNS int64
+	if info, err := AntigravityCLISessionFileInfo(path); err == nil {
+		sessionMtimeNS = info.ModTime().UnixNano()
+	}
+	root := filepath.Dir(filepath.Dir(path))
+	trimmedID := strings.TrimPrefix(id, antigravityImplicitTag)
 	hash, err := antigravityCompositeHashWithExtra(
+		ctx,
 		path,
 		antigravityCLIProviderCompanionPaths(path),
 		func(h interface{ Write([]byte) (int, error) }) error {
-			if err := addAntigravityCLIHistoryFingerprintPart(
-				h,
-				filepath.Join(filepath.Dir(filepath.Dir(path)), "history.jsonl"),
-				strings.TrimPrefix(id, antigravityImplicitTag),
-			); err != nil {
-				return err
-			}
-			if workspace == "" {
-				return nil
-			}
-			if _, err := fmt.Fprintf(h, "workspace\x00%d\x00", len(workspace)); err != nil {
-				return err
-			}
-			if _, err := h.Write([]byte(workspace)); err != nil {
-				return err
-			}
-			_, err := h.Write([]byte{0})
-			return err
+			return writeAntigravityCLIHistoryAndWorkspaceDigest(
+				h, root, trimmedID, workspace, sessionMtimeNS,
+			)
 		},
 	)
 	if err != nil {
 		return "", err
 	}
-	summaries := loadAntigravitySummaries(ctx, filepath.Dir(filepath.Dir(path)))
-	return antigravityHashWithSummary(hash, summaries.fingerprintDigest(strings.TrimPrefix(id, antigravityImplicitTag))), nil
+	summaries := loadAntigravitySummaries(ctx, root)
+	return antigravityHashWithSummary(hash, summaries.fingerprintDigest(trimmedID)), nil
+}
+
+func writeAntigravityCLIHistoryAndWorkspaceDigest(
+	h interface{ Write([]byte) (int, error) },
+	root, id, workspace string,
+	sessionMtimeNS int64,
+) error {
+	if err := addAntigravityCLIHistoryFingerprintPart(
+		h,
+		filepath.Join(root, "history.jsonl"),
+		id,
+		workspace,
+		sessionMtimeNS,
+	); err != nil {
+		return err
+	}
+	if workspace == "" {
+		return nil
+	}
+	if _, err := fmt.Fprintf(h, "workspace\x00%d\x00", len(workspace)); err != nil {
+		return err
+	}
+	if _, err := h.Write([]byte(workspace)); err != nil {
+		return err
+	}
+	_, err := h.Write([]byte{0})
+	return err
 }
 
 func antigravityCLIProviderCompanionPaths(path string) []string {
@@ -1281,50 +1603,53 @@ func addAntigravityCLIHistoryFingerprintPart(
 	h interface{ Write([]byte) (int, error) },
 	historyPath string,
 	id string,
+	workspace string,
+	sessionMtimeNS int64,
 ) error {
-	f, err := os.Open(historyPath)
+	snap, err := loadAntigravityHistorySnapshot(historyPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("open %s: %w", historyPath, err)
+		return err
 	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		cid := gjson.GetBytes(line, "conversationId").Str
-		if cid != "" && cid != id {
-			continue
-		}
-		label := "history"
-		if cid == "" {
-			// Untagged rows are used by the project fallback matcher, whose
-			// source cannot be known from the row alone.
-			label = "history-untagged"
-		}
+	writePart := func(label string, line []byte) error {
 		if _, err := fmt.Fprintf(h, "%s\x00%d\x00", label, len(line)); err != nil {
 			return err
 		}
 		if _, err := h.Write(line); err != nil {
 			return err
 		}
-		if _, err := h.Write([]byte{0}); err != nil {
+		_, err := h.Write([]byte{0})
+		return err
+	}
+	for _, line := range snap.taggedLinesByID[id] {
+		if err := writePart("history", line); err != nil {
 			return err
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return fmt.Errorf("scan %s: %w", historyPath, err)
+	// Untagged rows are only consulted by inferAntigravityProjectFromHistoryFallback
+	// when the session has no mapped workspace, and only within +/-60s of the
+	// session's start time (<= sessionMtime). Excluding already-mapped sessions
+	// and newer prompts prevents every new prompt from invalidating all
+	// historical session fingerprints.
+	if workspace != "" {
+		return nil
+	}
+	var maxFallbackTS int64
+	if sessionMtimeNS > 0 {
+		maxFallbackTS = sessionMtimeNS/int64(time.Millisecond) + 60_000
+	}
+	for _, entry := range snap.untagged {
+		if maxFallbackTS > 0 && entry.tsMS > maxFallbackTS {
+			continue
+		}
+		if err := writePart("history-untagged", entry.raw); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func addAntigravityFingerprintPart(
+	ctx context.Context,
 	h interface{ Write([]byte) (int, error) },
 	label string,
 	path string,
@@ -1345,13 +1670,95 @@ func addAntigravityFingerprintPart(
 		return fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
-	if _, err := io.Copy(h, f); err != nil {
+	n, err := io.Copy(h, ctxio.Reader{Context: ctx, Reader: f})
+	recordContentRead(ctx, n)
+	if err != nil {
 		return fmt.Errorf("hash %s: %w", path, err)
 	}
 	if _, err := h.Write([]byte{0}); err != nil {
 		return err
 	}
 	return nil
+}
+
+// antigravityStatHashFromCompanions hashes the stat tuples of the primary
+// source file and its counted companions plus any optional extra digest and the
+// per-session summary digest, returning 0 if file identity/ctime is unavailable
+// or the summary store is unreadable so callers fail closed to fingerprinting.
+func antigravityStatHashFromCompanions(
+	ctx context.Context,
+	path string,
+	companions []string,
+	root string,
+	id string,
+	extra func(h hash.Hash64, maxMtimeNS int64) bool,
+) uint64 {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte{0xAC})
+
+	var buf [32]byte
+	writeStatTuple := func(label, p string, fi os.FileInfo) (int64, bool) {
+		ctime, ok := codexIndexChangeTime(p, fi)
+		if !ok {
+			return 0, false
+		}
+		inode, _ := sourceFileIdentityForPath(p, fi)
+		if inode == 0 {
+			return 0, false
+		}
+		_, _ = fmt.Fprintf(h, "%s\x00%s\x00", label, p)
+		mtime := fi.ModTime().UnixNano()
+		binary.LittleEndian.PutUint64(buf[:8], uint64(fi.Size()))
+		binary.LittleEndian.PutUint64(buf[8:16], uint64(mtime))
+		binary.LittleEndian.PutUint64(buf[16:24], uint64(ctime))
+		binary.LittleEndian.PutUint64(buf[24:32], inode)
+		_, _ = h.Write(buf[:])
+		return mtime, true
+	}
+
+	maxMtimeNS, ok := writeStatTuple("source", path, info)
+	if !ok {
+		return 0
+	}
+	sort.Strings(companions)
+	var prev string
+	for _, companion := range companions {
+		if companion == "" || companion == prev {
+			continue
+		}
+		prev = companion
+		ci, err := os.Stat(companion)
+		if err != nil || ci.IsDir() || !antigravityCompanionCounts(companion, ci) {
+			continue
+		}
+		cmtime, ok := writeStatTuple("companion", companion, ci)
+		if !ok {
+			return 0
+		}
+		if cmtime > maxMtimeNS {
+			maxMtimeNS = cmtime
+		}
+	}
+
+	if extra != nil && !extra(h, maxMtimeNS) {
+		return 0
+	}
+	summaries := loadAntigravitySummaries(ctx, root)
+	if summaries.err != nil {
+		return 0
+	}
+	digest := summaries.fingerprintDigest(id)
+	_, _ = fmt.Fprintf(h, "summary\x00%d\x00%s\x00", len(digest), digest)
+
+	sum := h.Sum64()
+	if sum == 0 {
+		return 1
+	}
+	return sum
 }
 
 type fakeFileInfo struct {

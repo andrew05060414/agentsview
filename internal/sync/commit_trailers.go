@@ -29,6 +29,26 @@ func (e *Engine) reconcileCommitTrailersLocked(ctx context.Context) int {
 	return e.reconcileCommitTrailersWithBudget(ctx, 60*time.Second)
 }
 
+const trailerBadObjectCooldown = 30 * time.Minute
+
+func (e *Engine) trailerNow() time.Time {
+	if e != nil && e.trailerScanNow != nil {
+		return e.trailerScanNow()
+	}
+	return time.Now()
+}
+
+func isTrailerBadObjectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "fatal: bad object") ||
+		strings.Contains(msg, "fatal: failed to read object") ||
+		strings.Contains(msg, "fatal: loose object") ||
+		strings.Contains(msg, "fatal: packed object")
+}
+
 // A nonpositive budget permits one repository attempt before yielding.
 func (e *Engine) reconcileCommitTrailersWithBudget(ctx context.Context, budget time.Duration) (stored int) {
 	if e.ephemeral || e.forceParse || e.db.ArchiveContent().UsageOnly() {
@@ -57,8 +77,12 @@ func (e *Engine) reconcileCommitTrailersWithBudget(ctx context.Context, budget t
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	start := time.Now()
+	now := e.trailerNow()
 	if e.trailerScanAttempts == nil {
 		e.trailerScanAttempts = make(map[string]time.Time)
+	}
+	if e.trailerScanCooldownUntil == nil {
+		e.trailerScanCooldownUntil = make(map[string]time.Time)
 	}
 	order := slices.Sorted(maps.Keys(paths))
 	slices.SortStableFunc(order, func(a, b string) int {
@@ -68,11 +92,21 @@ func (e *Engine) reconcileCommitTrailersWithBudget(ctx context.Context, budget t
 		if ctx.Err() != nil {
 			return
 		}
+		if until, cooling := e.trailerScanCooldownUntil[repo]; cooling && now.Before(until) {
+			continue
+		}
 		// Failed scans also yield their place to repositories still waiting.
-		e.trailerScanAttempts[repo] = time.Now()
+		e.trailerScanAttempts[repo] = now
 		n, err := e.reconcileRepositoryTrailers(ctx, repo, paths[repo])
 		if err != nil {
-			log.Printf("commit trailers in %s: %v", repo, err)
+			if isTrailerBadObjectError(err) {
+				e.trailerScanCooldownUntil[repo] = now.Add(trailerBadObjectCooldown)
+				log.Printf("commit trailers in %s: %v (backing off for %s)", repo, err, trailerBadObjectCooldown)
+			} else {
+				log.Printf("commit trailers in %s: %v", repo, err)
+			}
+		} else {
+			delete(e.trailerScanCooldownUntil, repo)
 		}
 		stored += n
 		if time.Since(start) >= budget {

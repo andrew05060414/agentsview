@@ -36,8 +36,49 @@ func (f deepSeekHarnessProviderFactory) NewProvider(cfg ProviderConfig) Provider
 	return &deepSeekHarnessProvider{SourceSetProvider: provider}
 }
 
+var (
+	_ Provider            = (*deepSeekHarnessProvider)(nil)
+	_ MultiFileStatHasher = (*deepSeekHarnessProvider)(nil)
+)
+
 type deepSeekHarnessProvider struct {
 	*SourceSetProvider
+}
+
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher over the
+// primary session file and its alternate-encoding companion (.jsonl vs .zstd)
+// so warm sweeps skip unchanged sessions via the persisted stat-digest gate.
+func (p *deepSeekHarnessProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
+	clean := filepath.Clean(chatPath)
+	info, err := os.Stat(clean)
+	if err != nil || info.IsDir() {
+		return 0
+	}
+	altPath := ""
+	if candidate, ok := deepSeekHarnessAlternateSourcePath(clean); ok {
+		altInfo, altErr := siblingMetadataFileInfo(candidate)
+		if altErr != nil {
+			return 0
+		}
+		if altInfo != nil {
+			altPath = candidate
+		}
+	}
+	return fileStatTupleDigest(0xD8, clean, altPath)
+}
+
+// DeepSeekHarnessEffectiveMtime returns the max ModTime().UnixNano() across
+// the session file and its alternate-encoding companion, matching Fingerprint.
+func DeepSeekHarnessEffectiveMtime(chatPath string, chatInfo os.FileInfo) int64 {
+	mtime := chatInfo.ModTime().UnixNano()
+	if candidate, ok := deepSeekHarnessAlternateSourcePath(filepath.Clean(chatPath)); ok {
+		if altInfo, err := siblingMetadataFileInfo(candidate); err == nil && altInfo != nil {
+			if ts := altInfo.ModTime().UnixNano(); ts > mtime {
+				mtime = ts
+			}
+		}
+	}
+	return mtime
 }
 
 func (p *deepSeekHarnessProvider) FindSource(
@@ -283,6 +324,7 @@ func deepSeekHarnessProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
 	source.StreamingDiscovery = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
+	source.MultiFileStatHash = CapabilitySupported
 	return Capabilities{
 		Source: source,
 		Content: ContentCapabilities{

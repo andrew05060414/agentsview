@@ -979,3 +979,57 @@ func TestCursorProviderDeduplicatesChildStemAcrossParents(t *testing.T) {
 		})
 	}
 }
+
+func TestCursorProviderSourceForReconciliation(t *testing.T) {
+	root := t.TempDir()
+	projectDir := "Users-fiona-Documents-demo"
+	transcriptsDir := filepath.Join(root, projectDir, "agent-transcripts")
+	flatTxt := cursorProviderWriteTranscript(t, transcriptsDir, "flat.txt", "old")
+	flatJSONL := cursorProviderWriteJSONLTranscript(t, transcriptsDir, "flat.jsonl", "new")
+	nestedJSONL := cursorProviderWriteJSONLTranscript(
+		t, transcriptsDir, filepath.Join("nested", "nested.jsonl"), "nested",
+	)
+	childJSONL := cursorProviderWriteJSONLTranscript(
+		t, transcriptsDir, filepath.Join("nested", "subagents", "child.jsonl"), "child",
+	)
+	shadowedChild := cursorProviderWriteJSONLTranscript(
+		t, transcriptsDir, filepath.Join("nested", "subagents", "flat.jsonl"), "shadowed",
+	)
+	mismatch := cursorProviderWriteJSONLTranscript(
+		t, transcriptsDir, filepath.Join("mismatch", "other.jsonl"), "other",
+	)
+
+	provider, ok := NewProvider(AgentCursor, ProviderConfig{
+		Roots: []string{root}, Machine: "devbox",
+	})
+	require.True(t, ok)
+	resolver, ok := provider.(ReconciliationSourceResolver)
+	require.True(t, ok)
+
+	for _, canonical := range []string{flatJSONL, nestedJSONL, childJSONL} {
+		got, found, err := resolver.SourceForReconciliation(t.Context(), canonical, "")
+		require.NoError(t, err)
+		require.True(t, found)
+		assert.Equal(t, canonical, got.DisplayPath)
+	}
+
+	got, found, err := resolver.SourceForReconciliation(t.Context(), shadowedChild, "")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, flatJSONL, got.DisplayPath, "top-level sibling must shadow subagent transcript")
+
+	for _, ignored := range []string{
+		flatTxt,
+		mismatch,
+		filepath.Join(transcriptsDir, "missing.jsonl"),
+	} {
+		_, found, err := resolver.SourceForReconciliation(t.Context(), ignored, "")
+		require.NoError(t, err)
+		assert.False(t, found, "non-canonical path %s must not resolve", ignored)
+	}
+
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, _, err = resolver.SourceForReconciliation(canceled, flatJSONL, "")
+	assert.ErrorIs(t, err, context.Canceled)
+}

@@ -13,6 +13,7 @@ type manifestSession struct {
 	ID                   string  `json:"id"`
 	Project              string  `json:"project"`
 	Machine              string  `json:"machine"`
+	Account              string  `json:"account,omitempty"`
 	Agent                string  `json:"agent"`
 	AgentLabel           string  `json:"agent_label,omitempty"`
 	Entrypoint           string  `json:"entrypoint,omitempty"`
@@ -95,6 +96,7 @@ func manifestSessionFromDB(s db.Session) manifestSession {
 		ID:                   s.ID,
 		Project:              s.Project,
 		Machine:              s.Machine,
+		Account:              s.Account,
 		Agent:                s.Agent,
 		AgentLabel:           s.AgentLabel,
 		Entrypoint:           s.Entrypoint,
@@ -158,6 +160,7 @@ func (m manifestSession) dbSession() db.Session {
 		ID:                   m.ID,
 		Project:              m.Project,
 		Machine:              m.Machine,
+		Account:              m.Account,
 		Agent:                m.Agent,
 		AgentLabel:           m.AgentLabel,
 		Entrypoint:           m.Entrypoint,

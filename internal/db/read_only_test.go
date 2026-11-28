@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -537,4 +539,41 @@ func TestReadOnlySchemaAfterInitialCancellation(t *testing.T) {
 	required, err := readOnlyRequiredSchema(t.Context())
 	require.NoError(t, err)
 	assert.Contains(t, required["sessions"], "id")
+}
+
+func TestMakeDSNCacheSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.db")
+
+	cases := []struct {
+		name     string
+		readOnly bool
+		wantKiB  int
+	}{
+		{name: "writable", readOnly: false, wantKiB: sqliteWriterCacheSizeKiB},
+		{name: "readonly", readOnly: true, wantKiB: sqliteCacheSizeKiB},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := makeDSN(path, tc.readOnly)
+			parsed, err := url.Parse(dsn)
+			require.NoError(t, err)
+			assert.Equal(t, strconv.Itoa(tc.wantKiB), parsed.Query().Get("_cache_size"))
+			if tc.readOnly {
+				assert.Equal(t, "ro", parsed.Query().Get("mode"))
+			} else {
+				assert.Empty(t, parsed.Query().Get("mode"))
+			}
+		})
+	}
+
+	rw, err := Open(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rw.Close() })
+
+	var writerCache, readerCache int
+	require.NoError(t, rw.writer.Load().QueryRowContext(t.Context(), "PRAGMA cache_size").Scan(&writerCache))
+	require.NoError(t, rw.reader.Load().QueryRowContext(t.Context(), "PRAGMA cache_size").Scan(&readerCache))
+	assert.Equal(t, sqliteWriterCacheSizeKiB, writerCache)
+	assert.Equal(t, sqliteCacheSizeKiB, readerCache)
 }

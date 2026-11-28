@@ -31,8 +31,8 @@ export const platforms = {
   "grok-web": {
     origin: "https://grok.com",
     newTabURL: "https://grok.com/",
-    scripts: ["page_fetch.js"],
-    fetchFunction: "pageFetch",
+    scripts: ["page_fetch.js", "grok_fetch.js"],
+    fetchFunction: "grokFetch",
     // grok.com reads its REST API with the page's cookies; the allowed
     // shapes are plain GETs that ask for JSON.
     headers: { Accept: "application/json" },
