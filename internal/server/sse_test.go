@@ -39,7 +39,11 @@ func TestSSEStreamSendJSONRoundTrip(t *testing.T) {
 	rec := httptest.NewRecorder()
 	stream := &SSEStream{w: rec, f: rec}
 
-	require.True(t, stream.SendJSON("session", map[string]any{"id": 7, "ok": true}))
+	payload := struct {
+		ID int  `json:"id"`
+		OK bool `json:"ok"`
+	}{ID: 7, OK: true}
+	require.True(t, stream.SendJSON("session", payload))
 	assert.Equal(t, "event: session\ndata: {\"id\":7,\"ok\":true}\n\n", rec.Body.String())
 	assert.True(t, rec.Flushed)
 }
@@ -62,13 +66,10 @@ func TestSSEStreamSendJSONMarshalFailureWritesNothing(t *testing.T) {
 	assert.Empty(t, rec.Body.String())
 }
 
-// TestSSEStreamSendMultilineDataSplitsIntoDataLines reproduces a real bug:
-// a newline inside data is written verbatim, so the second line leaves the
-// frame without a "data:" prefix and the client silently loses that part of
-// the payload. SSE multi-line data requires one "data:" line per source
-// line. Fix tracked in PX-1949; unskip this test with the fix.
+// TestSSEStreamSendMultilineDataSplitsIntoDataLines pins SSE multi-line
+// data framing: each source line gets its own "data:" line so the client
+// receives the complete payload.
 func TestSSEStreamSendMultilineDataSplitsIntoDataLines(t *testing.T) {
-	t.Skip("reproduces PX-1949: newline in data breaks out of the SSE frame")
 	rec := httptest.NewRecorder()
 	stream := &SSEStream{w: rec, f: rec}
 

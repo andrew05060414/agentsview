@@ -2,9 +2,10 @@ package server
 
 import (
 	"encoding/json/v2"
-	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -34,11 +35,22 @@ func (s *SSEStream) send(event, data string, id *string) bool {
 	_ = rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
 	defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
 
-	prefix := ""
+	var frame strings.Builder
 	if id != nil {
-		prefix = fmt.Sprintf("id: %s\n", *id)
+		frame.WriteString("id: ")
+		frame.WriteString(*id)
+		frame.WriteByte('\n')
 	}
-	if _, err := fmt.Fprintf(s.w, "%sevent: %s\ndata: %s\n\n", prefix, event, data); err != nil {
+	frame.WriteString("event: ")
+	frame.WriteString(event)
+	frame.WriteByte('\n')
+	for _, line := range strings.Split(data, "\n") {
+		frame.WriteString("data: ")
+		frame.WriteString(line)
+		frame.WriteByte('\n')
+	}
+	frame.WriteByte('\n')
+	if _, err := io.WriteString(s.w, frame.String()); err != nil {
 		log.Printf("SSE write error for %q: %v", event, err)
 		return false
 	}
