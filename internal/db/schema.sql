@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     parent_session_id TEXT,
     parser_parent_session_id TEXT,
     parser_relationship_type TEXT,
+    -- 1 when the parser marked the session subagent only because it is a
+    -- parentless headless run, not because of an explicit child marker.
+    relationship_inferred INTEGER NOT NULL DEFAULT 0,
+    -- 1 once a spawn edge or launcher link has given the session a parent.
+    -- It survives the deletion of that parent.
+    spawn_linked INTEGER NOT NULL DEFAULT 0,
     relationship_type TEXT NOT NULL DEFAULT '',
     total_output_tokens INTEGER NOT NULL DEFAULT 0,
     peak_context_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1842,6 +1848,14 @@ CREATE INDEX IF NOT EXISTS idx_commit_trailers_sha ON commit_trailers(sha);
 CREATE TABLE IF NOT EXISTS codex_fork_state (
  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
  state_json TEXT NOT NULL
+);
+
+-- The Codex cloud account key of a chat imported from another computer's
+-- artifacts. Import clears the source path, which names the key for chats
+-- fetched on this computer, so reporting exports read it here instead.
+CREATE TABLE IF NOT EXISTS codex_cloud_accounts (
+ session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+ account_key TEXT NOT NULL
 );
 
 -- OCR text is shared by all occurrences of the same image and processor.

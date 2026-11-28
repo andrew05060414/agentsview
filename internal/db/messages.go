@@ -591,6 +591,9 @@ func (db *DB) GetMessages(
 
 // MessageSnapshot reads messages from one read-only transaction, so every
 // page sees the same transcript while sync keeps writing the archive.
+// While a snapshot is open, read through it instead of the DB: the snapshot
+// holds a reader connection, and a DB read paused by an archive swap would
+// keep that connection from draining until the swap gives up.
 type MessageSnapshot struct {
 	tx *sql.Tx
 }
@@ -610,6 +613,24 @@ func (s *MessageSnapshot) GetMessages(
 	sessionID string, from, limit int, asc bool,
 ) ([]Message, error) {
 	return getMessagesWith(ctx, s.tx, sessionID, from, limit, asc)
+}
+
+// GetUsageEvents works like DB.GetUsageEvents, reading from the snapshot.
+func (s *MessageSnapshot) GetUsageEvents(
+	ctx context.Context, sessionID string,
+) ([]UsageEvent, error) {
+	return usageEventsWithQuerier(ctx, s.tx, sessionID, 0)
+}
+
+// SortedUsageEventFingerprints works like DB.SortedUsageEventFingerprints,
+// reading from the snapshot.
+func (s *MessageSnapshot) SortedUsageEventFingerprints(
+	ctx context.Context, sessionIDs []string,
+	normalizeTimestamp func(string) string,
+) (map[string]string, error) {
+	return usageEventFingerprintsWithQuerier(
+		ctx, s.tx, sessionIDs, normalizeTimestamp, true,
+	)
 }
 
 // LegacyVSCodeReplyAnchors reads request anchors from the publication snapshot.
@@ -1819,7 +1840,6 @@ func (db *DB) writeSessionIncremental(ctx context.Context,
 	update.ToolCallResultUpdates = db.toolCallResultUpdatesForStorage(update.ToolCallResultUpdates)
 	if db.ArchiveContent().OmitsToolContent() {
 		policy = config.ToolResultImagesKeep
-		update.Checkpoint, update.CheckpointBlobs = nil, nil
 	}
 
 	t := time.Now()
@@ -1938,8 +1958,8 @@ func (db *DB) writeSessionIncremental(ctx context.Context,
 		return false, err
 	}
 	if update.Checkpoint != nil && update.CheckpointBlobs != nil {
-		if err := upsertParserCheckpointTx(
-			tx, *update.Checkpoint, *update.CheckpointBlobs,
+		if err := db.upsertParserCheckpointTx(
+			ctx, tx, *update.Checkpoint, *update.CheckpointBlobs,
 		); err != nil {
 			return false, err
 		}
@@ -2592,7 +2612,6 @@ func (db *DB) replaceSessionContent(ctx context.Context,
 	}
 	if db.ArchiveContent().OmitsToolContent() {
 		signals.ToolObservations = []ToolObservation{}
-		cp, blobs = nil, nil
 	}
 
 	db.mu.Lock()
@@ -2712,7 +2731,7 @@ func (db *DB) replaceSessionContent(ctx context.Context,
 		// shares the same native id.
 		c.SessionID = sessionID
 		b.SessionID = sessionID
-		if err := upsertParserCheckpointTx(tx, c, b); err != nil {
+		if err := db.upsertParserCheckpointTx(ctx, tx, c, b); err != nil {
 			return err
 		}
 	}
@@ -2759,10 +2778,12 @@ func sessionAutomationStateTx(
 		firstUserMessage sql.NullString
 		userMsgCount     int
 		sessionKind      string
+		entrypoint       string
 	)
 	err = tx.QueryRow(`
 		SELECT
 			s.session_kind,
+			s.entrypoint,
 			s.first_message,
 			s.user_message_count,
 			s.is_automated,
@@ -2782,6 +2803,7 @@ func sessionAutomationStateTx(
 		sessionID,
 	).Scan(
 		&sessionKind,
+		&entrypoint,
 		&firstMessage, &userMsgCount,
 		&rowAutomated, &firstUserMessage,
 	)
@@ -2795,7 +2817,7 @@ func sessionAutomationStateTx(
 		)
 	}
 
-	want = IsAutomatedSessionMetadata(sessionKind) ||
+	want = IsAutomatedSessionMetadata(sessionKind, entrypoint) ||
 		isAutomatedFromTextCandidates(userMsgCount, firstUserMessage, firstMessage)
 	return want, rowAutomated, true, nil
 }
@@ -2803,12 +2825,28 @@ func sessionAutomationStateTx(
 func setSessionAutomationTx(
 	tx transactionQueries, sessionID string, isAutomated bool,
 ) error {
+	clearable := clearableHeadlessWorkerSQL("? = 1")
 	if _, err := tx.Exec(`
 		UPDATE sessions
 		   SET is_automated = ?,
+		       relationship_type = CASE
+		           WHEN relationship_type = 'subagent' AND `+clearable+`
+		           THEN ''
+		           WHEN COALESCE(relationship_type, '') = ''
+		            AND COALESCE(parent_session_id, '') = ''
+		            AND `+parserRelationshipSQL+` = 'subagent'
+		            AND NOT (`+clearable+`)
+		           THEN 'subagent'
+		           ELSE relationship_type
+		       END,
+		       parser_relationship_type = CASE
+		           WHEN relationship_type = 'subagent' AND `+clearable+`
+		           THEN COALESCE(parser_relationship_type, 'subagent')
+		           ELSE parser_relationship_type
+		       END,
 		       local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = ?`,
-		isAutomated, sessionID,
+		isAutomated, isAutomated, isAutomated, isAutomated, sessionID,
 	); err != nil {
 		return fmt.Errorf(
 			"updating is_automated from messages for %s: %w",

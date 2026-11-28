@@ -298,6 +298,15 @@ type Sync struct {
 	afterPushBatch func()
 	// afterMessagePage is a test hook called after each copied message page.
 	afterMessagePage func()
+	// sequentialNewSessions, a test hook, writes new sessions one statement
+	// at a time, as sessions PostgreSQL already has are written.
+	sequentialNewSessions bool
+	// beforeNewSessionBatch is a test hook called after a chunk's new
+	// sessions are chosen and before their batched writes are sent.
+	beforeNewSessionBatch func()
+	// afterMessageSnapshot is a test hook called once a session push has
+	// opened its local message snapshot.
+	afterMessageSnapshot func()
 
 	closeOnce sync.Once
 	closeErr  error

@@ -170,7 +170,8 @@ const sessionFullColsAfterRelationship = `,
 		SELECT 1 FROM session_project_assignments spa
 		WHERE spa.session_id = sessions.id
 	) AS project_assigned,
-	pr_links, ` + sessionLabelsSelectSQL
+	pr_links, ` + sessionLabelsSelectSQL + `,
+	parser_relationship_type, relationship_inferred, spawn_linked`
 
 const (
 	// DefaultSessionLimit is the default number of sessions returned.
@@ -334,6 +335,7 @@ func (s *Session) UnmarshalJSON(data []byte) error {
 //
 //nolint:recvcheck // Value encoding and pointer decoding intentionally implement distinct interfaces.
 type Session struct {
+	RecordedProject bool `json:"-"`
 	// WebURL is a client-derived browser link, never persisted.
 	WebURL  string `json:"web_url,omitempty"`
 	ID      string `json:"id"`
@@ -355,12 +357,20 @@ type Session struct {
 	ParentSessionIDs      []string `json:"parent_session_ids,omitempty"`
 	ParentSessionID       *string  `json:"parent_session_id,omitempty"`
 	ParserParentSessionID *string  `json:"-"`
-	RelationshipType      string   `json:"relationship_type,omitempty"`
-	TotalOutputTokens     int      `json:"total_output_tokens"`
-	PeakContextTokens     int      `json:"peak_context_tokens"`
-	HasTotalOutputTokens  bool     `json:"has_total_output_tokens"`
-	HasPeakContextTokens  bool     `json:"has_peak_context_tokens"`
-	IsAutomated           bool     `json:"is_automated"`
+	// Relationship provenance is unexported so parser output digests and
+	// JSON ignore it. Ingest records parserRelationshipType and
+	// relationshipInferred; SQLite reads fill relationshipInferred,
+	// storedParserRelationshipType, and spawnLinked.
+	parserRelationshipType       *string
+	relationshipInferred         *bool
+	storedParserRelationshipType *string
+	spawnLinked                  bool
+	RelationshipType             string `json:"relationship_type,omitempty"`
+	TotalOutputTokens            int    `json:"total_output_tokens"`
+	PeakContextTokens            int    `json:"peak_context_tokens"`
+	HasTotalOutputTokens         bool   `json:"has_total_output_tokens"`
+	HasPeakContextTokens         bool   `json:"has_peak_context_tokens"`
+	IsAutomated                  bool   `json:"is_automated"`
 
 	// Session signals (computed from messages/tool_calls).
 	ToolFailureSignalCount int      `json:"tool_failure_signal_count"`
@@ -1278,7 +1288,17 @@ func (db *DB) GetArtifactExportSession(
 		AND EXISTS (SELECT 1 FROM session_external_parents ep
 			WHERE ep.session_id = sessions.id AND ep.parent_session_id = sessions.parent_session_id)`
 	parent := `CASE WHEN ` + launcherApplied + ` THEN NULL ELSE parent_session_id END`
-	relationship := `CASE WHEN ` + launcherApplied + ` THEN ` + parserRelationshipSQL + ` ELSE relationship_type END`
+	// Parentless rows export the relationship the importer's parser would
+	// produce, so the importer derives the same provenance and applies its
+	// own automation rules: a promoted non-interactive run exports none and
+	// is promoted again, and a cleared subagent exports its parser role.
+	relationship := `CASE
+		WHEN NOT (` + launcherApplied + `) AND COALESCE(parent_session_id, '') <> '' THEN relationship_type
+		WHEN relationship_inferred = 1 AND session_kind = 'non-interactive' THEN ''
+		WHEN ` + launcherApplied + ` THEN ` + parserRelationshipSQL + `
+		WHEN COALESCE(relationship_type, '') = '' AND parser_relationship_type = 'subagent' THEN 'subagent'
+		ELSE relationship_type
+	END`
 	cols := sessionFullColsBeforeParent + parent + `, parser_parent_session_id, ` + relationship + sessionFullColsAfterRelationship
 	s, err := scanSessionFullRow(db.getReader().QueryRowContext(ctx,
 		"SELECT "+cols+" FROM sessions WHERE id = ?", id), id)
@@ -1340,6 +1360,7 @@ func scanSessionFullRow(row interface{ Scan(...any) error }, id string) (*Sessio
 		&s.FileHash, &s.LocalModifiedAt,
 		&s.TranscriptRevision, &s.CreatedAt, &s.ProjectAssigned,
 		prLinksColumn{&s.PRLinks}, labelsColumn{&s.Labels},
+		&s.storedParserRelationshipType, &s.relationshipInferred, &s.spawnLinked,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1577,8 +1598,9 @@ const insertSessionSQL = `
 			file_path, file_size, file_mtime,
 			next_ordinal, last_entry_uuid, claude_linear_parse,
 			file_inode, file_device, file_hash,
-			pr_links, structured_pr_links, parser_relationship_type
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			pr_links, structured_pr_links, parser_relationship_type,
+			relationship_inferred
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // insertSessionIfAbsentSQL inserts a session only when its id does not already
 // exist, leaving an existing row untouched.
@@ -1607,6 +1629,7 @@ const upsertSessionBaseSQL = insertSessionSQL + `
 			parser_parent_session_id = excluded.parser_parent_session_id,
 			relationship_type = excluded.relationship_type,
 			parser_relationship_type = excluded.parser_relationship_type,
+			relationship_inferred = excluded.relationship_inferred,
 			friction_rules_version = CASE
 				WHEN sessions.parent_session_id IS NOT excluded.parent_session_id
 				  OR sessions.relationship_type IS NOT excluded.relationship_type
@@ -1654,7 +1677,7 @@ const upsertSessionSQL = upsertSessionBaseSQL + `,
 
 func sessionIsAutomated(s Session) bool {
 	return s.IsAutomated ||
-		IsAutomatedSessionMetadata(s.SessionKind) ||
+		IsAutomatedSessionMetadata(s.SessionKind, s.Entrypoint) ||
 		(s.UserMessageCount <= 1 &&
 			s.FirstMessage != nil &&
 			IsAutomatedSession(*s.FirstMessage))
@@ -1667,7 +1690,44 @@ func parserParentSessionID(s Session) *string {
 	return s.ParentSessionID
 }
 
+// RecordParserRelationship records the parser-derived relationship and
+// whether its subagent role comes only from headless shape. Call it once on
+// parser output, before write-time normalization replaces RelationshipType.
+func (s *Session) RecordParserRelationship() {
+	rel := ParserSessionRelationship(*s)
+	inferred := relationshipInferred(*s, rel)
+	s.parserRelationshipType = &rel
+	s.relationshipInferred = &inferred
+}
+
+// RelationshipProvenance returns the recorded parser relationship and
+// inferred flag for internal transport that skips unexported Session fields.
+func (s Session) RelationshipProvenance() (parserRel string, inferred bool, ok bool) {
+	if s.parserRelationshipType == nil &&
+		s.storedParserRelationshipType == nil &&
+		s.relationshipInferred == nil {
+		return "", false, false
+	}
+	return PersistedParserRelationship(s), SessionRelationshipInferred(s), true
+}
+
+// RestoreRelationshipProvenance restores parser relationship provenance
+// decoded from internal transport onto s.
+func (s *Session) RestoreRelationshipProvenance(parserRel string, inferred bool) {
+	s.parserRelationshipType = &parserRel
+	s.relationshipInferred = &inferred
+}
+
+// SpawnLinked reports whether a spawn edge or launcher link has given the
+// stored session a parent, even one since deleted.
+func (s Session) SpawnLinked() bool {
+	return s.spawnLinked
+}
+
 func upsertSessionArgs(s Session) []any {
+	parserRel := ParserSessionRelationship(s)
+	inferred := SessionRelationshipInferred(s)
+	s.IsAutomated = sessionIsAutomated(s)
 	s.RelationshipType = SessionRelationship(s)
 	return []any{
 		s.ID, s.Project, s.Machine, s.Agent, s.FirstMessage, s.SessionName,
@@ -1677,7 +1737,7 @@ func upsertSessionArgs(s Session) []any {
 		s.RelationshipType,
 		s.TotalOutputTokens, s.PeakContextTokens,
 		s.HasTotalOutputTokens, s.HasPeakContextTokens,
-		sessionIsAutomated(s),
+		s.IsAutomated,
 		s.TerminationStatus,
 		s.Cwd, s.GitBranch, s.SourceSessionID,
 		s.SourceVersion, s.GroupKey, s.TranscriptFidelity,
@@ -1693,17 +1753,78 @@ func upsertSessionArgs(s Session) []any {
 		s.FileInode, s.FileDevice, s.FileHash,
 		EncodePRLinks(s.PRLinks),
 		EncodePRLinks(s.PRLinks),
-		s.RelationshipType,
+		parserRel,
+		inferred,
 	}
 }
 
-// SessionRelationship normalizes older parentless workers at every session write.
-func SessionRelationship(s Session) string {
+// ParserSessionRelationship returns the parser-derived relationship, promoting
+// parentless non-interactive sessions to subagent for provenance tracking.
+func ParserSessionRelationship(s Session) string {
+	if s.parserRelationshipType != nil {
+		return *s.parserRelationshipType
+	}
 	var parent string
 	if s.ParentSessionID != nil {
 		parent = *s.ParentSessionID
 	}
 	return string(parser.PromoteParentlessWorker(parent, parser.RelationshipType(s.RelationshipType), s.SessionKind == parser.SessionKindNonInteractive))
+}
+
+// PersistedParserRelationship is the parser relationship a replica stores:
+// the one ingest recorded, else the one read from SQLite, else the one derived
+// from RelationshipType. A session read back from SQLite may hold an effective
+// relationship that no longer shows its parser role.
+func PersistedParserRelationship(s Session) string {
+	if s.parserRelationshipType == nil && s.storedParserRelationshipType != nil {
+		return *s.storedParserRelationshipType
+	}
+	return ParserSessionRelationship(s)
+}
+
+// SessionRelationshipInferred reports whether the parser marked s a subagent
+// only because it is a parentless headless run.
+func SessionRelationshipInferred(s Session) bool {
+	if s.relationshipInferred != nil {
+		return *s.relationshipInferred
+	}
+	return relationshipInferred(s, ParserSessionRelationship(s))
+}
+
+// relationshipInferred treats RelationshipType as the parser's relationship
+// before parentless promotion. Claude marks headless SDK runs as subagents
+// itself, so every parentless sdk-cli subagent is inferred; a non-interactive
+// session is inferred only when the parser had no explicit subagent marker.
+func relationshipInferred(s Session, parserRel string) bool {
+	_, rawID := parser.StripHostPrefix(s.ID)
+	_, rawSourceID := parser.StripHostPrefix(s.SourceSessionID)
+	if parserRel != string(parser.RelSubagent) ||
+		(s.ParentSessionID != nil && *s.ParentSessionID != "") ||
+		(s.ParserParentSessionID != nil && *s.ParserParentSessionID != "") ||
+		strings.HasPrefix(rawID, "agent-") ||
+		strings.HasPrefix(rawSourceID, "agent-") {
+		return false
+	}
+	if s.Entrypoint == "sdk-cli" {
+		return true
+	}
+	return s.SessionKind == parser.SessionKindNonInteractive &&
+		s.RelationshipType != string(parser.RelSubagent)
+}
+
+// SessionRelationship normalizes parentless workers at every session write.
+// An automated parentless run that the parser marked subagent only from its
+// headless shape stays un-delegated, so Activity counts it as Automated.
+// Sessions with a parent, an explicit child marker, or a spawn record keep
+// their subagent role.
+func SessionRelationship(s Session) string {
+	rel := ParserSessionRelationship(s)
+	if rel == string(parser.RelSubagent) && s.IsAutomated &&
+		(s.ParentSessionID == nil || *s.ParentSessionID == "") &&
+		!s.spawnLinked && SessionRelationshipInferred(s) {
+		return ""
+	}
+	return rel
 }
 
 // UpsertSession inserts or updates a session.
@@ -1808,13 +1929,14 @@ func upsertSessionExec(
 	var previousAutomated bool
 	var previousParent sql.NullString
 	var previousRelationship, previousStructuredPRLinks string
+	var previousSpawnLinked bool
 	var deletedAt, sourceMissingAt sql.NullString
 	err = queryRow(ctx,
-		"SELECT project, session_name, deleted_at, source_missing_at, is_automated, parent_session_id, relationship_type, structured_pr_links "+
+		"SELECT project, session_name, deleted_at, source_missing_at, is_automated, parent_session_id, relationship_type, structured_pr_links, spawn_linked "+
 			"FROM sessions WHERE id = ?", s.ID,
 	).Scan(
 		&previousProject, &previousSessionName, &deletedAt, &sourceMissingAt, &previousAutomated,
-		&previousParent, &previousRelationship, &previousStructuredPRLinks,
+		&previousParent, &previousRelationship, &previousStructuredPRLinks, &previousSpawnLinked,
 	)
 	result := sessionUpsertResult{
 		inserted:                 errors.Is(err, sql.ErrNoRows),
@@ -1829,6 +1951,9 @@ func upsertSessionExec(
 	if s.PreserveStoredAutomation {
 		s.IsAutomated = s.IsAutomated || previousAutomated
 	}
+	// The upsert keeps the stored spawn record, so a spawned worker whose
+	// spawner is gone keeps its subagent role.
+	s.spawnLinked = s.spawnLinked || previousSpawnLinked
 	if s.PreserveSessionName && !result.inserted {
 		if previousSessionName.Valid {
 			name := previousSessionName.String
@@ -2048,6 +2173,7 @@ const linkSubagentSessionsQuery = `
 	SET parent_session_id = (` + subagentSpawnerExpr + `
 	),
 	relationship_type = 'subagent',
+	spawn_linked = 1,
 	friction_rules_version = '',
 	local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 	-- The tool_calls edge (from toolUseResult.agentId) records the actual
@@ -2063,6 +2189,11 @@ const linkSubagentSessionsQuery = `
 	-- still linked). Because the resolved spawner depends only on the
 	-- stored edges, a row already pointing at it matches neither branch:
 	-- linking stays a no-op and does not churn local_modified_at.
+	--
+	-- spawn_linked records that a spawn edge gave the row a parent, so the
+	-- row stays a subagent after its spawner and edges are deleted. A row
+	-- already pointing at its spawner either has a transcript parent, which
+	-- keeps it a subagent anyway, or got that parent from an earlier link.
 	WHERE s.id IN (
 		SELECT tc.subagent_session_id FROM tool_calls tc
 		WHERE tc.subagent_session_id IS NOT NULL
@@ -2221,6 +2352,7 @@ func linkSubagentSessionsForSessionsQuery(ph string) string {
 	SET parent_session_id = (` + subagentSpawnerExpr + `
 	),
 	relationship_type = 'subagent',
+	spawn_linked = 1,
 	friction_rules_version = '',
 	local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 	WHERE s.id IN (
@@ -4530,6 +4662,96 @@ func (db *DB) ListSessionWriteIdentitiesByID(
 	return identities, nil
 }
 
+// SessionSummaryIdentity is the minimal stored identity needed to compare a
+// session's summary fingerprint digest against an external summary store.
+type SessionSummaryIdentity struct {
+	ID       string
+	FilePath string
+	FileHash string
+}
+
+const listSessionSummaryIdentitiesUnderPathQuery = `
+	SELECT id, file_path, COALESCE(file_hash, '')
+	FROM sessions INDEXED BY idx_sessions_file_path
+	WHERE file_path >= ?
+	  AND file_path < ?
+	  AND file_path IS NOT NULL
+	  AND agent = ?`
+
+// ListSessionSummaryIdentitiesUnderPathContext returns stored sessions for
+// agent whose file_path lies beneath root, including trashed and
+// source-missing retained sessions. It seeks idx_sessions_file_path over the
+// bounded [lower, upper) path range instead of scanning all sessions for agent.
+func (db *DB) ListSessionSummaryIdentitiesUnderPathContext(
+	ctx context.Context,
+	agent, root string,
+) ([]SessionSummaryIdentity, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if agent == "" || root == "" {
+		return nil, nil
+	}
+	lower, upper := sourcePathPrefixBounds(root)
+	rows, err := db.getReader().QueryContext(
+		ctx, listSessionSummaryIdentitiesUnderPathQuery, lower, upper, agent,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing session summary identities under path: %w", err)
+	}
+	defer rows.Close()
+
+	var identities []SessionSummaryIdentity
+	for rows.Next() {
+		var identity SessionSummaryIdentity
+		if err := rows.Scan(&identity.ID, &identity.FilePath, &identity.FileHash); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scanning session summary identity: %w", err)
+		}
+		identities = append(identities, identity)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterating session summary identities: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("closing session summary identities: %w", err)
+	}
+	sort.Slice(identities, func(i, j int) bool {
+		return identities[i].ID < identities[j].ID
+	})
+	return identities, nil
+}
+
+// sourcePathPrefixBounds computes a byte-exact [lower, upper) B-tree seek range
+// for descendants of root, preserving remote separator syntax across platforms.
+func sourcePathPrefixBounds(root string) (lower, upper string) {
+	var sep byte
+	switch {
+	case strings.Contains(root, `\`) && !strings.Contains(root, "/"):
+		sep = '\\'
+		lower = strings.TrimRight(root, `\`)
+		if lower == "" {
+			lower = `\`
+		} else {
+			lower += `\`
+		}
+	case strings.Contains(root, "/"):
+		sep = '/'
+		lower = strings.TrimRight(root, "/")
+		if lower == "" {
+			lower = "/"
+		} else {
+			lower += "/"
+		}
+	default:
+		return activeSessionSourceBounds(root)
+	}
+	upperBytes := []byte(lower)
+	upperBytes[len(upperBytes)-1] = sep + 1
+	return lower, string(upperBytes)
+}
+
 // ListSessionMachinesByID returns the stored machine attribution for each
 // requested session, including tombstoned rows that may be revived by a later
 // successful parse. Requests are chunked below SQLite's bind-variable limit.
@@ -6718,6 +6940,7 @@ func (db *DB) ListSessionsModifiedBetween(
 			&s.FileHash, &s.LocalModifiedAt,
 			&s.TranscriptRevision, &s.CreatedAt, &s.ProjectAssigned,
 			prLinksColumn{&s.PRLinks}, labelsColumn{&s.Labels},
+			&s.storedParserRelationshipType, &s.relationshipInferred, &s.spawnLinked,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning session: %w", err)
@@ -6829,6 +7052,7 @@ func (db *DB) ListSessionsForMirrorWindow(
 			&s.FileHash, &s.LocalModifiedAt,
 			&s.TranscriptRevision, &s.CreatedAt, &s.ProjectAssigned,
 			prLinksColumn{&s.PRLinks}, labelsColumn{&s.Labels},
+			&s.storedParserRelationshipType, &s.relationshipInferred, &s.spawnLinked,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning session: %w", err)

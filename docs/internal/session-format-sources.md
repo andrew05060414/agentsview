@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-11-23
+last_edited: 2026-11-27
 ---
 
 # Session Format Source Inventory
@@ -287,9 +287,17 @@ evidence; they do not establish whether a tool helped the task.
   for interactive terminal launches; SDK libraries use `sdk-py` or `sdk-ts`.
   Worker prompts record `turnOrigin=sdk`; relayed human prompts record
   `turnOrigin=human` and `origin.kind=human`, even when `promptSource=sdk`.
-  AgentsView assigns `relationship_type=subagent` for parentless `sdk-cli`
-  sessions with no existing relationship when the first real normalized prompt
-  has SDK origin, after queued prompts merge. SDK ingress discards queued SDK
+  AgentsView records `parser_relationship_type=subagent` for parentless
+  `sdk-cli` sessions with no existing relationship when the first real
+  normalized prompt has SDK origin, after queued prompts merge. When such a
+  parentless headless run is classified as automated, AgentsView leaves
+  `relationship_type` empty so it counts as Automated instead of Subagents,
+  and restores `relationship_type=subagent` if automation clears (for example,
+  on a second user turn or after removing a user `[automated]` pattern).
+  Sessions with `entrypoint=roborev` (from `CLAUDE_CODE_ENTRYPOINT=roborev`,
+  which Claude Code preserves verbatim on `-p` launches) count as automated
+  directly via `IsAutomatedSessionMetadata` without subagent promotion. SDK
+  ingress discards queued SDK
   origin before attachments are persisted. A queued first prompt supplies no
   SDK evidence and blocks later-turn inference. Human origin wins conflicting
   markers; missing origin remains ambiguous. Explicit provider kinds remain
@@ -1351,7 +1359,20 @@ fixtures retain this field; missing identities remain source-local.
   prefix in labels. Codex writes dated rollouts under the home's `sessions`
   directory and its `session_index.jsonl` beside that directory. The sandbox
   omits `--thread-source`, so Agentsview identifies parentless `codex_exec`
-  sessions in these homes as roborev runs from their path.
+  sessions in these homes as roborev runs from their path. Raw capture keeps
+  the marked home in its paths so replay preserves that classification.
+
+- **Roborev recorded labels (2026-11-26):** [Roborev's recorded-label
+  change](https://github.com/kenn-io/roborev/pull/1865) makes `CodexSandbox.prepare` in
+  `internal/agent/codex_sandbox.go` write `roborev.json` in the retained
+  `.codex-run-v1-*` home before the run starts, with a `label` string.
+  AgentsView reads it from the parent of the rollout's `sessions` directory on
+  a full parse; `docs/configuration.md` lists what can replace it later.
+  A missing, malformed, or empty label leaves the project derived from the
+  configured folder or the session's working directory; a read error fails the
+  parse for retry. `TestCodexLabeledRunDiscoveryAndParse` covers the missing
+  and malformed fallbacks, and `TestCodexRecordedLabelReadErrorRetries` covers
+  the read error.
 
 - **Launch classification (reverified 2026-10-08):**
   `session_meta.payload.originator=codex_exec` is durable producer evidence of
@@ -5439,7 +5460,12 @@ schemas keep their existing ordering behavior.
   uses `~/.gemini/antigravity/conversation_summaries.db` with
   `conversation_summaries(conversation_id PRIMARY KEY, title, ...)` in the
   desktop app. The IDE root is read the same way but remains unconfirmed;
-  `antigravity-cli` has no known title store. Titles stay out of the
+  `antigravity-cli` shares the same title store table and reconciliation path
+  (reverified 2026-11-26 against local `antigravity-acp` profiles under
+  `~/.t3/userdata/providers/antigravity/<hash>/antigravity-acp`, where
+  `conversation_summaries.title` holds generated conversation titles, and
+  standalone `~/.gemini/antigravity-cli/conversation_summaries.db`, where
+  `title` was empty `""`). Titles stay out of the
   transcript fingerprint: parsing copies the saved title, and each sync pass
   copies changed titles onto stored sessions, including those whose transcript
   is gone. A NULL title or unreadable store keeps the stored title; a blank
@@ -5605,10 +5631,12 @@ schemas keep their existing ordering behavior.
   `cache/last_conversations.json`. Agentsview includes
   `$T3CODE_HOME/userdata/providers/antigravity` (default
   `~/.t3/userdata/providers/antigravity`) as a default container root for
-  `antigravity-cli` and expands per-instance roots dynamically across both T3
+  `antigravity-cli`, expands per-instance roots dynamically across both T3
   Code and user-configured meta-harness containers
   (`internal/config/meta_harnesses.go`, `internal/parser/instance_container.go`,
-  and `internal/parser/antigravity_cli_provider.go`). Evidence remains
+  and `internal/parser/antigravity_cli_provider.go`), and imports
+  `conversation_summaries.title` into `session_name` on parse and native-title
+  reconciliation (excluding `implicit/` sessions). Evidence remains
   `no-public-source`.
 
 ## iFlow CLI (`iflow`)

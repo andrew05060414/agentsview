@@ -496,6 +496,9 @@ type Engine struct {
 	// changedPathListedHook is a test seam called after a changed-path
 	// listing and before its re-list check; nil in production.
 	changedPathListedHook func(path string)
+	// antigravitySummaryDigests is a test seam for simulating transient
+	// conversation_summaries.db read failures; nil uses parser.AntigravitySummaryDigests.
+	antigravitySummaryDigests func(context.Context, string) (map[string]string, error)
 	// incrementalCommittedHook is a test seam called after an incremental
 	// session write commits; nil in production.
 	incrementalCommittedHook func(sessionID string)
@@ -1571,10 +1574,11 @@ func (e *Engine) SyncPaths(paths []string) {
 // that ignored SIGTERM would hold shutdown until a service manager's kill
 // timeout instead of aborting between files like every other sync path.
 type preparedChangedPathSync struct {
-	files              []parser.DiscoveredFile
-	missingPaths       []string
-	preContainerStates map[string]parser.SQLiteContainerState
-	classificationErr  error
+	files               []parser.DiscoveredFile
+	missingPaths        []string
+	failedSummaryStores []string
+	preContainerStates  map[string]parser.SQLiteContainerState
+	classificationErr   error
 }
 
 func (p preparedChangedPathSync) empty() bool {
@@ -1595,7 +1599,7 @@ func (e *Engine) prepareChangedPathSync(
 	// Capture container states before classifyPaths lists any session rows,
 	// matching the capture-before-discovery ordering of full syncs.
 	prepared.preContainerStates = e.captureSQLiteContainerStates(paths)
-	prepared.files, prepared.classificationErr = e.classifyPaths(ctx, paths)
+	prepared.files, prepared.failedSummaryStores, prepared.classificationErr = e.classifyPathsWithSummaryFailures(ctx, paths)
 	prepared.missingPaths = omitMissingPersistentContainerPaths(
 		prepared.missingPaths, prepared.files,
 	)
@@ -1659,10 +1663,15 @@ func (e *Engine) syncChangedPathsLocked(
 	// Title store events carry no session files, so this also handles them.
 	if err == nil && !stats.Aborted {
 		var titleStats SyncStats
-		e.reconcileNativeTitlesLocked(ctx, &titleStats)
+		failedTitleStores := e.reconcileNativeTitlesLocked(ctx, &titleStats)
+		e.recordFailedAntigravitySummaryStoresLocked(
+			ctx, prepared.failedSummaryStores, failedTitleStores, &titleStats,
+		)
 		e.recordNativeTitleUpdates(titleStats)
 		stats.TitlesUpdated += titleStats.TitlesUpdated
 		stats.Failed += titleStats.Failed
+	} else {
+		e.queueFailedAntigravitySummaryStoreRetriesLocked(ctx, prepared.failedSummaryStores)
 	}
 	return stats, tombstoned, err
 }
@@ -1909,8 +1918,17 @@ func (e *Engine) classifyPaths(
 	ctx context.Context,
 	paths []string,
 ) ([]parser.DiscoveredFile, error) {
+	files, _, err := e.classifyPathsWithSummaryFailures(ctx, paths)
+	return files, err
+}
+
+func (e *Engine) classifyPathsWithSummaryFailures(
+	ctx context.Context,
+	paths []string,
+) ([]parser.DiscoveredFile, []string, error) {
 	seen := make(map[string]int, len(paths))
 	files := make([]parser.DiscoveredFile, 0, len(paths))
+	var failedSummaryStores []string
 	var classificationErr error
 	for _, p := range paths {
 		// Codex resolved-index events map to potentially several session
@@ -1920,7 +1938,10 @@ func (e *Engine) classifyPaths(
 		// history.jsonl), are owned by each provider-authoritative
 		// SourcesForChangedPath via classifyProviderChangedPath.
 		dfs := e.classifyCodexIndexPath(ctx, p)
-		providerFiles, err := e.classifyProviderChangedPath(ctx, p)
+		providerFiles, failedStores, err := e.classifyProviderChangedPathWithSummaryFailures(ctx, p)
+		for _, store := range failedStores {
+			failedSummaryStores = watchAppendUniqueString(failedSummaryStores, store)
+		}
 		if err != nil {
 			classificationErr = errors.Join(
 				classificationErr,
@@ -1944,7 +1965,7 @@ func (e *Engine) classifyPaths(
 		classificationErr = errors.Join(classificationErr, err)
 	}
 	files = dedupeDiscoveredFiles(files)
-	return e.dedupeClaudeDiscoveredFiles(ctx, files), classificationErr
+	return e.dedupeClaudeDiscoveredFiles(ctx, files), failedSummaryStores, classificationErr
 }
 
 func mergeChangedPathDiscoveredFile(
@@ -1970,8 +1991,17 @@ func (e *Engine) classifyProviderChangedPath(
 	ctx context.Context,
 	path string,
 ) ([]parser.DiscoveredFile, error) {
+	files, _, err := e.classifyProviderChangedPathWithSummaryFailures(ctx, path)
+	return files, err
+}
+
+func (e *Engine) classifyProviderChangedPathWithSummaryFailures(
+	ctx context.Context,
+	path string,
+) ([]parser.DiscoveredFile, []string, error) {
 	eventKind := providerChangedPathEventKind(path)
 	var files []parser.DiscoveredFile
+	var failedSummaryStores []string
 	var classificationErr error
 	seen := map[string]struct{}{}
 
@@ -2038,6 +2068,37 @@ func (e *Engine) classifyProviderChangedPath(
 		// every registered agent on every watcher event.
 		if !changedPathWithinAnyRoot(path, roots) &&
 			!changedPathWithinAnyRoot(path, watchRoots) {
+			continue
+		}
+		if isAntigravitySummariesEventPath(agentType, path) {
+			// Titles reconcile in syncChangedPathsLocked, while workspace or
+			// parent changes in conversation_summaries.db select only the
+			// sessions whose stored summary fingerprint digest no longer
+			// matches.
+			summaryFiles, summaryReadErr, fallbackErr, summaryErr := e.classifyAntigravitySummariesPath(
+				ctx, agentType, provider, roots, path,
+			)
+			if summaryReadErr != nil {
+				store := strings.TrimSuffix(filepath.Clean(path), "-wal")
+				failedSummaryStores = watchAppendUniqueString(failedSummaryStores, store)
+			}
+			if err := errors.Join(summaryErr, fallbackErr); err != nil {
+				classificationErr = errors.Join(
+					classificationErr,
+					fmt.Errorf(
+						"%s provider changed-path classification for %q: %w",
+						def.Type, path, err,
+					),
+				)
+			}
+			for _, discovered := range summaryFiles {
+				key := string(discovered.Agent) + "\x00" + discovered.Path
+				if _, dup := seen[key]; dup {
+					continue
+				}
+				seen[key] = struct{}{}
+				files = append(files, discovered)
+			}
 			continue
 		}
 		// Capture the shared container's state before any watermark-only
@@ -2195,7 +2256,7 @@ func (e *Engine) classifyProviderChangedPath(
 			}
 		}
 	}
-	return files, classificationErr
+	return files, failedSummaryStores, classificationErr
 }
 
 // expandOmnigentInheritedMetadataSources adds the still-archived descendant
@@ -2963,67 +3024,81 @@ func (e *Engine) swapResyncDatabaseLocked(
 		})
 	}
 
-	// Close the original to quiesce writes and checkpoint its WAL before the
-	// rename. The worker path already holds the daemon's write barrier; the
-	// in-process path relies on this close for the same guarantee.
-	reportResyncPhase(PhaseCopyingMetadata, "Closing current database before swap")
-	if err := origDB.CloseConnections(ctx); err != nil {
-		log.Printf("resync: close orig db: %v", err)
-		stats.Aborted = true
-		stats.Warnings = append(stats.Warnings,
-			"close before swap failed: "+err.Error(),
-		)
-		err = fmt.Errorf("full resync not installed, archive unchanged: %w", err)
-		removeTempDB(tempPath)
-		// Connections may be partially closed; reopen to restore service.
-		if rerr := origDB.Reopen(); rerr != nil {
-			log.Printf("resync: recovery reopen: %v", rerr)
-			return false, errors.Join(err, fmt.Errorf("recovery reopen: %w", rerr))
-		}
-		return false, err
-	}
-
-	reportResyncPhase(PhaseSwappingDatabase, "Swapping rebuilt database into place")
-	// CloseConnections checkpointed the original (including the
-	// barrier-closed-writer case), so its remaining sidecars are stale files
-	// whose removal cannot discard data, and a failed rename below reopens a
-	// complete original.
-	removeWAL(origPath)
-
-	if err := atomicfile.Replace(tempPath, origPath); err != nil {
-		log.Printf("resync: rename temp db: %v", err)
-		stats.Aborted = true
-		stats.Warnings = append(stats.Warnings,
-			"resync swap failed: "+err.Error(),
-		)
-		removeTempDB(tempPath)
-		// Restore service even on rename failure.
-		if rerr := origDB.Reopen(); rerr != nil {
-			log.Printf("resync: recovery reopen: %v", rerr)
-			return false, errors.Join(err, fmt.Errorf("recovery reopen: %w", rerr))
-		}
-		return false, err
-	}
-	removeWAL(tempPath)
-
-	if err := ops.reopen(origDB); err != nil {
-		log.Printf("resync: reopen db: %v", err)
-		// The replacement is already renamed into place; a failed reopen
-		// leaves both pools closed and every read failing until restart, so
-		// retry before surfacing the failure.
-		if rerr := ops.reopen(origDB); rerr != nil {
-			log.Printf("resync: recovery reopen: %v", rerr)
+	// Hold the database write lock and pause new reads across the entire
+	// close-rename-reopen window so live HTTP requests wait for the replacement
+	// pool and no lock-holding caller can block on paused reads.
+	swapErr := origDB.WithArchiveSwap(ctx, func(swap *db.ArchiveSwap) error {
+		// Close the original to quiesce writes and checkpoint its WAL before the
+		// rename. The worker path already holds the daemon's write barrier; the
+		// in-process path relies on this close for the same guarantee.
+		reportResyncPhase(PhaseCopyingMetadata, "Closing current database before swap")
+		if err := swap.Close(ctx); err != nil {
+			log.Printf("resync: close orig db: %v", err)
 			stats.Aborted = true
 			stats.Warnings = append(stats.Warnings,
-				"resync swap completed but reopening active database failed: "+
-					err.Error(),
+				"close before swap failed: "+err.Error(),
 			)
-			return true, errors.Join(err, fmt.Errorf("recovery reopen: %w", rerr))
+			err = fmt.Errorf("full resync not installed, archive unchanged: %w", err)
+			removeTempDB(tempPath)
+			// Connections may be partially closed; reopen to restore service.
+			if rerr := swap.Reopen(); rerr != nil {
+				log.Printf("resync: recovery reopen: %v", rerr)
+				return errors.Join(err, fmt.Errorf("recovery reopen: %w", rerr))
+			}
+			return err
 		}
-		log.Printf("resync: reopen recovered on retry")
-		stats.Warnings = append(stats.Warnings,
-			"resync reopen required a retry: "+err.Error(),
-		)
+
+		reportResyncPhase(PhaseSwappingDatabase, "Swapping rebuilt database into place")
+		// Close checkpointed the original (including the
+		// barrier-closed-writer case), so its remaining sidecars are stale files
+		// whose removal cannot discard data, and a failed rename below reopens a
+		// complete original.
+		removeWAL(origPath)
+
+		if err := atomicfile.Replace(tempPath, origPath); err != nil {
+			log.Printf("resync: rename temp db: %v", err)
+			stats.Aborted = true
+			stats.Warnings = append(stats.Warnings,
+				"resync swap failed: "+err.Error(),
+			)
+			removeTempDB(tempPath)
+			// Restore service even on rename failure.
+			if rerr := swap.Reopen(); rerr != nil {
+				log.Printf("resync: recovery reopen: %v", rerr)
+				return errors.Join(err, fmt.Errorf("recovery reopen: %w", rerr))
+			}
+			return err
+		}
+		removeWAL(tempPath)
+		installed = true
+
+		if err := ops.reopen(swap.Reopen); err != nil {
+			log.Printf("resync: reopen db: %v", err)
+			// The replacement is already renamed into place; a failed reopen
+			// leaves both pools closed and every read failing until restart, so
+			// retry before surfacing the failure.
+			if rerr := ops.reopen(swap.Reopen); rerr != nil {
+				log.Printf("resync: recovery reopen: %v", rerr)
+				stats.Aborted = true
+				stats.Warnings = append(stats.Warnings,
+					"resync swap completed but reopening active database failed: "+
+						err.Error(),
+				)
+				return errors.Join(err, fmt.Errorf("recovery reopen: %w", rerr))
+			}
+			log.Printf("resync: reopen recovered on retry")
+			stats.Warnings = append(stats.Warnings,
+				"resync reopen required a retry: "+err.Error(),
+			)
+		}
+		return nil
+	})
+	if swapErr != nil {
+		if !stats.Aborted {
+			stats.Aborted = true
+			stats.Warnings = append(stats.Warnings, "resync swap failed: "+swapErr.Error())
+		}
+		return installed, swapErr
 	}
 	origDB.MarkDataCurrent()
 	if err := origDB.CheckpointWALTruncateWithRetry(ctx); err != nil {
@@ -11033,7 +11108,7 @@ func (e *Engine) preserveUnavailableSourceProjects(
 	indexes := make(map[string][]int)
 	ids := make([]string, 0, len(batch))
 	for i := range batch {
-		if batch[i].sourceProjectResolved {
+		if batch[i].sourceProjectResolved || batch[i].sess.RecordedProject {
 			continue
 		}
 		sess := batch[i].sess
@@ -13156,7 +13231,7 @@ func (e *Engine) syncSingleSessionContext(ctx context.Context, sessionID string,
 	if exhaustive && def.Type == parser.AgentCodex && e.db.GetSessionFilePath(ctx, sessionID) != "" {
 		raw := strings.TrimPrefix(sessionID, def.IDPrefix)
 		if found := e.findProviderSourceFile(ctx, def, sessionID, raw, ""); found != "" &&
-			parser.CodexSourceLabelForRoots(e.sources().agentDirs[def.Type], found) != "" {
+			parser.CodexLabeledSource(e.sources().agentDirs[def.Type], found) {
 			path = found
 		}
 	}
