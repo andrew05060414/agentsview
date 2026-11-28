@@ -160,7 +160,7 @@ You can also run `agentsview source import --type claude-ai --sync` while the
 server and Chrome are running, with no AgentsView tab open.
 
 Sync reuses an open Claude.ai tab. If none is open, it opens a background
-Claude.ai tab and leaves it open.
+Claude.ai tab and closes it after its requests finish.
 
 In the desktop app connected to its local archive, click **Sign in**, sign in
 with an email code, close the sign-in window, and then click **Sync**. The
@@ -248,7 +248,7 @@ also syncs ChatGPT through Chrome; its own sign-in window serves Claude.ai
 only.
 
 Sync reuses an open ChatGPT tab. If none is open, it opens one in the
-background and leaves it open.
+background and closes it after its requests finish.
 
 Inside the ChatGPT page, the extension reads a short-lived access token and
 uses it only for the allowed conversation-list and conversation requests. That
@@ -332,8 +332,8 @@ to ten accounts. Each account gets its own request token, whatever account the
 open tab shows.
 
 Sync reuses an open Gemini tab. If none is open, it opens one in the background
-and leaves it open. If the open tab belongs to a second Google account
-(`/u/1/`), Sync reads that account.
+and closes it after its requests finish. If the open tab belongs to a second
+Google account (`/u/1/`), Sync reads that account.
 
 Gemini has no public API. The extension makes the same two read requests as the
 Gemini web app: the chat list and one chat's turns. It reads the page's request
@@ -412,7 +412,7 @@ that Grok offers in its settings.
    ```
 
 Sync reuses an open Grok tab. If none is open, it opens one in the background
-and leaves it open.
+and closes it after its requests finish.
 
 The extension makes the same two read requests as the Grok web app: the chat
 list and one chat's responses. It sends them with the tab's sign-in cookies,
